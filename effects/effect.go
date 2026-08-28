@@ -406,10 +406,9 @@ func NewEngine(cfg EngineConfig) *Engine {
 	// until you've joined, and can't join if joining needs a majority). Pin it
 	// as the first rule so first-match-wins makes it an invariant no config can
 	// override; the anchored pattern won't match user keys like "_foo".
-	rules := append([]KeyRangeRule{{Pattern: "__swytch:*", Mode: UnsafeMode}}, cfg.KeyRangeRules...)
 	e.safety.Store(&safetyMap{
 		defaultMode: cfg.DefaultMode,
-		rules:       rules,
+		rules:       withSystemKeyException(cfg.KeyRangeRules),
 	})
 
 	if cfg.Broadcaster != nil {
@@ -937,8 +936,17 @@ func (e *Engine) SetOnLocalEffect(hook func(offset Tip, eff *pb.Effect)) {
 func (e *Engine) UpdateSafetyRules(defaultMode SafetyMode, rules []KeyRangeRule) {
 	e.safety.Store(&safetyMap{
 		defaultMode: defaultMode,
-		rules:       rules,
+		rules:       withSystemKeyException(rules),
 	})
+}
+
+// withSystemKeyException returns a private copy of rules with the pinned
+// "__swytch:*" UnsafeMode rule prepended. System keys are commutative protocol
+// metadata that must never be quorum-gated, so first-match-wins makes this an
+// invariant no config can override. Copying detaches the running config from
+// the caller's slice, so later mutations can't reach into the live engine.
+func withSystemKeyException(rules []KeyRangeRule) []KeyRangeRule {
+	return append([]KeyRangeRule{{Pattern: "__swytch:*", Mode: UnsafeMode}}, rules...)
 }
 
 func (e *Engine) modeForKey(key string) SafetyMode {
