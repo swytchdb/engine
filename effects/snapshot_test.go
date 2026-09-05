@@ -1195,9 +1195,11 @@ func TestSubscriptionBootstrap_FetchesRemoteState(t *testing.T) {
 	// Set up "local" engine (node 1) with no data
 	localLog := newSnapshotLog()
 
-	// Create the bootstrap broadcaster that connects local and remote
 	bc := &bootstrapBroadcaster{
-		peerIDs: []pb.NodeID{2}, allRegionPeersReachable: true,
+		mockBroadcaster: mockBroadcaster{
+			peerIDs:                 []pb.NodeID{2},
+			allRegionPeersReachable: true,
+		},
 	}
 	// The remote engine's broadcaster needs to forward NACKs to the local engine
 	// We'll set this up after creating the local engine
