@@ -188,9 +188,11 @@ func TestEnsureSubscribed_InstallsOnlyWalkableTips(t *testing.T) {
 	ghostTip := Tip{99999, 4}
 
 	bc := &selectiveBroadcaster{
-		peerIDs:                 []pb.NodeID{peerNode},
-		allRegionPeersReachable: true,
-		nackTips:                []*pb.EffectRef{toPbRef(realTip), toPbRef(ghostTip)},
+		mockBroadcaster: mockBroadcaster{
+			peerIDs:                 []pb.NodeID{peerNode},
+			allRegionPeersReachable: true,
+		},
+		nackTips: []*pb.EffectRef{toPbRef(realTip), toPbRef(ghostTip)},
 		fetchable: map[Tip][]byte{
 			realTip: realBytes,
 			// ghostTip intentionally absent — FetchFromAny returns error.
@@ -255,10 +257,12 @@ func TestEnsureSubscribed_AllTipsUnreachable_RetriesBootstrap(t *testing.T) {
 	ghostB := Tip{500, 2}
 
 	bc := &selectiveBroadcaster{
-		peerIDs:                 []pb.NodeID{peerNode},
-		allRegionPeersReachable: true,
-		nackTips:                []*pb.EffectRef{toPbRef(ghostA), toPbRef(ghostB)},
-		fetchable:               map[Tip][]byte{}, // nothing fetchable
+		mockBroadcaster: mockBroadcaster{
+			peerIDs:                 []pb.NodeID{peerNode},
+			allRegionPeersReachable: true,
+		},
+		nackTips:  []*pb.EffectRef{toPbRef(ghostA), toPbRef(ghostB)},
+		fetchable: map[Tip][]byte{}, // nothing fetchable
 	}
 
 	e := newTestEngine(bc)
@@ -416,10 +420,12 @@ func TestRetryBootstrap_ShutdownUnblocksWaiters(t *testing.T) {
 	const peerNode pb.NodeID = 7
 
 	bc := &selectiveBroadcaster{
-		peerIDs:                 []pb.NodeID{peerNode},
-		allRegionPeersReachable: true,
-		nackTips:                []*pb.EffectRef{toPbRef(Tip{500, 1})},
-		fetchable:               map[Tip][]byte{},
+		mockBroadcaster: mockBroadcaster{
+			peerIDs:                 []pb.NodeID{peerNode},
+			allRegionPeersReachable: true,
+		},
+		nackTips:  []*pb.EffectRef{toPbRef(Tip{500, 1})},
+		fetchable: map[Tip][]byte{},
 	}
 
 	e := newTestEngine(bc)

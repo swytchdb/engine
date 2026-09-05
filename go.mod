@@ -1,10 +1,10 @@
 module github.com/swytchdb/engine
 
-go 1.27.0
+go 1.26.5
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0
-	github.com/klauspost/compress v1.19.2
+	github.com/klauspost/compress v1.20.0
 	github.com/prometheus/client_golang v1.24.1
 	github.com/prometheus/client_model v0.6.3
 	github.com/puzpuzpuz/xsync/v4 v4.5.0
@@ -14,7 +14,7 @@ require (
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.46.0
 	go.opentelemetry.io/otel/sdk v1.46.0
 	go.opentelemetry.io/otel/trace v1.46.0
-	golang.org/x/crypto v0.55.0
+	golang.org/x/crypto v0.56.0
 	golang.org/x/sync v0.22.0
 	google.golang.org/grpc v1.83.2
 	google.golang.org/protobuf v1.36.12
