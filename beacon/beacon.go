@@ -72,6 +72,9 @@ type Beacon struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	selfRegistered bool
+	stopOnce       sync.Once
 }
 
 // New creates a beacon. Call Start to begin discovery and membership.
@@ -197,12 +200,12 @@ func (b *Beacon) applyQueuedRemovals() {
 // remote effects that arrive before its first subscription.
 func (b *Beacon) Start(ctx context.Context) (err error) {
 	b.ctx, b.cancel = context.WithCancel(ctx)
-	// A failed Start must not leak background workers: the caller only pairs
-	// Stop with a successful Start.
+	// A failed Start owns the same one-shot cleanup as normal shutdown. This
+	// rolls back a completed self-registration before returning the error and
+	// prevents a later Runtime.Stop from removing it twice.
 	defer func() {
 		if err != nil {
-			b.cancel()
-			b.wg.Wait()
+			b.Stop()
 		}
 	}()
 
@@ -273,22 +276,16 @@ func (b *Beacon) Start(ctx context.Context) (err error) {
 
 // Stop sends a REMOVE_OP for this node and stops background loops.
 func (b *Beacon) Stop() {
-	// Graceful departure: remove our membership entry. A failure here means
-	// peers keep our entry and redial us until an operator intervenes, so it
-	// must be loud.
-	ctx := b.engine.NewContext()
-	if err := ctx.Emit(buildMemberRemove(uint64(b.cfg.NodeID))); err != nil {
-		slog.Error("beacon: departure remove emit failed", "node_id", b.cfg.NodeID, "error", err)
-	} else if err := ctx.Flush(); err != nil {
-		slog.Error("beacon: departure remove flush failed", "node_id", b.cfg.NodeID, "error", err)
-	}
+	b.stopOnce.Do(func() {
+		b.unregisterSelf()
 
-	if b.cancel != nil {
-		b.cancel()
-	}
-	b.wg.Wait()
+		if b.cancel != nil {
+			b.cancel()
+		}
+		b.wg.Wait()
 
-	slog.Info("beacon stopped", "node_id", b.cfg.NodeID)
+		slog.Info("beacon stopped", "node_id", b.cfg.NodeID)
+	})
 }
 
 // Members returns the current known membership.
@@ -338,6 +335,10 @@ func (b *Beacon) primeSubscription() {
 // the stale entry becomes visible — a one-shot sweep at registration would
 // silently miss an entry that hasn't bootstrapped in yet.
 func (b *Beacon) registerSelf() error {
+	if b.selfRegistered {
+		return nil
+	}
+
 	ctx := b.engine.NewContext()
 	if err := ctx.Emit(buildMemberInsert(uint64(b.cfg.NodeID), b.cfg.AdvertiseAddr)); err != nil {
 		return err
@@ -345,7 +346,33 @@ func (b *Beacon) registerSelf() error {
 	if err := ctx.Emit(buildMemberTypeTag()); err != nil {
 		return err
 	}
-	return ctx.Flush()
+	if err := ctx.Flush(); err != nil {
+		return err
+	}
+	b.selfRegistered = true
+	return nil
+}
+
+// unregisterSelf removes this node's membership entry after a successful
+// registration. Stop's sync.Once makes this shared normal-shutdown and
+// failed-start rollback path one-shot.
+func (b *Beacon) unregisterSelf() {
+	if !b.selfRegistered {
+		return
+	}
+
+	// A failure here means peers keep our entry and redial us until an operator
+	// intervenes, so it must be loud.
+	ctx := b.engine.NewContext()
+	if err := ctx.Emit(buildMemberRemove(uint64(b.cfg.NodeID))); err != nil {
+		slog.Error("beacon: departure remove emit failed", "node_id", b.cfg.NodeID, "error", err)
+		return
+	}
+	if err := ctx.Flush(); err != nil {
+		slog.Error("beacon: departure remove flush failed", "node_id", b.cfg.NodeID, "error", err)
+		return
+	}
+	b.selfRegistered = false
 }
 
 // topologyLoop keeps the PeerManager's connection table as a reactive
