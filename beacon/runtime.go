@@ -147,7 +147,7 @@ type Runtime struct {
 // adds its own callbacks via Engine.OnKeyDataAdded etc. is
 // responsible for unwiring those — Stop only tears down what
 // NewRuntime built.
-func NewRuntime(cfg RuntimeConfig) (*Runtime, error) {
+func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 	log := cfg.Logger
 	if log == nil {
 		log = slog.Default()
@@ -261,7 +261,7 @@ func NewRuntime(cfg RuntimeConfig) (*Runtime, error) {
 	// connection establishment, and a peer counts as "holds everything"
 	// until its filter arrives.
 	pm.SetKeyFilterProvider(engine)
-	if err := pm.Start(context.Background()); err != nil {
+	if err := pm.Start(ctx); err != nil {
 		return nil, errors.Join(
 			fmt.Errorf("failed to start peer manager: %w", err),
 			closeRuntimeOnError(rt),
@@ -333,7 +333,7 @@ func NewRuntime(cfg RuntimeConfig) (*Runtime, error) {
 		// promptly and serve solo until peers converge. joinCtx lets Stop
 		// abort an in-flight join; joinWG lets it wait for the goroutine to
 		// return before closing the peer manager / engine the join uses.
-		joinCtx, joinCancel := context.WithCancel(context.Background())
+		joinCtx, joinCancel := context.WithCancel(ctx)
 		rt.joinCancel = joinCancel
 		rt.Beacon = b
 		rt.joinWG.Go(func() {
@@ -342,7 +342,7 @@ func NewRuntime(cfg RuntimeConfig) (*Runtime, error) {
 			}
 		})
 	} else {
-		if err := b.Start(context.Background()); err != nil {
+		if err := b.Start(ctx); err != nil {
 			return nil, errors.Join(
 				fmt.Errorf("failed to start beacon: %w", err),
 				closeRuntimeOnError(rt),
