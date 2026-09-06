@@ -281,7 +281,7 @@ Most of the time you don't touch `Beacon` directly — you build a `Runtime`, wh
 whole engine:
 
 ```go
-rt, err := beacon.NewRuntime(context.Background, beacon.RuntimeConfig{
+rt, err := beacon.NewRuntime(context.Background(), beacon.RuntimeConfig{
     ClusterPassphrase: passphrase, // empty → single-node, no peers, no beacon
     ClusterPort:       7000,
     JoinAddr:          "my-cache.local", // DNS name every peer resolves to
