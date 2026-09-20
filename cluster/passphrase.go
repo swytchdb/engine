@@ -35,6 +35,7 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/hkdf"
@@ -47,7 +48,7 @@ var (
 	caNotBefore = time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	caNotAfter  = caNotBefore.Add(100 * 365 * 24 * time.Hour) // ~100 years
 
-	// Leaf certs are short-lived — regenerated each startup.
+	// Leaf certs are short-lived; leafSource re-mints them at half-life.
 	leafValidity = 7 * 24 * time.Hour
 )
 
@@ -137,10 +138,61 @@ func GenerateLeafCert(caKey crypto.Signer, caCert *x509.Certificate, nodeAddr st
 		return tls.Certificate{}, fmt.Errorf("failed to create leaf certificate: %w", err)
 	}
 
+	leafCert, err := x509.ParseCertificate(leafDER)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("failed to parse leaf certificate: %w", err)
+	}
+
 	return tls.Certificate{
 		Certificate: [][]byte{leafDER, caCert.Raw},
 		PrivateKey:  leafKey,
+		Leaf:        leafCert,
 	}, nil
+}
+
+// leafSource hands out this node's leaf certificate for TLS handshakes,
+// re-minting it at half-life so nodes that outlive leafValidity keep
+// forming new connections. Established connections never recheck cert
+// validity, so rotation only ever affects handshakes.
+type leafSource struct {
+	caKey    crypto.Signer
+	caCert   *x509.Certificate
+	nodeAddr string
+
+	mu   sync.Mutex
+	leaf *tls.Certificate
+}
+
+func newLeafSource(caKey crypto.Signer, caCert *x509.Certificate, nodeAddr string) (*leafSource, error) {
+	s := &leafSource{caKey: caKey, caCert: caCert, nodeAddr: nodeAddr}
+	if err := s.mint(); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// mint replaces the cached leaf. Callers other than newLeafSource must hold mu.
+func (s *leafSource) mint() error {
+	leaf, err := GenerateLeafCert(s.caKey, s.caCert, s.nodeAddr)
+	if err != nil {
+		return err
+	}
+	s.leaf = &leaf
+	return nil
+}
+
+// current returns the cached leaf, re-minting once less than half of
+// leafValidity remains. A re-mint swaps the pointer rather than mutating
+// the certificate, so callers may hold the result across a handshake.
+func (s *leafSource) current() (*tls.Certificate, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if time.Until(s.leaf.Leaf.NotAfter) < leafValidity/2 {
+		if err := s.mint(); err != nil {
+			return nil, err
+		}
+	}
+	return s.leaf, nil
 }
 
 // GeneratePassphrase returns a cryptographically random passphrase suitable

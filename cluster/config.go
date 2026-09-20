@@ -112,16 +112,18 @@ func (c *ClusterConfig) BuildTLSConfig() (*tls.Config, error) {
 		return nil, nil
 	}
 
-	leaf, caPool, err := c.deriveTLS()
+	src, caPool, err := c.deriveTLS()
 	if err != nil {
 		return nil, err
 	}
 
 	return &tls.Config{
-		Certificates: []tls.Certificate{leaf},
-		ClientCAs:    caPool,
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-		MinVersion:   tls.VersionTLS13,
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			return src.current()
+		},
+		ClientCAs:  caPool,
+		ClientAuth: tls.RequireAndVerifyClientCert,
+		MinVersion: tls.VersionTLS13,
 	}, nil
 }
 
@@ -132,24 +134,27 @@ func (c *ClusterConfig) BuildClientTLSConfig() (*tls.Config, error) {
 		return nil, nil
 	}
 
-	leaf, caPool, err := c.deriveTLS()
+	src, caPool, err := c.deriveTLS()
 	if err != nil {
 		return nil, err
 	}
 
 	return &tls.Config{
-		Certificates: []tls.Certificate{leaf},
-		RootCAs:      caPool,
-		MinVersion:   tls.VersionTLS13,
+		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			return src.current()
+		},
+		RootCAs:    caPool,
+		MinVersion: tls.VersionTLS13,
 	}, nil
 }
 
-// deriveTLS derives the CA from the passphrase and generates an ephemeral leaf
-// certificate for this node. Returns the leaf tls.Certificate and a CA pool.
-func (c *ClusterConfig) deriveTLS() (tls.Certificate, *x509.CertPool, error) {
+// deriveTLS derives the CA from the passphrase and builds the leafSource
+// that mints this node's ephemeral leaf certificates. Returns the source
+// and a CA pool.
+func (c *ClusterConfig) deriveTLS() (*leafSource, *x509.CertPool, error) {
 	caKey, caCert, err := DeriveCAFromPassphrase(c.TLSPassphrase)
 	if err != nil {
-		return tls.Certificate{}, nil, fmt.Errorf("failed to derive cluster CA: %w", err)
+		return nil, nil, fmt.Errorf("failed to derive cluster CA: %w", err)
 	}
 
 	nodeAddr := ""
@@ -157,15 +162,15 @@ func (c *ClusterConfig) deriveTLS() (tls.Certificate, *x509.CertPool, error) {
 		nodeAddr = self.Address
 	}
 
-	leaf, err := GenerateLeafCert(caKey, caCert, nodeAddr)
+	src, err := newLeafSource(caKey, caCert, nodeAddr)
 	if err != nil {
-		return tls.Certificate{}, nil, fmt.Errorf("failed to generate cluster leaf cert: %w", err)
+		return nil, nil, fmt.Errorf("failed to generate cluster leaf cert: %w", err)
 	}
 
 	pool := x509.NewCertPool()
 	pool.AddCert(caCert)
 
-	return leaf, pool, nil
+	return src, pool, nil
 }
 
 // clusterQUICConfig returns the shared QUIC config for all cluster connections.

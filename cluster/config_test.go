@@ -224,8 +224,15 @@ func TestBuildTLSConfigWithPassphrase(t *testing.T) {
 	if tlsCfg == nil {
 		t.Fatal("expected non-nil TLS config")
 	}
-	if len(tlsCfg.Certificates) != 1 {
-		t.Fatalf("expected 1 certificate, got %d", len(tlsCfg.Certificates))
+	if tlsCfg.GetCertificate == nil {
+		t.Fatal("expected GetCertificate to be set")
+	}
+	cert, err := tlsCfg.GetCertificate(&tls.ClientHelloInfo{})
+	if err != nil {
+		t.Fatalf("GetCertificate failed: %v", err)
+	}
+	if cert == nil || len(cert.Certificate) == 0 {
+		t.Fatal("expected GetCertificate to return a leaf certificate")
 	}
 	if tlsCfg.ClientAuth != tls.RequireAndVerifyClientCert {
 		t.Fatalf("expected RequireAndVerifyClientCert, got %v", tlsCfg.ClientAuth)
@@ -252,8 +259,15 @@ func TestBuildClientTLSConfigWithPassphrase(t *testing.T) {
 	if tlsCfg == nil {
 		t.Fatal("expected non-nil TLS config")
 	}
-	if len(tlsCfg.Certificates) != 1 {
-		t.Fatalf("expected 1 certificate, got %d", len(tlsCfg.Certificates))
+	if tlsCfg.GetClientCertificate == nil {
+		t.Fatal("expected GetClientCertificate to be set")
+	}
+	cert, err := tlsCfg.GetClientCertificate(&tls.CertificateRequestInfo{})
+	if err != nil {
+		t.Fatalf("GetClientCertificate failed: %v", err)
+	}
+	if cert == nil || len(cert.Certificate) == 0 {
+		t.Fatal("expected GetClientCertificate to return a leaf certificate")
 	}
 	if tlsCfg.RootCAs == nil {
 		t.Fatal("expected RootCAs to be set")
