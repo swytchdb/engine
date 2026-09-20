@@ -30,6 +30,7 @@ import (
 	"crypto/x509"
 	"net"
 	"testing"
+	"time"
 )
 
 func TestDeriveCADeterministic(t *testing.T) {
@@ -178,6 +179,44 @@ func TestGeneratePassphraseEntropy(t *testing.T) {
 	}
 	if p1 == p2 {
 		t.Fatal("two generated passphrases should not be identical")
+	}
+}
+
+func TestLeafSourceReMintsNearExpiry(t *testing.T) {
+	caKey, caCert, err := DeriveCAFromPassphrase("rotation-test-passphrase")
+	if err != nil {
+		t.Fatalf("derive CA: %v", err)
+	}
+
+	src, err := newLeafSource(caKey, caCert, "127.0.0.1:7000")
+	if err != nil {
+		t.Fatalf("new leaf source: %v", err)
+	}
+
+	first, err := src.current()
+	if err != nil {
+		t.Fatalf("first current: %v", err)
+	}
+	again, err := src.current()
+	if err != nil {
+		t.Fatalf("second current: %v", err)
+	}
+	if again != first {
+		t.Fatal("expected the cached leaf to be reused while fresh")
+	}
+
+	// Age the cached leaf past its half-life so the next handshake re-mints.
+	src.leaf.Leaf.NotAfter = time.Now().Add(leafValidity/2 - time.Minute)
+
+	rotated, err := src.current()
+	if err != nil {
+		t.Fatalf("rotated current: %v", err)
+	}
+	if rotated == first {
+		t.Fatal("expected a re-minted leaf past half-life")
+	}
+	if time.Until(rotated.Leaf.NotAfter) < leafValidity-time.Minute {
+		t.Fatal("re-minted leaf should carry a fresh validity window")
 	}
 }
 
