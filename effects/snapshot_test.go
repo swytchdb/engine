@@ -1141,18 +1141,12 @@ func TestEmitWithoutSnapshotTips_ReadsIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// After Emit, the new effect should be in the effectCache with deps pointing to off
-	tips := e.index.Contains("k")
-	if tips == nil {
-		// Not flushed yet — check the context's pending effects instead.
-		// The emitted effect lives in ctx.effects; inspect its Deps directly.
-	}
 	// Flush to commit
 	if err := ctx.Flush(); err != nil {
 		t.Fatal(err)
 	}
 
-	tips = e.index.Contains("k")
+	tips := e.index.Contains("k")
 	if tips == nil || tips.Len() != 1 {
 		t.Fatalf("expected 1 tip after flush, got %v", tips)
 	}
