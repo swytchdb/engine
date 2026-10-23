@@ -237,6 +237,8 @@ func predEval(p *pb.Predicate, rw *pb.RowWriteEffect) predTri {
 			return predFalse
 		case predFalse:
 			return predTrue
+		case predUnknown:
+			return predUnknown
 		}
 
 		return predUnknown
@@ -302,6 +304,8 @@ func predColCmp(leftCol int, op pb.PredicateCmpOp, rightCol int, rw *pb.RowWrite
 func compareTypedValues(a *pb.TypedValue, op pb.PredicateCmpOp, b *pb.TypedValue) predTri {
 	if a.GetKind() == b.GetKind() {
 		switch a.GetKind() {
+		case pb.TypedValue_NULL_VALUE:
+			return predUnknown
 		case pb.TypedValue_INT:
 			return predCmpFromInt(cmp3Int(a.GetIntVal(), b.GetIntVal()), op)
 		case pb.TypedValue_FLOAT:

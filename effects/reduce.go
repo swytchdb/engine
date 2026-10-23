@@ -385,6 +385,8 @@ func reduceScalar(r *pb.ReducedEffect, _ *pb.Effect, d *pb.DataEffect) {
 			r.Scalar.Merge = pb.MergeRule_LAST_WRITE_WINS
 			r.Merge = pb.MergeRule_LAST_WRITE_WINS
 			r.Commutative = false
+		case pb.MergeRule_ADDITIVE_FLOAT, pb.MergeRule_MAX_INT, pb.MergeRule_FIRST_WRITE_WINS, pb.MergeRule_MAX_BYTES:
+			// Other base rules do not accumulate integer increments.
 		}
 
 	case pb.MergeRule_ADDITIVE_FLOAT:
@@ -396,6 +398,8 @@ func reduceScalar(r *pb.ReducedEffect, _ *pb.Effect, d *pb.DataEffect) {
 			r.Scalar.Merge = pb.MergeRule_LAST_WRITE_WINS
 			r.Merge = pb.MergeRule_LAST_WRITE_WINS
 			r.Commutative = false
+		case pb.MergeRule_ADDITIVE_INT, pb.MergeRule_MAX_INT, pb.MergeRule_FIRST_WRITE_WINS, pb.MergeRule_MAX_BYTES:
+			// Other base rules do not accumulate floating-point increments.
 		}
 
 	case pb.MergeRule_LAST_WRITE_WINS:
@@ -405,6 +409,9 @@ func reduceScalar(r *pb.ReducedEffect, _ *pb.Effect, d *pb.DataEffect) {
 		// A LWW write replaces the entire value — clear any inherited TTL.
 		// If a TTL is desired, an explicit MetaEffect follows (EX/PX/KEEPTTL).
 		r.ExpiresAt = nil
+
+	case pb.MergeRule_FIRST_WRITE_WINS:
+		// Keep the scalar already accumulated from the first write.
 
 	case pb.MergeRule_MAX_INT:
 		if d.GetIntVal() > r.GetScalar().GetIntVal() {
@@ -496,8 +503,11 @@ func reduceKeyed(r *pb.ReducedEffect, e *pb.Effect, d *pb.DataEffect) {
 			newElem.Data.Value = &pb.DataEffect_IntVal{IntVal: d.GetIntVal()}
 			r.NetAdds[key] = newElem
 		}
+	case pb.MergeRule_LAST_WRITE_WINS, pb.MergeRule_FIRST_WRITE_WINS, pb.MergeRule_MAX_BYTES:
+		// Preserve replacement semantics for non-accumulating keyed rules.
+		r.NetAdds[key] = elementFromData(e, d)
 	default:
-		// LWW: replace
+		// Unknown rules retain the existing replacement fallback.
 		r.NetAdds[key] = elementFromData(e, d)
 	}
 }
@@ -575,6 +585,8 @@ func isCommutative(m pb.MergeRule) bool {
 	switch m {
 	case pb.MergeRule_ADDITIVE_INT, pb.MergeRule_ADDITIVE_FLOAT, pb.MergeRule_MAX_INT, pb.MergeRule_MAX_BYTES:
 		return true
+	case pb.MergeRule_LAST_WRITE_WINS, pb.MergeRule_FIRST_WRITE_WINS:
+		return false
 	default:
 		return false
 	}

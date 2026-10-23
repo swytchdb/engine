@@ -331,12 +331,7 @@ func (v verdictMap) harvest(snapshotTip Tip, snap *pb.SnapshotEffect) {
 // nested object/array). JSON nodes are exempt from Redis empty-collection
 // auto-delete — an empty {} or [] is a real value.
 func isJSONType(t pb.ValueType) bool {
-	switch t {
-	case pb.ValueType_TYPE_JSON, pb.ValueType_TYPE_JSON_OBJECT, pb.ValueType_TYPE_JSON_ARRAY:
-		return true
-	}
-
-	return false
+	return t == pb.ValueType_TYPE_JSON || t == pb.ValueType_TYPE_JSON_OBJECT || t == pb.ValueType_TYPE_JSON_ARRAY
 }
 
 // filterSnapshot applies post-reconstruction filtering: key-level expiry,

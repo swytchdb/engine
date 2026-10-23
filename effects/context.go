@@ -655,6 +655,8 @@ func (c *Context) Emit(eff *pb.Effect, snapshotTips ...[]Tip) error {
 	// Track notification intent from DataEffect ops
 	if data := eff.GetData(); data != nil {
 		switch data.GetOp() {
+		case pb.EffectOp_UNKNOWN_OP:
+			// Unspecified operations leave notification intent unchanged.
 		case pb.EffectOp_INSERT_OP:
 			ck.shouldNotifyData = true
 			ck.shouldNotifyDelete = false

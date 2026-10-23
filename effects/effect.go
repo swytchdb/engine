@@ -1652,6 +1652,8 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 	} else if data := eff.GetData(); data != nil {
 		// Non-transactional data effect
 		switch data.GetOp() {
+		case pb.EffectOp_UNKNOWN_OP:
+			// Unspecified operations do not trigger notifications.
 		case pb.EffectOp_INSERT_OP:
 			e.ownFilterAdd(key)
 
