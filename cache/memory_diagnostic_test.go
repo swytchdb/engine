@@ -34,6 +34,7 @@ import (
 // countEntries counts the actual number of entries in the cache
 func (c *CloxCache[K, V]) countEntries() int {
 	count := 0
+
 	for shardID := range c.shards {
 		shard := &c.shards[shardID]
 		for slotID := range shard.slots {
@@ -44,6 +45,7 @@ func (c *CloxCache[K, V]) countEntries() int {
 			}
 		}
 	}
+
 	return count
 }
 
@@ -58,6 +60,7 @@ func (c *CloxCache[K, V]) getSlotStats() (totalSlots, occupiedSlots int) {
 			}
 		}
 	}
+
 	return
 }
 
@@ -82,6 +85,7 @@ func TestMemoryAllocationDiagnostic(t *testing.T) {
 
 	// Force GC and get baseline
 	runtime.GC()
+
 	var memBefore runtime.MemStats
 	runtime.ReadMemStats(&memBefore)
 
@@ -123,6 +127,7 @@ func TestMemoryAllocationDiagnostic(t *testing.T) {
 
 	// Final stats
 	runtime.GC()
+
 	var memFinal runtime.MemStats
 	runtime.ReadMemStats(&memFinal)
 
@@ -139,11 +144,13 @@ func TestMemoryAllocationDiagnostic(t *testing.T) {
 
 	// Analysis
 	t.Logf("\n=== Analysis ===")
+
 	if entriesAfterInsert > totalSlots {
 		t.Logf("  ISSUE: Cache has %.1fx more entries than capacity", float64(entriesAfterInsert)/float64(totalSlots))
 	} else {
 		t.Logf("  OK: Entries (%d) within capacity (%d)", entriesAfterInsert, totalSlots)
 	}
+
 	if evictions > 0 {
 		t.Logf("  OK: Synchronous eviction working - %d evictions during insertion", evictions)
 	}
@@ -152,7 +159,6 @@ func TestMemoryAllocationDiagnostic(t *testing.T) {
 func BenchmarkMemoryAllocation50K(b *testing.B) {
 	// This benchmark measures memory allocation when overfilling the cache
 	// Run with: go test -bench=BenchmarkMemoryAllocation50K -benchmem -count=5
-
 	cfg := Config{
 		NumShards:     16,
 		SlotsPerShard: 1024, // 16K slots
@@ -239,6 +245,7 @@ func TestEvictionRateVsInsertionRate(t *testing.T) {
 
 			// Pace the insertions
 			elapsed := time.Since(start)
+
 			expected := time.Duration(i+1) * interval
 			if elapsed < expected {
 				time.Sleep(expected - elapsed)
@@ -267,6 +274,7 @@ func TestBurstInsertionMemoryGrowth(t *testing.T) {
 	defer cache.Close()
 
 	runtime.GC()
+
 	var memBaseline runtime.MemStats
 	runtime.ReadMemStats(&memBaseline)
 

@@ -208,6 +208,7 @@ func RecordPeerSymmetric(peerID NodeId, symmetric bool) {
 	if symmetric {
 		v = 1
 	}
+
 	peerSymmetricGauge.WithLabelValues(peerLabel(peerID)).Set(v)
 }
 
@@ -217,6 +218,7 @@ func RecordPeerAlive(peerID NodeId, alive bool) {
 	if alive {
 		v = 1
 	}
+
 	peerAliveGauge.WithLabelValues(peerLabel(peerID)).Set(v)
 }
 

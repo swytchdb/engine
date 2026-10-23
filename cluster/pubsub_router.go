@@ -53,6 +53,7 @@ func encodeRoutingKey(prefix []byte, name string) []byte {
 	out := make([]byte, 0, len(prefix)+len(name))
 	out = append(out, prefix...)
 	out = append(out, name...)
+
 	return out
 }
 
@@ -63,9 +64,11 @@ func decodeRoutingKey(routingKey []byte) (name string, isPattern bool, ok bool) 
 	if bytes.HasPrefix(routingKey, chKeyPrefix) {
 		return string(routingKey[len(chKeyPrefix):]), false, true
 	}
+
 	if bytes.HasPrefix(routingKey, patKeyPrefix) {
 		return string(routingKey[len(patKeyPrefix):]), true, true
 	}
+
 	return "", false, false
 }
 
@@ -132,8 +135,10 @@ func (r *PubSubRouter) HandleEphemeralSubscribe(subscriberNodeID uint64, routing
 	if !ok {
 		slog.Debug("pubsub router: ignoring unknown routing key prefix",
 			"key", string(routingKey))
+
 		return
 	}
+
 	peerID := NodeId(subscriberNodeID)
 	if peerID == r.self {
 		// Local-origin echo: we never broadcast to ourselves, but
@@ -152,10 +157,12 @@ func (r *PubSubRouter) HandleEphemeralSubscribe(subscriberNodeID uint64, routing
 	if unsubscribe {
 		if set := table[peerID]; set != nil {
 			delete(set, name)
+
 			if len(set) == 0 {
 				delete(table, peerID)
 			}
 		}
+
 		return
 	}
 
@@ -164,6 +171,7 @@ func (r *PubSubRouter) HandleEphemeralSubscribe(subscriberNodeID uint64, routing
 		set = make(map[string]struct{})
 		table[peerID] = set
 	}
+
 	set[name] = struct{}{}
 }
 
@@ -181,10 +189,12 @@ func (r *PubSubRouter) OnPeerAdded(peerID NodeId) {
 	if peerID == r.self {
 		return
 	}
+
 	channels, patterns := r.broker.LocalSubsSnapshot()
 	for _, ch := range channels {
 		r.sendAnnounce(encodeRoutingKey(chKeyPrefix, ch), false, peerID)
 	}
+
 	for _, pat := range patterns {
 		r.sendAnnounce(encodeRoutingKey(patKeyPrefix, pat), false, peerID)
 	}
@@ -195,6 +205,7 @@ func (r *PubSubRouter) OnPeerAdded(peerID NodeId) {
 func (r *PubSubRouter) OnPeerRemoved(peerID NodeId) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
 	delete(r.channels, peerID)
 	delete(r.patterns, peerID)
 }
@@ -217,6 +228,7 @@ func routingKeyFor(name string, isPattern bool) []byte {
 	if isPattern {
 		return encodeRoutingKey(patKeyPrefix, name)
 	}
+
 	return encodeRoutingKey(chKeyPrefix, name)
 }
 
@@ -231,14 +243,18 @@ func (r *PubSubRouter) RouteMessage(channel string, payload []byte) int {
 
 	notify, wireData := r.buildPubSubMessage(channel, payload)
 	sent := 0
+
 	for _, peerID := range targets {
 		if err := r.transport.SendOneWayTo(notify, wireData, peerID); err != nil {
 			slog.Debug("pubsub router: one-way send failed",
 				"peer", peerID, "channel", channel, "error", err)
+
 			continue
 		}
+
 		sent++
 	}
+
 	return sent
 }
 
@@ -249,6 +265,7 @@ func (r *PubSubRouter) ClusterChannels(pattern string) []string {
 	defer r.mu.RUnlock(token)
 
 	seen := make(map[string]struct{})
+
 	for _, set := range r.channels {
 		for ch := range set {
 			if pattern == "" || keytrie.MatchGlob(ch, pattern) {
@@ -256,11 +273,14 @@ func (r *PubSubRouter) ClusterChannels(pattern string) []string {
 			}
 		}
 	}
+
 	out := make([]string, 0, len(seen))
 	for ch := range seen {
 		out = append(out, ch)
 	}
+
 	sort.Strings(out)
+
 	return out
 }
 
@@ -274,13 +294,16 @@ func (r *PubSubRouter) ClusterNumSub(channels []string) map[string]int {
 	out := make(map[string]int, len(channels))
 	for _, ch := range channels {
 		count := 0
+
 		for _, set := range r.channels {
 			if _, ok := set[ch]; ok {
 				count++
 			}
 		}
+
 		out[ch] = count
 	}
+
 	return out
 }
 
@@ -292,15 +315,18 @@ func (r *PubSubRouter) ClusterPatterns() []string {
 	defer r.mu.RUnlock(token)
 
 	seen := make(map[string]struct{})
+
 	for _, set := range r.patterns {
 		for p := range set {
 			seen[p] = struct{}{}
 		}
 	}
+
 	out := make([]string, 0, len(seen))
 	for p := range seen {
 		out = append(out, p)
 	}
+
 	return out
 }
 
@@ -313,29 +339,36 @@ func (r *PubSubRouter) targetsFor(channel string) []NodeId {
 	defer r.mu.RUnlock(token)
 
 	matched := make(map[NodeId]struct{})
+
 	for peerID, set := range r.channels {
 		if _, ok := set[channel]; ok {
 			matched[peerID] = struct{}{}
 		}
 	}
+
 	for peerID, set := range r.patterns {
 		if _, ok := matched[peerID]; ok {
 			continue
 		}
+
 		for pat := range set {
 			if keytrie.MatchGlob(channel, pat) {
 				matched[peerID] = struct{}{}
+
 				break
 			}
 		}
 	}
+
 	if len(matched) == 0 {
 		return nil
 	}
+
 	out := make([]NodeId, 0, len(matched))
 	for id := range matched {
 		out = append(out, id)
 	}
+
 	return out
 }
 
@@ -353,20 +386,23 @@ func (r *PubSubRouter) sendAnnounce(routingKey []byte, unsubscribe bool, peerID 
 		Key:            routingKey,
 		Hlc:            hlc,
 		NodeId:         uint64(r.self),
-		ForkChoiceHash: effects.ComputeForkChoiceHash(pb.NodeID(r.self), hlc),
+		ForkChoiceHash: effects.ComputeForkChoiceHash(r.self, hlc),
 		Kind: &pb.Effect_Subscription{Subscription: &pb.SubscriptionEffect{
 			SubscriberNodeId: uint64(r.self),
 			Unsubscribe:      unsubscribe,
 			Ephemeral:        true,
 		}},
 	}
+
 	data, err := effects.MarshalEffect(eff)
 	if err != nil {
 		slog.Debug("pubsub router: marshal announce failed", "error", err)
+
 		return
 	}
+
 	notify := buildEphemeralNotify(r.self, eff, data)
-	if err := r.transport.SendOneWayTo(notify, notify.EffectData, peerID); err != nil {
+	if err := r.transport.SendOneWayTo(notify, notify.GetEffectData(), peerID); err != nil {
 		slog.Debug("pubsub router: announce send failed",
 			"peer", peerID, "unsubscribe", unsubscribe, "error", err)
 	}
@@ -379,19 +415,23 @@ func (r *PubSubRouter) buildPubSubMessage(channel string, payload []byte) (*pb.O
 		Key:            routingKey,
 		Hlc:            hlc,
 		NodeId:         uint64(r.self),
-		ForkChoiceHash: effects.ComputeForkChoiceHash(pb.NodeID(r.self), hlc),
+		ForkChoiceHash: effects.ComputeForkChoiceHash(r.self, hlc),
 		Kind: &pb.Effect_PubsubMessage{PubsubMessage: &pb.PubSubMessage{
 			Channel: []byte(channel),
 			Payload: payload,
 		}},
 	}
+
 	data, err := effects.MarshalEffect(eff)
 	if err != nil {
 		slog.Debug("pubsub router: marshal message failed", "error", err)
+
 		return nil, nil
 	}
+
 	notify := buildEphemeralNotify(r.self, eff, data)
-	return notify, notify.EffectData
+
+	return notify, notify.GetEffectData()
 }
 
 // buildEphemeralNotify delegates to effects.BuildOffsetNotify so wire
@@ -401,5 +441,6 @@ func (r *PubSubRouter) buildPubSubMessage(channel string, payload []byte) (*pb.O
 // HandleRemote rejects nil origins so we set a plausible one.
 func buildEphemeralNotify(self NodeId, eff *pb.Effect, data []byte) *pb.OffsetNotify {
 	origin := keytrie.EffectRef{uint64(self), uint64(time.Now().UnixNano())}
-	return effects.BuildOffsetNotify(pb.NodeID(self), origin, eff, data, nil)
+
+	return effects.BuildOffsetNotify(self, origin, eff, data, nil)
 }

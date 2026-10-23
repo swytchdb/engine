@@ -40,23 +40,28 @@ func TestSetOnLocalEffectWaitsForInflightCallback(t *testing.T) {
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
+
 	engine.SetOnLocalEffect(func(Tip, *pb.Effect) {
 		close(entered)
 		<-release
 	})
 
 	fired := make(chan struct{})
+
 	go func() {
 		engine.fireLocalEffect(Tip{1, 1}, &pb.Effect{})
 		close(fired)
 	}()
+
 	<-entered
 
 	detached := make(chan struct{})
+
 	go func() {
 		engine.SetOnLocalEffect(nil)
 		close(detached)
 	}()
+
 	select {
 	case <-detached:
 		t.Fatal("hook detached while its callback was still in flight")

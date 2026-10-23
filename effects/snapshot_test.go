@@ -66,9 +66,10 @@ func newSnapshotLog() *snapshotLog {
 // putEffect serialises eff, stores it in both the raw entries map and the
 // effectCache, advances nextOff by 100, and returns the Tip assigned.
 func (l *snapshotLog) putEffect(eff *pb.Effect) Tip {
-	if len(eff.ForkChoiceHash) == 0 {
-		eff.ForkChoiceHash = ComputeForkChoiceHash(pb.NodeID(eff.NodeId), eff.Hlc)
+	if len(eff.GetForkChoiceHash()) == 0 {
+		eff.ForkChoiceHash = ComputeForkChoiceHash(pb.NodeID(eff.GetNodeId()), eff.GetHlc())
 	}
+
 	off := l.nextOff
 	l.nextOff += 100
 	t := Tip{l.nodeID, off}
@@ -76,6 +77,7 @@ func (l *snapshotLog) putEffect(eff *pb.Effect) Tip {
 	data, _ := proto.Marshal(eff)
 	l.entries[t] = data
 	l.effectCache.Put(t, proto.Clone(eff).(*pb.Effect))
+
 	return t
 }
 
@@ -88,6 +90,7 @@ func newSnapshotEngine(log *snapshotLog) *Engine {
 	} else {
 		ec = newVertexPool()
 	}
+
 	e := &Engine{
 		index:             keytrie.NewCritbit[leafState](),
 		effectCache:       ec,
@@ -108,6 +111,7 @@ func newSnapshotEngine(log *snapshotLog) *Engine {
 	// subscription effects ensureSubscribed emits during a read would climb into the
 	// log's range and alias a data effect's Tip (a collision that desyncs refcounts).
 	e.nextOff.Store(1 << 32)
+
 	return e
 }
 
@@ -120,6 +124,7 @@ func TestGetSnapshot_MissReturnsNil(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if r != nil {
 		t.Fatal("expected nil for missing key")
 	}
@@ -139,11 +144,13 @@ func TestGetSnapshot_SingleEffect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if r == nil {
 		t.Fatal("expected non-nil")
 	}
-	if string(r.Scalar.GetRaw()) != "hello" {
-		t.Fatalf("expected 'hello', got %q", r.Scalar.GetRaw())
+
+	if string(r.GetScalar().GetRaw()) != "hello" {
+		t.Fatalf("expected 'hello', got %q", r.GetScalar().GetRaw())
 	}
 }
 
@@ -161,13 +168,16 @@ func TestGetSnapshot_ReusesImmutableReducedMemo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	second, _, _, err := e.GetSnapshot("k")
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if first != second {
 		t.Fatal("stable reads should reuse the immutable reduced memo")
 	}
+
 	if string(second.GetScalar().GetRaw()) != "hello" {
 		t.Fatalf("expected hello, got %q", second.GetScalar().GetRaw())
 	}
@@ -181,11 +191,13 @@ func TestEnsureSubscribed_OwnsBorrowedKey(t *testing.T) {
 	if err := e.ensureSubscribed(key); err != nil {
 		t.Fatal(err)
 	}
+
 	copy(buf, "overwritten!!")
 
 	if _, ok := e.subscriptions.Load("borrowed-key"); !ok {
 		t.Fatal("subscription retained the caller's borrowed key buffer")
 	}
+
 	if e.index.Contains("borrowed-key") == nil {
 		t.Fatal("index retained the caller's borrowed key buffer")
 	}
@@ -206,13 +218,16 @@ func TestFilterSnapshot_DoesNotMutateReducedMemo(t *testing.T) {
 	if filtered == memo {
 		t.Fatal("expired-element filtering must detach from the immutable memo")
 	}
-	if _, ok := filtered.NetAdds["expired"]; ok {
+
+	if _, ok := filtered.GetNetAdds()["expired"]; ok {
 		t.Fatal("expired element remained in filtered result")
 	}
-	if _, ok := memo.NetAdds["expired"]; !ok {
+
+	if _, ok := memo.GetNetAdds()["expired"]; !ok {
 		t.Fatal("filtering mutated the cached reduced result")
 	}
-	if filtered.NetAdds["live"] != live {
+
+	if filtered.GetNetAdds()["live"] != live {
 		t.Fatal("filtering should preserve live elements")
 	}
 }
@@ -225,11 +240,13 @@ func BenchmarkGetSnapshot_Cached(b *testing.B) {
 		Kind: &pb.Effect_Data{Data: scalarInsertRaw([]byte("hello"))},
 	})
 	e.index.Insert("k", nil, keytrie.NewTipSet(off))
+
 	if _, _, _, err := e.GetSnapshot("k"); err != nil {
 		b.Fatal(err)
 	}
 
 	b.ReportAllocs()
+
 	for b.Loop() {
 		if _, _, _, err := e.GetSnapshot("k"); err != nil {
 			b.Fatal(err)
@@ -259,8 +276,9 @@ func TestGetSnapshot_LinearChain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(r.Scalar.GetRaw()) != "third" {
-		t.Fatalf("expected 'third', got %q", r.Scalar.GetRaw())
+
+	if string(r.GetScalar().GetRaw()) != "third" {
+		t.Fatalf("expected 'third', got %q", r.GetScalar().GetRaw())
 	}
 }
 
@@ -286,8 +304,9 @@ func TestGetSnapshot_LinearAdditiveChain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Scalar.GetIntVal() != 10 {
-		t.Fatalf("expected 10, got %d", r.Scalar.GetIntVal())
+
+	if r.GetScalar().GetIntVal() != 10 {
+		t.Fatalf("expected 10, got %d", r.GetScalar().GetIntVal())
 	}
 }
 
@@ -317,12 +336,14 @@ func TestGetSnapshot_ForkLWW(t *testing.T) {
 	// Higher fork_choice_hash wins (applied last in linearized reduction)
 	hashA := ComputeForkChoiceHash(1, sTs(20))
 	hashB := ComputeForkChoiceHash(2, sTs(30))
+
 	expected := "branchB"
 	if ForkChoiceLess(hashB, hashA) {
 		expected = "branchA"
 	}
-	if string(r.Scalar.GetRaw()) != expected {
-		t.Fatalf("expected %q (higher hash), got %q", expected, r.Scalar.GetRaw())
+
+	if string(r.GetScalar().GetRaw()) != expected {
+		t.Fatalf("expected %q (higher hash), got %q", expected, r.GetScalar().GetRaw())
 	}
 }
 
@@ -350,8 +371,9 @@ func TestGetSnapshot_ForkAdditiveCorrect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Scalar.GetIntVal() != 10 {
-		t.Fatalf("expected 10, got %d", r.Scalar.GetIntVal())
+
+	if r.GetScalar().GetIntVal() != 10 {
+		t.Fatalf("expected 10, got %d", r.GetScalar().GetIntVal())
 	}
 }
 
@@ -379,11 +401,12 @@ func TestGetSnapshot_ForkKeyedUnion(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Should have all 3 fields
-	if len(r.NetAdds) != 3 {
-		t.Fatalf("expected 3 fields, got %d", len(r.NetAdds))
+	if len(r.GetNetAdds()) != 3 {
+		t.Fatalf("expected 3 fields, got %d", len(r.GetNetAdds()))
 	}
+
 	for _, f := range []string{"f0", "f1", "f2"} {
-		if _, ok := r.NetAdds[f]; !ok {
+		if _, ok := r.GetNetAdds()[f]; !ok {
 			t.Fatalf("missing field %s", f)
 		}
 	}
@@ -451,8 +474,8 @@ func TestGetSnapshot_MergePointInChain(t *testing.T) {
 	// which sums their full reductions (including shared root).
 	// Correct: root(1) + A(2) + B(3) + C(4) + D(5) = 15
 	// mergeDeps uses LCA + inclusion-exclusion to avoid double-counting root.
-	if r.Scalar.GetIntVal() != 15 {
-		t.Fatalf("expected 15, got %d", r.Scalar.GetIntVal())
+	if r.GetScalar().GetIntVal() != 15 {
+		t.Fatalf("expected 15, got %d", r.GetScalar().GetIntVal())
 	}
 }
 
@@ -488,8 +511,9 @@ func TestGetSnapshot_MergePointLWW(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(r.Scalar.GetRaw()) != "D" {
-		t.Fatalf("expected 'D', got %q", r.Scalar.GetRaw())
+
+	if string(r.GetScalar().GetRaw()) != "D" {
+		t.Fatalf("expected 'D', got %q", r.GetScalar().GetRaw())
 	}
 }
 
@@ -526,8 +550,8 @@ func TestGetSnapshot_SnapshotEffectStopsWalk(t *testing.T) {
 		t.Fatal(err)
 	}
 	// "after" overwrites "snap" via LWW (higher HLC)
-	if string(r.Scalar.GetRaw()) != "after" {
-		t.Fatalf("expected 'after', got %q", r.Scalar.GetRaw())
+	if string(r.GetScalar().GetRaw()) != "after" {
+		t.Fatalf("expected 'after', got %q", r.GetScalar().GetRaw())
 	}
 }
 
@@ -595,8 +619,9 @@ func TestGetSnapshot_LinearSnapshotSeed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Scalar.GetIntVal() != 5 {
-		t.Fatalf("expected 5, got %d", r.Scalar.GetIntVal())
+
+	if r.GetScalar().GetIntVal() != 5 {
+		t.Fatalf("expected 5, got %d", r.GetScalar().GetIntVal())
 	}
 }
 
@@ -621,6 +646,7 @@ func TestGetSnapshot_ExpiredReconstructedStillReturnsState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if r == nil {
 		t.Fatal("expected non-nil — raw causal state should be returned regardless of expiry")
 	}
@@ -643,6 +669,7 @@ func TestGetSnapshot_SubscriptionTracked(t *testing.T) {
 		Kind: &pb.Effect_Data{Data: scalarInsertRaw([]byte("v"))},
 	})
 	e.index.Insert("held", nil, keytrie.NewTipSet(off))
+
 	_, _, _, _ = e.GetSnapshot("held")
 	if _, ok := e.subscriptions.Load("held"); !ok {
 		t.Fatal("expected subscription to be recorded for a key we hold")
@@ -667,6 +694,7 @@ func TestGetSnapshot_SubscriptionBroadcast(t *testing.T) {
 	for _, pid := range bc.replicateToPeers {
 		peerSet[pid]++
 	}
+
 	if peerSet[10] == 0 || peerSet[20] == 0 {
 		t.Fatalf("expected ReplicateTo to peers 10 and 20, got %v", bc.replicateToPeers)
 	}
@@ -693,11 +721,13 @@ func TestGetSnapshot_MetaWithData(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(r.Scalar.GetRaw()) != "hello" {
-		t.Fatalf("expected 'hello', got %q", r.Scalar.GetRaw())
+
+	if string(r.GetScalar().GetRaw()) != "hello" {
+		t.Fatalf("expected 'hello', got %q", r.GetScalar().GetRaw())
 	}
-	if r.TypeTag != pb.ValueType_TYPE_STRING {
-		t.Fatalf("expected TYPE_STRING, got %v", r.TypeTag)
+
+	if r.GetTypeTag() != pb.ValueType_TYPE_STRING {
+		t.Fatalf("expected TYPE_STRING, got %v", r.GetTypeTag())
 	}
 }
 
@@ -723,11 +753,13 @@ func TestGetSnapshot_HashMultiField(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(r.NetAdds) != 2 {
-		t.Fatalf("expected 2 fields, got %d", len(r.NetAdds))
+
+	if len(r.GetNetAdds()) != 2 {
+		t.Fatalf("expected 2 fields, got %d", len(r.GetNetAdds()))
 	}
-	if string(r.NetAdds["f1"].Data.GetRaw()) != "v1-updated" {
-		t.Fatalf("expected f1=v1-updated, got %q", r.NetAdds["f1"].Data.GetRaw())
+
+	if string(r.GetNetAdds()["f1"].GetData().GetRaw()) != "v1-updated" {
+		t.Fatalf("expected f1=v1-updated, got %q", r.GetNetAdds()["f1"].GetData().GetRaw())
 	}
 }
 
@@ -753,12 +785,14 @@ func TestGetSnapshot_OrderedList(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(r.OrderedElements) != 3 {
-		t.Fatalf("expected 3 elements, got %d", len(r.OrderedElements))
+
+	if len(r.GetOrderedElements()) != 3 {
+		t.Fatalf("expected 3 elements, got %d", len(r.GetOrderedElements()))
 	}
+
 	got := make([]string, 3)
-	for i, elem := range r.OrderedElements {
-		got[i] = string(elem.Data.GetRaw())
+	for i, elem := range r.GetOrderedElements() {
+		got[i] = string(elem.GetData().GetRaw())
 	}
 	// RPUSH a, RPUSH b, LPUSH c → [c, a, b]
 	want := []string{"c", "a", "b"}
@@ -795,6 +829,7 @@ func TestGetSnapshot_DELReturnsNil(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if r != nil {
 		t.Fatalf("expected nil after DEL, got %+v", r)
 	}
@@ -804,10 +839,11 @@ func TestGetSnapshot_DELReturnsNil(t *testing.T) {
 
 func TestReduceChain_NilSeedDelegatesToReduceBranch(t *testing.T) {
 	effects := []*pb.Effect{
-		makeDataEffect("k", 1, 1, scalarInsertRaw([]byte("hello"))),
+		makeDataEffect(1, scalarInsertRaw([]byte("hello"))),
 	}
+
 	r := ReduceChain(nil, effects)
-	if r == nil || string(r.Scalar.GetRaw()) != "hello" {
+	if r == nil || string(r.GetScalar().GetRaw()) != "hello" {
 		t.Fatal("ReduceChain(nil, ...) should behave like ReduceBranch")
 	}
 }
@@ -825,11 +861,12 @@ func TestReduceChain_SeedWithEffects(t *testing.T) {
 		},
 	}
 	effects := []*pb.Effect{
-		makeDataEffect("k", 20, 1, scalarInsertInt(pb.MergeRule_ADDITIVE_INT, 5)),
+		makeDataEffect(20, scalarInsertInt(pb.MergeRule_ADDITIVE_INT, 5)),
 	}
+
 	r := ReduceChain(seed, effects)
-	if r.Scalar.GetIntVal() != 15 {
-		t.Fatalf("expected 15, got %d", r.Scalar.GetIntVal())
+	if r.GetScalar().GetIntVal() != 15 {
+		t.Fatalf("expected 15, got %d", r.GetScalar().GetIntVal())
 	}
 }
 
@@ -838,8 +875,9 @@ func TestReduceChain_SeedNoEffects(t *testing.T) {
 		Op:     pb.EffectOp_INSERT_OP,
 		Scalar: &pb.DataEffect{Value: &pb.DataEffect_Raw{Raw: []byte("seed")}},
 	}
+
 	r := ReduceChain(seed, nil)
-	if r == nil || string(r.Scalar.GetRaw()) != "seed" {
+	if r == nil || string(r.GetScalar().GetRaw()) != "seed" {
 		t.Fatal("ReduceChain(seed, nil) should return clone of seed")
 	}
 }
@@ -858,12 +896,14 @@ func TestReduceChain_MetaOnTopOfSeed(t *testing.T) {
 	effects := []*pb.Effect{
 		makeMetaEffect("k", 20, 1, &pb.MetaEffect{ExpiresAt: sTs(9999)}),
 	}
+
 	r := ReduceChain(seed, effects)
-	if string(r.Scalar.GetRaw()) != "data" {
-		t.Fatalf("expected seed data preserved, got %q", r.Scalar.GetRaw())
+	if string(r.GetScalar().GetRaw()) != "data" {
+		t.Fatalf("expected seed data preserved, got %q", r.GetScalar().GetRaw())
 	}
+
 	if r.GetExpiresAt().AsTime().UnixNano() != 9999 {
-		t.Fatalf("expected ExpiresAt=9999ns, got %v", r.ExpiresAt)
+		t.Fatalf("expected ExpiresAt=9999ns, got %v", r.GetExpiresAt())
 	}
 }
 
@@ -885,6 +925,7 @@ func TestEmitFlushGetSnapshot(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := ctx.Flush(); err != nil {
 		t.Fatal(err)
 	}
@@ -893,11 +934,13 @@ func TestEmitFlushGetSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if r == nil {
 		t.Fatal("expected non-nil snapshot after Emit+Flush")
 	}
-	if string(r.Scalar.GetRaw()) != "myval" {
-		t.Fatalf("expected 'myval', got %q", r.Scalar.GetRaw())
+
+	if string(r.GetScalar().GetRaw()) != "myval" {
+		t.Fatalf("expected 'myval', got %q", r.GetScalar().GetRaw())
 	}
 }
 
@@ -918,6 +961,7 @@ func TestEmitFlushGetSnapshot_MultipleWrites(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := ctx.Flush(); err != nil {
 		t.Fatal(err)
 	}
@@ -935,6 +979,7 @@ func TestEmitFlushGetSnapshot_MultipleWrites(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := ctx2.Flush(); err != nil {
 		t.Fatal(err)
 	}
@@ -943,8 +988,9 @@ func TestEmitFlushGetSnapshot_MultipleWrites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(r.Scalar.GetRaw()) != "v2" {
-		t.Fatalf("expected 'v2', got %q", r.Scalar.GetRaw())
+
+	if string(r.GetScalar().GetRaw()) != "v2" {
+		t.Fatalf("expected 'v2', got %q", r.GetScalar().GetRaw())
 	}
 }
 
@@ -972,10 +1018,12 @@ func TestGetSnapshot_ReturnsTips(t *testing.T) {
 	if len(tips) != 3 {
 		t.Fatalf("expected 3 tips (off1 + off2 + subscription), got %d", len(tips))
 	}
+
 	tipSet := make(map[Tip]bool, len(tips))
 	for _, tp := range tips {
 		tipSet[tp] = true
 	}
+
 	if !tipSet[off1] || !tipSet[off2] {
 		t.Fatalf("expected tips to include {%v, %v}, got %v", off1, off2, tips)
 	}
@@ -1023,6 +1071,7 @@ func TestEmitWithSnapshotTips_PreventsStaleDepRace(t *testing.T) {
 
 	// Step 3: Emit with the snapshot tips from step 1
 	ctx := e.NewContext()
+
 	err = ctx.Emit(&pb.Effect{
 		Key:  []byte("k"),
 		Kind: &pb.Effect_Data{Data: scalarInsertRaw([]byte("D"))},
@@ -1033,22 +1082,26 @@ func TestEmitWithSnapshotTips_PreventsStaleDepRace(t *testing.T) {
 
 	// Verify the emitted effect depends on {A, B}, not {C}
 	lastCall := log.entries[Tip{uint64(e.nodeID), log.nextOff - 100}]
+
 	var emittedEff pb.Effect
 	if err := proto.Unmarshal(lastCall, &emittedEff); err != nil {
 		t.Fatal(err)
 	}
-	if len(emittedEff.Deps) != 2 {
-		t.Fatalf("expected 2 deps (snapshot tips), got %v", emittedEff.Deps)
+
+	if len(emittedEff.GetDeps()) != 2 {
+		t.Fatalf("expected 2 deps (snapshot tips), got %v", emittedEff.GetDeps())
 	}
-	depSet := map[Tip]bool{r(emittedEff.Deps[0]): true, r(emittedEff.Deps[1]): true}
+
+	depSet := map[Tip]bool{r(emittedEff.GetDeps()[0]): true, r(emittedEff.GetDeps()[1]): true}
 	if !depSet[offA] || !depSet[offB] {
-		t.Fatalf("expected deps {%v, %v}, got %v", offA, offB, emittedEff.Deps)
+		t.Fatalf("expected deps {%v, %v}, got %v", offA, offB, emittedEff.GetDeps())
 	}
 
 	// Step 4: Flush should create a fork {C, D}
 	if err := ctx.Flush(); err != nil {
 		t.Fatal(err)
 	}
+
 	finalTips := e.index.Contains("k")
 	if finalTips == nil {
 		t.Fatal("expected tips after flush")
@@ -1058,6 +1111,7 @@ func TestEmitWithSnapshotTips_PreventsStaleDepRace(t *testing.T) {
 	if finalTips.Len() != 2 {
 		t.Fatalf("expected 2 tips (fork: C + D), got %d: %v", finalTips.Len(), finalTips.Tips())
 	}
+
 	if !finalTips.Contains(offC) {
 		t.Fatalf("expected fork to contain C (%v), got %v", offC, finalTips.Tips())
 	}
@@ -1078,6 +1132,7 @@ func TestEmitWithoutSnapshotTips_ReadsIndex(t *testing.T) {
 
 	// Emit without snapshot tips — should read from index
 	ctx := e.NewContext()
+
 	err := ctx.Emit(&pb.Effect{
 		Key:  []byte("k"),
 		Kind: &pb.Effect_Data{Data: scalarInsertRaw([]byte("new"))},
@@ -1096,17 +1151,21 @@ func TestEmitWithoutSnapshotTips_ReadsIndex(t *testing.T) {
 	if err := ctx.Flush(); err != nil {
 		t.Fatal(err)
 	}
+
 	tips = e.index.Contains("k")
 	if tips == nil || tips.Len() != 1 {
 		t.Fatalf("expected 1 tip after flush, got %v", tips)
 	}
+
 	newOff := tips.Tips()[0]
+
 	cached, ok := e.effectCache.Get(newOff)
 	if !ok {
 		t.Fatal("emitted effect not in effectCache")
 	}
-	if len(cached.Deps) != 1 || r(cached.Deps[0]) != off {
-		t.Fatalf("expected deps [%v], got %v", off, cached.Deps)
+
+	if len(cached.GetDeps()) != 1 || r(cached.GetDeps()[0]) != off {
+		t.Fatalf("expected deps [%v], got %v", off, cached.GetDeps())
 	}
 }
 
@@ -1117,11 +1176,12 @@ func TestEmitWithoutSnapshotTips_ReadsIndex(t *testing.T) {
 // back through the engine's HandleNack path (as the real cluster would).
 type bootstrapBroadcaster struct {
 	mockBroadcaster
+
 	remoteEngine *Engine // the "remote" engine that has data
 }
 
 func (b *bootstrapBroadcaster) ReplicateMarshalled(notify *pb.OffsetNotify, _ []byte, target pb.NodeID) ([]*pb.NackNotify, error) {
-	return b.ReplicateTo(notify, notify.EffectData, target)
+	return b.ReplicateTo(notify, notify.GetEffectData(), target)
 }
 
 func (b *bootstrapBroadcaster) ReplicateTo(notify *pb.OffsetNotify, wireData []byte, targetNodeID pb.NodeID) ([]*pb.NackNotify, error) {
@@ -1132,8 +1192,10 @@ func (b *bootstrapBroadcaster) ReplicateTo(notify *pb.OffsetNotify, wireData []b
 	// so ensureSubscribed can collect bootstrap tips.
 	if b.remoteEngine != nil {
 		nacks, err := b.remoteEngine.HandleRemote(notify)
+
 		return nacks, err
 	}
+
 	return nil, nil
 }
 
@@ -1141,6 +1203,7 @@ func (b *bootstrapBroadcaster) FetchFromAny(ref *pb.EffectRef, _ FetchHint) ([]b
 	if b.remoteEngine == nil {
 		return nil, nil
 	}
+
 	offset := r(ref)
 	// Read from remote engine's effect cache
 	cached, ok := b.remoteEngine.effectCache.Get(offset)
@@ -1152,11 +1215,13 @@ func (b *bootstrapBroadcaster) FetchFromAny(ref *pb.EffectRef, _ FetchHint) ([]b
 	if err != nil {
 		return nil, err
 	}
-	keyBytes := cached.Key
+
+	keyBytes := cached.GetKey()
 	wire := make([]byte, 4+len(keyBytes)+len(protoData))
 	binary.LittleEndian.PutUint32(wire[:4], uint32(len(keyBytes)))
 	copy(wire[4:4+len(keyBytes)], keyBytes)
 	copy(wire[4+len(keyBytes):], protoData)
+
 	return wire, nil
 }
 
@@ -1192,6 +1257,7 @@ func TestSubscriptionBootstrap_FetchesRemoteState(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := remoteCtx.Flush(); err != nil {
 		t.Fatal(err)
 	}
@@ -1239,17 +1305,20 @@ func TestSubscriptionBootstrap_FetchesRemoteState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if r == nil {
 		t.Fatal("expected non-nil snapshot after subscription bootstrap")
 	}
-	if string(r.Scalar.GetRaw()) != "remote-value" {
-		t.Fatalf("expected 'remote-value', got %q", r.Scalar.GetRaw())
+
+	if string(r.GetScalar().GetRaw()) != "remote-value" {
+		t.Fatalf("expected 'remote-value', got %q", r.GetScalar().GetRaw())
 	}
 }
 
 // nackForwardBroadcaster forwards SendNack calls to a target engine's HandleNack.
 type nackForwardBroadcaster struct {
 	mockBroadcaster
+
 	target *Engine
 }
 
@@ -1269,6 +1338,7 @@ func TestSubscriptionBootstrap_NoPeers_NoBlock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if r != nil {
 		t.Fatal("expected nil for key with no data and no peers")
 	}
@@ -1289,15 +1359,19 @@ func TestSubscriptionBootstrap_AllPeersEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if r != nil {
 		t.Fatal("expected nil when all peers have no data")
 	}
+
 	if len(bc.replicateToPeers) != 0 {
 		t.Fatalf("nowhere-key miss must not block on ReplicateTo rounds, got %d", len(bc.replicateToPeers))
 	}
+
 	if _, ok := e.subscriptions.Load("missing-key"); ok {
 		t.Fatal("a free miss must not record a subscription")
 	}
+
 	if bc.broadcastCount() != 0 {
 		t.Fatalf("a free miss must not announce, got %d broadcasts", bc.broadcastCount())
 	}
@@ -1348,12 +1422,14 @@ func TestHandleRemote_SubscriptionEffect_SendsNack(t *testing.T) {
 	if len(nacks) != 1 {
 		t.Fatalf("expected 1 NACK returned, got %d", len(nacks))
 	}
+
 	nack := nacks[0]
-	if string(nack.Key) != "k" {
-		t.Fatalf("expected NACK for key 'k', got %q", nack.Key)
+	if string(nack.GetKey()) != "k" {
+		t.Fatalf("expected NACK for key 'k', got %q", nack.GetKey())
 	}
-	if len(nack.Tips) != 1 || r(nack.Tips[0]) != off {
-		t.Fatalf("expected NACK tips [%v], got %v", off, nack.Tips)
+
+	if len(nack.GetTips()) != 1 || r(nack.GetTips()[0]) != off {
+		t.Fatalf("expected NACK tips [%v], got %v", off, nack.GetTips())
 	}
 }
 
@@ -1399,6 +1475,7 @@ func TestHandleRemote_SubscriptionEffect_NoAuthority_EmptyAck(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected nil err (empty ACK), got %v", err)
 	}
+
 	if len(nacks) != 0 {
 		t.Fatalf("expected 0 NACKs from a no-authority key; got %d", len(nacks))
 	}
@@ -1436,6 +1513,7 @@ func TestHandleRemote_FlushKey_BypassesAuthorityGate(t *testing.T) {
 
 	e.updateIndex("alpha", nil, Tip{1, 100})
 	e.updateIndex("beta", nil, Tip{1, 101})
+
 	if e.index.Contains("alpha") == nil || e.index.Contains("beta") == nil {
 		t.Fatal("test setup: seeded keys not in index")
 	}
@@ -1459,12 +1537,15 @@ func TestHandleRemote_FlushKey_BypassesAuthorityGate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected nil err (gate must bypass FlushKey), got %v", err)
 	}
+
 	if len(nacks) != 0 {
 		t.Fatalf("expected 0 NACKs from flush, got %d", len(nacks))
 	}
+
 	if e.index.Contains("alpha") != nil || e.index.Contains("beta") != nil {
 		t.Fatal("FlushIndex did not run; seeded keys remain in the index")
 	}
+
 	if !flushFired {
 		t.Fatal("OnFlushAll callback did not fire")
 	}
@@ -1525,6 +1606,7 @@ func TestHandleRemote_TxnBind_AuthorityViaNonCanonicalKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected gate to bypass via non-canonical key authority, got %v", err)
 	}
+
 	if len(nacks) != 0 {
 		t.Fatalf("expected 0 NACKs (no divergence), got %d", len(nacks))
 	}
@@ -1535,6 +1617,7 @@ func TestHandleRemote_TxnBind_AuthorityViaNonCanonicalKey(t *testing.T) {
 	if tipsB == nil {
 		t.Fatal("bind not indexed under 'B' (the authoritative key)")
 	}
+
 	if !slices.Contains(tipsB.Tips(), bindOffset) {
 		t.Fatalf("bind offset %v missing from 'B' tips: %v", bindOffset, tipsB.Tips())
 	}
@@ -1612,8 +1695,8 @@ func TestGetSnapshot_ForkWithSnapshotEffect(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 3 (common: E1+E2+E3) + 1 (branch1: E4) + 1 (branch2: E5) = 5
-	if r.Scalar.GetIntVal() != 5 {
-		t.Fatalf("expected 5, got %d (double-counting bug if >5)", r.Scalar.GetIntVal())
+	if r.GetScalar().GetIntVal() != 5 {
+		t.Fatalf("expected 5, got %d (double-counting bug if >5)", r.GetScalar().GetIntVal())
 	}
 }
 
@@ -1680,8 +1763,8 @@ func TestGetSnapshot_ForkBothBranchesHaveSnapshots(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 10 (common: E1) + 1 (branch1: E2) + 2 (branch2: E3) = 13
-	if r.Scalar.GetIntVal() != 13 {
-		t.Fatalf("expected 13, got %d (double-counting bug if >13)", r.Scalar.GetIntVal())
+	if r.GetScalar().GetIntVal() != 13 {
+		t.Fatalf("expected 13, got %d (double-counting bug if >13)", r.GetScalar().GetIntVal())
 	}
 }
 
@@ -1767,8 +1850,8 @@ func TestGetSnapshot_CrossBranchSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	// E1+E2+E3+E4+E5+E6+E7 = 7
-	if r.Scalar.GetIntVal() != 7 {
-		t.Fatalf("expected 7, got %d", r.Scalar.GetIntVal())
+	if r.GetScalar().GetIntVal() != 7 {
+		t.Fatalf("expected 7, got %d", r.GetScalar().GetIntVal())
 	}
 }
 
@@ -1834,8 +1917,8 @@ func TestGetSnapshot_ForkMultiEffectBranches(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 3 (common) + 3 (branch A) + 2 (branch B) = 8
-	if r.Scalar.GetIntVal() != 8 {
-		t.Fatalf("expected 8, got %d", r.Scalar.GetIntVal())
+	if r.GetScalar().GetIntVal() != 8 {
+		t.Fatalf("expected 8, got %d", r.GetScalar().GetIntVal())
 	}
 }
 
@@ -1904,8 +1987,8 @@ func TestGetSnapshot_ForkAfterMerge(t *testing.T) {
 		t.Fatal(err)
 	}
 	// E1+E2+E3+E4+E5+E6+E7 = 7
-	if r.Scalar.GetIntVal() != 7 {
-		t.Fatalf("expected 7, got %d", r.Scalar.GetIntVal())
+	if r.GetScalar().GetIntVal() != 7 {
+		t.Fatalf("expected 7, got %d", r.GetScalar().GetIntVal())
 	}
 }
 
@@ -1958,8 +2041,8 @@ func TestGetSnapshot_ForkWithPartialReplication(t *testing.T) {
 		t.Fatal(err)
 	}
 	// E1+E2+E3+E4+E5 = 5
-	if r.Scalar.GetIntVal() != 5 {
-		t.Fatalf("expected 5, got %d", r.Scalar.GetIntVal())
+	if r.GetScalar().GetIntVal() != 5 {
+		t.Fatalf("expected 5, got %d", r.GetScalar().GetIntVal())
 	}
 }
 
@@ -1986,9 +2069,10 @@ func TestGetSnapshot_JepsenDAG14(t *testing.T) {
 
 	putN := func(id int, eff *pb.Effect) {
 		eff.Hlc = sTs(int64(id + 1))
-		if len(eff.ForkChoiceHash) == 0 {
-			eff.ForkChoiceHash = ComputeForkChoiceHash(pb.NodeID(eff.NodeId), eff.Hlc)
+		if len(eff.GetForkChoiceHash()) == 0 {
+			eff.ForkChoiceHash = ComputeForkChoiceHash(pb.NodeID(eff.GetNodeId()), eff.GetHlc())
 		}
+
 		data, _ := proto.Marshal(eff)
 		log.entries[off[id]] = data
 		log.effectCache.Put(off[id], proto.Clone(eff).(*pb.Effect))
@@ -1999,6 +2083,7 @@ func TestGetSnapshot_JepsenDAG14(t *testing.T) {
 		for i, id := range ids {
 			d[i] = toPbRef(off[id])
 		}
+
 		return d
 	}
 
@@ -2038,8 +2123,8 @@ func TestGetSnapshot_JepsenDAG14(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 7 data effects (nodes 1,3,5,6,8,10,12), each +1, correct = 7
-	if r.Scalar.GetIntVal() != 7 {
-		t.Fatalf("expected 7, got %d", r.Scalar.GetIntVal())
+	if r.GetScalar().GetIntVal() != 7 {
+		t.Fatalf("expected 7, got %d", r.GetScalar().GetIntVal())
 	}
 }
 
@@ -2099,8 +2184,8 @@ func TestGetSnapshot_ThreeWayMergeUnequalLCA(t *testing.T) {
 		t.Fatal(err)
 	}
 	// E1(1) + E2(1) + E3(1) + E4(1) + E5(1) = 5
-	if r.Scalar.GetIntVal() != 5 {
-		t.Fatalf("expected 5, got %d", r.Scalar.GetIntVal())
+	if r.GetScalar().GetIntVal() != 5 {
+		t.Fatalf("expected 5, got %d", r.GetScalar().GetIntVal())
 	}
 }
 
@@ -2159,8 +2244,8 @@ func TestGetSnapshot_FourWayMergeFromJepsen(t *testing.T) {
 		t.Fatal(err)
 	}
 	// E1(1) + E2(1) + E3(1) + E4(1) + E5(1) + E6(1) = 6
-	if r.Scalar.GetIntVal() != 6 {
-		t.Fatalf("expected 6, got %d", r.Scalar.GetIntVal())
+	if r.GetScalar().GetIntVal() != 6 {
+		t.Fatalf("expected 6, got %d", r.GetScalar().GetIntVal())
 	}
 }
 
@@ -2179,25 +2264,33 @@ func TestGetSnapshot_ChainedCompactionSnapshots(t *testing.T) {
 	log := newSnapshotLog()
 	e := newSnapshotEngine(log)
 	hlc := int64(0)
-	nextHLC := func() int64 { hlc++; return hlc }
+	nextHLC := func() int64 {
+		hlc++
+
+		return hlc
+	}
 
 	// Round 1: 10 increments per node from root
 	var prev1, prev2 Tip
+
 	for range 10 {
 		deps := []*pb.EffectRef{}
 		if prev1 != (Tip{}) {
 			deps = []*pb.EffectRef{toPbRef(prev1)}
 		}
+
 		prev1 = log.putEffect(&pb.Effect{
 			Key: []byte("k"), Hlc: sTs(nextHLC()), NodeId: 1, Deps: deps,
 			Kind: &pb.Effect_Data{Data: scalarInsertInt(pb.MergeRule_ADDITIVE_INT, 1)},
 		})
 	}
+
 	for range 10 {
 		deps := []*pb.EffectRef{}
 		if prev2 != (Tip{}) {
 			deps = []*pb.EffectRef{toPbRef(prev2)}
 		}
+
 		prev2 = log.putEffect(&pb.Effect{
 			Key: []byte("k"), Hlc: sTs(nextHLC()), NodeId: 2, Deps: deps,
 			Kind: &pb.Effect_Data{Data: scalarInsertInt(pb.MergeRule_ADDITIVE_INT, 1)},
@@ -2224,12 +2317,14 @@ func TestGetSnapshot_ChainedCompactionSnapshots(t *testing.T) {
 	// Round 2: 5 more per node, both starting from S1
 	prev1 = s1
 	prev2 = s1
+
 	for range 5 {
 		prev1 = log.putEffect(&pb.Effect{
 			Key: []byte("k"), Hlc: sTs(nextHLC()), NodeId: 1, Deps: []*pb.EffectRef{toPbRef(prev1)},
 			Kind: &pb.Effect_Data{Data: scalarInsertInt(pb.MergeRule_ADDITIVE_INT, 1)},
 		})
 	}
+
 	for range 5 {
 		prev2 = log.putEffect(&pb.Effect{
 			Key: []byte("k"), Hlc: sTs(nextHLC()), NodeId: 2, Deps: []*pb.EffectRef{toPbRef(prev2)},
@@ -2257,12 +2352,14 @@ func TestGetSnapshot_ChainedCompactionSnapshots(t *testing.T) {
 	// Round 3: 3 more per node from S2
 	prev1 = s2
 	prev2 = s2
+
 	for range 3 {
 		prev1 = log.putEffect(&pb.Effect{
 			Key: []byte("k"), Hlc: sTs(nextHLC()), NodeId: 1, Deps: []*pb.EffectRef{toPbRef(prev1)},
 			Kind: &pb.Effect_Data{Data: scalarInsertInt(pb.MergeRule_ADDITIVE_INT, 1)},
 		})
 	}
+
 	for range 3 {
 		prev2 = log.putEffect(&pb.Effect{
 			Key: []byte("k"), Hlc: sTs(nextHLC()), NodeId: 2, Deps: []*pb.EffectRef{toPbRef(prev2)},
@@ -2277,8 +2374,8 @@ func TestGetSnapshot_ChainedCompactionSnapshots(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 10+10 + 5+5 + 3+3 = 36
-	if r.Scalar.GetIntVal() != 36 {
-		t.Fatalf("expected 36, got %d", r.Scalar.GetIntVal())
+	if r.GetScalar().GetIntVal() != 36 {
+		t.Fatalf("expected 36, got %d", r.GetScalar().GetIntVal())
 	}
 }
 
@@ -2298,15 +2395,21 @@ func TestGetSnapshot_SnapshotChainWithPartialVisibility(t *testing.T) {
 	log := newSnapshotLog()
 	e := newSnapshotEngine(log)
 	hlc := int64(0)
-	nextHLC := func() int64 { hlc++; return hlc }
+	nextHLC := func() int64 {
+		hlc++
+
+		return hlc
+	}
 
 	// 10 increments on node1
 	var prev1 Tip
+
 	for range 10 {
 		deps := []*pb.EffectRef{}
 		if prev1 != (Tip{}) {
 			deps = []*pb.EffectRef{toPbRef(prev1)}
 		}
+
 		prev1 = log.putEffect(&pb.Effect{
 			Key: []byte("k"), Hlc: sTs(nextHLC()), NodeId: 1, Deps: deps,
 			Kind: &pb.Effect_Data{Data: scalarInsertInt(pb.MergeRule_ADDITIVE_INT, 1)},
@@ -2315,11 +2418,13 @@ func TestGetSnapshot_SnapshotChainWithPartialVisibility(t *testing.T) {
 
 	// 10 increments on node2 (independent, no shared root)
 	var prev2 Tip
+
 	for range 10 {
 		deps := []*pb.EffectRef{}
 		if prev2 != (Tip{}) {
 			deps = []*pb.EffectRef{toPbRef(prev2)}
 		}
+
 		prev2 = log.putEffect(&pb.Effect{
 			Key: []byte("k"), Hlc: sTs(nextHLC()), NodeId: 2, Deps: deps,
 			Kind: &pb.Effect_Data{Data: scalarInsertInt(pb.MergeRule_ADDITIVE_INT, 1)},
@@ -2370,8 +2475,8 @@ func TestGetSnapshot_SnapshotChainWithPartialVisibility(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 10+10 + 2+2 = 24
-	if r.Scalar.GetIntVal() != 24 {
-		t.Fatalf("expected 24, got %d", r.Scalar.GetIntVal())
+	if r.GetScalar().GetIntVal() != 24 {
+		t.Fatalf("expected 24, got %d", r.GetScalar().GetIntVal())
 	}
 }
 
@@ -2382,11 +2487,17 @@ func TestGetSnapshot_ManyForksAndMerges(t *testing.T) {
 	log := newSnapshotLog()
 	e := newSnapshotEngine(log)
 	hlc := int64(0)
-	nextHLC := func() int64 { hlc++; return hlc }
+	nextHLC := func() int64 {
+		hlc++
 
-	const nNodes = 5
-	const incrsPerRound = 4
-	const rounds = 5
+		return hlc
+	}
+
+	const (
+		nNodes        = 5
+		incrsPerRound = 4
+		rounds        = 5
+	)
 
 	tips := make([]Tip, nNodes)
 	totalIncrements := 0
@@ -2399,6 +2510,7 @@ func TestGetSnapshot_ManyForksAndMerges(t *testing.T) {
 				if tips[node] != (Tip{}) {
 					deps = []*pb.EffectRef{toPbRef(tips[node])}
 				}
+
 				tips[node] = log.putEffect(&pb.Effect{
 					Key: []byte("k"), Hlc: sTs(nextHLC()), NodeId: uint64(node) + 1, Deps: deps,
 					Kind: &pb.Effect_Data{Data: scalarInsertInt(pb.MergeRule_ADDITIVE_INT, 1)},
@@ -2429,8 +2541,9 @@ func TestGetSnapshot_ManyForksAndMerges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Scalar.GetIntVal() != int64(totalIncrements) {
-		t.Fatalf("expected %d, got %d", totalIncrements, r.Scalar.GetIntVal())
+
+	if r.GetScalar().GetIntVal() != int64(totalIncrements) {
+		t.Fatalf("expected %d, got %d", totalIncrements, r.GetScalar().GetIntVal())
 	}
 }
 
@@ -2470,17 +2583,20 @@ func TestGetSnapshot_AbortedCrossKeyBind_JepsenG1aRepro(t *testing.T) {
 	)
 
 	putAt := func(tip Tip, eff *pb.Effect) Tip {
-		if len(eff.ForkChoiceHash) == 0 {
-			eff.ForkChoiceHash = ComputeForkChoiceHash(pb.NodeID(eff.NodeId), eff.Hlc)
+		if len(eff.GetForkChoiceHash()) == 0 {
+			eff.ForkChoiceHash = ComputeForkChoiceHash(pb.NodeID(eff.GetNodeId()), eff.GetHlc())
 		}
+
 		data, _ := proto.Marshal(eff)
 		log.entries[tip] = data
 		log.effectCache.Put(tip, proto.Clone(eff).(*pb.Effect))
+
 		return tip
 	}
 
 	// Hashes chosen so Y < X (so X loses fork choice on el-2).
 	xHash := []byte{0xff, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+
 	yHash := []byte{0x00, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 	if !ForkChoiceLess(yHash, xHash) {
 		t.Fatalf("test setup: expected Y < X by hash")
@@ -2563,6 +2679,7 @@ func TestGetSnapshot_AbortedCrossKeyBind_JepsenG1aRepro(t *testing.T) {
 	if slices.Contains(got, "53") {
 		t.Fatalf("G1a: aborted bind X's effect '53' visible in el-3 reconstruction: %v", got)
 	}
+
 	if !slices.Contains(got, "48") {
 		t.Fatalf("expected baseline '48' to be visible in el-3 reconstruction, got %v", got)
 	}
@@ -2582,12 +2699,14 @@ func TestLosersOnKey_TwoConcurrentBindsLowerHashWins(t *testing.T) {
 	)
 
 	putAt := func(tip Tip, eff *pb.Effect) Tip {
-		if len(eff.ForkChoiceHash) == 0 {
-			eff.ForkChoiceHash = ComputeForkChoiceHash(pb.NodeID(eff.NodeId), eff.Hlc)
+		if len(eff.GetForkChoiceHash()) == 0 {
+			eff.ForkChoiceHash = ComputeForkChoiceHash(pb.NodeID(eff.GetNodeId()), eff.GetHlc())
 		}
+
 		data, _ := proto.Marshal(eff)
 		log.entries[tip] = data
 		log.effectCache.Put(tip, proto.Clone(eff).(*pb.Effect))
+
 		return tip
 	}
 
@@ -2629,6 +2748,7 @@ func TestLosersOnKey_TwoConcurrentBindsLowerHashWins(t *testing.T) {
 	if _, ok := losers["txn-hi"]; !ok {
 		t.Fatalf("expected higher-hash bind 'txn-hi' to be in losers, got %v", losers)
 	}
+
 	if _, ok := losers["txn-lo"]; ok {
 		t.Fatalf("lower-hash bind 'txn-lo' should not be in losers, got %v", losers)
 	}
@@ -2662,12 +2782,14 @@ func TestLosersOnKey_XDependsOnYsAncestorsButNotNewTip(t *testing.T) {
 	)
 
 	putAt := func(tip Tip, eff *pb.Effect) Tip {
-		if len(eff.ForkChoiceHash) == 0 {
-			eff.ForkChoiceHash = ComputeForkChoiceHash(pb.NodeID(eff.NodeId), eff.Hlc)
+		if len(eff.GetForkChoiceHash()) == 0 {
+			eff.ForkChoiceHash = ComputeForkChoiceHash(pb.NodeID(eff.GetNodeId()), eff.GetHlc())
 		}
+
 		data, _ := proto.Marshal(eff)
 		log.entries[tip] = data
 		log.effectCache.Put(tip, proto.Clone(eff).(*pb.Effect))
+
 		return tip
 	}
 
@@ -2757,6 +2879,7 @@ func TestLosersOnKey_XDependsOnYsAncestorsButNotNewTip(t *testing.T) {
 	if !ForkChoiceLess(yHash, xHash) {
 		t.Fatalf("test setup: expected Y.hash < X.hash")
 	}
+
 	xBind := putAt(Tip{nodeA, 28}, &pb.Effect{
 		Key: []byte("el-2"), Hlc: sTs(80), NodeId: nodeA,
 		TxnId:          "txn-X",
@@ -2778,9 +2901,11 @@ func TestLosersOnKey_XDependsOnYsAncestorsButNotNewTip(t *testing.T) {
 
 	losers, _ := e.losersOnKey("el-2", nil, nil)
 	t.Logf("losersOnKey(el-2) returned: %v", losers)
+
 	if _, ok := losers["txn-X"]; !ok {
 		t.Fatalf("expected X (txn-X) to be marked as loser; production observed 53 surfacing on el-3 means X must be a loser on el-2. Got losers=%v", losers)
 	}
+
 	if _, ok := losers["txn-Y"]; ok {
 		t.Fatalf("Y (txn-Y) should NOT be a loser (it has the lower hash). Got losers=%v", losers)
 	}
@@ -2821,12 +2946,14 @@ func TestLosersOnKey_SharedAncestorConcurrentBinds(t *testing.T) {
 	)
 
 	putAt := func(tip Tip, eff *pb.Effect) Tip {
-		if len(eff.ForkChoiceHash) == 0 {
-			eff.ForkChoiceHash = ComputeForkChoiceHash(pb.NodeID(eff.NodeId), eff.Hlc)
+		if len(eff.GetForkChoiceHash()) == 0 {
+			eff.ForkChoiceHash = ComputeForkChoiceHash(pb.NodeID(eff.GetNodeId()), eff.GetHlc())
 		}
+
 		data, _ := proto.Marshal(eff)
 		log.entries[tip] = data
 		log.effectCache.Put(tip, proto.Clone(eff).(*pb.Effect))
+
 		return tip
 	}
 
@@ -2868,6 +2995,7 @@ func TestLosersOnKey_SharedAncestorConcurrentBinds(t *testing.T) {
 
 	// Hashes chosen so Y < X (matches production: 15d2c1af < bea34ea4).
 	yHash := []byte{0x15, 0xd2, 0xc1, 0xaf, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+
 	xHash := []byte{0xbe, 0xa3, 0x4e, 0xa4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 	if !ForkChoiceLess(yHash, xHash) {
 		t.Fatalf("test setup: expected Y < X by hash")
@@ -2903,9 +3031,11 @@ func TestLosersOnKey_SharedAncestorConcurrentBinds(t *testing.T) {
 
 	losers, _ := e.losersOnKey("el-1", nil, nil)
 	t.Logf("losersOnKey(el-1) returned: %v", losers)
+
 	if _, ok := losers["txn-X"]; !ok {
 		t.Fatalf("BUG: expected X (higher hash) to be marked as loser. X and Y are concurrent siblings around shared non-tx ancestor — neither reaches the other. Got losers=%v", losers)
 	}
+
 	if _, ok := losers["txn-Y"]; ok {
 		t.Fatalf("Y (lower hash) should NOT be a loser. Got losers=%v", losers)
 	}
@@ -2947,12 +3077,14 @@ func TestLosersOnKey_SideChannelMakesSequential(t *testing.T) {
 	)
 
 	putAt := func(tip Tip, eff *pb.Effect) Tip {
-		if len(eff.ForkChoiceHash) == 0 {
-			eff.ForkChoiceHash = ComputeForkChoiceHash(pb.NodeID(eff.NodeId), eff.Hlc)
+		if len(eff.GetForkChoiceHash()) == 0 {
+			eff.ForkChoiceHash = ComputeForkChoiceHash(pb.NodeID(eff.GetNodeId()), eff.GetHlc())
 		}
+
 		data, _ := proto.Marshal(eff)
 		log.entries[tip] = data
 		log.effectCache.Put(tip, proto.Clone(eff).(*pb.Effect))
+
 		return tip
 	}
 
@@ -3012,10 +3144,12 @@ func TestLosersOnKey_SideChannelMakesSequential(t *testing.T) {
 		TxnId: "txn-X", Deps: []*pb.EffectRef{toPbRef(x40)},
 		Kind: &pb.Effect_Data{Data: orderedInsert(pb.Placement_PLACE_TAIL, "X-180", []byte("180"))},
 	})
+
 	xHash := []byte{0xbe, 0xa3, 0x4e, 0xa4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 	if !ForkChoiceLess(yHash, xHash) {
 		t.Fatalf("test setup: expected Y < X by hash")
 	}
+
 	xBind := putAt(Tip{nodeX, 42}, &pb.Effect{
 		Key: []byte("el-1"), Hlc: sTs(70), NodeId: nodeX,
 		TxnId:          "txn-X",
@@ -3033,6 +3167,7 @@ func TestLosersOnKey_SideChannelMakesSequential(t *testing.T) {
 
 	losers, _ := e.losersOnKey("el-1", nil, nil)
 	t.Logf("losersOnKey(el-1) returned: %v", losers)
+
 	if len(losers) != 0 {
 		t.Fatalf("X reaches Y via side-channel noop — they are sequential, not concurrent. losersOnKey must return no losers. Got %v", losers)
 	}
@@ -3058,12 +3193,14 @@ func TestIsRealConflict_TransitiveReachMakesSequential(t *testing.T) {
 	)
 
 	putAt := func(tip Tip, eff *pb.Effect) Tip {
-		if len(eff.ForkChoiceHash) == 0 {
-			eff.ForkChoiceHash = ComputeForkChoiceHash(pb.NodeID(eff.NodeId), eff.Hlc)
+		if len(eff.GetForkChoiceHash()) == 0 {
+			eff.ForkChoiceHash = ComputeForkChoiceHash(pb.NodeID(eff.GetNodeId()), eff.GetHlc())
 		}
+
 		data, _ := proto.Marshal(eff)
 		log.entries[tip] = data
 		log.effectCache.Put(tip, proto.Clone(eff).(*pb.Effect))
+
 		return tip
 	}
 
@@ -3114,10 +3251,12 @@ func TestIsRealConflict_TransitiveReachMakesSequential(t *testing.T) {
 		TxnId: "txn-X", Deps: []*pb.EffectRef{toPbRef(x40)},
 		Kind: &pb.Effect_Data{Data: orderedInsert(pb.Placement_PLACE_TAIL, "X-180", []byte("180"))},
 	})
+
 	xHash := []byte{0xbe, 0xa3, 0x4e, 0xa4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 	if !ForkChoiceLess(yHash, xHash) {
 		t.Fatalf("test setup: expected Y < X by hash")
 	}
+
 	xBind := putAt(Tip{nodeX, 42}, &pb.Effect{
 		Key: []byte("el-1"), Hlc: sTs(70), NodeId: nodeX,
 		TxnId:          "txn-X",
@@ -3166,12 +3305,14 @@ func TestBindKeyClosure_ExpandsViaBindKeysField(t *testing.T) {
 	const nodeA uint64 = 7639866581326252873
 
 	putAt := func(tip Tip, eff *pb.Effect) Tip {
-		if len(eff.ForkChoiceHash) == 0 {
-			eff.ForkChoiceHash = ComputeForkChoiceHash(pb.NodeID(eff.NodeId), eff.Hlc)
+		if len(eff.GetForkChoiceHash()) == 0 {
+			eff.ForkChoiceHash = ComputeForkChoiceHash(pb.NodeID(eff.GetNodeId()), eff.GetHlc())
 		}
+
 		data, _ := proto.Marshal(eff)
 		log.entries[tip] = data
 		log.effectCache.Put(tip, proto.Clone(eff).(*pb.Effect))
+
 		return tip
 	}
 
@@ -3197,6 +3338,7 @@ func TestBindKeyClosure_ExpandsViaBindKeysField(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bindKeyClosure: %v", err)
 	}
+
 	for _, want := range []string{"el-2", "el-3", "el-4"} {
 		if _, ok := closure[want]; !ok {
 			t.Fatalf("bindKeyClosure(el-3) missing %q; got %v", want, closure)
@@ -3228,12 +3370,14 @@ func TestReconstruct_VerdictSnapshotSurvivesCompaction(t *testing.T) {
 	)
 
 	putAt := func(tip Tip, eff *pb.Effect) Tip {
-		if len(eff.ForkChoiceHash) == 0 {
-			eff.ForkChoiceHash = ComputeForkChoiceHash(pb.NodeID(eff.NodeId), eff.Hlc)
+		if len(eff.GetForkChoiceHash()) == 0 {
+			eff.ForkChoiceHash = ComputeForkChoiceHash(pb.NodeID(eff.GetNodeId()), eff.GetHlc())
 		}
+
 		data, _ := proto.Marshal(eff)
 		log.entries[tip] = data
 		log.effectCache.Put(tip, proto.Clone(eff).(*pb.Effect))
+
 		return tip
 	}
 
@@ -3364,12 +3508,14 @@ func TestGetSnapshot_NilResultZeroesChainLen(t *testing.T) {
 	e.subscriptions.Store("k", sub)
 
 	const nodeA uint64 = 1
+
 	hlc := func(n int64) *timestamppb.Timestamp { return sTs(n) }
 
 	// 25 NoopEffects in a linear chain on key "k". Noops are skipped by
 	// ReduceChain (no Data/Meta/Sub/Ser), so result stays nil. Walk visits
 	// all 25 nodes, count=25, chainLen=25.
 	var prev Tip
+
 	for i := range 25 {
 		eff := &pb.Effect{
 			Key:    []byte("k"),
@@ -3377,21 +3523,26 @@ func TestGetSnapshot_NilResultZeroesChainLen(t *testing.T) {
 			NodeId: nodeA,
 			Kind:   &pb.Effect_Noop{Noop: &pb.NoopEffect{}},
 		}
+
 		var zero Tip
 		if prev != zero {
 			eff.Deps = []*pb.EffectRef{toPbRef(prev)}
 		}
+
 		prev = log.putEffect(eff)
 	}
+
 	e.index.Insert("k", nil, keytrie.NewTipSet(prev))
 
 	r, _, chainLen, err := e.GetSnapshot("k")
 	if err != nil {
 		t.Fatalf("GetSnapshot returned error: %v", err)
 	}
+
 	if r != nil {
 		t.Fatalf("expected nil result for a Noop-only chain; got %+v", r)
 	}
+
 	if chainLen != 0 {
 		t.Fatalf("chainLen must be zero when result is nil so callers don't dereference; got %d", chainLen)
 	}
@@ -3410,9 +3561,11 @@ func TestContextGetSnapshot_NilResultDoesNotPanicCompaction(t *testing.T) {
 	e.subscriptions.Store("k", sub)
 
 	const nodeA uint64 = 1
+
 	hlc := func(n int64) *timestamppb.Timestamp { return sTs(n) }
 
 	var prev Tip
+
 	for i := range 60 {
 		eff := &pb.Effect{
 			Key:    []byte("k"),
@@ -3420,24 +3573,30 @@ func TestContextGetSnapshot_NilResultDoesNotPanicCompaction(t *testing.T) {
 			NodeId: nodeA,
 			Kind:   &pb.Effect_Noop{Noop: &pb.NoopEffect{}},
 		}
+
 		var zero Tip
 		if prev != zero {
 			eff.Deps = []*pb.EffectRef{toPbRef(prev)}
 		}
+
 		prev = log.putEffect(eff)
 	}
+
 	e.index.Insert("k", nil, keytrie.NewTipSet(prev))
 
 	ctx := e.NewContext()
+
 	defer func() {
 		if r := recover(); r != nil {
 			t.Fatalf("Context.GetSnapshot panicked on nil result during compaction: %v", r)
 		}
 	}()
+
 	r, _, err := ctx.GetSnapshot("k")
 	if err != nil {
 		t.Fatalf("Context.GetSnapshot returned error: %v", err)
 	}
+
 	if r != nil {
 		t.Fatalf("expected nil result; got %+v", r)
 	}
@@ -3461,8 +3620,10 @@ func TestReconstruct_TxCutoffDoesNotHideCrossKeyForkLoser(t *testing.T) {
 		if err != nil {
 			t.Fatalf("marshal effect at %v: %v", tip, err)
 		}
+
 		log.entries[tip] = data
 		log.effectCache.Put(tip, proto.Clone(eff).(*pb.Effect))
+
 		return tip
 	}
 
@@ -3471,7 +3632,9 @@ func TestReconstruct_TxCutoffDoesNotHideCrossKeyForkLoser(t *testing.T) {
 		winnerNode uint64 = 7661756235913149987
 		readerNode uint64 = 7661756235913149987
 	)
+
 	loserHash := []byte{0xb4, 0x37, 0xd4, 0xa6}
+
 	winnerHash := []byte{0xb1, 0x40, 0x1e, 0x49}
 	if !ForkChoiceLess(winnerHash, loserHash) {
 		t.Fatal("test setup: winner hash must sort before loser hash")
@@ -3532,15 +3695,18 @@ func TestReconstruct_TxCutoffDoesNotHideCrossKeyForkLoser(t *testing.T) {
 		Deps: []*pb.EffectRef{toPbRef(loserBind)},
 		Kind: &pb.Effect_Noop{Noop: &pb.NoopEffect{}},
 	})
+
 	e.index.Insert("el-1", nil, keytrie.NewTipSet(boundaryEl1))
 	e.index.Insert("el-2", nil, keytrie.NewTipSet(boundaryEl2))
 
 	reader := e.NewContext()
 	reader.BeginTx()
+
 	r, _, err := reader.GetSnapshot("el-2")
 	if err != nil {
 		t.Fatalf("reconstruct el-2: %v", err)
 	}
+
 	if got := orderedValues(r); slices.Contains(got, "77") {
 		t.Fatalf("G1a: losing append 77 crossed the transaction cutoff: %v", got)
 	}

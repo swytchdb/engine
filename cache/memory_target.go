@@ -44,15 +44,18 @@ func GetAvailableMemory() uint64 {
 	if mem := getCgroupV2MemoryLimit(); mem > 0 {
 		return mem
 	}
+
 	if mem := getCgroupV1MemoryLimit(); mem > 0 {
 		return mem
 	}
+
 	if mem := getProcMemTotal(); mem > 0 {
 		return mem
 	}
 	// Fallback: use Go's view of available memory
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
+
 	return m.Sys + 1024*1024*1024 // Sys + 1GB headroom estimate
 }
 
@@ -62,14 +65,17 @@ func getCgroupV2MemoryLimit() uint64 {
 	if err != nil {
 		return 0
 	}
+
 	s := strings.TrimSpace(string(data))
 	if s == "max" {
 		return 0 // no limit set
 	}
+
 	v, err := strconv.ParseUint(s, 10, 64)
 	if err != nil {
 		return 0
 	}
+
 	return v
 }
 
@@ -79,7 +85,9 @@ func getCgroupV1MemoryLimit() uint64 {
 	if err != nil {
 		return 0
 	}
+
 	s := strings.TrimSpace(string(data))
+
 	v, err := strconv.ParseUint(s, 10, 64)
 	if err != nil {
 		return 0
@@ -88,6 +96,7 @@ func getCgroupV1MemoryLimit() uint64 {
 	if v > uint64(1)<<62 {
 		return 0
 	}
+
 	return v
 }
 
@@ -97,6 +106,7 @@ func getProcMemTotal() uint64 {
 	if err != nil {
 		return 0
 	}
+
 	for line := range strings.SplitSeq(string(data), "\n") {
 		if strings.HasPrefix(line, "MemTotal:") {
 			fields := strings.Fields(line)
@@ -108,6 +118,7 @@ func getProcMemTotal() uint64 {
 			}
 		}
 	}
+
 	return 0
 }
 
@@ -128,6 +139,7 @@ func GetProcessRSS() uint64 {
 	// Fallback
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
+
 	return m.Sys
 }
 
@@ -232,6 +244,7 @@ func (c *CloxCache[K, V]) adjustForMemoryTarget(targetBytes, avgItemSize int64) 
 	if c.sizeFunc != nil {
 		cacheBytes = c.bytes.Load()
 	}
+
 	if cacheBytes <= 0 {
 		cacheBytes = entryCount * avgItemSize
 	}
@@ -281,10 +294,12 @@ func (c *CloxCache[K, V]) adjustForMemoryTarget(targetBytes, avgItemSize int64) 
 		// Cap growth at 4x actual entry count so we don't pre-allocate
 		// hundreds of thousands of empty slots on a nearly-empty cache.
 		usageCap := max(entryCount*4, int64(c.numShards))
+
 		growTarget := min(targetCapacity, usageCap)
 		if growTarget <= currentCapacity {
 			return
 		}
+
 		maxIncrease := currentCapacity + max(1, currentCapacity/10)
 		newCapacity := min(growTarget, maxIncrease)
 		slog.Debug("headroom available: increasing capacity",

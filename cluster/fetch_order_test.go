@@ -46,13 +46,16 @@ type recordingCDN struct {
 func (c *recordingCDN) FetchFromCDN(context.Context, *pb.EffectRef) ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	c.calls++
+
 	return c.data, c.err
 }
 
 func (c *recordingCDN) callCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	return c.calls
 }
 
@@ -61,15 +64,19 @@ func (c *recordingCDN) callCount() int {
 // fallback logic.
 func newFetchTestPM(t *testing.T) *PeerManager {
 	t.Helper()
+
 	cfg := &ClusterConfig{
 		NodeID: 0,
 		Nodes:  []NodeConfig{{ID: 0, Address: "127.0.0.1:0", Region: "test"}},
 	}
+
 	pm, err := NewPeerManager(cfg, &recordingHandler{}, &mockLogReader{})
 	if err != nil {
 		t.Fatalf("NewPeerManager: %v", err)
 	}
+
 	pm.ctx = t.Context()
+
 	return pm
 }
 
@@ -82,9 +89,11 @@ func TestFetchFromAnyPreferPeersFallsBackToCDN(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected CDN fallback to serve the fetch, got error: %v", err)
 	}
+
 	if string(data) != "cdn-bytes" {
 		t.Fatalf("got %q, want the CDN bytes", data)
 	}
+
 	if cdn.callCount() != 1 {
 		t.Fatalf("CDN called %d times, want exactly 1", cdn.callCount())
 	}
@@ -99,9 +108,11 @@ func TestFetchFromAnyPreferCDNServesWithoutPeers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PreferCDN fetch errored: %v", err)
 	}
+
 	if string(data) != "cdn-bytes" {
 		t.Fatalf("got %q, want the CDN bytes", data)
 	}
+
 	if cdn.callCount() != 1 {
 		t.Fatalf("CDN called %d times, want exactly 1", cdn.callCount())
 	}
@@ -116,6 +127,7 @@ func TestFetchFromAnyPreferCDNFallsBackToPeers(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error when both CDN and peers fail")
 	}
+
 	if cdn.callCount() != 1 {
 		t.Fatalf("CDN called %d times, want exactly 1 (no retry loop)", cdn.callCount())
 	}
@@ -135,6 +147,7 @@ func TestFetchFromAnyPreferCDNMissSkipsPeerLeg(t *testing.T) {
 	if !errors.Is(err, effects.ErrCDNBlobMissing) {
 		t.Fatalf("want the CDN-missing sentinel surfaced, got: %v", err)
 	}
+
 	if cdn.callCount() != 1 {
 		t.Fatalf("CDN called %d times, want exactly 1", cdn.callCount())
 	}
@@ -152,6 +165,7 @@ func TestFetchFromAnyPreferPeersMissStillTriesCDN(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error when both peers and CDN fail")
 	}
+
 	if cdn.callCount() != 1 {
 		t.Fatalf("CDN called %d times, want the fallback to have run once", cdn.callCount())
 	}
@@ -171,6 +185,7 @@ func TestFetchFromAnyCDN404NotMaskedByPeerError(t *testing.T) {
 	if !errors.Is(err, effects.ErrCDNBlobMissing) {
 		t.Fatalf("want the CDN-missing sentinel preserved through errors.Is, got: %v", err)
 	}
+
 	if !strings.Contains(err.Error(), ErrPeerUnavailable.Error()) {
 		t.Fatalf("want the peer failure text preserved alongside the sentinel, got: %v", err)
 	}

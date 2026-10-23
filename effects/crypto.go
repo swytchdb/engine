@@ -47,10 +47,12 @@ func init() {
 	if err != nil {
 		panic(fmt.Sprintf("zstd encoder init: %v", err))
 	}
+
 	dec, err := zstd.NewReader(nil, zstd.WithDecoderMaxMemory(128<<20))
 	if err != nil {
 		panic(fmt.Sprintf("zstd decoder init: %v", err))
 	}
+
 	wireZEnc = enc
 	wireZDec = dec
 }
@@ -67,6 +69,7 @@ func Decompress(b []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("zstd decompress: %w", err)
 	}
+
 	return out, nil
 }
 
@@ -99,6 +102,7 @@ func NewEncryptorFromIKM(ikm []byte) (*Encryptor, error) {
 	if _, err := io.ReadFull(hkdf.New(sha256.New, ikm, nil, []byte(cipherKeyInfo)), key); err != nil {
 		return nil, fmt.Errorf("derive seal key: %w", err)
 	}
+
 	return &Encryptor{key: key}, nil
 }
 
@@ -111,11 +115,14 @@ func (enc *Encryptor) SealAndCompress(plaintext, info []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("seal init: %w", err)
 	}
+
 	compressed := Compress(plaintext)
+
 	out := make([]byte, chacha20poly1305.NonceSizeX, chacha20poly1305.NonceSizeX+len(compressed)+aead.Overhead())
 	if _, err := rand.Read(out); err != nil {
 		return nil, fmt.Errorf("seal nonce: %w", err)
 	}
+
 	return aead.Seal(out, out, compressed, info), nil
 }
 
@@ -126,12 +133,15 @@ func (enc *Encryptor) OpenAndDecompress(sealed, info []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open init: %w", err)
 	}
+
 	if len(sealed) < chacha20poly1305.NonceSizeX {
 		return nil, fmt.Errorf("open: sealed blob shorter than a nonce")
 	}
+
 	compressed, err := aead.Open(nil, sealed[:chacha20poly1305.NonceSizeX], sealed[chacha20poly1305.NonceSizeX:], info)
 	if err != nil {
 		return nil, fmt.Errorf("open: %w", err)
 	}
+
 	return Decompress(compressed)
 }

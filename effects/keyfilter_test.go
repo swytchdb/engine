@@ -36,6 +36,7 @@ import (
 // transport, so the macro behavior is testable in milliseconds (not Jepsen).
 type linkedBroadcaster struct {
 	mockBroadcaster
+
 	peer *Engine
 }
 
@@ -44,11 +45,13 @@ func (b *linkedBroadcaster) ReplicateTo(notify *pb.OffsetNotify, data []byte, ta
 	if b.peer != nil {
 		return b.peer.HandleRemote(notify)
 	}
+
 	return nil, nil
 }
 
 func (b *linkedBroadcaster) BroadcastWithData(notify *pb.OffsetNotify, data []byte) {
 	b.mockBroadcaster.BroadcastWithData(notify, data)
+
 	if b.peer != nil {
 		if _, err := b.peer.HandleRemote(notify); err != nil {
 			panic("linkedBroadcaster: peer HandleRemote: " + err.Error())
@@ -78,9 +81,11 @@ func TestPeerWriteVisibleToReader(t *testing.T) {
 	if _, _, err := ctx.GetSnapshot("k"); err != nil {
 		t.Fatalf("writer GetSnapshot: %v", err)
 	}
+
 	if err := ctx.Emit(dataEffect("k")); err != nil {
 		t.Fatalf("writer Emit: %v", err)
 	}
+
 	if err := ctx.Flush(); err != nil {
 		t.Fatalf("writer Flush: %v", err)
 	}
@@ -106,22 +111,28 @@ func TestReadOnlyMissIsFree(t *testing.T) {
 	e := newTestEngine(bc)
 
 	ctx := e.NewReadOnlyContext()
+
 	result, _, err := ctx.GetSnapshot("never-written")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+
 	if result != nil {
 		t.Fatalf("expected nil snapshot for absent key, got %v", result)
 	}
+
 	if len(bc.replicateToPeers) != 0 {
 		t.Fatalf("read-only miss must not block on a subscribe round-trip, but ReplicateTo was called for %v", bc.replicateToPeers)
 	}
+
 	if _, ok := e.subscriptions.Load("never-written"); ok {
 		t.Fatal("a free miss must not record a subscription")
 	}
+
 	if e.index.Contains("never-written") != nil {
 		t.Fatal("a free miss must not touch the index")
 	}
+
 	if bc.broadcastCount() != 0 {
 		t.Fatalf("a free miss must not announce, got %d broadcasts", bc.broadcastCount())
 	}
@@ -139,6 +150,7 @@ func TestReadWriteMissSubscribesAtWrite(t *testing.T) {
 	if _, _, err := ctx.GetSnapshot("never-written"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+
 	if _, ok := e.subscriptions.Load("never-written"); ok {
 		t.Fatal("the miss alone must not subscribe")
 	}
@@ -146,14 +158,18 @@ func TestReadWriteMissSubscribesAtWrite(t *testing.T) {
 	if err := ctx.Emit(dataEffect("never-written")); err != nil {
 		t.Fatalf("Emit: %v", err)
 	}
+
 	if _, ok := e.subscriptions.Load("never-written"); !ok {
 		t.Fatal("the write must subscribe")
 	}
+
 	subTips := e.index.Contains("never-written")
 	if subTips == nil || subTips.Len() != 1 {
 		t.Fatalf("the write's subscription must self-install as the key's tip, got %v", subTips)
 	}
+
 	subTip := subTips.Tips()[0]
+
 	if err := ctx.Flush(); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
@@ -162,12 +178,14 @@ func TestReadWriteMissSubscribesAtWrite(t *testing.T) {
 	if tips == nil || tips.Len() != 1 {
 		t.Fatalf("expected the data effect as the sole tip, got %v", tips)
 	}
+
 	eff, ok := e.effectCache.Get(tips.Tips()[0])
 	if !ok {
 		t.Fatal("flushed effect not in cache")
 	}
-	if len(eff.Deps) != 1 || (Tip{eff.Deps[0].NodeId, eff.Deps[0].Offset}) != subTip {
-		t.Fatalf("the write must dep-reference our own SubscriptionEffect %v, got %v", subTip, eff.Deps)
+
+	if len(eff.GetDeps()) != 1 || (Tip{eff.GetDeps()[0].GetNodeId(), eff.GetDeps()[0].GetOffset()}) != subTip {
+		t.Fatalf("the write must dep-reference our own SubscriptionEffect %v, got %v", subTip, eff.GetDeps())
 	}
 	// The announce is fire-and-forget (go), so observe it through the lock.
 	waitForBroadcast(t, bc)
@@ -181,6 +199,7 @@ func TestReadOnlyHitSubscribes(t *testing.T) {
 
 	// Peer 2 announces "k" (as it would via an inbound SubscriptionEffect).
 	e.peerFilterAdd(pb.NodeID(2), "k")
+
 	if !e.clusterMaybeHasKey("k") {
 		t.Fatal("clusterMaybeHasKey should report the announced key")
 	}
@@ -189,6 +208,7 @@ func TestReadOnlyHitSubscribes(t *testing.T) {
 	if _, _, err := ctx.GetSnapshot("k"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+
 	if len(bc.replicateToPeers) == 0 {
 		t.Fatal("a filter hit must fall through to a real subscribe")
 	}
@@ -204,6 +224,7 @@ func TestReadOnlyMinorityDoesNotFreeMiss(t *testing.T) {
 	e.safety.Store(&safetyMap{defaultMode: SafeMode})
 
 	ctx := e.NewReadOnlyContext()
+
 	_, _, err := ctx.GetSnapshot("absent")
 	if !errors.Is(err, ErrRegionPartitioned) {
 		t.Fatalf("minority read of absent key must not free-miss; want ErrRegionPartitioned, got %v", err)
@@ -218,10 +239,12 @@ func TestReadOnlyMinorityUnsafeReadsThrough(t *testing.T) {
 	e := newTestEngine(bc)
 
 	ctx := e.NewReadOnlyContext()
+
 	r, _, err := ctx.GetSnapshot("absent")
 	if err != nil {
 		t.Fatalf("unsafe minority read must not error, got %v", err)
 	}
+
 	if r != nil {
 		t.Fatalf("expected nil for an absent key, got %v", r)
 	}
@@ -237,6 +260,7 @@ func TestOwnFilterPopulatedOnWrite(t *testing.T) {
 	if err := ctx.Emit(dataEffect("written")); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := ctx.Flush(); err != nil {
 		t.Fatal(err)
 	}
@@ -245,10 +269,12 @@ func TestOwnFilterPopulatedOnWrite(t *testing.T) {
 	if len(data) == 0 || ver == 0 {
 		t.Fatalf("own filter should be populated after a write: bytes=%d ver=%d", len(data), ver)
 	}
+
 	var chain CuckooChain
 	if err := chain.UnmarshalBinary(data); err != nil {
 		t.Fatalf("own filter did not round-trip: %v", err)
 	}
+
 	if !chain.MaybeContains("written") {
 		t.Fatal("own filter should contain the written key")
 	}
@@ -260,15 +286,18 @@ func TestOwnFilterPopulatedOnWrite(t *testing.T) {
 func TestPeerFilterBulkPropagation(t *testing.T) {
 	// Peer builds its own filter by writing keys.
 	peer := newTestEngine(nil)
+
 	pctx := peer.NewContext()
 	for _, k := range []string{"alpha", "beta", "gamma"} {
 		if err := pctx.Emit(dataEffect(k)); err != nil {
 			t.Fatal(err)
 		}
+
 		if err := pctx.Flush(); err != nil {
 			t.Fatal(err)
 		}
 	}
+
 	data, ver := peer.OwnKeyFilterSnapshot()
 
 	// Local node receives that bulk filter at connection establishment.
@@ -280,6 +309,7 @@ func TestPeerFilterBulkPropagation(t *testing.T) {
 			t.Fatalf("local should see peer key %q after bulk transfer", k)
 		}
 	}
+
 	if local.clusterMaybeHasKey("delta-never-written") {
 		t.Fatal("unexpected false positive for a never-written key")
 	}
@@ -312,6 +342,7 @@ func TestUnfilteredPeerPresumedToHoldEverything(t *testing.T) {
 	// Disconnect forgets the filter; a reconnect re-enters as presumed-everything.
 	local.removePeerKeyFilter(pb.NodeID(2))
 	local.NotePeerConnected(pb.NodeID(2))
+
 	if !local.clusterMaybeHasKey("anything-at-all") {
 		t.Fatal("a reconnected peer must re-enter as presumed-everything")
 	}
@@ -322,13 +353,16 @@ func TestUnfilteredPeerPresumedToHoldEverything(t *testing.T) {
 // lost.
 func TestPeerFilterBulkReplacePreservesRealtime(t *testing.T) {
 	peer := newTestEngine(nil)
+
 	pctx := peer.NewContext()
 	if err := pctx.Emit(dataEffect("bulk-key")); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := pctx.Flush(); err != nil {
 		t.Fatal(err)
 	}
+
 	data, ver := peer.OwnKeyFilterSnapshot()
 
 	local := newTestEngine(nil)
@@ -343,6 +377,7 @@ func TestPeerFilterBulkReplacePreservesRealtime(t *testing.T) {
 	if !local.clusterMaybeHasKey("bulk-key") {
 		t.Fatal("bulk key lost after bulk replace")
 	}
+
 	if !local.clusterMaybeHasKey("realtime-key") {
 		t.Fatal("real-time key lost after bulk replace")
 	}
@@ -352,18 +387,21 @@ func TestPeerFilterBulkReplacePreservesRealtime(t *testing.T) {
 // establishment, not NACKs — no key inspects the NACK path.
 func TestEnrichedNackCarriesNoFilter(t *testing.T) {
 	e := newTestEngine(&mockBroadcaster{})
+
 	ctx := e.NewContext()
 	if err := ctx.Emit(dataEffect("advertised")); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := ctx.Flush(); err != nil {
 		t.Fatal(err)
 	}
 
-	if nack := e.buildEnrichedNack("advertised", nil, nil); len(nack.NodeKeyFilter) != 0 {
+	if nack := e.buildEnrichedNack("advertised", nil, nil); len(nack.GetNodeKeyFilter()) != 0 {
 		t.Fatal("NACKs must not carry the bulk filter")
 	}
-	if nack := e.buildEnrichedNack("__swytch:members", nil, nil); len(nack.NodeKeyFilter) != 0 {
+
+	if nack := e.buildEnrichedNack("__swytch:members", nil, nil); len(nack.GetNodeKeyFilter()) != 0 {
 		t.Fatal("membership NACKs must not carry the bulk filter either")
 	}
 }

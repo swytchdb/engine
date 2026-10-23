@@ -39,6 +39,7 @@ import (
 // driving HandleRemote tests. Mirrors the boilerplate in snapshot_test.go.
 func newTestEngineForEphemeral(t *testing.T) *Engine {
 	t.Helper()
+
 	log := newSnapshotLog()
 	e := &Engine{
 		effectCache:       log.effectCache,
@@ -54,6 +55,7 @@ func newTestEngineForEphemeral(t *testing.T) *Engine {
 		spokenBinds:       clox.NewCloxCache[Tip, struct{}](clox.ConfigFromCapacity(256)),
 	}
 	e.safety.Store(&safetyMap{defaultMode: UnsafeMode})
+
 	return e
 }
 
@@ -63,12 +65,16 @@ func newTestEngineForEphemeral(t *testing.T) *Engine {
 func TestHandleRemote_EphemeralSubscribe_FiresCallback(t *testing.T) {
 	e := newTestEngineForEphemeral(t)
 
-	var gotPeer uint64
-	var gotKey []byte
-	var gotUnsub bool
-	var calls int
+	var (
+		gotPeer  uint64
+		gotKey   []byte
+		gotUnsub bool
+		calls    int
+	)
+
 	e.OnEphemeralSubscribe = func(peer uint64, key []byte, unsub bool) {
 		gotPeer = peer
+
 		gotKey = append([]byte(nil), key...)
 		gotUnsub = unsub
 		calls++
@@ -84,28 +90,35 @@ func TestHandleRemote_EphemeralSubscribe_FiresCallback(t *testing.T) {
 			Ephemeral:        true,
 		}},
 	}
+
 	data, err := proto.Marshal(subEff)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
+
 	notify := BuildOffsetNotify(2, Tip{2, 5000}, subEff, data, nil)
 
 	nacks, err := e.HandleRemote(notify)
 	if err != nil {
 		t.Fatalf("HandleRemote: %v", err)
 	}
+
 	if len(nacks) != 0 {
 		t.Fatalf("ephemeral path should not produce NACKs, got %d", len(nacks))
 	}
+
 	if calls != 1 {
 		t.Fatalf("expected exactly 1 callback, got %d", calls)
 	}
+
 	if gotPeer != 2 {
 		t.Errorf("subscriber id: got %d want 2", gotPeer)
 	}
+
 	if string(gotKey) != "__swytch:ch\x00news" {
 		t.Errorf("routing key: got %q", string(gotKey))
 	}
+
 	if gotUnsub {
 		t.Errorf("expected unsub=false")
 	}
@@ -122,6 +135,7 @@ func TestHandleRemote_EphemeralUnsubscribe_FiresCallbackWithUnsub(t *testing.T) 
 	e := newTestEngineForEphemeral(t)
 
 	var gotUnsub bool
+
 	e.OnEphemeralSubscribe = func(_ uint64, _ []byte, unsub bool) {
 		gotUnsub = unsub
 	}
@@ -143,6 +157,7 @@ func TestHandleRemote_EphemeralUnsubscribe_FiresCallbackWithUnsub(t *testing.T) 
 	if _, err := e.HandleRemote(notify); err != nil {
 		t.Fatalf("HandleRemote: %v", err)
 	}
+
 	if !gotUnsub {
 		t.Errorf("expected unsub=true to propagate")
 	}
@@ -154,9 +169,12 @@ func TestHandleRemote_EphemeralUnsubscribe_FiresCallbackWithUnsub(t *testing.T) 
 func TestHandleRemote_PubSubMessage_DeliversToCallback(t *testing.T) {
 	e := newTestEngineForEphemeral(t)
 
-	var gotChannel []byte
-	var gotPayload []byte
-	var calls int
+	var (
+		gotChannel []byte
+		gotPayload []byte
+		calls      int
+	)
+
 	e.OnPubSubMessage = func(channel, payload []byte) {
 		gotChannel = append([]byte(nil), channel...)
 		gotPayload = append([]byte(nil), payload...)
@@ -180,15 +198,19 @@ func TestHandleRemote_PubSubMessage_DeliversToCallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HandleRemote: %v", err)
 	}
+
 	if len(nacks) != 0 {
 		t.Fatalf("pubsub message path should not produce NACKs, got %d", len(nacks))
 	}
+
 	if calls != 1 {
 		t.Fatalf("expected exactly 1 callback, got %d", calls)
 	}
+
 	if string(gotChannel) != "news" {
 		t.Errorf("channel: got %q", string(gotChannel))
 	}
+
 	if string(gotPayload) != "breaking" {
 		t.Errorf("payload: got %q", string(gotPayload))
 	}
@@ -215,6 +237,7 @@ func TestHandleRemote_EphemeralCallbacks_NilSafe(t *testing.T) {
 		}},
 	}
 	data, _ := proto.Marshal(subEff)
+
 	notify := BuildOffsetNotify(2, Tip{2, 5000}, subEff, data, nil)
 	if _, err := e.HandleRemote(notify); err != nil {
 		t.Errorf("ephemeral sub with nil callback: %v", err)
@@ -230,6 +253,7 @@ func TestHandleRemote_EphemeralCallbacks_NilSafe(t *testing.T) {
 		}},
 	}
 	data, _ = proto.Marshal(msgEff)
+
 	notify = BuildOffsetNotify(2, Tip{2, 5001}, msgEff, data, nil)
 	if _, err := e.HandleRemote(notify); err != nil {
 		t.Errorf("pubsub message with nil callback: %v", err)

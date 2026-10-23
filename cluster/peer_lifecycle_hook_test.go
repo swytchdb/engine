@@ -51,16 +51,20 @@ func TestPeerLifecycleHook_NoDeadlock(t *testing.T) {
 			{ID: 0, Address: "127.0.0.1:0", Region: "test"},
 		},
 	}
+
 	pm, err := NewPeerManager(cfg, handler, logReader)
 	if err != nil {
 		t.Fatalf("create pm: %v", err)
 	}
+
 	tlsCfg := generateTestTLSConfig(t)
 	pm.serverTLS = tlsCfg
 	pm.clientTLS = tlsCfg
 
-	var addedCalls atomic.Int32
-	var removedCalls atomic.Int32
+	var (
+		addedCalls   atomic.Int32
+		removedCalls atomic.Int32
+	)
 
 	pm.SetPeerLifecycleHooks(
 		func(id NodeId) {
@@ -71,6 +75,7 @@ func TestPeerLifecycleHook_NoDeadlock(t *testing.T) {
 		},
 		func(id NodeId) {
 			removedCalls.Add(1)
+
 			_ = pm.PeerIDs()
 		},
 	)
@@ -85,10 +90,12 @@ func TestPeerLifecycleHook_NoDeadlock(t *testing.T) {
 
 	runUnderTimeout := func(name string, fn func()) {
 		done := make(chan struct{})
+
 		go func() {
 			fn()
 			close(done)
 		}()
+
 		select {
 		case <-done:
 		case <-time.After(2 * time.Second):
@@ -105,6 +112,7 @@ func TestPeerLifecycleHook_NoDeadlock(t *testing.T) {
 			},
 		})
 	})
+
 	if got := addedCalls.Load(); got < 1 {
 		t.Errorf("onPeerAdded should have fired at least once, got %d", got)
 	}
@@ -115,6 +123,7 @@ func TestPeerLifecycleHook_NoDeadlock(t *testing.T) {
 			Nodes:  []NodeConfig{{ID: 0, Address: pm.ListenAddr(), Region: "test"}},
 		})
 	})
+
 	if got := removedCalls.Load(); got < 1 {
 		t.Errorf("onPeerRemoved should have fired at least once, got %d", got)
 	}

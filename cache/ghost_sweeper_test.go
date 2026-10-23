@@ -32,6 +32,7 @@ import (
 // countGhosts counts ghost entries (freq <= 0) across all shards
 func (c *CloxCache[K, V]) countGhosts() int {
 	count := 0
+
 	for shardID := range c.shards {
 		shard := &c.shards[shardID]
 		for slotID := range shard.slots {
@@ -40,16 +41,19 @@ func (c *CloxCache[K, V]) countGhosts() int {
 				if node.freq.Load() <= 0 {
 					count++
 				}
+
 				node = node.next.Load()
 			}
 		}
 	}
+
 	return count
 }
 
 // countLiveEntries counts live entries (freq > 0) across all shards
 func (c *CloxCache[K, V]) countLiveEntries() int {
 	count := 0
+
 	for shardID := range c.shards {
 		shard := &c.shards[shardID]
 		for slotID := range shard.slots {
@@ -58,10 +62,12 @@ func (c *CloxCache[K, V]) countLiveEntries() int {
 				if node.freq.Load() > 0 {
 					count++
 				}
+
 				node = node.next.Load()
 			}
 		}
 	}
+
 	return count
 }
 
@@ -78,6 +84,7 @@ func TestGhostsAccumulateWithoutSweeper(t *testing.T) {
 		CollectStats:  true,
 		SweepPercent:  5, // only 5% scanned per eviction = ~410 slots out of 8192
 	}
+
 	cache := NewCloxCache[string, int](cfg)
 	defer cache.Close()
 
@@ -103,10 +110,12 @@ func TestGhostsAccumulateWithoutSweeper(t *testing.T) {
 
 	// There should be ghosts accumulated — this documents the existing behavior
 	t.Logf("  ghost capacity per shard: %d", cache.shards[0].ghostCapacity)
+
 	totalGhostCap := int64(0)
 	for i := range cache.shards {
 		totalGhostCap += cache.shards[i].ghostCapacity
 	}
+
 	t.Logf("  total ghost capacity: %d", totalGhostCap)
 
 	// Ghost count should be within capacity — the CLOCK hand self-limits by
@@ -123,6 +132,7 @@ func totalGhostCount[K Key, V any](c *CloxCache[K, V]) int64 {
 	for i := range c.shards {
 		total += c.shards[i].ghostCount.Load()
 	}
+
 	return total
 }
 
@@ -137,6 +147,7 @@ func TestGhostSweeperCullsGhostsUnderMildPressure(t *testing.T) {
 		CollectStats:  true,
 		SweepPercent:  5,
 	}
+
 	cache := NewCloxCache[string, int](cfg)
 	defer cache.Close()
 
@@ -188,6 +199,7 @@ func TestGhostSweeperUnderMemoryPressure(t *testing.T) {
 		SweepPercent:  10,
 	}
 	cache := NewCloxCache[string, []byte](cfg)
+
 	cache.SetSizeFunc(func(k string, v []byte) int64 {
 		return int64(len(k) + len(v))
 	})
@@ -242,6 +254,7 @@ func TestGhostSweeperStopsOnClose(t *testing.T) {
 
 	// Close should not hang
 	done := make(chan struct{})
+
 	go func() {
 		cache.Close()
 		close(done)

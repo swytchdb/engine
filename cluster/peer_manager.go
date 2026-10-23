@@ -126,6 +126,7 @@ func NewPeerManager(config *ClusterConfig, handler EffectHandler, logReader LogR
 	if err != nil {
 		return nil, err
 	}
+
 	clientTLS, err := config.BuildClientTLSConfig()
 	if err != nil {
 		return nil, err
@@ -155,16 +156,21 @@ func (pm *PeerManager) registerInboundConn(peerID NodeId, conn *quic.Conn) (newP
 	if peerID == pm.selfID {
 		return false
 	}
+
 	pm.inboundMu.Lock()
+
 	existing := pm.inboundConns[peerID]
 	if existing == conn {
 		pm.inboundMu.Unlock()
+
 		return false
 	}
+
 	pm.inboundConns[peerID] = conn
 	pm.inboundMu.Unlock()
 	slog.Debug("inbound connection registered",
 		"peer", peerID, "local_node_id", pm.selfID)
+
 	return true
 }
 
@@ -174,6 +180,7 @@ func (pm *PeerManager) registerInboundConn(peerID NodeId, conn *quic.Conn) (newP
 func (pm *PeerManager) forgetInboundConn(conn *quic.Conn) {
 	pm.inboundMu.Lock()
 	defer pm.inboundMu.Unlock()
+
 	for id, c := range pm.inboundConns {
 		if c == conn {
 			delete(pm.inboundConns, id)
@@ -186,6 +193,7 @@ func (pm *PeerManager) forgetInboundConn(conn *quic.Conn) {
 func (pm *PeerManager) inboundConnFor(peerID NodeId) *quic.Conn {
 	pm.inboundMu.RLock()
 	defer pm.inboundMu.RUnlock()
+
 	return pm.inboundConns[peerID]
 }
 
@@ -194,6 +202,7 @@ func (pm *PeerManager) Start(ctx context.Context) error {
 	pm.ctx, pm.cancel = context.WithCancel(ctx)
 
 	self := pm.config.Self()
+
 	selfRegion := ""
 	if self != nil {
 		selfRegion = self.Region
@@ -215,20 +224,24 @@ func (pm *PeerManager) Start(ctx context.Context) error {
 				token := pm.mu.RLock()
 				pc := pm.peers[peerID]
 				pm.mu.RUnlock(token)
+
 				if pc != nil {
 					if c := pc.GetQuicConn(); c != nil {
 						return c
 					}
 				}
+
 				return pm.inboundConnFor(peerID)
 			},
 			func(peerID NodeId, conn *quic.Conn) {
 				if !pm.registerInboundConn(peerID, conn) {
 					return
 				}
+
 				if pm.heartbeat != nil {
 					pm.heartbeat.SendTickTo(peerID)
 				}
+
 				pm.sendKeyFilterTo(peerID)
 			},
 		)
@@ -258,9 +271,11 @@ func (pm *PeerManager) Start(ctx context.Context) error {
 		peerID := peer.ID
 		pc := newPeerConn(peer.ID, peer.Address, peer.Region, selfRegion, pm.handler, pm.clientTLS, func(conn *quic.Conn) {
 			pm.acceptOutboundStreams(conn)
+
 			if pm.heartbeat != nil {
 				pm.heartbeat.SendTickTo(peerID)
 			}
+
 			pm.sendKeyFilterTo(peerID)
 		})
 		pm.peers[peer.ID] = pc
@@ -273,6 +288,7 @@ func (pm *PeerManager) Start(ctx context.Context) error {
 	}
 
 	slog.Info("peer manager started", "node_id", pm.config.NodeID, "peers", len(pm.config.Peers()))
+
 	return nil
 }
 
@@ -282,14 +298,17 @@ func (pm *PeerManager) WaitForAnyPeer(ctx context.Context) error {
 	if len(pm.config.Peers()) == 0 {
 		return nil
 	}
+
 	for {
 		token := pm.mu.RLock()
 		for _, pc := range pm.peers {
 			if pc.streamReady.Load() {
 				pm.mu.RUnlock(token)
+
 				return nil
 			}
 		}
+
 		pm.mu.RUnlock(token)
 
 		select {
@@ -305,12 +324,15 @@ func (pm *PeerManager) registerPeer(peer NodeConfig) {
 	if pm.heartbeat != nil {
 		pm.heartbeat.AddPeer(peer.ID, peer.Region)
 	}
+
 	if pm.replicator != nil {
 		pm.replicator.AddPeer(peer.ID, peer.Region)
 	}
+
 	if pm.keyFilter != nil {
 		pm.keyFilter.NotePeerConnected(peer.ID)
 	}
+
 	if pm.onPeerAdded != nil {
 		pm.onPeerAdded(peer.ID)
 	}
@@ -321,12 +343,15 @@ func (pm *PeerManager) unregisterPeer(peerID NodeId) {
 	if pm.heartbeat != nil {
 		pm.heartbeat.RemovePeer(peerID)
 	}
+
 	if pm.replicator != nil {
 		pm.replicator.RemovePeer(peerID)
 	}
+
 	if pm.keyFilter != nil {
 		pm.keyFilter.DropPeer(peerID)
 	}
+
 	if pm.onPeerRemoved != nil {
 		pm.onPeerRemoved(peerID)
 	}
@@ -345,11 +370,13 @@ func (pm *PeerManager) sendKeyFilterTo(peerID NodeId) {
 	if pm.keyFilter == nil || pm.quicTransport == nil {
 		return
 	}
+
 	b, ver := pm.keyFilter.OwnKeyFilterSnapshot()
 	if b == nil && ver == 0 {
 		// Marshal failure — the peer keeps the presumed-everything default.
 		return
 	}
+
 	if err := pm.quicTransport.SendDirect(peerID, MarshalKeyFilterPacket(ver, b)); err != nil {
 		slog.Debug("failed to send key filter", "peer", peerID, "error", err)
 	}
@@ -373,9 +400,11 @@ func (pm *PeerManager) Stop() {
 	if pm.replicator != nil {
 		pm.replicator.Stop()
 	}
+
 	if pm.heartbeat != nil {
 		pm.heartbeat.Stop()
 	}
+
 	if pm.quicTransport != nil {
 		pm.quicTransport.Stop()
 	}
@@ -385,6 +414,7 @@ func (pm *PeerManager) Stop() {
 	// PeerManager via pm.mu.RLock.
 	pm.mu.Lock()
 	conns := make([]*PeerConn, 0, len(pm.peers))
+
 	departing := make([]NodeId, 0, len(pm.peers))
 	for id, pc := range pm.peers {
 		conns = append(conns, pc)
@@ -396,6 +426,7 @@ func (pm *PeerManager) Stop() {
 	for _, pc := range conns {
 		pc.Stop()
 	}
+
 	if pm.onPeerRemoved != nil {
 		for _, id := range departing {
 			pm.onPeerRemoved(id)
@@ -424,6 +455,7 @@ func (pm *PeerManager) SendOneWayTo(notify *pb.OffsetNotify, wireData []byte, ta
 	if pm.replicator == nil {
 		return fmt.Errorf("replicator not initialized")
 	}
+
 	return pm.replicator.SendOneWay(notify, wireData, targetNodeID)
 }
 
@@ -436,8 +468,10 @@ func (pm *PeerManager) Broadcast(notify *pb.OffsetNotify) {
 func (pm *PeerManager) BroadcastWithData(notify *pb.OffsetNotify, effectData []byte) {
 	if pm.replicator != nil {
 		pm.replicator.Replicate(notify, effectData)
+
 		return
 	}
+
 	slog.Warn("BroadcastWithData called without replicator — notifications not sent")
 }
 
@@ -447,11 +481,13 @@ func (pm *PeerManager) BroadcastWithData(notify *pb.OffsetNotify, effectData []b
 // If the replicator is not set up (no UDP transport), falls back to BroadcastWithData.
 func (pm *PeerManager) Replicate(notify *pb.OffsetNotify, wireData []byte) error {
 	remoteCtx := tracing.ExtractFromBytes(notify.GetTraceContext())
+
 	_, waitSpan := tracing.Tracer().Start(remoteCtx, "replication.wait_ack",
 		trace.WithAttributes(attribute.String("effect.key", string(notify.GetKey()))))
 	defer waitSpan.End()
 
 	future := pm.replicator.Replicate(notify, wireData)
+
 	return future.Wait()
 }
 
@@ -461,6 +497,7 @@ func (pm *PeerManager) AllRegionPeersReachable() bool {
 	if pm.replicator != nil {
 		return pm.replicator.AllRegionPeersReachable()
 	}
+
 	return true
 }
 
@@ -470,6 +507,7 @@ func (pm *PeerManager) InMajorityPartition() bool {
 	if pm.replicator != nil {
 		return pm.replicator.InMajorityPartition()
 	}
+
 	return true
 }
 
@@ -482,6 +520,7 @@ func (pm *PeerManager) PeerIDs() []NodeId {
 	for id := range pm.peers {
 		ids = append(ids, id)
 	}
+
 	return ids
 }
 
@@ -509,6 +548,7 @@ func (pm *PeerManager) ForwardTransaction(ctx context.Context, targetNodeID Node
 func (pm *PeerManager) SetCDNFetcher(f CDNFetcher) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
+
 	pm.cdnFetcher = f
 }
 
@@ -530,6 +570,7 @@ func (pm *PeerManager) FetchFromAny(offset *pb.EffectRef, hint effects.FetchHint
 	fetchPeers := func() ([]byte, error) {
 		ctx, cancel := context.WithTimeout(pm.ctx, 10*time.Second)
 		defer cancel()
+
 		return pm.fetchFromConns(ctx, offset, pm.fetchConns())
 	}
 
@@ -540,6 +581,7 @@ func (pm *PeerManager) FetchFromAny(offset *pb.EffectRef, hint effects.FetchHint
 	fetchCDN := func() ([]byte, error) {
 		ctx, cancel := context.WithTimeout(pm.ctx, cloudBackstopTimeout)
 		defer cancel()
+
 		return cdnFetcher.FetchFromCDN(ctx, offset)
 	}
 
@@ -558,6 +600,7 @@ func (pm *PeerManager) FetchFromAny(offset *pb.EffectRef, hint effects.FetchHint
 	if hint == effects.PreferCDN && errors.Is(err, effects.ErrCDNBlobMissing) {
 		return nil, err
 	}
+
 	fallbackData, fallbackErr := second()
 	if fallbackErr == nil && len(fallbackData) > 0 {
 		return fallbackData, nil
@@ -571,14 +614,18 @@ func (pm *PeerManager) FetchFromAny(offset *pb.EffectRef, hint effects.FetchHint
 		if err != nil {
 			return nil, fmt.Errorf("%w (peer fetch also failed: %v)", fallbackErr, err)
 		}
+
 		return nil, fallbackErr
 	}
+
 	if err != nil {
 		return nil, err
 	}
+
 	if fallbackErr != nil {
 		return nil, fallbackErr
 	}
+
 	return nil, ErrPeerUnavailable
 }
 
@@ -591,21 +638,26 @@ func (pm *PeerManager) FetchFromAny(offset *pb.EffectRef, hint effects.FetchHint
 // peers the send path already reaches via the transport's inbound fallback.
 func (pm *PeerManager) fetchConns() []*quic.Conn {
 	token := pm.mu.RLock()
+
 	pcs := make([]*PeerConn, 0, len(pm.peers))
 	for _, pc := range pm.peers {
 		pcs = append(pcs, pc)
 	}
+
 	pm.mu.RUnlock(token)
 
 	seen := make(map[*quic.Conn]struct{})
 	conns := make([]*quic.Conn, 0, len(pcs))
+
 	add := func(c *quic.Conn) {
 		if c == nil {
 			return
 		}
+
 		if _, ok := seen[c]; ok {
 			return
 		}
+
 		seen[c] = struct{}{}
 		conns = append(conns, c)
 	}
@@ -614,9 +666,11 @@ func (pm *PeerManager) fetchConns() []*quic.Conn {
 	}
 
 	pm.inboundMu.RLock()
+
 	for _, c := range pm.inboundConns {
 		add(c)
 	}
+
 	pm.inboundMu.RUnlock()
 
 	return conns
@@ -643,35 +697,43 @@ func (pm *PeerManager) fetchFromConns(ctx context.Context, offset *pb.EffectRef,
 			data, err := fetchOverConn(ctx, c, offset)
 			if err != nil {
 				ch <- result{nil, err}
+
 				return
 			}
+
 			if len(data) == 0 {
 				ch <- result{nil, errFetchNotFound}
+
 				return
 			}
+
 			ch <- result{data, nil}
 		}(c)
 	}
 
 	var lastErr error
+
 	for range conns {
 		r := <-ch
 		if r.err != nil {
 			lastErr = r.err
+
 			continue
 		}
+
 		return r.data, nil
 	}
 
 	if lastErr != nil {
 		return nil, lastErr
 	}
+
 	return nil, ErrPeerUnavailable
 }
 
 // Fetch retrieves effect bytes from a specific peer by slot and offset.
 func (pm *PeerManager) Fetch(ref *pb.EffectRef) ([]byte, error) {
-	nodeID := NodeId(ref.NodeId)
+	nodeID := NodeId(ref.GetNodeId())
 	token := pm.mu.RLock()
 	pc := pm.peers[nodeID]
 	pm.mu.RUnlock(token)
@@ -684,9 +746,11 @@ func (pm *PeerManager) Fetch(ref *pb.EffectRef) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	if len(data) == 0 {
 		return nil, errFetchNotFound
 	}
+
 	return data, nil
 }
 
@@ -706,11 +770,14 @@ func (pm *PeerManager) UpdateTopology(newCfg *ClusterConfig) {
 
 	connect := func(n NodeConfig) *PeerConn {
 		peerID := n.ID
+
 		return newPeerConn(n.ID, n.Address, n.Region, selfRegion, pm.handler, pm.clientTLS, func(conn *quic.Conn) {
 			pm.acceptOutboundStreams(conn)
+
 			if pm.heartbeat != nil {
 				pm.heartbeat.SendTickTo(peerID)
 			}
+
 			pm.sendKeyFilterTo(peerID)
 		})
 	}
@@ -727,7 +794,9 @@ func (pm *PeerManager) UpdateTopology(newCfg *ClusterConfig) {
 	for _, removed := range diff.Removed {
 		if pc, ok := pm.peers[removed.ID]; ok {
 			slog.Info("disconnecting removed peer", "peer", removed.ID, "address", removed.Address)
+
 			stops = append(stops, pc)
+
 			delete(pm.peers, removed.ID)
 		}
 	}
@@ -743,8 +812,10 @@ func (pm *PeerManager) UpdateTopology(newCfg *ClusterConfig) {
 		if pc, ok := pm.peers[changed.ID]; ok {
 			slog.Info("reconnecting peer with new config", "peer", changed.ID, "old_address", pc.addr, "new_address", changed.Address)
 			stops = append(stops, pc)
+
 			delete(pm.peers, changed.ID)
 		}
+
 		pc := connect(changed)
 		pm.peers[changed.ID] = pc
 		pc.Start(pm.ctx)
@@ -757,6 +828,7 @@ func (pm *PeerManager) UpdateTopology(newCfg *ClusterConfig) {
 		for _, n := range newCfg.Nodes {
 			known[n.ID] = struct{}{}
 		}
+
 		pm.healthTable.PruneUnknownPeers(known)
 	}
 
@@ -769,9 +841,11 @@ func (pm *PeerManager) UpdateTopology(newCfg *ClusterConfig) {
 	for _, removed := range diff.Removed {
 		pm.unregisterPeer(removed.ID)
 	}
+
 	for _, added := range diff.Added {
 		pm.registerPeer(added)
 	}
+
 	for _, changed := range diff.Changed {
 		pm.unregisterPeer(changed.ID)
 		pm.registerPeer(changed)
@@ -803,6 +877,7 @@ func (pm *PeerManager) ListenAddr() string {
 	if pm.lisAddr != nil {
 		return pm.lisAddr.String()
 	}
+
 	return ""
 }
 
@@ -857,6 +932,7 @@ func (pm *PeerManager) ReplicateTo(notify *pb.OffsetNotify, wireData []byte, tar
 	if pm.replicator != nil {
 		return pm.replicator.ReplicateTo(notify, wireData, targetNodeID)
 	}
+
 	return nil, nil
 }
 
@@ -867,6 +943,7 @@ func (pm *PeerManager) ReplicateMarshalled(notify *pb.OffsetNotify, notifyBody [
 	if pm.replicator != nil {
 		return pm.replicator.ReplicateMarshalled(notify, notifyBody, targetNodeID)
 	}
+
 	return nil, nil
 }
 
@@ -882,6 +959,7 @@ func (pm *PeerManager) startServer() error {
 	self := pm.config.Self()
 	if self == nil {
 		slog.Warn("no self entry in cluster config, skipping QUIC listener")
+
 		return nil
 	}
 
@@ -897,12 +975,14 @@ func (pm *PeerManager) startServer() error {
 	if err != nil {
 		return err
 	}
+
 	pm.listener = listener
 	pm.lisAddr = listener.Addr()
 
 	go pm.acceptLoop()
 
 	slog.Info("QUIC listener started", "address", pm.lisAddr.String())
+
 	return nil
 }
 
@@ -914,9 +994,12 @@ func (pm *PeerManager) acceptLoop() {
 			if pm.ctx.Err() != nil {
 				return // shutting down
 			}
+
 			slog.Error("failed to accept QUIC connection", "error", err)
+
 			continue
 		}
+
 		pm.dispatchConnStreams(conn)
 		// Clean up the inbound-connection map when this conn closes so a
 		// later reconnect from the same peer isn't shadowed by a stale
@@ -940,6 +1023,7 @@ func (pm *PeerManager) acceptLoop() {
 // calling AcceptUniStream on it).
 func (pm *PeerManager) dispatchConnStreams(conn *quic.Conn) {
 	go acceptStreams(conn, pm.logReader, pm.forwardHandler)
+
 	if pm.quicTransport != nil {
 		go pm.quicTransport.AcceptUniStreams(conn)
 	}

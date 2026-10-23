@@ -43,14 +43,17 @@ func TestNormalizeCloudTipCandidatesDropsMissingStaleMarker(t *testing.T) {
 		if tip == realTip {
 			return realEff, nil
 		}
+
 		return nil, fmt.Errorf("fetch %v: %w", tip, ErrCDNBlobMissing)
 	})
 	if err != nil {
 		t.Fatalf("normalize candidates: %v", err)
 	}
+
 	if !slices.Equal(real, []Tip{realTip}) {
 		t.Fatalf("real tips = %v, want %v", real, []Tip{realTip})
 	}
+
 	if !slices.Equal(superseded, []Tip{stale}) {
 		t.Fatalf("superseded candidates = %v, want %v", superseded, []Tip{stale})
 	}
@@ -70,14 +73,17 @@ func TestNormalizeCloudTipCandidatesDropsMarkerCoveredByLocalAncestry(t *testing
 		if tip == localTip {
 			return localEff, nil
 		}
+
 		return nil, fmt.Errorf("fetch %v: %w", tip, ErrCDNBlobMissing)
 	})
 	if err != nil {
 		t.Fatalf("normalize candidates: %v", err)
 	}
+
 	if len(real) != 0 {
 		t.Fatalf("real tips = %v, want none: the only candidate is covered by local ancestry", real)
 	}
+
 	if !slices.Equal(superseded, []Tip{stale}) {
 		t.Fatalf("superseded candidates = %v, want %v", superseded, []Tip{stale})
 	}
@@ -106,16 +112,20 @@ func TestInstallCloudTipsNeverMints(t *testing.T) {
 	if err := ctx.Emit(scalarSet("k", "local")); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := ctx.Flush(); err != nil {
 		t.Fatal(err)
 	}
+
 	before := e.index.Contains("k").Tips()
 
 	holedTip := Tip{12345, 7}
+
 	pending, err := e.InstallCloudTips("k", []Tip{holedTip}, nil, nil)
 	if err != nil {
 		t.Fatalf("install over holed frontier: %v", err)
 	}
+
 	if !slices.Equal(pending, []Tip{holedTip}) {
 		t.Fatalf("pending = %v, want [%v]", pending, holedTip)
 	}
@@ -129,7 +139,8 @@ func TestInstallCloudTipsNeverMints(t *testing.T) {
 	if err != nil {
 		t.Fatalf("post-install read: %v", err)
 	}
-	if result == nil || result.Scalar == nil || string(result.Scalar.GetRaw()) != "local" {
+
+	if result == nil || result.GetScalar() == nil || string(result.GetScalar().GetRaw()) != "local" {
 		t.Fatalf("post-install state = %v, want scalar %q", result, "local")
 	}
 }
@@ -159,10 +170,12 @@ func TestInstallCloudTipsPreservesReadableSiblings(t *testing.T) {
 	holedTip := Tip{12345, 7}
 
 	sidecar := []CloudEffect{{Tip: readableTip, Eff: readableEff, ProtoLen: proto.Size(readableEff)}}
+
 	pending, err := e.InstallCloudTips("k", []Tip{readableTip, holedTip}, sidecar, nil)
 	if err != nil {
 		t.Fatalf("install over partially holed frontier: %v", err)
 	}
+
 	if !slices.Equal(pending, []Tip{holedTip}) {
 		t.Fatalf("pending = %v, want [%v]", pending, holedTip)
 	}
@@ -171,6 +184,7 @@ func TestInstallCloudTipsPreservesReadableSiblings(t *testing.T) {
 	if ts == nil || !slices.Contains(ts.Tips(), readableTip) {
 		t.Fatalf("post-install tips = %v, want the readable tip installed", ts.Tips())
 	}
+
 	if ts != nil && slices.Contains(ts.Tips(), holedTip) {
 		t.Fatalf("post-install tips = %v, holed tip must never be installed", ts.Tips())
 	}
@@ -179,7 +193,8 @@ func TestInstallCloudTipsPreservesReadableSiblings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("post-install read: %v", err)
 	}
-	if result == nil || result.Scalar == nil || string(result.Scalar.GetRaw()) != "cloud" {
+
+	if result == nil || result.GetScalar() == nil || string(result.GetScalar().GetRaw()) != "cloud" {
 		t.Fatalf("post-install state = %v, want the readable sibling's scalar %q", result, "cloud")
 	}
 }

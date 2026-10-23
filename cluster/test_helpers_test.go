@@ -87,6 +87,7 @@ func (h *recordingHandler) HandleOffsetNotify(notify *pb.OffsetNotify) ([]*pb.Na
 	h.received = append(h.received, notify)
 	h.mu.Unlock()
 	h.count.Add(1)
+
 	return nil, nil
 }
 
@@ -100,16 +101,20 @@ func (h *recordingHandler) waitForCount(target int32, timeout time.Duration) boo
 		if h.count.Load() >= target {
 			return true
 		}
+
 		time.Sleep(20 * time.Millisecond)
 	}
+
 	return false
 }
 
 func (h *recordingHandler) getAll() []*pb.OffsetNotify {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+
 	cp := make([]*pb.OffsetNotify, len(h.received))
 	copy(cp, h.received)
+
 	return cp
 }
 
@@ -126,17 +131,21 @@ func newStaticLogReader() *staticLogReader {
 func (r *staticLogReader) Put(nodeID uint64, offset uint64, data []byte) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
 	r.data[pb.NewEffectSeq(pb.NodeID(nodeID), offset)] = data
 }
 
 func (r *staticLogReader) ReadEffect(ref *pb.EffectRef) ([]byte, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+
 	key := pb.EffectSeqFromRef(ref)
+
 	d, ok := r.data[key]
 	if !ok {
 		return nil, ErrPeerUnavailable
 	}
+
 	return d, nil
 }
 
@@ -153,6 +162,7 @@ func (m *mockLogReader) ReadEffect(_ *pb.EffectRef) ([]byte, error) {
 // Blocks until all QUIC connections and heartbeat symmetry are established.
 func startNNodeCluster(t *testing.T, handlers []EffectHandler, logReaders []LogReader) []*PeerManager {
 	t.Helper()
+
 	n := len(handlers)
 
 	pms := make([]*PeerManager, n)
@@ -167,22 +177,30 @@ func startNNodeCluster(t *testing.T, handlers []EffectHandler, logReaders []LogR
 				{ID: NodeId(i), Address: "127.0.0.1:0", Region: "test"},
 			},
 		}
+
 		var pmErr error
+
 		pms[i], pmErr = NewPeerManager(cfg, handlers[i], logReaders[i])
 		if pmErr != nil {
 			pmCancel()
+
 			for j := range i {
 				pms[j].Stop()
 			}
+
 			t.Fatalf("failed to create pm%d: %v", i, pmErr)
 		}
+
 		pms[i].serverTLS = tlsCfg
+
 		pms[i].clientTLS = tlsCfg
 		if err := pms[i].Start(pmCtx); err != nil {
 			pmCancel()
+
 			for j := range i {
 				pms[j].Stop()
 			}
+
 			t.Fatalf("failed to start pm%d: %v", i, err)
 		}
 	}
@@ -196,6 +214,7 @@ func startNNodeCluster(t *testing.T, handlers []EffectHandler, logReaders []LogR
 			Region:  "test",
 		}
 	}
+
 	for i := range n {
 		pms[i].UpdateTopology(&ClusterConfig{
 			NodeID: NodeId(i),
@@ -212,11 +231,14 @@ func startNNodeCluster(t *testing.T, handlers []EffectHandler, logReaders []LogR
 			if i == j {
 				continue
 			}
+
 			if !pms[i].WaitForPeer(waitCtx, NodeId(j)) {
 				pmCancel()
+
 				for k := range n {
 					pms[k].Stop()
 				}
+
 				t.Fatalf("pm%d did not connect to pm%d", i, j)
 			}
 		}
@@ -227,41 +249,52 @@ func startNNodeCluster(t *testing.T, handlers []EffectHandler, logReaders []LogR
 		deadline := time.Now().Add(10 * time.Second)
 		for time.Now().Before(deadline) {
 			allHealthy := true
+
 			for i := range n {
 				if pms[i].healthTable == nil {
 					continue
 				}
+
 				for j := range n {
 					if i == j {
 						continue
 					}
+
 					ph := pms[i].healthTable.GetOrCreate(NodeId(j))
 					if !ph.alive.Load() || !ph.symmetric.Load() {
 						allHealthy = false
+
 						break
 					}
 				}
+
 				if !allHealthy {
 					break
 				}
 			}
+
 			if allHealthy {
 				return true
 			}
+
 			time.Sleep(100 * time.Millisecond)
 		}
+
 		return false
 	}
 	if !waitForHealthy() {
 		pmCancel()
+
 		for k := range n {
 			pms[k].Stop()
 		}
+
 		t.Fatal("peers did not become healthy within timeout")
 	}
 
 	t.Cleanup(func() {
 		pmCancel()
+
 		for i := range n {
 			pms[i].Stop()
 		}

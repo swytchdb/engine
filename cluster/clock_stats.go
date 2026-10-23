@@ -50,6 +50,7 @@ func newClockWindow(size int) clockWindow {
 
 func (w *clockWindow) push(v int64) {
 	w.samples[w.next] = v
+
 	w.next = (w.next + 1) % len(w.samples)
 	if w.count < len(w.samples) {
 		w.count++
@@ -71,6 +72,7 @@ func (w *clockWindow) min() int64 {
 			m = w.samples[i]
 		}
 	}
+
 	return m
 }
 
@@ -80,7 +82,9 @@ func (w *clockWindow) quantile(q float64) int64 {
 	sorted := make([]int64, w.count)
 	copy(sorted, w.samples[:w.count])
 	slices.Sort(sorted)
+
 	idx := int(q * float64(w.count-1))
+
 	return sorted[idx]
 }
 
@@ -166,9 +170,11 @@ func (s *peerClockStats) observeTick(tick *ClockTick, now time.Time) {
 	if !s.lastArrival.IsZero() {
 		s.interArrival.push(int64(now.Sub(s.lastArrival)))
 	}
+
 	s.lastArrival = now
 
 	s.offsetIn.push(now.UnixNano() - tick.WallClock)
+
 	if tick.Seq > s.lastSeq {
 		s.lastSeq = tick.Seq
 	}
@@ -179,6 +185,7 @@ func (s *peerClockStats) observeTick(tick *ClockTick, now time.Time) {
 func (s *peerClockStats) observeEcho(rawOffsetOut int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	s.offsetOut.push(rawOffsetOut)
 }
 
@@ -188,8 +195,10 @@ func (s *peerClockStats) snapshot(now time.Time) ClockStats {
 	defer s.mu.Unlock()
 
 	var st ClockStats
+
 	if s.offsetIn.len() > 0 && s.offsetOut.len() > 0 {
 		minIn := s.offsetIn.min()
+
 		minOut := s.offsetOut.min()
 		if rtt := minIn + minOut; rtt > 0 {
 			st.Primed = true
@@ -197,16 +206,20 @@ func (s *peerClockStats) snapshot(now time.Time) ClockStats {
 			st.SkewEst = time.Duration((minOut - minIn) / 2)
 		}
 	}
+
 	if s.interArrival.len() > 0 {
 		median := s.interArrival.quantile(0.5)
+
 		st.TickInterval = time.Duration(median)
 		if margin := s.interArrival.quantile(0.99) - median; margin > 0 {
 			st.JitterQ99 = time.Duration(margin)
 		}
 	}
+
 	if st.Primed && !s.lastArrival.IsZero() {
 		st.Epsilon = now.Sub(s.lastArrival) + st.RTTMin
 	}
+
 	return st
 }
 
@@ -215,9 +228,11 @@ func (s *peerClockStats) snapshot(now time.Time) ClockStats {
 func (s *peerClockStats) sinceLastArrival(now time.Time) (time.Duration, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	if s.lastArrival.IsZero() {
 		return 0, false
 	}
+
 	return now.Sub(s.lastArrival), true
 }
 
@@ -228,12 +243,15 @@ func (s *peerClockStats) sinceLastArrival(now time.Time) (time.Duration, bool) {
 func (s *peerClockStats) livenessTimeout(cfg ClockConfig) (time.Duration, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	if s.interArrival.len() < minAdaptiveSamples {
 		return 0, false
 	}
+
 	median := s.interArrival.quantile(0.5)
 	margin := max(s.interArrival.quantile(0.99)-median, 0)
 	timeout := time.Duration(int64(cfg.MissedIntervals)*median + margin)
+
 	return clampDuration(timeout, cfg.MinTimeout, cfg.MaxTimeout), true
 }
 
@@ -241,8 +259,10 @@ func clampDuration(d, lo, hi time.Duration) time.Duration {
 	if d < lo {
 		return lo
 	}
+
 	if d > hi {
 		return hi
 	}
+
 	return d
 }

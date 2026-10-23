@@ -44,10 +44,12 @@ const cloudSaltV1 = "swytch-cloud-v1"
 // here means a broken runtime, not a recoverable condition.
 func deriveCloud(ikm []byte, info string) []byte {
 	r := hkdf.New(sha256.New, ikm, []byte(cloudSaltV1), []byte(info))
+
 	out := make([]byte, 32)
 	if _, err := io.ReadFull(r, out); err != nil {
 		panic(fmt.Sprintf("cloud secret derivation failed: %v", err))
 	}
+
 	return out
 }
 
@@ -87,6 +89,7 @@ func CloudFolder(authKey []byte) string {
 	h := sha256.New()
 	h.Write([]byte("swytch-cloud-folder-v1"))
 	h.Write(authKey)
+
 	return hex.EncodeToString(h.Sum(nil))
 }
 
@@ -101,6 +104,7 @@ func CloudFolder(authKey []byte) string {
 func CloudKeyName(keyNameKey, key []byte) []byte {
 	mac := hmac.New(sha256.New, keyNameKey)
 	mac.Write(key)
+
 	return mac.Sum(nil)
 }
 

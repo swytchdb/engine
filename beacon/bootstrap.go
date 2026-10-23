@@ -47,8 +47,10 @@ import (
 // we've fallen back to solo mode with a warning.
 func (b *Beacon) bootstrap(ctx context.Context) error {
 	var candidates []string
+
 	if b.cfg.Cloud != nil {
 		var err error
+
 		candidates, err = b.cloudCandidates(ctx)
 		if err != nil {
 			// Shutdown during discovery. Unlike the DNS path there is no solo
@@ -57,9 +59,11 @@ func (b *Beacon) bootstrap(ctx context.Context) error {
 		}
 	} else {
 		var err error
+
 		candidates, err = b.resolveJoinAddrWithRetry(ctx)
 		if err != nil {
 			slog.Warn("beacon: DNS resolution failed after retries, starting solo", "error", err)
+
 			return nil
 		}
 	}
@@ -67,6 +71,7 @@ func (b *Beacon) bootstrap(ctx context.Context) error {
 	candidates = b.filterSelf(candidates)
 	if len(candidates) == 0 {
 		slog.Info("beacon: no peers found, starting solo")
+
 		return nil
 	}
 
@@ -78,6 +83,7 @@ func (b *Beacon) bootstrap(ctx context.Context) error {
 	// subscriptions have a peer to exchange NACKs with.
 	waitCtx, waitCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer waitCancel()
+
 	if err := b.pm.WaitForAnyPeer(waitCtx); err != nil {
 		slog.Warn("beacon: no candidates reachable, starting solo", "error", err)
 		// Bootstrap candidates are DNS guesses, not members. Conceding solo
@@ -91,8 +97,10 @@ func (b *Beacon) bootstrap(ctx context.Context) error {
 		// effects, which own the topology from then on.
 		b.setTemporaryTopology(nil)
 		b.expectedPeers = 0
+
 		return nil
 	}
+
 	return nil
 }
 
@@ -116,15 +124,19 @@ func (b *Beacon) cloudCandidates(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	members := parseMembership(reduced)
 	selfID := uint64(b.cfg.NodeID)
+
 	addrs := make([]string, 0, len(members))
 	for _, m := range members {
 		if m.NodeID == selfID {
 			continue
 		}
+
 		addrs = append(addrs, m.Addr)
 	}
+
 	return addrs, nil
 }
 
@@ -154,8 +166,11 @@ func (b *Beacon) discoverMembersWithRetry(ctx context.Context) (*pb.ReducedEffec
 	)
 
 	started := time.Now()
+
 	var lastComplaint time.Time // zero value: the first failure warns
+
 	backoff := backoffStart
+
 	for attempt := 1; ; attempt++ {
 		reduced, err := b.cfg.Cloud.DiscoverMembers(ctx, MembershipKey)
 		if err == nil {
@@ -163,14 +178,18 @@ func (b *Beacon) discoverMembersWithRetry(ctx context.Context) (*pb.ReducedEffec
 				slog.Info("beacon: cloud member discovery succeeded after retries",
 					"attempts", attempt, "elapsed", time.Since(started))
 			}
+
 			return reduced, nil
 		}
+
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
+
 		if time.Since(lastComplaint) >= complainEvery {
 			slog.Warn("beacon: cloud member discovery failing, still retrying — will NOT start solo",
 				"error", err, "attempts", attempt, "elapsed", time.Since(started))
+
 			lastComplaint = time.Now()
 		} else {
 			slog.Debug("beacon: cloud member discovery failed, retrying", "error", err, "backoff", backoff)
@@ -181,6 +200,7 @@ func (b *Beacon) discoverMembersWithRetry(ctx context.Context) (*pb.ReducedEffec
 			return nil, ctx.Err()
 		case <-time.After(backoff):
 		}
+
 		backoff = min(backoff*2, backoffMax)
 	}
 }
@@ -206,14 +226,19 @@ func (b *Beacon) resolveJoinAddrWithRetry(ctx context.Context) ([]string, error)
 	defer cancel()
 
 	backoff := backoffStart
+
 	var lastErr error
+
 	for {
 		attemptCtx, attemptCancel := context.WithTimeout(deadlineCtx, perAttemptTimeout)
 		candidates, err := ResolveJoinAddr(attemptCtx, nil, b.cfg.JoinAddr, b.cfg.ClusterPort)
+
 		attemptCancel()
+
 		if err == nil {
 			return candidates, nil
 		}
+
 		lastErr = err
 		slog.Debug("beacon: DNS resolution failed, retrying", "error", err, "backoff", backoff)
 
@@ -222,6 +247,7 @@ func (b *Beacon) resolveJoinAddrWithRetry(ctx context.Context) ([]string, error)
 			return nil, lastErr
 		case <-time.After(backoff):
 		}
+
 		backoff = min(backoff*2, backoffMax)
 	}
 }
@@ -256,6 +282,7 @@ func (b *Beacon) waitForMembershipConverged(ctx context.Context) error {
 	b.members = members
 	b.mu.Unlock()
 	b.updateTopology(members)
+
 	return nil
 }
 
@@ -269,24 +296,30 @@ func (b *Beacon) waitForMembershipConverged(ctx context.Context) error {
 // registrant.
 func (b *Beacon) readMembershipWithRetry(ctx context.Context, expectedPeers int) ([]Member, error) {
 	backoff := 100 * time.Millisecond
+
 	const maxBackoff = 1 * time.Second
+
 	selfID := uint64(b.cfg.NodeID)
 
 	for {
 		ectx := b.engine.NewContext()
 		snapshot, _, err := ectx.GetSnapshot(MembershipKey)
 		ectx.Flush()
+
 		if err == nil {
 			members := parseMembership(snapshot)
 			nonSelf := 0
+
 			for _, m := range members {
 				if m.NodeID != selfID {
 					nonSelf++
 				}
 			}
+
 			if nonSelf >= expectedPeers {
 				return members, nil
 			}
+
 			slog.Debug("beacon: membership not fully converged",
 				"have", nonSelf, "want", expectedPeers, "backoff", backoff)
 		} else if errors.Is(err, effects.ErrRegionPartitioned) {
@@ -301,6 +334,7 @@ func (b *Beacon) readMembershipWithRetry(ctx context.Context, expectedPeers int)
 			return nil, errors.Join(ctx.Err(), err)
 		case <-time.After(backoff):
 		}
+
 		if backoff < maxBackoff {
 			backoff *= 2
 			if backoff > maxBackoff {
@@ -325,8 +359,10 @@ func (b *Beacon) filterSelf(candidates []string) []string {
 		if host == selfHost && port == selfPort {
 			continue
 		}
+
 		filtered = append(filtered, addr)
 	}
+
 	return filtered
 }
 
@@ -337,7 +373,7 @@ func (b *Beacon) filterSelf(candidates []string) []string {
 func (b *Beacon) setTemporaryTopology(candidates []string) {
 	nodes := []cluster.NodeConfig{
 		{
-			ID:      cluster.NodeId(b.cfg.NodeID),
+			ID:      b.cfg.NodeID,
 			Address: b.cfg.AdvertiseAddr,
 		},
 	}
@@ -354,7 +390,7 @@ func (b *Beacon) setTemporaryTopology(candidates []string) {
 	}
 
 	cfg := &cluster.ClusterConfig{
-		NodeID:        cluster.NodeId(b.cfg.NodeID),
+		NodeID:        b.cfg.NodeID,
 		Nodes:         nodes,
 		TLSPassphrase: b.cfg.Passphrase,
 	}

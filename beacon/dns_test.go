@@ -37,6 +37,7 @@ func TestResolveJoinAddr_SRV(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+
 	if len(addrs) == 0 {
 		t.Fatal("expected at least one address for localhost")
 	}
@@ -47,6 +48,7 @@ func TestResolveJoinAddr_SRV(t *testing.T) {
 		if err != nil {
 			t.Fatalf("invalid address %q: %v", addr, err)
 		}
+
 		if port != "7379" {
 			t.Fatalf("expected port 7379, got %s in %q", port, addr)
 		}
@@ -58,6 +60,7 @@ func TestResolveJoinAddr_FallbackToA(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+
 	if len(addrs) == 0 {
 		t.Fatal("expected at least one address")
 	}
@@ -83,6 +86,7 @@ func TestResolveJoinAddr_LiteralHostPort(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+
 	if len(addrs) != 1 || addrs[0] != "127.0.0.1:7001" {
 		t.Fatalf("expected [127.0.0.1:7001], got %v", addrs)
 	}
@@ -93,6 +97,7 @@ func TestResolveJoinAddr_BareIP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+
 	if len(addrs) != 1 || addrs[0] != "10.0.0.1:7379" {
 		t.Fatalf("expected [10.0.0.1:7379], got %v", addrs)
 	}
@@ -103,10 +108,12 @@ func TestResolveJoinAddr_CommaSeparated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+
 	want := []string{"127.0.0.1:7001", "127.0.0.1:7002", "127.0.0.1:7003"}
 	if len(addrs) != len(want) {
 		t.Fatalf("expected %v, got %v", want, addrs)
 	}
+
 	for i, a := range addrs {
 		if a != want[i] {
 			t.Fatalf("addr[%d]: expected %s, got %s", i, want[i], a)
@@ -119,10 +126,12 @@ func TestResolveJoinAddr_CommaSeparatedDefaultPort(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+
 	want := []string{"10.0.0.1:7379", "10.0.0.2:7379"}
 	if len(addrs) != len(want) {
 		t.Fatalf("expected %v, got %v", want, addrs)
 	}
+
 	for i, a := range addrs {
 		if a != want[i] {
 			t.Fatalf("addr[%d]: expected %s, got %s", i, want[i], a)
@@ -136,6 +145,7 @@ func TestResolveJoinAddr_HostnameStillUsesDNS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+
 	if len(addrs) == 0 {
 		t.Fatal("expected at least one address for localhost via DNS")
 	}

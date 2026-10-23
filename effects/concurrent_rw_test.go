@@ -48,6 +48,7 @@ func TestConcurrentRowWritesSharedBase_WeWin(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := subCtx.Flush(); err != nil {
 		t.Fatal(err)
 	}
@@ -56,10 +57,13 @@ func TestConcurrentRowWritesSharedBase_WeWin(t *testing.T) {
 	if err := setupCtx.Emit(scalarSet("k", "base")); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := setupCtx.Flush(); err != nil {
 		t.Fatal(err)
 	}
+
 	setupTips := e.index.Contains("k")
+
 	var sharedBase []*pb.EffectRef
 	for _, tp := range setupTips.Tips() {
 		sharedBase = append(sharedBase, toPbRef(tp))
@@ -88,6 +92,7 @@ func TestConcurrentRowWritesSharedBase_WeWin(t *testing.T) {
 	for i := range theirHash {
 		theirHash[i] = 0xff
 	}
+
 	theirBind := &pb.Effect{
 		Key:            []byte("k"),
 		Hlc:            theirBindHLC,
@@ -130,6 +135,7 @@ func TestConcurrentRowWritesSharedBase_WeWin(t *testing.T) {
 
 	ctx := e.NewContext()
 	ctx.BeginTx()
+
 	if err := ctx.Emit(&pb.Effect{
 		Key: []byte("k"),
 		Kind: &pb.Effect_RowWrite{RowWrite: &pb.RowWriteEffect{

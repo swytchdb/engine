@@ -32,15 +32,19 @@ import (
 // successfully Added must be reported present.
 func TestCuckooNoFalseNegatives(t *testing.T) {
 	const n = 50_000
+
 	c := NewCuckooFilter(n)
+
 	added := make([]string, 0, n)
 	for i := range n {
 		k := fmt.Sprintf("key:%d", i)
 		if err := c.Add(k); err != nil {
 			t.Fatalf("Add(%q) failed at load %.3f: %v", k, c.LoadFactor(), err)
 		}
+
 		added = append(added, k)
 	}
+
 	for _, k := range added {
 		if !c.MaybeContains(k) {
 			t.Fatalf("false negative for %q", k)
@@ -52,23 +56,29 @@ func TestCuckooNoFalseNegatives(t *testing.T) {
 // below 1% with 16-bit fingerprints.
 func TestCuckooFalsePositiveRate(t *testing.T) {
 	const n = 50_000
+
 	c := NewCuckooFilter(n)
 	for i := range n {
 		if err := c.Add(fmt.Sprintf("key:%d", i)); err != nil {
 			t.Fatalf("Add failed: %v", err)
 		}
 	}
+
 	const probes = 100_000
+
 	fp := 0
+
 	for i := range probes {
 		if c.MaybeContains(fmt.Sprintf("absent:%d", i)) {
 			fp++
 		}
 	}
+
 	rate := float64(fp) / float64(probes)
 	if rate > 0.01 {
 		t.Fatalf("false-positive rate %.4f exceeds 1%%", rate)
 	}
+
 	t.Logf("false-positive rate: %.4f", rate)
 }
 
@@ -76,23 +86,28 @@ func TestCuckooFalsePositiveRate(t *testing.T) {
 // identically after decoding — the cross-node shipping requirement.
 func TestCuckooMarshalRoundTrip(t *testing.T) {
 	const n = 10_000
+
 	c := NewCuckooFilter(n)
 	for i := range n {
 		if err := c.Add(fmt.Sprintf("key:%d", i)); err != nil {
 			t.Fatalf("Add failed: %v", err)
 		}
 	}
+
 	data, err := c.MarshalBinary()
 	if err != nil {
 		t.Fatalf("MarshalBinary: %v", err)
 	}
+
 	var dec CuckooFilter
 	if err := dec.UnmarshalBinary(data); err != nil {
 		t.Fatalf("UnmarshalBinary: %v", err)
 	}
+
 	if dec.Count() != c.Count() {
 		t.Fatalf("count mismatch: got %d want %d", dec.Count(), c.Count())
 	}
+
 	for i := range n {
 		k := fmt.Sprintf("key:%d", i)
 		if !dec.MaybeContains(k) {
@@ -115,6 +130,7 @@ func TestCuckooUnmarshalRejectsGarbage(t *testing.T) {
 	}
 	// numBuckets=3 (not power of two)
 	bad := make([]byte, 8)
+
 	bad[7] = 3
 	if err := c.UnmarshalBinary(bad); err == nil {
 		t.Fatal("expected error on non-power-of-two numBuckets")
@@ -127,10 +143,12 @@ func TestCuckooUnmarshalRejectsGarbage(t *testing.T) {
 // must still report present, and the marshal round-trip must preserve them.
 func TestCuckooChainNoFalseNegativesAcrossRotation(t *testing.T) {
 	const n = cuckooChainChunk*5 + 123 // force several rotations
+
 	var cc CuckooChain
 	for i := range n {
 		cc.Add(fmt.Sprintf("key:%d", i))
 	}
+
 	for i := range n {
 		k := fmt.Sprintf("key:%d", i)
 		if !cc.MaybeContains(k) {
@@ -142,10 +160,12 @@ func TestCuckooChainNoFalseNegativesAcrossRotation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MarshalBinary: %v", err)
 	}
+
 	var dec CuckooChain
 	if err := dec.UnmarshalBinary(data); err != nil {
 		t.Fatalf("UnmarshalBinary: %v", err)
 	}
+
 	for i := range n {
 		k := fmt.Sprintf("key:%d", i)
 		if !dec.MaybeContains(k) {
@@ -161,6 +181,7 @@ func TestCuckooChainAddReportsChange(t *testing.T) {
 	if !cc.Add("x") {
 		t.Fatal("first add of a key should report a change")
 	}
+
 	if cc.Add("x") {
 		t.Fatal("re-adding the same key should report no change")
 	}
@@ -171,10 +192,12 @@ func TestCuckooAddIdempotent(t *testing.T) {
 	if err := c.Add("x"); err != nil {
 		t.Fatal(err)
 	}
+
 	before := c.Count()
 	if err := c.Add("x"); err != nil {
 		t.Fatal(err)
 	}
+
 	if c.Count() != before {
 		t.Fatalf("re-adding changed count: %d -> %d", before, c.Count())
 	}

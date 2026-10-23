@@ -97,13 +97,14 @@ func (h *HorizonSet) computeHorizonWait() time.Duration {
 // fires. If the bind's keys overlap with an existing group's consumed tips,
 // it joins that group; otherwise a new group is created.
 func (h *HorizonSet) Add(txnID string, bindOffset Tip, bind *pb.TransactionalBindEffect) {
-	consumedByKey := make(map[string][]Tip, len(bind.Keys))
-	newTips := make(map[string]Tip, len(bind.Keys))
-	allKeys := make(map[string]struct{}, len(bind.Keys))
-	for _, kb := range bind.Keys {
-		k := string(kb.Key)
-		consumedByKey[k] = fromPbRefs(kb.ConsumedTips)
-		newTips[k] = r(kb.NewTip)
+	consumedByKey := make(map[string][]Tip, len(bind.GetKeys()))
+	newTips := make(map[string]Tip, len(bind.GetKeys()))
+
+	allKeys := make(map[string]struct{}, len(bind.GetKeys()))
+	for _, kb := range bind.GetKeys() {
+		k := string(kb.GetKey())
+		consumedByKey[k] = fromPbRefs(kb.GetConsumedTips())
+		newTips[k] = r(kb.GetNewTip())
 		allKeys[k] = struct{}{}
 	}
 
@@ -118,11 +119,14 @@ func (h *HorizonSet) Add(txnID string, bindOffset Tip, bind *pb.TransactionalBin
 
 	h.mu.Lock()
 	newBind := &forkChoiceBindEntry{keys: consumedByKey}
+
 	var overlapping []*horizonGroup
+
 	for _, g := range h.groups {
 		if g.visible {
 			continue
 		}
+
 		g.mu.Lock()
 		if groupOverlaps(g, newBind) {
 			overlapping = append(overlapping, g)
@@ -149,29 +153,36 @@ func (h *HorizonSet) Add(txnID string, bindOffset Tip, bind *pb.TransactionalBin
 				e.group = targetGroup
 				targetGroup.entries[tid] = e
 			}
+
 			for k, tips := range other.bindKeys {
 				targetGroup.bindKeys[k] = append(targetGroup.bindKeys[k], tips...)
 			}
+
 			for k := range other.allKeys {
 				targetGroup.allKeys[k] = struct{}{}
 			}
+
 			if other.timer != nil {
 				other.timer.Stop()
 				other.timer = nil
 			}
+
 			other.visible = true // consumed
 			other.mu.Unlock()
 		}
 		targetGroup.mu.Unlock()
+
 		h.groups = filterGroups(h.groups)
 	}
 
 	targetGroup.mu.Lock()
 	entry.group = targetGroup
+
 	targetGroup.entries[txnID] = entry
 	for k, tips := range consumedByKey {
 		targetGroup.bindKeys[k] = append(targetGroup.bindKeys[k], tips...)
 	}
+
 	for k := range allKeys {
 		targetGroup.allKeys[k] = struct{}{}
 	}
@@ -201,6 +212,7 @@ func (h *HorizonSet) WaitForClear(txnID string) *HorizonWait {
 	if entry, ok := h.entries.Load(txnID); ok {
 		return &HorizonWait{entry: entry, tok: entry.waiters.RLock()}
 	}
+
 	return nil
 }
 
@@ -209,6 +221,7 @@ func (w *HorizonWait) Release() {
 	if w == nil {
 		return
 	}
+
 	w.entry.waiters.RUnlock(w.tok)
 }
 
@@ -225,15 +238,19 @@ func (h *HorizonSet) ScheduleMakeVisible(txnID string, wait time.Duration) {
 	if !ok {
 		return
 	}
+
 	group := entry.group
 	group.mu.Lock()
 	if group.visible {
 		group.mu.Unlock()
+
 		return
 	}
+
 	if group.timer != nil {
 		group.timer.Stop()
 	}
+
 	fn := func() { h.MakeVisible(txnID) }
 	if h.afterFunc != nil {
 		group.timer = h.afterFunc(wait, fn)
@@ -255,13 +272,16 @@ func (h *HorizonSet) MakeVisible(txnID string) {
 	group.mu.Lock()
 	if group.visible {
 		group.mu.Unlock()
+
 		return
 	}
+
 	group.visible = true
 	if group.timer != nil {
 		group.timer.Stop()
 		group.timer = nil
 	}
+
 	entries := make([]*horizonEntry, 0, len(group.entries))
 	for _, e := range group.entries {
 		entries = append(entries, e)
@@ -269,20 +289,24 @@ func (h *HorizonSet) MakeVisible(txnID string) {
 	group.mu.Unlock()
 
 	allKeys := make(map[string]struct{})
+
 	for _, e := range entries {
 		if et, ok := h.entries.Load(e.txnID); ok {
 			et.waiters.Unlock()
 		}
 
 		h.entries.Delete(e.txnID)
+
 		for k, newTip := range e.keyNewTips {
 			h.engine.pendingTxTips.Delete(newTip)
+
 			allKeys[k] = struct{}{}
 		}
 	}
 
 	for k := range allKeys {
 		h.engine.ownFilterAdd(k)
+
 		if h.engine.OnKeyDataAdded != nil {
 			h.engine.OnKeyDataAdded(k)
 		}
@@ -308,21 +332,25 @@ func (h *HorizonSet) Abort(txnID string) {
 	if !ok {
 		return
 	}
+
 	h.entries.Delete(txnID)
 	entry.waiters.Unlock()
 
 	group := entry.group
 	group.mu.Lock()
 	delete(group.entries, txnID)
+
 	for _, newTip := range entry.keyNewTips {
 		h.engine.pendingTxTips.Delete(newTip)
 	}
+
 	isEmpty := len(group.entries) == 0
 	if isEmpty {
 		if group.timer != nil {
 			group.timer.Stop()
 			group.timer = nil
 		}
+
 		group.visible = true // marker for filterGroups
 	}
 	group.mu.Unlock()
@@ -339,6 +367,7 @@ func (h *HorizonSet) Abort(txnID string) {
 // IsInvisible returns true if the given txnID is in the invisible set.
 func (h *HorizonSet) IsInvisible(txnID string) bool {
 	_, ok := h.entries.Load(txnID)
+
 	return ok
 }
 
@@ -359,30 +388,36 @@ func groupOverlaps(g *horizonGroup, newBind *forkChoiceBindEntry) bool {
 		if !ok {
 			continue
 		}
+
 		existingSet := make(map[Tip]bool, len(existingBase))
 		for _, off := range existingBase {
 			existingSet[off] = true
 		}
+
 		for _, off := range newBase {
 			if existingSet[off] {
 				return true
 			}
 		}
 	}
+
 	return false
 }
 
 // filterGroups removes groups that are marked as visible.
 func filterGroups(groups []*horizonGroup) []*horizonGroup {
 	n := 0
+
 	for _, g := range groups {
 		if !g.visible {
 			groups[n] = g
 			n++
 		}
 	}
+
 	for i := n; i < len(groups); i++ {
 		groups[i] = nil
 	}
+
 	return groups[:n]
 }

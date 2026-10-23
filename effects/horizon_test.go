@@ -52,27 +52,34 @@ func newHorizonTestEngine() *Engine {
 	}
 	e.safety.Store(&safetyMap{defaultMode: UnsafeMode})
 	e.horizon = newHorizonSet(e)
+
 	return e
 }
 
 // installFakeTimers replaces timer creation with a controllable fire function.
 func installFakeTimers(h *HorizonSet) func() {
-	var mu sync.Mutex
-	var fns []func()
+	var (
+		mu  sync.Mutex
+		fns []func()
+	)
 
 	h.afterFunc = func(d time.Duration, f func()) *time.Timer {
 		mu.Lock()
+
 		fns = append(fns, f)
 		mu.Unlock()
+
 		return time.NewTimer(time.Hour) // never fires
 	}
 
 	return func() {
 		mu.Lock()
 		defer mu.Unlock()
+
 		for _, f := range fns {
 			f()
 		}
+
 		fns = nil
 	}
 }
@@ -90,6 +97,7 @@ func TestHorizonSet_StandaloneEngineNilHorizon(t *testing.T) {
 		pendingBootstraps: xsync.NewMap[string, *bootstrapCollector](),
 	}
 	e.safety.Store(&safetyMap{defaultMode: UnsafeMode})
+
 	if e.horizon != nil {
 		t.Fatal("standalone engine should have nil horizon")
 	}
@@ -139,6 +147,7 @@ func TestHorizonSet_MakeVisibleRemovesEntry(t *testing.T) {
 	if e.horizon.IsInvisible("tx1") {
 		t.Fatal("tx1 should be visible after MakeVisible")
 	}
+
 	if _, ok := e.pendingTxTips.Load(Tip{1, 20}); ok {
 		t.Fatal("pendingTxTips should be cleaned after MakeVisible")
 	}
@@ -161,6 +170,7 @@ func TestHorizonSet_AbortRemovesEntryWithoutPromotion(t *testing.T) {
 	if e.horizon.IsInvisible("tx1") {
 		t.Fatal("tx1 should no longer be in the invisible set after Abort")
 	}
+
 	if _, ok := e.pendingTxTips.Load(Tip{1, 20}); ok {
 		t.Fatal("pendingTxTips should be cleaned after Abort")
 	}
@@ -207,12 +217,15 @@ func TestHorizonSet_VerdictSnapshotEndsWaitEarly(t *testing.T) {
 	if e.horizon.IsInvisible("winner") {
 		t.Fatal("winner should be visible after verdict snapshot")
 	}
+
 	if e.horizon.IsInvisible("loser") {
 		t.Fatal("loser should be visible after verdict snapshot (DAG/snapshot will filter it on reconstruct)")
 	}
+
 	if _, ok := e.pendingTxTips.Load(Tip{1, 20}); ok {
 		t.Fatal("winner pendingTxTips should be cleaned after MakeVisible")
 	}
+
 	if _, ok := e.pendingTxTips.Load(Tip{1, 40}); ok {
 		t.Fatal("loser pendingTxTips should be cleaned after MakeVisible")
 	}
@@ -255,6 +268,7 @@ func TestHorizonSet_ScheduledTimerFiresMakesVisible(t *testing.T) {
 	if e.horizon.IsInvisible("tx1") {
 		t.Fatal("tx1 should be visible after timer fires")
 	}
+
 	if _, ok := e.pendingTxTips.Load(Tip{1, 20}); ok {
 		t.Fatal("pendingTxTips should be cleaned after timer fires")
 	}

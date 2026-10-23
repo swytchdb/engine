@@ -44,6 +44,7 @@ func handleStream(stream *quic.Stream, logReader LogReader, forwardHandler Forwa
 	var typeBuf [1]byte
 	if _, err := io.ReadFull(stream, typeBuf[:]); err != nil {
 		slog.Debug("failed to read stream type", "error", err)
+
 		return
 	}
 
@@ -63,6 +64,7 @@ func handleFetchStream(stream *quic.Stream, logReader LogReader) {
 	req := &pb.FetchRequest{}
 	if err := readMessage(stream, req); err != nil {
 		slog.Debug("failed to read fetch request", "error", err)
+
 		return
 	}
 
@@ -71,6 +73,7 @@ func handleFetchStream(stream *quic.Stream, logReader LogReader) {
 		if err := writeMessage(stream, resp); err != nil {
 			slog.Debug("failed to write empty fetch response", "error", err)
 		}
+
 		return
 	}
 
@@ -87,6 +90,7 @@ func handleFetchStream(stream *quic.Stream, logReader LogReader) {
 		if err := writeMessage(stream, resp); err != nil {
 			slog.Debug("failed to write not-found fetch response", "error", err)
 		}
+
 		return
 	}
 
@@ -109,14 +113,17 @@ func handleFetchStream(stream *quic.Stream, logReader LogReader) {
 func handleForwardStream(stream *quic.Stream, handler ForwardHandler) {
 	if handler == nil {
 		slog.Warn("received forward stream but no ForwardHandler configured")
+
 		resp := &pb.ForwardedResponse{Error: true, ErrorMessage: "forwarding not supported"}
 		_ = writeMessage(stream, resp)
+
 		return
 	}
 
 	req := &pb.ForwardedTransaction{}
 	if err := readMessage(stream, req); err != nil {
 		slog.Debug("failed to read forwarded transaction", "error", err)
+
 		return
 	}
 
@@ -133,6 +140,7 @@ func acceptStreams(conn *quic.Conn, logReader LogReader, forwardHandler ForwardH
 		if err != nil {
 			return // connection closed
 		}
+
 		go handleStream(stream, logReader, forwardHandler)
 	}
 }

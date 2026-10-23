@@ -96,18 +96,21 @@ type pendingTxnKey struct {
 // node. All call sites must reach the same answer so the client's
 // abort/commit signal matches the cluster's view of the bind.
 func (e *Engine) isRealConflict(ptxn *pendingTxn, key string, detail *pb.NackTipDetail) bool {
-	for _, dep := range detail.Deps {
+	for _, dep := range detail.GetDeps() {
 		if r(dep) == ptxn.bindOffset {
 			return false
 		}
+
 		for _, pk := range ptxn.keys {
 			if r(dep) == pk.newTip {
 				return false
 			}
 		}
 	}
-	if detail.Ref != nil {
-		target := r(detail.Ref)
+
+	if detail.GetRef() != nil {
+		target := r(detail.GetRef())
+
 		var zero Tip
 		if target != zero && e.reachesFromTx(ptxn, target) {
 			return false
@@ -115,7 +118,7 @@ func (e *Engine) isRealConflict(ptxn *pendingTxn, key string, detail *pb.NackTip
 	}
 
 	// Commutative effects: never conflict
-	if !detail.IsData && !detail.IsBind {
+	if !detail.GetIsData() && !detail.GetIsBind() {
 		// MetaEffect, SubscriptionEffect, SerializationEffect, NoopEffect
 		return false
 	}
@@ -128,17 +131,21 @@ func (e *Engine) isRealConflict(ptxn *pendingTxn, key string, detail *pb.NackTip
 	// independent "first"; the hash provides the deterministic order
 	// every observer agrees on. Predicate refinement is the only out:
 	// disjoint writes coexist regardless of hash.
-	if detail.IsBind {
-		theirBindOffset := r(detail.Ref)
+	if detail.GetIsBind() {
+		theirBindOffset := r(detail.GetRef())
+
 		var theirTxnID string
 		if theirEff, err := e.getEffect(key, theirBindOffset); err == nil {
-			theirTxnID = theirEff.TxnId
+			theirTxnID = theirEff.GetTxnId()
 		}
+
 		if theirTxnID != "" && theirTxnID == ptxn.txnID {
 			return false // our own bind
 		}
+
 		if ptxn.txnID != "" && theirTxnID != "" {
 			ourStart := collectOurBindTips(ptxn, key)
+
 			conflict, bothHadEvidence := e.hasPredicateConflict(
 				ptxn.txnID, theirTxnID, key,
 				ourStart,
@@ -147,7 +154,8 @@ func (e *Engine) isRealConflict(ptxn *pendingTxn, key string, detail *pb.NackTip
 				return false // disjoint predicates — can coexist
 			}
 		}
-		if ForkChoiceLess(detail.BindForkChoiceHash, ptxn.forkChoiceHash) {
+
+		if ForkChoiceLess(detail.GetBindForkChoiceHash(), ptxn.forkChoiceHash) {
 			// Their hash is lower → they win, we lose, abort.
 			return true
 		}
@@ -156,16 +164,17 @@ func (e *Engine) isRealConflict(ptxn *pendingTxn, key string, detail *pb.NackTip
 	}
 
 	// Transactional effect without a bind: in-progress, not yet competing
-	if detail.IsTransactional && !detail.IsBind {
+	if detail.GetIsTransactional() && !detail.GetIsBind() {
 		return false
 	}
 
 	// Non-transactional DataEffect on same key
-	if detail.IsData {
+	if detail.GetIsData() {
 		pk := findPendingKey(ptxn, key)
 		if pk == nil {
 			return false
 		}
+
 		return affectsSameData(pk, detail)
 	}
 
@@ -183,36 +192,45 @@ func (e *Engine) reachesFromTx(ptxn *pendingTxn, target Tip) bool {
 	if target == zero {
 		return false
 	}
+
 	visited := make(map[Tip]struct{})
 	stack := make([]Tip, 0, 1+len(ptxn.keys))
 	push := func(t Tip) {
 		if t == zero {
 			return
 		}
+
 		if _, seen := visited[t]; seen {
 			return
 		}
+
 		visited[t] = struct{}{}
 		stack = append(stack, t)
 	}
 	push(ptxn.bindOffset)
+
 	for _, pk := range ptxn.keys {
 		push(pk.newTip)
 	}
+
 	for len(stack) > 0 {
 		cur := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
+
 		if cur == target {
 			return true
 		}
+
 		eff, err := e.getEffect("", cur)
 		if err != nil {
 			continue
 		}
-		for _, dep := range eff.Deps {
+
+		for _, dep := range eff.GetDeps() {
 			push(r(dep))
 		}
 	}
+
 	return false
 }
 
@@ -223,9 +241,11 @@ func collectOurBindTips(ptxn *pendingTxn, key string) []Tip {
 	for i := range ptxn.keys {
 		if ptxn.keys[i].key == key {
 			tips = append(tips, ptxn.keys[i].newTip)
+
 			break
 		}
 	}
+
 	return tips
 }
 
@@ -234,7 +254,7 @@ func collectOurBindTips(ptxn *pendingTxn, key string) []Tip {
 func affectsSameData(pk *pendingTxnKey, detail *pb.NackTipDetail) bool {
 	// If our key is read-only (NoopEffect), any SCALAR write is a phantom write conflict
 	if pk.readOnly {
-		if detail.Collection == pb.CollectionKind_SCALAR {
+		if detail.GetCollection() == pb.CollectionKind_SCALAR {
 			return true
 		}
 		// For KEYED/ORDERED, a noop read doesn't conflict with writes to
@@ -244,25 +264,27 @@ func affectsSameData(pk *pendingTxnKey, detail *pb.NackTipDetail) bool {
 	}
 
 	// SCALAR: always conflicts (single value per key)
-	if pk.collection == pb.CollectionKind_SCALAR || detail.Collection == pb.CollectionKind_SCALAR {
+	if pk.collection == pb.CollectionKind_SCALAR || detail.GetCollection() == pb.CollectionKind_SCALAR {
 		return true
 	}
 
 	// ORDERED: any concurrent insert conflicts — position depends on seeing
 	// all prior inserts, so concurrent inserts create incompatible orderings.
-	if pk.collection == pb.CollectionKind_ORDERED || detail.Collection == pb.CollectionKind_ORDERED {
+	if pk.collection == pb.CollectionKind_ORDERED || detail.GetCollection() == pb.CollectionKind_ORDERED {
 		return true
 	}
 
 	// KEYED: compare element IDs — concurrent writes to different fields are fine
-	if len(detail.ElementId) == 0 {
+	if len(detail.GetElementId()) == 0 {
 		return true // no element ID → assume conflict
 	}
+
 	for _, eid := range pk.elementIDs {
-		if bytes.Equal(eid, detail.ElementId) {
+		if bytes.Equal(eid, detail.GetElementId()) {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -273,6 +295,7 @@ func findPendingKey(ptxn *pendingTxn, key string) *pendingTxnKey {
 			return &ptxn.keys[i]
 		}
 	}
+
 	return nil
 }
 
@@ -284,14 +307,17 @@ func findPendingKey(ptxn *pendingTxn, key string) *pendingTxnKey {
 // snapshot. Mirrors isRealConflict's filtering structure exactly so the two
 // classifications stay aligned.
 func (e *Engine) defeatedCompetitor(ptxn *pendingTxn, key string, detail *pb.NackTipDetail) string {
-	if !detail.IsBind || detail.Ref == nil {
+	if !detail.GetIsBind() || detail.GetRef() == nil {
 		return ""
 	}
-	theirBindOffset := r(detail.Ref)
+
+	theirBindOffset := r(detail.GetRef())
+
 	var theirTxnID string
 	if theirEff, err := e.getEffect(key, theirBindOffset); err == nil {
-		theirTxnID = theirEff.TxnId
+		theirTxnID = theirEff.GetTxnId()
 	}
+
 	if theirTxnID == "" || theirTxnID == ptxn.txnID {
 		return ""
 	}
@@ -300,22 +326,26 @@ func (e *Engine) defeatedCompetitor(ptxn *pendingTxn, key string, detail *pb.Nac
 	// must not enter defeatedSet. Without these, our post-commit snapshot
 	// records LOST for a transaction that committed cleanly elsewhere
 	// and propagates the wrong verdict.
-	for _, dep := range detail.Deps {
+	for _, dep := range detail.GetDeps() {
 		if r(dep) == ptxn.bindOffset {
 			return ""
 		}
+
 		for _, pk := range ptxn.keys {
 			if r(dep) == pk.newTip {
 				return ""
 			}
 		}
 	}
+
 	var zero Tip
 	if theirBindOffset != zero && e.reachesFromTx(ptxn, theirBindOffset) {
 		return ""
 	}
+
 	if ptxn.txnID != "" {
 		ourStart := collectOurBindTips(ptxn, key)
+
 		conflict, bothHadEvidence := e.hasPredicateConflict(
 			ptxn.txnID, theirTxnID, key,
 			ourStart,
@@ -324,9 +354,11 @@ func (e *Engine) defeatedCompetitor(ptxn *pendingTxn, key string, detail *pb.Nac
 			return ""
 		}
 	}
-	if !ForkChoiceLess(ptxn.forkChoiceHash, detail.BindForkChoiceHash) {
+
+	if !ForkChoiceLess(ptxn.forkChoiceHash, detail.GetBindForkChoiceHash()) {
 		return ""
 	}
+
 	return theirTxnID
 }
 
@@ -334,8 +366,10 @@ func (e *Engine) defeatedCompetitor(ptxn *pendingTxn, key string, detail *pb.Nac
 func commitPendingTxn(ptxn *pendingTxn) bool {
 	if ptxn.state.CompareAndSwap(txnStatePending, txnStateCommitted) {
 		close(ptxn.done)
+
 		return true
 	}
+
 	return false
 }
 
@@ -343,7 +377,9 @@ func commitPendingTxn(ptxn *pendingTxn) bool {
 func abortPendingTxn(ptxn *pendingTxn) bool {
 	if ptxn.state.CompareAndSwap(txnStatePending, txnStateAborted) {
 		close(ptxn.done)
+
 		return true
 	}
+
 	return false
 }

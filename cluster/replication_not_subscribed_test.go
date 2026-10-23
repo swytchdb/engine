@@ -37,7 +37,7 @@ import (
 type notSubscribedHandler struct{}
 
 func (h *notSubscribedHandler) HandleOffsetNotify(notify *pb.OffsetNotify) ([]*pb.NackNotify, error) {
-	return []*pb.NackNotify{{Key: notify.Key, NotSubscribed: true}}, nil
+	return []*pb.NackNotify{{Key: notify.GetKey(), NotSubscribed: true}}, nil
 }
 
 func (h *notSubscribedHandler) HandleNack(_ *pb.NackNotify) error {
@@ -155,6 +155,7 @@ func TestReplicate_AllPeersNotSubscribed_HighConcurrency(t *testing.T) {
 	pms := startNNodeCluster(t, handlers, logReaders)
 
 	const numOps = 200
+
 	errs := make(chan error, numOps)
 	durations := make(chan time.Duration, numOps)
 
@@ -176,18 +177,23 @@ func TestReplicate_AllPeersNotSubscribed_HighConcurrency(t *testing.T) {
 			}
 			start := time.Now()
 			err := pms[0].Replicate(final, []byte("final"))
+
 			durations <- time.Since(start)
+
 			errs <- err
 		}(i)
 	}
 
 	var maxDuration time.Duration
+
 	for range numOps {
 		d := <-durations
+
 		err := <-errs
 		if !errors.Is(err, ErrAllPeersNotSubscribed) {
 			t.Errorf("expected ErrAllPeersNotSubscribed, got: %v", err)
 		}
+
 		if d > maxDuration {
 			maxDuration = d
 		}
@@ -196,5 +202,6 @@ func TestReplicate_AllPeersNotSubscribed_HighConcurrency(t *testing.T) {
 	if maxDuration > 5*time.Second {
 		t.Fatalf("worst-case Replicate took %v — expected fast reject under load", maxDuration)
 	}
+
 	t.Logf("200 concurrent ops: worst-case %v", maxDuration)
 }

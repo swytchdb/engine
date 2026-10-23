@@ -103,6 +103,7 @@ func newPeerConn(
 func (pc *PeerConn) GetQuicConn() *quic.Conn {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
+
 	return pc.quicConn
 }
 
@@ -121,9 +122,11 @@ func (pc *PeerConn) Start(ctx context.Context) {
 func (pc *PeerConn) Stop() {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
+
 	if pc.cancel != nil {
 		pc.cancel()
 	}
+
 	if pc.quicConn != nil {
 		if err := pc.quicConn.CloseWithError(0, "shutdown"); err != nil {
 			slog.Warn("failed to close peer connection", "peer", pc.nodeID, "error", err)
@@ -136,6 +139,7 @@ func (pc *PeerConn) Fetch(ctx context.Context, offset *pb.EffectRef) ([]byte, er
 	pc.mu.Lock()
 	conn := pc.quicConn
 	pc.mu.Unlock()
+
 	return fetchOverConn(ctx, conn, offset)
 }
 
@@ -163,6 +167,7 @@ func fetchOverConn(ctx context.Context, conn *quic.Conn, offset *pb.EffectRef) (
 	// watcher never cancels a healthy stream.
 	done := make(chan struct{})
 	defer close(done)
+
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -220,6 +225,7 @@ func (pc *PeerConn) ForwardTransaction(ctx context.Context, tx *pb.ForwardedTran
 	// never cancelled.
 	done := make(chan struct{})
 	defer close(done)
+
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -270,12 +276,15 @@ func (pc *PeerConn) connectLoop(ctx context.Context) {
 		err := pc.dial(ctx)
 		if err != nil {
 			slog.Warn("failed to dial peer", "peer", pc.nodeID, "address", pc.addr, "error", err)
+
 			select {
 			case <-ctx.Done():
 				return
 			case <-time.After(backoff):
 			}
+
 			backoff = min(backoff*2, backoffCap)
+
 			continue
 		}
 
@@ -287,6 +296,7 @@ func (pc *PeerConn) connectLoop(ctx context.Context) {
 		RecordPeerReconnect(pc.nodeID)
 
 		pc.streamReady.Store(true)
+
 		if pc.onConnected != nil {
 			pc.onConnected(pc.quicConn)
 		}
@@ -295,10 +305,13 @@ func (pc *PeerConn) connectLoop(ctx context.Context) {
 		<-pc.quicConn.Context().Done()
 
 		pc.streamReady.Store(false)
+
 		if ctx.Err() != nil {
 			RecordPeerDisconnected(pc.nodeID)
+
 			return
 		}
+
 		slog.Warn("peer connection lost", "peer", pc.nodeID)
 		RecordPeerDisconnected(pc.nodeID)
 
@@ -314,10 +327,12 @@ func (pc *PeerConn) dial(ctx context.Context) error {
 	if pc.tlsConfig == nil {
 		return fmt.Errorf("TLS configuration is required for cluster connections")
 	}
+
 	tlsCfg := pc.tlsConfig
 	// QUIC requires ALPN. Use CA verification when available;
 	// fall back to Noise-layer identity verification otherwise.
 	tlsCfg = tlsCfg.Clone()
+
 	tlsCfg.NextProtos = []string{"swytch-cluster"}
 	if tlsCfg.RootCAs == nil {
 		tlsCfg.InsecureSkipVerify = true
@@ -344,10 +359,13 @@ func writeMessage(w io.Writer, msg proto.Message) error {
 
 	var lenBuf [4]byte
 	binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(data)))
+
 	if _, err := w.Write(lenBuf[:]); err != nil {
 		return err
 	}
+
 	_, err = w.Write(data)
+
 	return err
 }
 
@@ -366,6 +384,7 @@ func readMessage(r io.Reader, msg proto.Message) error {
 	if length > maxFrameSize {
 		return fmt.Errorf("frame size %d exceeds maximum %d", length, maxFrameSize)
 	}
+
 	data := make([]byte, length)
 	if _, err := io.ReadFull(r, data); err != nil {
 		return err

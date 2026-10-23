@@ -62,6 +62,7 @@ func (w *windowCounter) load() uint64 {
 	for i := range w.shards {
 		total += w.shards[i].v.Load()
 	}
+
 	return total
 }
 

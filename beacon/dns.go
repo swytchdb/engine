@@ -57,6 +57,7 @@ func ResolveJoinAddr(ctx context.Context, resolver *net.Resolver, joinAddr strin
 	if err != nil {
 		return nil, fmt.Errorf("dns resolution failed for %q: %w", joinAddr, err)
 	}
+
 	return addrs, nil
 }
 
@@ -75,11 +76,14 @@ func parseLiteralAddrs(joinAddr string, defaultPort int) ([]string, bool) {
 			if net.ParseIP(joinAddr) != nil {
 				return []string{net.JoinHostPort(joinAddr, strconv.Itoa(defaultPort))}, true
 			}
+
 			return nil, false
 		}
+
 		if net.ParseIP(host) != nil {
 			return []string{joinAddr}, true
 		}
+
 		return nil, false
 	}
 
@@ -90,13 +94,16 @@ func parseLiteralAddrs(joinAddr string, defaultPort int) ([]string, bool) {
 		if p == "" {
 			continue
 		}
+
 		_, _, err := net.SplitHostPort(p)
 		if err != nil {
 			// No port — append default.
 			p = net.JoinHostPort(p, strconv.Itoa(defaultPort))
 		}
+
 		addrs = append(addrs, p)
 	}
+
 	return addrs, true
 }
 
@@ -109,6 +116,7 @@ func resolveSRV(ctx context.Context, resolver *net.Resolver, name string) ([]str
 	}
 
 	var addrs []string
+
 	for _, srv := range srvs {
 		port := strconv.Itoa(int(srv.Port))
 		// SRV targets may be hostnames — resolve to IPs.
@@ -117,10 +125,12 @@ func resolveSRV(ctx context.Context, resolver *net.Resolver, name string) ([]str
 			// Skip unresolvable targets.
 			continue
 		}
+
 		for _, ip := range ips {
 			addrs = append(addrs, net.JoinHostPort(ip, port))
 		}
 	}
+
 	return addrs, nil
 }
 
@@ -132,9 +142,11 @@ func resolveHost(ctx context.Context, resolver *net.Resolver, name string, port 
 	}
 
 	portStr := strconv.Itoa(port)
+
 	addrs := make([]string, len(ips))
 	for i, ip := range ips {
 		addrs[i] = net.JoinHostPort(ip, portStr)
 	}
+
 	return addrs, nil
 }

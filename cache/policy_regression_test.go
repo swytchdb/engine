@@ -41,6 +41,7 @@ func findNode[K Key, V any](c *CloxCache[K, V], key K) *recordNode[K, V] {
 			}
 		}
 	}
+
 	return nil
 }
 
@@ -63,6 +64,7 @@ func TestEvictGhostTrimOrder(t *testing.T) {
 	// The victim-to-be goes in first so its recency predates every ghost's;
 	// the decider pins it while the fodder churn fills the ghost cache.
 	pinned := "victim"
+
 	c.SetEvictDecider(func(k string, _ int) bool { return k != pinned })
 	c.Put("victim", 0)
 
@@ -70,6 +72,7 @@ func TestEvictGhostTrimOrder(t *testing.T) {
 	for i := range 7 {
 		c.Put(fmt.Sprintf("fodder-%d", i), i)
 	}
+
 	if got := c.shards[0].ghostCount.Load(); got != 4 {
 		t.Fatalf("ghostCount = %d; want 4 (at capacity)", got)
 	}
@@ -78,17 +81,21 @@ func TestEvictGhostTrimOrder(t *testing.T) {
 	// recency is older than all existing ghosts — the exact scenario where the
 	// buggy order trims the fresh ghost instead of the oldest one.
 	pinned = ""
+
 	c.Put("fodder-7", 7)
 
 	if got := c.shards[0].ghostCount.Load(); got != 4 {
 		t.Fatalf("ghostCount = %d after trim+ghost; want 4 (net unchanged)", got)
 	}
+
 	if n := findNode(c, "victim"); n == nil || n.freq.Load() >= 0 {
 		t.Fatal("fresh victim must survive as a ghost")
 	}
+
 	if n := findNode(c, "fodder-0"); n != nil {
 		t.Fatal("oldest existing ghost must be the one trimmed")
 	}
+
 	for i := 1; i <= 3; i++ {
 		if n := findNode(c, fmt.Sprintf("fodder-%d", i)); n == nil || n.freq.Load() >= 0 {
 			t.Fatalf("younger ghost fodder-%d must survive the trim", i)
@@ -112,9 +119,11 @@ func TestEvictionDrivenDecayStepsFreqDown(t *testing.T) {
 		c.shards[0].k.Store(2)
 
 		c.Put("hot", 0)
+
 		for range 30 {
 			c.Get("hot", 0)
 		}
+
 		if got := findNode(c, "hot").freq.Load(); got != maxFrequency {
 			t.Fatalf("hot freq = %d after saturation; want %d", got, maxFrequency)
 		}
@@ -125,12 +134,14 @@ func TestEvictionDrivenDecayStepsFreqDown(t *testing.T) {
 		for i := range 150 {
 			c.Put(fmt.Sprintf("churn-%d", i), i)
 		}
+
 		return findNode(c, "hot").freq.Load()
 	}
 
 	if got := run(100); got != maxFrequency-1 {
 		t.Fatalf("hot freq = %d after one decay epoch; want %d", got, maxFrequency-1)
 	}
+
 	if got := run(-1); got != maxFrequency {
 		t.Fatalf("hot freq = %d with decay disabled; want %d untouched", got, maxFrequency)
 	}

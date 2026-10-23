@@ -43,14 +43,17 @@ func tTs(nanos int64) *timestamppb.Timestamp {
 // are absent, predicate refinement is bypassed and the test's
 // shared-base + tie-break expectations match the pre-refinement
 // behaviour.
-func testIsRealConflict(t *testing.T, ptxn *pendingTxn, key string, detail *pb.NackTipDetail) bool {
+func testIsRealConflict(t *testing.T, ptxn *pendingTxn, detail *pb.NackTipDetail) bool {
 	t.Helper()
+
 	e := &Engine{}
-	return e.isRealConflict(ptxn, key, detail)
+
+	return e.isRealConflict(ptxn, "k", detail)
 }
 
-func newTestPendingTxn(txnHLCNanos int64, keys ...pendingTxnKey) *pendingTxn {
-	txnHLC := time.Unix(0, txnHLCNanos)
+func newTestPendingTxn(keys ...pendingTxnKey) *pendingTxn {
+	txnHLC := time.Unix(0, 100)
+
 	return &pendingTxn{
 		txnHLC:         txnHLC,
 		originNode:     1,
@@ -62,7 +65,7 @@ func newTestPendingTxn(txnHLCNanos int64, keys ...pendingTxnKey) *pendingTxn {
 }
 
 func TestIsRealConflict_MetaEffect_NotConflict(t *testing.T) {
-	ptxn := newTestPendingTxn(100, pendingTxnKey{
+	ptxn := newTestPendingTxn(pendingTxnKey{
 		key:        "k",
 		newTip:     Tip{1, 500},
 		collection: pb.CollectionKind_SCALAR,
@@ -76,13 +79,13 @@ func TestIsRealConflict_MetaEffect_NotConflict(t *testing.T) {
 		IsTransactional: false,
 	}
 
-	if testIsRealConflict(t, ptxn, "k", detail) {
+	if testIsRealConflict(t, ptxn, detail) {
 		t.Fatal("MetaEffect should not be a real conflict")
 	}
 }
 
 func TestIsRealConflict_SameElementID_Conflict(t *testing.T) {
-	ptxn := newTestPendingTxn(100, pendingTxnKey{
+	ptxn := newTestPendingTxn(pendingTxnKey{
 		key:        "k",
 		newTip:     Tip{1, 500},
 		collection: pb.CollectionKind_KEYED,
@@ -97,13 +100,13 @@ func TestIsRealConflict_SameElementID_Conflict(t *testing.T) {
 		ElementId:  []byte("field1"),
 	}
 
-	if !testIsRealConflict(t, ptxn, "k", detail) {
+	if !testIsRealConflict(t, ptxn, detail) {
 		t.Fatal("same element ID should be a real conflict")
 	}
 }
 
 func TestIsRealConflict_DifferentElementID_NotConflict(t *testing.T) {
-	ptxn := newTestPendingTxn(100, pendingTxnKey{
+	ptxn := newTestPendingTxn(pendingTxnKey{
 		key:        "k",
 		newTip:     Tip{1, 500},
 		collection: pb.CollectionKind_KEYED,
@@ -118,13 +121,13 @@ func TestIsRealConflict_DifferentElementID_NotConflict(t *testing.T) {
 		ElementId:  []byte("field2"),
 	}
 
-	if testIsRealConflict(t, ptxn, "k", detail) {
+	if testIsRealConflict(t, ptxn, detail) {
 		t.Fatal("different element ID should not be a real conflict")
 	}
 }
 
 func TestIsRealConflict_NoopKey_AnyWriteConflicts(t *testing.T) {
-	ptxn := newTestPendingTxn(100, pendingTxnKey{
+	ptxn := newTestPendingTxn(pendingTxnKey{
 		key:        "k",
 		newTip:     Tip{1, 500},
 		readOnly:   true,
@@ -138,13 +141,13 @@ func TestIsRealConflict_NoopKey_AnyWriteConflicts(t *testing.T) {
 		Collection: pb.CollectionKind_SCALAR,
 	}
 
-	if !testIsRealConflict(t, ptxn, "k", detail) {
+	if !testIsRealConflict(t, ptxn, detail) {
 		t.Fatal("any write on a read-only key should be a real conflict (phantom write)")
 	}
 }
 
 func TestIsRealConflict_DependentEffect_NotConflict(t *testing.T) {
-	ptxn := newTestPendingTxn(100, pendingTxnKey{
+	ptxn := newTestPendingTxn(pendingTxnKey{
 		key:        "k",
 		newTip:     Tip{1, 500},
 		collection: pb.CollectionKind_SCALAR,
@@ -159,7 +162,7 @@ func TestIsRealConflict_DependentEffect_NotConflict(t *testing.T) {
 		Deps:       []*pb.EffectRef{{NodeId: 1, Offset: 500}}, // depends on our newTip
 	}
 
-	if testIsRealConflict(t, ptxn, "k", detail) {
+	if testIsRealConflict(t, ptxn, detail) {
 		t.Fatal("effect that depends on our tx should not be a real conflict")
 	}
 }
@@ -168,7 +171,7 @@ func TestIsRealConflict_DependentEffect_NotConflict(t *testing.T) {
 // ForkChoiceHash, the same arbiter reconstruct uses. We abort iff their
 // hash is lower than ours; otherwise we win and continue.
 func TestIsRealConflict_CompetingBind_TheirHashLower_WeAbort(t *testing.T) {
-	ptxn := newTestPendingTxn(100, pendingTxnKey{
+	ptxn := newTestPendingTxn(pendingTxnKey{
 		key:          "k",
 		newTip:       Tip{1, 500},
 		consumedTips: []Tip{{1, 300}},
@@ -176,11 +179,13 @@ func TestIsRealConflict_CompetingBind_TheirHashLower_WeAbort(t *testing.T) {
 	})
 	// Find a (nodeID, hlc) pair whose hash sorts below ours.
 	theirNode := pb.NodeID(2)
+
 	theirHash := ComputeForkChoiceHash(theirNode, tTs(100))
 	for !ForkChoiceLess(theirHash, ptxn.forkChoiceHash) {
 		theirNode++
 		theirHash = ComputeForkChoiceHash(theirNode, tTs(100))
 	}
+
 	detail := &pb.NackTipDetail{
 		Ref:                &pb.EffectRef{NodeId: 1, Offset: 600},
 		Hlc:                tTs(100),
@@ -192,13 +197,13 @@ func TestIsRealConflict_CompetingBind_TheirHashLower_WeAbort(t *testing.T) {
 			{Key: []byte("k"), ConsumedTips: []*pb.EffectRef{{NodeId: 1, Offset: 400}}},
 		},
 	}
-	if !testIsRealConflict(t, ptxn, "k", detail) {
+	if !testIsRealConflict(t, ptxn, detail) {
 		t.Fatal("their lower hash → we must abort")
 	}
 }
 
 func TestIsRealConflict_CompetingBind_OurHashLower_WeWin(t *testing.T) {
-	ptxn := newTestPendingTxn(100, pendingTxnKey{
+	ptxn := newTestPendingTxn(pendingTxnKey{
 		key:          "k",
 		newTip:       Tip{1, 500},
 		consumedTips: []Tip{{1, 300}},
@@ -206,11 +211,13 @@ func TestIsRealConflict_CompetingBind_OurHashLower_WeWin(t *testing.T) {
 	})
 	// Find a (nodeID, hlc) pair whose hash sorts above ours.
 	theirNode := pb.NodeID(2)
+
 	theirHash := ComputeForkChoiceHash(theirNode, tTs(200))
 	for ForkChoiceLess(theirHash, ptxn.forkChoiceHash) {
 		theirNode++
 		theirHash = ComputeForkChoiceHash(theirNode, tTs(200))
 	}
+
 	detail := &pb.NackTipDetail{
 		Ref:                &pb.EffectRef{NodeId: 1, Offset: 600},
 		Hlc:                tTs(200),
@@ -222,13 +229,13 @@ func TestIsRealConflict_CompetingBind_OurHashLower_WeWin(t *testing.T) {
 			{Key: []byte("k"), ConsumedTips: []*pb.EffectRef{{NodeId: 1, Offset: 400}}},
 		},
 	}
-	if testIsRealConflict(t, ptxn, "k", detail) {
+	if testIsRealConflict(t, ptxn, detail) {
 		t.Fatal("our lower hash → we must win and continue")
 	}
 }
 
 func TestIsRealConflict_NonTxCompetitor_Conflict(t *testing.T) {
-	ptxn := newTestPendingTxn(100, pendingTxnKey{
+	ptxn := newTestPendingTxn(pendingTxnKey{
 		key:        "k",
 		newTip:     Tip{1, 500},
 		collection: pb.CollectionKind_SCALAR,
@@ -243,13 +250,13 @@ func TestIsRealConflict_NonTxCompetitor_Conflict(t *testing.T) {
 		Collection:      pb.CollectionKind_SCALAR,
 	}
 
-	if !testIsRealConflict(t, ptxn, "k", detail) {
+	if !testIsRealConflict(t, ptxn, detail) {
 		t.Fatal("non-tx data write on same scalar key should be a real conflict")
 	}
 }
 
 func TestIsRealConflict_InProgressTx_NotConflict(t *testing.T) {
-	ptxn := newTestPendingTxn(100, pendingTxnKey{
+	ptxn := newTestPendingTxn(pendingTxnKey{
 		key:        "k",
 		newTip:     Tip{1, 500},
 		collection: pb.CollectionKind_SCALAR,
@@ -265,13 +272,13 @@ func TestIsRealConflict_InProgressTx_NotConflict(t *testing.T) {
 		Collection:      pb.CollectionKind_SCALAR,
 	}
 
-	if testIsRealConflict(t, ptxn, "k", detail) {
+	if testIsRealConflict(t, ptxn, detail) {
 		t.Fatal("in-progress tx effect without bind should not be a real conflict")
 	}
 }
 
 func TestCommitAbortPendingTxn(t *testing.T) {
-	ptxn := newTestPendingTxn(100)
+	ptxn := newTestPendingTxn()
 
 	// Commit should succeed
 	if !commitPendingTxn(ptxn) {
@@ -301,7 +308,7 @@ func TestCommitAbortPendingTxn(t *testing.T) {
 }
 
 func TestAbortThenCommit(t *testing.T) {
-	ptxn := newTestPendingTxn(100)
+	ptxn := newTestPendingTxn()
 
 	if !abortPendingTxn(ptxn) {
 		t.Fatal("first abort should succeed")
@@ -323,7 +330,7 @@ func TestAbortThenCommit(t *testing.T) {
 }
 
 func TestIsRealConflict_SubscriptionEffect_NotConflict(t *testing.T) {
-	ptxn := newTestPendingTxn(100, pendingTxnKey{
+	ptxn := newTestPendingTxn(pendingTxnKey{
 		key:        "k",
 		newTip:     Tip{1, 500},
 		collection: pb.CollectionKind_SCALAR,
@@ -337,13 +344,13 @@ func TestIsRealConflict_SubscriptionEffect_NotConflict(t *testing.T) {
 		IsBind: false,
 	}
 
-	if testIsRealConflict(t, ptxn, "k", detail) {
+	if testIsRealConflict(t, ptxn, detail) {
 		t.Fatal("SubscriptionEffect should not be a real conflict")
 	}
 }
 
 func TestIsRealConflict_DependsOnBindOffset_NotConflict(t *testing.T) {
-	ptxn := newTestPendingTxn(100, pendingTxnKey{
+	ptxn := newTestPendingTxn(pendingTxnKey{
 		key:        "k",
 		newTip:     Tip{1, 500},
 		collection: pb.CollectionKind_SCALAR,
@@ -358,7 +365,7 @@ func TestIsRealConflict_DependsOnBindOffset_NotConflict(t *testing.T) {
 		Deps:       []*pb.EffectRef{{NodeId: 1, Offset: 9999}}, // depends on our bindOffset
 	}
 
-	if testIsRealConflict(t, ptxn, "k", detail) {
+	if testIsRealConflict(t, ptxn, detail) {
 		t.Fatal("effect depending on our bind should not conflict")
 	}
 }
@@ -383,10 +390,12 @@ func TestDefeatedCompetitor_TheirBindReachableViaDeps_NotDefeated(t *testing.T) 
 	// Already committed in the past; lives in our effectCache.
 	theirTxnID := "their-already-committed-tx"
 	theirBindOffset := Tip{5, 100}
+
 	theirHash := make([]byte, 32)
 	for i := range theirHash {
 		theirHash[i] = 0xff
 	}
+
 	theirBindHLC := tTs(50)
 	e.effectCache.Put(theirBindOffset, &pb.Effect{
 		TxnId:          theirTxnID,
@@ -441,10 +450,12 @@ func TestDefeatedCompetitor_DetailDepsReferenceOurNewTip_NotDefeated(t *testing.
 
 	theirTxnID := "their-tx"
 	theirBindOffset := Tip{5, 600}
+
 	theirHash := make([]byte, 32)
 	for i := range theirHash {
 		theirHash[i] = 0xff
 	}
+
 	theirBindHLC := tTs(200)
 	e.effectCache.Put(theirBindOffset, &pb.Effect{
 		TxnId:          theirTxnID,
@@ -492,10 +503,12 @@ func TestDefeatedCompetitor_ConcurrentHigherHash_Defeated(t *testing.T) {
 
 	theirTxnID := "their-concurrent-tx"
 	theirBindOffset := Tip{5, 100}
+
 	theirHash := make([]byte, 32)
 	for i := range theirHash {
 		theirHash[i] = 0xff
 	}
+
 	theirBindHLC := tTs(50)
 	e.effectCache.Put(theirBindOffset, &pb.Effect{
 		TxnId:          theirTxnID,

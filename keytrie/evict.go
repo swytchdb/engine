@@ -187,17 +187,21 @@ func (c *Critbit[T]) EvictStats() EvictStats {
 	eu := c.evictedUnprot.Load()
 	ep := c.evictedProt.Load()
 	grad := c.reachedProt.Load()
+
 	var rate float64
 	if total := eu + ep; total > 0 {
 		rate = float64(grad) / float64(total)
 	}
+
 	var hitRate float64
+
 	if ops := c.windowOps.load(); ops > 0 {
 		// windowHits/windowOps are bumped as two separate atomics, so a reader can
 		// momentarily observe more hits than ops; clamp so the rate never exceeds 1.
 		hits := min(c.windowHits.load(), ops)
 		hitRate = float64(hits) / float64(ops)
 	}
+
 	return EvictStats{
 		K:                  c.evictK.Load(),
 		GraduationRate:     rate,
@@ -251,7 +255,9 @@ func (c *Critbit[T]) EvictBatch(want int) int {
 		leaf   *critNode[T]
 		access uint64
 	}
+
 	cands := make([]cand, 0, window)
+
 	var (
 		ghosts   []cand // ghosts seen this sweep, sorted oldest-first below
 		fbVictim *critNode[T]
@@ -269,6 +275,7 @@ func (c *Critbit[T]) EvictBatch(want int) int {
 		if leaf.deleted.Load() {
 			// The sweep only forwards deleted leaves that are ghosts (freq < 0).
 			ghosts = append(ghosts, cand{leaf, access})
+
 			return
 		}
 		// Absorb pending eviction-driven decay before judging protection: −1
@@ -279,12 +286,15 @@ func (c *Critbit[T]) EvictBatch(want int) int {
 		if epoch > 0 {
 			decayLeaf(leaf, epoch)
 		}
+
 		if leaf.pinned {
 			return // pinned (e.g. a system key) — verdict cached at leaf creation
 		}
+
 		if leaf.pins.Load() != 0 {
 			return // dynamically pinned (e.g. cloud outbox holds un-acked uploads)
 		}
+
 		if access < fbAccess {
 			fbVictim, fbAccess = leaf, access
 		}
@@ -325,10 +335,12 @@ func (c *Critbit[T]) EvictBatch(want int) int {
 		for len(ghosts) > 0 {
 			g := ghosts[0].leaf
 			ghosts = ghosts[1:]
+
 			if c.reclaimGhost(g) {
 				return true
 			}
 		}
+
 		return false
 	}
 
@@ -337,12 +349,14 @@ func (c *Critbit[T]) EvictBatch(want int) int {
 		tips *TipSet
 		data *T
 	}
+
 	victims := make([]evicted, 0, len(cands))
 	for _, cd := range cands {
 		leaf := cd.leaf
 		if !c.claimForEviction(leaf) {
 			continue
 		}
+
 		tips := leaf.tips.Load()
 		data := leaf.data.Load()
 		leaf.tips.Store(nil)
@@ -360,30 +374,37 @@ func (c *Critbit[T]) EvictBatch(want int) int {
 		if c.ghostCount.Load() >= c.ghostCap() {
 			trimOldestGhost()
 		}
+
 		if c.ghostCount.Load() < c.ghostCap() {
 			// Ghost: retain the frequency (negated) for a warm restart.
 			for {
 				f := leaf.freq.Load()
+
 				nf := -f
 				if nf >= 0 {
 					nf = -1
 				}
+
 				if leaf.freq.CompareAndSwap(f, nf) {
 					break
 				}
 			}
+
 			c.ghostCount.Add(1)
 		} else {
 			c.deletedCount.Add(1)
 			c.enqueueReap(leaf)
 		}
+
 		tick()
+
 		victims = append(victims, evicted{leaf.key, tips, data})
 	}
 
 	// Fallback when the window held no cold leaf: reclaim the oldest ghost ahead
 	// of evicting a hot key; only with neither do we take the LRU protected leaf.
 	reclaimedGhost := false
+
 	if len(victims) == 0 {
 		if trimOldestGhost() {
 			reclaimedGhost = true
@@ -401,23 +422,27 @@ func (c *Critbit[T]) EvictBatch(want int) int {
 			c.deletedCount.Add(1)
 			c.enqueueReap(fbVictim)
 			victims = append(victims, evicted{fbVictim.key, tips, data})
+
 			c.evictedProt.Add(1)
 			tick()
 		}
 	} else {
 		c.evictedUnprot.Add(uint64(len(victims)))
 	}
+
 	c.reapMu.RUnlock(rt)
 
 	// Release tip/payload references and notify, outside the lock (the consumer
 	// callbacks may re-enter the trie).
 	for _, v := range victims {
 		c.fireTipDelta(v.tips, nil, v.data)
+
 		if c.evictNotify != nil {
 			var tipRefs []EffectRef
 			if v.tips != nil {
 				tipRefs = v.tips.Tips()
 			}
+
 			c.evictNotify(v.key, tipRefs, v.data)
 		}
 	}
@@ -428,6 +453,7 @@ func (c *Critbit[T]) EvictBatch(want int) int {
 	if reclaimedGhost {
 		return 1
 	}
+
 	return len(victims)
 }
 
@@ -437,6 +463,7 @@ func (c *Critbit[T]) EvictBatch(want int) int {
 func (c *Critbit[T]) SetDecayInterval(n int) {
 	if n > 0 {
 		c.decayEvery.Store(uint64(n))
+
 		return
 	}
 	// MaxUint64 keeps the epoch counter frozen — decay never applies — while
@@ -479,12 +506,15 @@ func decayLeaf[T any](leaf *critNode[T], epoch uint64) {
 	if last >= epoch || !leaf.lastDecayEpoch.CompareAndSwap(last, epoch) {
 		return
 	}
+
 	steps := epoch - last
+
 	for {
 		f := leaf.freq.Load()
 		if f <= 1 {
 			return // floor 1; ghosts (freq < 0) never reach here
 		}
+
 		nf := f - int32(min(steps, uint64(f-1)))
 		if leaf.freq.CompareAndSwap(f, nf) {
 			return
@@ -504,10 +534,13 @@ func (c *Critbit[T]) claimForEviction(leaf *critNode[T]) bool {
 	if !leaf.deleted.CompareAndSwap(false, true) {
 		return false
 	}
+
 	if leaf.pins.Load() != 0 {
 		leaf.deleted.Store(false)
+
 		return false
 	}
+
 	return true
 }
 
@@ -533,10 +566,12 @@ func (c *Critbit[T]) reclaimGhost(g *critNode[T]) bool {
 		if f >= 0 {
 			return false // promoted back to a live leaf under us
 		}
+
 		if g.freq.CompareAndSwap(f, 0) {
 			c.ghostCount.Add(-1)
 			c.deletedCount.Add(1)
 			c.enqueueReap(g)
+
 			return true
 		}
 	}
@@ -551,6 +586,7 @@ func (c *Critbit[T]) promoteIfGhost(leaf *critNode[T]) {
 		if f >= 0 {
 			return
 		}
+
 		nf := min(-f+1, maxLeafFreq)
 		if leaf.freq.CompareAndSwap(f, nf) {
 			c.ghostCount.Add(-1)
@@ -562,6 +598,7 @@ func (c *Critbit[T]) promoteIfGhost(leaf *critNode[T]) {
 			// A returning ghost is a window miss (op, not hit). Shard by the
 			// reactivated leaf's address, same as the live-hit path.
 			c.windowOps.add(unsafe.Pointer(leaf), 1)
+
 			return
 		}
 	}
@@ -607,6 +644,7 @@ func (c *Critbit[T]) maybeAdaptK() {
 	if c.windowOps.load() < hitRateWindowSize {
 		return
 	}
+
 	c.lastAdaptCheck.Store(total)
 
 	graduated := c.reachedProt.Load()
@@ -614,6 +652,7 @@ func (c *Critbit[T]) maybeAdaptK() {
 		if graduated > 100 {
 			c.reachedProt.Store(graduated / 2)
 		}
+
 		return
 	}
 
@@ -625,10 +664,12 @@ func (c *Critbit[T]) maybeAdaptK() {
 		hits := min(c.windowHits.load(), ops)
 		hitRate := uint64(float64(hits) / float64(ops) * 10000)
 		prev := c.prevHitRate.Load()
+
 		dir := c.lastKDir.Load()
 		if prev > 0 && dir != 0 {
 			improved := hitRate > prev
 			rateLow := c.rateLow.Load()
+
 			rateHigh := c.rateHigh.Load()
 			if dir > 0 { // last change raised k
 				if improved {
@@ -648,6 +689,7 @@ func (c *Critbit[T]) maybeAdaptK() {
 				}
 			}
 		}
+
 		c.prevHitRate.Store(hitRate)
 		// bumpAccess bumps hits before ops. Resetting in the same order (ops
 		// first, hits last) means a concurrent access straddling the reset has its
@@ -662,6 +704,7 @@ func (c *Critbit[T]) maybeAdaptK() {
 	rateLow := float64(c.rateLow.Load()) / 10000.0
 	rateHigh := float64(c.rateHigh.Load()) / 10000.0
 	k := c.evictK.Load()
+
 	var dir int32
 	// k may walk all the way to 0: protection off, pure LRU. When graduation
 	// collapses, LRU IS the correct policy and the adapter must be able to
@@ -671,17 +714,21 @@ func (c *Critbit[T]) maybeAdaptK() {
 	// workload that develops skew climbs back out.
 	if rate < rateLow && k > 0 {
 		c.evictK.Store(k - 1)
+
 		dir = -1
 	} else if rate > rateHigh && k < maxLeafFreq-1 {
 		c.evictK.Store(k + 1)
+
 		dir = 1
 	}
+
 	c.lastKDir.Store(dir)
 
 	// Decay counters so recent behaviour dominates.
 	if graduated > 100 {
 		c.reachedProt.Store(graduated / 2)
 	}
+
 	if total > 100 {
 		c.evictedUnprot.Store(c.evictedUnprot.Load() / 2)
 		c.evictedProt.Store(c.evictedProt.Load() / 2)
@@ -703,10 +750,12 @@ func (c *Critbit[T]) maybeAdaptK() {
 // reap read-lock.
 func (c *Critbit[T]) sweepLeaves(base int, fn func(*critNode[T])) {
 	chunks, chunkSize := c.leafArena.chunkSnapshot()
+
 	total := uint64(len(chunks)) * chunkSize
 	if total == 0 {
 		return
 	}
+
 	if base < 1 {
 		base = 1
 	}
@@ -718,24 +767,31 @@ func (c *Critbit[T]) sweepLeaves(base int, fn func(*critNode[T])) {
 	if int64(base) >= c.size.Load() || base < nSeg {
 		nSeg = 1
 	}
+
 	segLen := base / nSeg
+
 	segGap := total / uint64(nSeg) // origin spacing; also each segment's max span
 	if segGap == 0 {
 		segGap = total
 	}
 
 	hand := c.evictHand
+
 	var advance uint64
+
 	for s := 0; s < nSeg; s++ {
 		want := segLen
 		if s == nSeg-1 {
 			want = base - segLen*(nSeg-1) // remainder rides the last segment
 		}
+
 		origin := hand + uint64(s)*segGap
 		live := 0
+
 		var j uint64
 		for ; live < want && j < segGap; j++ {
 			idx := (origin + j) % total
+
 			chunk := chunks[idx/chunkSize]
 			if chunk == nil {
 				// Chunk was reclaimed and not recycled. Jump to the next
@@ -745,23 +801,30 @@ func (c *Critbit[T]) sweepLeaves(base int, fn func(*critNode[T])) {
 				// held, so every wasted iteration is serialized against
 				// writers.
 				j += chunkSize - 1 - idx%chunkSize
+
 				continue
 			}
+
 			n := &chunk[idx%chunkSize]
 			if n.deleted.Load() {
 				if n.freq.Load() < 0 {
 					fn(n) // ghost — forwarded for the reclaim fallback, not counted
 				}
+
 				continue // ghosts/uninitialized/unlink-pending don't count as live
 			}
+
 			fn(n)
+
 			live++
 		}
+
 		if s == 0 {
 			// The hand advances by segment 0's span only; every origin rotates
 			// with it, so successive sweeps still cover the entire arena.
 			advance = max(j, 1)
 		}
 	}
+
 	c.evictHand = hand + advance
 }

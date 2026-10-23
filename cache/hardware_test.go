@@ -49,9 +49,11 @@ func TestConfigFromCapacity(t *testing.T) {
 			if cfg.NumShards <= 0 {
 				t.Errorf("Invalid NumShards: %d", cfg.NumShards)
 			}
+
 			if cfg.SlotsPerShard <= 0 {
 				t.Errorf("Invalid SlotsPerShard: %d", cfg.SlotsPerShard)
 			}
+
 			if cfg.Capacity != tt.capacity {
 				t.Errorf("Capacity mismatch: got %d, expected %d", cfg.Capacity, tt.capacity)
 			}
@@ -60,6 +62,7 @@ func TestConfigFromCapacity(t *testing.T) {
 			if cfg.NumShards&(cfg.NumShards-1) != 0 {
 				t.Errorf("NumShards not power of 2: %d", cfg.NumShards)
 			}
+
 			if cfg.SlotsPerShard&(cfg.SlotsPerShard-1) != 0 {
 				t.Errorf("SlotsPerShard not power of 2: %d", cfg.SlotsPerShard)
 			}
@@ -69,6 +72,7 @@ func TestConfigFromCapacity(t *testing.T) {
 				t.Errorf("NumShards out of bounds: %d (expected %d-%d)",
 					cfg.NumShards, tt.minShards, tt.maxShards)
 			}
+
 			if cfg.SlotsPerShard < tt.minSlots {
 				t.Errorf("SlotsPerShard too small: %d (min: %d)",
 					cfg.SlotsPerShard, tt.minSlots)
@@ -76,6 +80,7 @@ func TestConfigFromCapacity(t *testing.T) {
 
 			// Verify total slots >= capacity * 3 (for ghost support)
 			totalSlots := cfg.NumShards * cfg.SlotsPerShard
+
 			minTotalSlots := tt.capacity * 3
 			if totalSlots < minTotalSlots {
 				t.Errorf("Total slots too small: %d (min: %d for capacity %d)",
@@ -105,9 +110,11 @@ func TestConfigFromMemorySize(t *testing.T) {
 			if cfg.NumShards <= 0 {
 				t.Errorf("Invalid NumShards: %d", cfg.NumShards)
 			}
+
 			if cfg.SlotsPerShard <= 0 {
 				t.Errorf("Invalid SlotsPerShard: %d", cfg.SlotsPerShard)
 			}
+
 			if cfg.Capacity <= 0 {
 				t.Errorf("Invalid Capacity: %d", cfg.Capacity)
 			}
@@ -116,6 +123,7 @@ func TestConfigFromMemorySize(t *testing.T) {
 			if cfg.NumShards&(cfg.NumShards-1) != 0 {
 				t.Errorf("NumShards not power of 2: %d", cfg.NumShards)
 			}
+
 			if cfg.SlotsPerShard&(cfg.SlotsPerShard-1) != 0 {
 				t.Errorf("SlotsPerShard not power of 2: %d", cfg.SlotsPerShard)
 			}

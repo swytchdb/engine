@@ -64,6 +64,7 @@ func TestMarshalEffect_BinaryNetAddsKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MarshalEffect failed on binary NetAdds key: %v", err)
 	}
+
 	if len(data) == 0 {
 		t.Fatal("expected non-empty marshalled bytes")
 	}
@@ -77,19 +78,23 @@ func TestMarshalEffect_BinaryNetAddsKey(t *testing.T) {
 	if snap == nil {
 		t.Fatal("decoded effect lost its Snapshot kind")
 	}
-	if snap.State == nil {
+
+	if snap.GetState() == nil {
 		t.Fatal("decoded snapshot lost its state")
 	}
-	if len(snap.State.NetAdds) != 1 {
-		t.Fatalf("expected 1 NetAdds entry, got %d", len(snap.State.NetAdds))
+
+	if len(snap.GetState().GetNetAdds()) != 1 {
+		t.Fatalf("expected 1 NetAdds entry, got %d", len(snap.GetState().GetNetAdds()))
 	}
-	got, ok := snap.State.NetAdds[string(idBytes)]
+
+	got, ok := snap.GetState().GetNetAdds()[string(idBytes)]
 	if !ok {
 		t.Fatalf("decoded NetAdds key not equal to original binary bytes\nkeys: %q",
-			keysOf(snap.State.NetAdds))
+			keysOf(snap.GetState().GetNetAdds()))
 	}
-	if string(got.Data.GetRaw()) != "127.0.0.1:9000" {
-		t.Fatalf("value lost in round-trip: got %q", got.Data.GetRaw())
+
+	if string(got.GetData().GetRaw()) != "127.0.0.1:9000" {
+		t.Fatalf("value lost in round-trip: got %q", got.GetData().GetRaw())
 	}
 }
 
@@ -119,10 +124,11 @@ func TestMarshalEffect_OriginalNotMutated(t *testing.T) {
 	}
 
 	// Original NetAdds key must still be the raw binary string, not hex.
-	if _, ok := state.NetAdds[string(idBytes)]; !ok {
-		t.Fatalf("MarshalEffect mutated original NetAdds keys: %q", keysOf(state.NetAdds))
+	if _, ok := state.GetNetAdds()[string(idBytes)]; !ok {
+		t.Fatalf("MarshalEffect mutated original NetAdds keys: %q", keysOf(state.GetNetAdds()))
 	}
-	if _, ok := state.NetRemoves[string([]byte{0xff, 0xff})]; !ok {
+
+	if _, ok := state.GetNetRemoves()[string([]byte{0xff, 0xff})]; !ok {
 		t.Fatal("MarshalEffect mutated original NetRemoves keys")
 	}
 }
@@ -137,14 +143,17 @@ func TestMarshalEffect_NoSnapshotShortCircuit(t *testing.T) {
 			Value: &pb.DataEffect_Raw{Raw: []byte("v")},
 		}},
 	}
+
 	data, err := MarshalEffect(eff)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	out := &pb.Effect{}
 	if err := UnmarshalEffect(data, out); err != nil {
 		t.Fatal(err)
 	}
+
 	if out.GetData() == nil || string(out.GetData().GetRaw()) != "v" {
 		t.Fatalf("data effect did not round-trip: %+v", out)
 	}
@@ -155,5 +164,6 @@ func keysOf(m map[string]*pb.ReducedElement) []string {
 	for k := range m {
 		out = append(out, k)
 	}
+
 	return out
 }

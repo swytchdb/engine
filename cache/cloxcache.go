@@ -270,6 +270,7 @@ func NewCloxCache[K Key, V any](cfg Config) *CloxCache[K, V] {
 	if cfg.NumShards <= 0 {
 		panic("NumShards must be positive")
 	}
+
 	if cfg.SlotsPerShard <= 0 {
 		panic("SlotsPerShard must be positive")
 	}
@@ -278,6 +279,7 @@ func NewCloxCache[K Key, V any](cfg Config) *CloxCache[K, V] {
 	if cfg.NumShards&(cfg.NumShards-1) != 0 {
 		panic("NumShards must be a power of 2")
 	}
+
 	if cfg.SlotsPerShard&(cfg.SlotsPerShard-1) != 0 {
 		panic("SlotsPerShard must be a power of 2")
 	}
@@ -308,6 +310,7 @@ func NewCloxCache[K Key, V any](cfg Config) *CloxCache[K, V] {
 	if totalCapacity <= 0 {
 		totalCapacity = cfg.NumShards * cfg.SlotsPerShard
 	}
+
 	perShardCapacity := max(int64(totalCapacity/cfg.NumShards), 1)
 
 	// Ghost capacity uses unused slot space, capped at 100% of live capacity
@@ -368,6 +371,7 @@ func (c *CloxCache[K, V]) Get(key K, offset uint64) (V, bool) {
 			// Skip ghosts (freq <= 0)
 			if f <= 0 {
 				node = node.next.Load()
+
 				continue
 			}
 
@@ -400,14 +404,17 @@ func (c *CloxCache[K, V]) Get(key K, offset uint64) (V, bool) {
 			if c.collectStats {
 				c.hits.Add(1)
 			}
+
 			return node.value.Load().(V), true
 		}
+
 		node = node.next.Load()
 	}
 
 	if c.collectStats {
 		c.misses.Add(1)
 	}
+
 	return zero, false
 }
 
@@ -419,6 +426,7 @@ func (c *CloxCache[K, V]) Put(key K, value V) (success bool, evictedKey K, evict
 
 	shard := &c.shards[shardID]
 	slot := &shard.slots[slotID]
+
 	var k K
 
 	// First, try to update the existing key (lock-free)
@@ -430,6 +438,7 @@ func (c *CloxCache[K, V]) Put(key K, value V) (success bool, evictedKey K, evict
 				// Skip ghosts - we'll handle them under lock
 				if f <= 0 {
 					node = node.next.Load()
+
 					continue
 				}
 				// Update existing - bump frequency and update access time
@@ -438,21 +447,26 @@ func (c *CloxCache[K, V]) Put(key K, value V) (success bool, evictedKey K, evict
 					oldValue := node.value.Load().(V)
 					c.bytes.Add(c.sizeFunc(key, value) - c.sizeFunc(key, oldValue))
 				}
+
 				node.value.Store(value)
 				node.lastAccess.Store(shard.timestamp.Add(1))
+
 				for {
 					f = node.freq.Load()
 					if f >= maxFrequency || f < 1 {
 						// already at max-freq or became a ghost while we were putting
 						break
 					}
+
 					if node.freq.CompareAndSwap(f, f+1) {
 						break
 					}
 				}
+
 				return true, k, 0, 0
 			}
 		}
+
 		node = node.next.Load()
 	}
 
@@ -482,6 +496,7 @@ func (c *CloxCache[K, V]) Put(key K, value V) (success bool, evictedKey K, evict
 					if c.sizeFunc != nil {
 						c.bytes.Add(c.sizeFunc(key, value))
 					}
+
 					node.value.Store(value)
 					node.freq.Store(promotedFreq)
 					node.lastAccess.Store(shard.timestamp.Add(1))
@@ -492,6 +507,7 @@ func (c *CloxCache[K, V]) Put(key K, value V) (success bool, evictedKey K, evict
 					node.lastDecayEpoch.Store(shard.decayEpoch.Load())
 					shard.ghostCount.Add(-1)
 					shard.entryCount.Add(1)
+
 					return true, k, 0, 0
 				}
 				// Someone else inserted it - update value and access time
@@ -500,11 +516,14 @@ func (c *CloxCache[K, V]) Put(key K, value V) (success bool, evictedKey K, evict
 					oldValue := node.value.Load().(V)
 					c.bytes.Add(c.sizeFunc(key, value) - c.sizeFunc(key, oldValue))
 				}
+
 				node.value.Store(value)
 				node.lastAccess.Store(shard.timestamp.Add(1))
+
 				return true, k, 0, 0
 			}
 		}
+
 		node = node.next.Load()
 	}
 
@@ -553,6 +572,7 @@ func (c *CloxCache[K, V]) PutBack(key K, value V, oldSize int64) (success bool, 
 			// Skip ghosts
 			if f <= 0 {
 				node = node.next.Load()
+
 				continue
 			}
 
@@ -575,18 +595,21 @@ func (c *CloxCache[K, V]) PutBack(key K, value V, oldSize int64) (success bool, 
 				if f >= maxFrequency || f <= 0 {
 					break
 				}
+
 				if node.freq.CompareAndSwap(f, f+1) {
 					// Track graduation if crossing threshold (at k=0 every
 					// bump counts; see the Get path)
 					if kk := shard.k.Load(); (kk == 0 || f == kk) && shard.entryCount.Load() >= shard.capacity.Load() {
 						shard.reachedProtected.Add(1)
 					}
+
 					break
 				}
 			}
 
 			return true, 0
 		}
+
 		node = node.next.Load()
 	}
 
@@ -614,12 +637,14 @@ func (c *CloxCache[K, V]) CompareAndSwap(key K, expected, new V) (swapped bool, 
 				// Use atomic CAS - truly atomic, no interleaving
 				if node.value.CompareAndSwap(expected, new) {
 					node.lastAccess.Store(shard.timestamp.Add(1))
+
 					return true, new, true, 0
 				}
 				// CAS failed - return current value for retry
 				return false, node.value.Load().(V), true, 0
 			}
 		}
+
 		node = node.next.Load()
 	}
 
@@ -645,6 +670,7 @@ func (c *CloxCache[K, V]) Evict(key K) bool {
 			f := node.freq.Load()
 			if f <= 0 {
 				node = node.next.Load()
+
 				continue
 			}
 
@@ -660,16 +686,21 @@ func (c *CloxCache[K, V]) Evict(key K) bool {
 				if f <= 0 {
 					break // already a ghost
 				}
+
 				if node.freq.CompareAndSwap(f, -f) {
 					shard.entryCount.Add(-1)
 					shard.ghostCount.Add(1)
+
 					break
 				}
 			}
+
 			return true
 		}
+
 		node = node.next.Load()
 	}
+
 	return false
 }
 
@@ -684,6 +715,7 @@ func (c *CloxCache[K, V]) decayIntervalFor(shard *shard[K, V]) uint64 {
 	case c.decayInterval < 0:
 		return 0
 	}
+
 	return max(defaultDecayInterval, uint64(shard.capacity.Load())/2)
 }
 
@@ -697,12 +729,15 @@ func decayNode[K Key, V any](node *recordNode[K, V], epoch uint64) {
 	if last >= epoch || !node.lastDecayEpoch.CompareAndSwap(last, epoch) {
 		return
 	}
+
 	steps := epoch - last
+
 	for {
 		f := node.freq.Load()
 		if f <= 1 {
 			return
 		}
+
 		nf := f - int32(min(steps, uint64(f-1)))
 		if node.freq.CompareAndSwap(f, nf) {
 			return
@@ -734,23 +769,33 @@ func (c *CloxCache[K, V]) evictFromShard(shardID, slotsPerShard int) int {
 
 	// Track the best victims: low-freq preferred, any as fallback
 	// Also track oldest ghost for eviction when ghost capacity is full
-	var lowFreqVictim, lowFreqPrev *recordNode[K, V]
-	var lowFreqSlot *atomic.Pointer[recordNode[K, V]]
-	lowFreqAccess := uint64(^uint64(0))
+	var (
+		lowFreqVictim, lowFreqPrev *recordNode[K, V]
+		lowFreqSlot                *atomic.Pointer[recordNode[K, V]]
+	)
 
-	var fallbackVictim, fallbackPrev *recordNode[K, V]
-	var fallbackSlot *atomic.Pointer[recordNode[K, V]]
-	fallbackAccess := uint64(^uint64(0))
+	lowFreqAccess := ^uint64(0)
 
-	var oldestGhost, oldestGhostPrev *recordNode[K, V]
-	var oldestGhostSlot *atomic.Pointer[recordNode[K, V]]
-	oldestGhostAccess := uint64(^uint64(0))
+	var (
+		fallbackVictim, fallbackPrev *recordNode[K, V]
+		fallbackSlot                 *atomic.Pointer[recordNode[K, V]]
+	)
+
+	fallbackAccess := ^uint64(0)
+
+	var (
+		oldestGhost, oldestGhostPrev *recordNode[K, V]
+		oldestGhostSlot              *atomic.Pointer[recordNode[K, V]]
+	)
+
+	oldestGhostAccess := ^uint64(0)
 
 	// Walks one slot's chain and updates the captured victim/ghost trackers.
 	// Returns true if a live (non-ghost, non-pinned) eviction candidate
 	// has been recorded so far in this shard scan.
 	scanSlot := func(slot *atomic.Pointer[recordNode[K, V]]) bool {
 		node := slot.Load()
+
 		var prev *recordNode[K, V]
 
 		for node != nil {
@@ -765,8 +810,10 @@ func (c *CloxCache[K, V]) evictFromShard(shardID, slotsPerShard int) int {
 					oldestGhostSlot = slot
 					oldestGhostAccess = access
 				}
+
 				prev = node
 				node = node.next.Load()
+
 				continue
 			}
 
@@ -782,6 +829,7 @@ func (c *CloxCache[K, V]) evictFromShard(shardID, slotsPerShard int) int {
 			if c.evictDecider != nil && !c.evictDecider(node.key, node.value.Load().(V)) {
 				prev = node
 				node = node.next.Load()
+
 				continue
 			}
 
@@ -833,18 +881,23 @@ func (c *CloxCache[K, V]) evictFromShard(shardID, slotsPerShard int) int {
 	}
 
 	// Choose a victim: prefer low-freq, protect high-freq items
-	var victim, victimPrev *recordNode[K, V]
-	var victimSlot *atomic.Pointer[recordNode[K, V]]
+	var (
+		victim, victimPrev *recordNode[K, V]
+		victimSlot         *atomic.Pointer[recordNode[K, V]]
+	)
+
 	isUnprotected := false
 
 	if lowFreqVictim != nil {
 		shard.evictedUnprotected.Add(1) // evicting low-freq (unprotected) item
+
 		victim = lowFreqVictim
 		victimPrev = lowFreqPrev
 		victimSlot = lowFreqSlot
 		isUnprotected = true
 	} else if fallbackVictim != nil {
 		shard.evictedProtected.Add(1) // forced to evict high-freq (protected) item
+
 		victim = fallbackVictim
 		victimPrev = fallbackPrev
 		victimSlot = fallbackSlot
@@ -868,7 +921,9 @@ func (c *CloxCache[K, V]) evictFromShard(shardID, slotsPerShard int) int {
 		} else {
 			oldestGhostPrev.next.Store(next)
 		}
+
 		shard.ghostCount.Add(-1)
+
 		canGhost = true
 	}
 
@@ -896,6 +951,7 @@ func (c *CloxCache[K, V]) evictFromShard(shardID, slotsPerShard int) int {
 			if victim.freq.CompareAndSwap(f, -f) {
 				shard.entryCount.Add(-1)
 				shard.ghostCount.Add(1)
+
 				break
 			}
 			// CAS failed - freq was bumped by concurrent access, retry with fresh value
@@ -937,6 +993,7 @@ func (c *CloxCache[K, V]) evictFromShard(shardID, slotsPerShard int) int {
 	// the most recent direction. lastAdaptCheck is not advanced while gated,
 	// so the check stays armed until the window completes.
 	totalEvictions := shard.evictedUnprotected.Load() + shard.evictedProtected.Load()
+
 	lastCheck := shard.lastAdaptCheck.Load()
 	if totalEvictions-lastCheck >= adaptiveCheckInterval && shard.windowOps.Load() >= hitRateWindowSize {
 		if shard.lastAdaptCheck.CompareAndSwap(lastCheck, totalEvictions) {
@@ -960,6 +1017,7 @@ func (c *CloxCache[K, V]) adaptThreshold(shard *shard[K, V]) {
 		if graduated > 100 {
 			shard.reachedProtected.Store(graduated / 2)
 		}
+
 		return
 	}
 
@@ -1022,6 +1080,7 @@ func (c *CloxCache[K, V]) adaptThreshold(shard *shard[K, V]) {
 	rateHigh := float64(shard.rateHigh.Load()) / 10000.0
 
 	var kDirection int32 = 0
+
 	if rate < rateLow && currentK > 0 {
 		// Very few items graduating - protection isn't helping. k may walk
 		// all the way to 0 (protection off, pure LRU): when graduation
@@ -1029,19 +1088,23 @@ func (c *CloxCache[K, V]) adaptThreshold(shard *shard[K, V]) {
 		// to reach it. The graduation probe keeps counting 1→2 crossings at
 		// k=0, so a workload that develops skew climbs back out.
 		shard.k.Store(currentK - 1)
+
 		kDirection = -1
 	} else if rate > rateHigh && currentK < maxFrequency-1 {
 		// Many items graduating - protection is working, can raise k
 		// Cap at maxFrequency-1 so there's always room to reach protected status
 		shard.k.Store(currentK + 1)
+
 		kDirection = 1
 	}
+
 	shard.lastKDirection.Store(kDirection)
 
 	// Decay counters to weight recent behavior (but keep minimum for signal)
 	if graduated > 100 {
 		shard.reachedProtected.Store(graduated / 2)
 	}
+
 	if totalEvictions > 100 {
 		shard.evictedUnprotected.Store(shard.evictedUnprotected.Load() / 2)
 		shard.evictedProtected.Store(shard.evictedProtected.Load() / 2)
@@ -1113,6 +1176,7 @@ func (c *CloxCache[K, V]) Capacity() int {
 	for i := range c.shards {
 		total += c.shards[i].capacity.Load()
 	}
+
 	return int(total)
 }
 
@@ -1122,6 +1186,7 @@ func (c *CloxCache[K, V]) EntryCount() int {
 	for i := range c.shards {
 		total += c.shards[i].entryCount.Load()
 	}
+
 	return int(total)
 }
 
@@ -1157,6 +1222,7 @@ func (c *CloxCache[K, V]) GetAdaptiveStats() []AdaptiveStats {
 
 		// Calculate current window hit rate
 		windowOps := shard.windowOps.Load()
+
 		var windowHitRate float64
 		if windowOps > 0 {
 			windowHitRate = float64(shard.windowHits.Load()) / float64(windowOps)
@@ -1174,6 +1240,7 @@ func (c *CloxCache[K, V]) GetAdaptiveStats() []AdaptiveStats {
 			WindowHitRate:      windowHitRate,
 		}
 	}
+
 	return stats
 }
 
@@ -1183,6 +1250,7 @@ func (c *CloxCache[K, V]) AverageK() float64 {
 	for i := range c.shards {
 		sum += c.shards[i].k.Load()
 	}
+
 	return float64(sum) / float64(c.numShards)
 }
 
@@ -1193,8 +1261,10 @@ func (c *CloxCache[K, V]) AverageLearnedThresholds() (rateLow, rateHigh float64)
 		sumLow += c.shards[i].rateLow.Load()
 		sumHigh += c.shards[i].rateHigh.Load()
 	}
+
 	rateLow = float64(sumLow) / float64(c.numShards) / 10000.0
 	rateHigh = float64(sumHigh) / float64(c.numShards) / 10000.0
+
 	return
 }
 
@@ -1212,6 +1282,7 @@ func (c *CloxCache[K, V]) EnforceMemoryCapacity(memoryLimit, avgItemSize int64) 
 	}
 
 	c.memoryLimit.Store(memoryLimit)
+
 	c.wg.Add(1)
 	go c.memoryEnforcerLoop(memoryLimit, avgItemSize)
 }
@@ -1289,6 +1360,7 @@ func (c *CloxCache[K, V]) adjustCapacityForMemory(memoryLimit, avgItemSize int64
 		if targetCapacity > maxIncrease {
 			targetCapacity = maxIncrease
 		}
+
 		slog.Debug("increasing capacity", "from", currentCapacity, "to", targetCapacity)
 		c.SetCapacity(int(targetCapacity))
 	}

@@ -128,9 +128,12 @@ func (p *VertexPool) Get(tip Tip) (*pb.Effect, bool) {
 	v, ok := p.m.Load(tip)
 	if !ok {
 		p.misses.Add(1)
+
 		return nil, false
 	}
+
 	p.hits.Add(1)
+
 	return v.eff, true
 }
 
@@ -148,6 +151,7 @@ func (p *VertexPool) Put(tip Tip, eff *pb.Effect) {
 	if _, ok := p.m.Load(tip); ok {
 		return
 	}
+
 	p.PutSized(tip, eff, proto.Size(eff))
 }
 
@@ -179,6 +183,7 @@ func (p *VertexPool) PutSized(tip Tip, eff *pb.Effect, protoLen int) {
 	tc := tipCount(eff)
 	nv := &vertex{eff: eff, size: int64(protoLen) + vertexOverhead}
 	nv.refs.Store(tc)
+
 	if v, loaded := p.m.LoadOrStore(tip, nv); loaded {
 		v.refs.CompareAndSwap(0, tc) // promote a cache-only entry to owned, once
 	}
@@ -189,10 +194,11 @@ func (p *VertexPool) PutSized(tip Tip, eff *pb.Effect, protoLen int) {
 // tip of each; any other effect is the tip of its single key.
 func tipCount(eff *pb.Effect) int32 {
 	if bind := eff.GetTxnBind(); bind != nil {
-		if n := len(bind.Keys); n > 0 {
+		if n := len(bind.GetKeys()); n > 0 {
 			return int32(n)
 		}
 	}
+
 	return 1
 }
 
@@ -228,7 +234,9 @@ func (p *VertexPool) delete(tip Tip) int64 {
 	if !loaded {
 		return 0
 	}
+
 	p.reclaimed.Add(1)
+
 	return prev.size
 }
 
@@ -245,18 +253,22 @@ func (p *VertexPool) decrefChainNode(tip Tip) (*pb.Effect, bool) {
 	if !ok {
 		return nil, false
 	}
+
 	for {
 		n := v.refs.Load()
 		if n <= 0 {
 			break // cache node (no creation ref) or already released — nothing to do
 		}
+
 		if v.refs.CompareAndSwap(n, n-1) {
 			if n-1 == 0 {
 				p.enqueueReclaim(tip) // last ref released — reclaim candidate
 			}
+
 			break
 		}
 	}
+
 	return v.eff, true
 }
 
@@ -283,12 +295,14 @@ func (p *VertexPool) enqueueReclaim(tip Tip) {
 // claim is safe. Without the CAS this check-then-delete races incref and frees a
 // referenced vertex. System keys are pinned defensively.
 func (p *VertexPool) claimAndDelete(tip Tip, v *vertex) int64 {
-	if v.eff != nil && isSystemKey(v.eff.Key) {
+	if v.eff != nil && isSystemKey(v.eff.GetKey()) {
 		return 0
 	}
+
 	if !v.refs.CompareAndSwap(0, vertexTombstone) {
 		return 0
 	}
+
 	return p.delete(tip)
 }
 
@@ -305,13 +319,16 @@ func (p *VertexPool) claimAndDelete(tip Tip, v *vertex) int64 {
 // concurrently after the Swap are counted into the next drain.
 func (p *VertexPool) drainReclaim() int64 {
 	n := p.reclaimPending.Swap(0)
+
 	var total int64
+
 	for ; n > 0; n-- {
 		tip := p.reclaimQueue.Dequeue()
 		if v, ok := p.m.Load(tip); ok {
 			total += p.claimAndDelete(tip, v)
 		}
 	}
+
 	return total
 }
 
@@ -339,11 +356,13 @@ func (p *VertexPool) incref(tip Tip) bool {
 			if r < 0 {
 				return false // claimed for reclamation; do not resurrect
 			}
+
 			if v.refs.CompareAndSwap(r, r+1) {
 				return true
 			}
 		}
 	}
+
 	return false
 }
 
@@ -365,6 +384,7 @@ func (p *VertexPool) decref(tip Tip) {
 		if n < 0 {
 			panic(fmt.Sprintf("vertex refcount underflow: tip=%v refs=%d (decref without matching incref)", tip, n))
 		}
+
 		if n == 0 {
 			p.enqueueReclaim(tip) // last ref released — reclaim candidate
 		}
@@ -389,6 +409,7 @@ func (p *VertexPool) decref(tip Tip) {
 func (p *VertexPool) Bytes() int64 {
 	s := []metrics.Sample{{Name: "/gc/heap/live:bytes"}}
 	metrics.Read(s)
+
 	return int64(s[0].Value.Uint64())
 }
 
@@ -440,20 +461,25 @@ func (e *Engine) startMemoryGovernor(targetBytes int64) {
 		// there is genuinely pressure to adapt against.
 		func() bool { return e.evictBudget.Load() > 0 },
 	)
+
 	if cur := debug.SetMemoryLimit(-1); cur == math.MaxInt64 {
 		// Reserve 5% of the target for non-heap memory (stacks, mmap, etc.).
 		debug.SetMemoryLimit(targetBytes * 95 / 100)
 		slog.Debug("vertex pool: set GOMEMLIMIT", "limit", clox.FormatMemory(uint64(targetBytes*95/100)))
 	}
+
 	e.memGovStop = make(chan struct{})
+
 	e.memGovWg.Add(1)
 	go e.memoryGovernorLoop(targetBytes)
 }
 
 func (e *Engine) memoryGovernorLoop(targetBytes int64) {
 	defer e.memGovWg.Done()
+
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+
 	for {
 		select {
 		case <-e.memGovStop:
@@ -481,16 +507,21 @@ func (e *Engine) memoryGovernorLoop(targetBytes int64) {
 			//    pressure converges through the queue, never through a full scan.
 			//    Sized as overage / true per-key footprint (live heap / live keys).
 			live := e.effectCache.Bytes()
+
 			over := live - targetBytes
 			if over <= 0 {
 				e.evictBudget.Store(0)
+
 				continue
 			}
+
 			keys := e.index.Size()
 			if keys == 0 {
 				e.evictBudget.Store(0)
+
 				continue
 			}
+
 			avgPerKey := max(live/keys, 64)
 			// Round a positive deficit up to at least one key: an overage
 			// smaller than avgPerKey would otherwise divide to a zero budget
@@ -540,11 +571,14 @@ func (e *Engine) drainEvictBudget(maxKeys int) {
 		if b <= 0 {
 			return
 		}
+
 		want := int(min(b, int64(maxKeys), evictBatchSize))
+
 		n := e.index.EvictBatch(want)
 		if n == 0 {
 			return // nothing evictable right now; leave the budget for next time
 		}
+
 		e.evictBudget.Add(-int64(n))
 		maxKeys -= n
 	}
@@ -564,6 +598,7 @@ func (e *Engine) ReleaseQueueDepth() int {
 	e.releaseMu.Lock()
 	n := len(e.releaseItems)
 	e.releaseMu.Unlock()
+
 	return n
 }
 
@@ -580,13 +615,17 @@ func (e *Engine) drainPendingReleases() {
 	batch := e.releaseItems
 	e.releaseItems = e.releaseSpare[:0]
 	e.releaseMu.Unlock()
+
 	if len(batch) == 0 {
 		e.releaseSpare = batch
+
 		return
 	}
+
 	for _, ek := range batch {
 		e.releaseChainRefs(ek.key, ek.tips, ek.ls)
 	}
+
 	clear(batch)
 	e.releaseSpare = batch[:0]
 }
@@ -603,15 +642,16 @@ func (e *Engine) drainPendingReleases() {
 // Like drainReclaim it is single-consumer: only the governor goroutine (and
 // tests, which never start a governor — it requires a memory target) may call
 // it.
-func (e *Engine) reclaimUnreferenced() int64 {
+func (e *Engine) reclaimUnreferenced() {
 	if e.effectCache == nil {
-		return 0
+		return
 	}
+
 	e.drainPendingReleases()
+
 	total := e.effectCache.drainReclaim()
 	if total > 0 {
 		slog.Debug("vertex pool: reclaimed unreferenced effects",
 			"est_bytes_freed", total, "live_heap", e.effectCache.Bytes())
 	}
-	return total
 }

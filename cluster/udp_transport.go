@@ -57,6 +57,7 @@ func MarshalNotifyPacket(requestID uint64, notify *pb.OffsetNotify) ([]byte, err
 	if err != nil {
 		return nil, fmt.Errorf("marshal OffsetNotify: %w", err)
 	}
+
 	return AssembleNotifyPacket(requestID, protoBytes), nil
 }
 
@@ -70,6 +71,7 @@ func AssembleNotifyPacket(requestID uint64, body []byte) []byte {
 	buf[0] = PacketTypeNotify
 	binary.LittleEndian.PutUint64(buf[1:9], requestID)
 	copy(buf[9:], body)
+
 	return buf
 }
 
@@ -114,6 +116,7 @@ func parseNotifyACKPacket(data []byte) (peerID NodeId, requestID uint64, status 
 	requestID = binary.LittleEndian.Uint64(data[9:17])
 	status = data[17]
 	credits = binary.LittleEndian.Uint32(data[18:22])
+
 	return peerID, requestID, status, credits, nil
 }
 
@@ -133,8 +136,10 @@ func MarshalNotifyNACKPacket(nodeID NodeId, requestID uint64, nacks []*pb.NackNo
 		protoBytes, err := proto.Marshal(nack)
 		if err != nil {
 			slog.Error("failed to marshal NackNotify in NACK response", "error", err)
+
 			continue
 		}
+
 		lenBuf := make([]byte, 4)
 		binary.LittleEndian.PutUint32(lenBuf, uint32(len(protoBytes)))
 		buf = append(buf, lenBuf...)
@@ -150,25 +155,32 @@ func parseNotifyNACKPayload(data []byte) ([]*pb.NackNotify, error) {
 	if len(data) < 4 {
 		return nil, fmt.Errorf("NACK payload too short: %d", len(data))
 	}
+
 	count := binary.LittleEndian.Uint32(data[:4])
 	offset := 4
+
 	nacks := make([]*pb.NackNotify, 0, count)
 	for i := range count {
 		if offset+4 > len(data) {
 			return nacks, fmt.Errorf("NACK payload truncated at entry %d", i)
 		}
+
 		nLen := binary.LittleEndian.Uint32(data[offset : offset+4])
+
 		offset += 4
 		if offset+int(nLen) > len(data) {
 			return nacks, fmt.Errorf("NACK entry %d truncated", i)
 		}
+
 		nack := &pb.NackNotify{}
 		if err := proto.Unmarshal(data[offset:offset+int(nLen)], nack); err != nil {
 			return nacks, fmt.Errorf("unmarshal NACK entry %d: %w", i, err)
 		}
+
 		nacks = append(nacks, nack)
 		offset += int(nLen)
 	}
+
 	return nacks, nil
 }
 
@@ -181,6 +193,7 @@ func MarshalKeyFilterPacket(version uint64, filter []byte) []byte {
 	buf[0] = PacketTypeKeyFilter
 	binary.LittleEndian.PutUint64(buf[1:9], version)
 	copy(buf[9:], filter)
+
 	return buf
 }
 
@@ -189,6 +202,7 @@ func parseKeyFilterPacket(data []byte) (version uint64, filter []byte, err error
 	if len(data) < 9 {
 		return 0, nil, fmt.Errorf("key filter packet too short: %d", len(data))
 	}
+
 	return binary.LittleEndian.Uint64(data[1:9]), data[9:], nil
 }
 
@@ -203,5 +217,6 @@ func MarshalNackPacket(nack *pb.NackNotify) ([]byte, error) {
 	buf := make([]byte, 1+len(protoBytes))
 	buf[0] = PacketTypeNack
 	copy(buf[1:], protoBytes)
+
 	return buf, nil
 }

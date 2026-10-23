@@ -44,9 +44,11 @@ import (
 func MarshalEffect(eff *pb.Effect) ([]byte, error) {
 	if needsKeySanitize(eff) {
 		clone := proto.Clone(eff).(*pb.Effect)
-		sanitizeReducedKeys(clone.GetSnapshot().State)
+		sanitizeReducedKeys(clone.GetSnapshot().GetState())
+
 		return proto.Marshal(clone)
 	}
+
 	return proto.Marshal(eff)
 }
 
@@ -56,9 +58,11 @@ func UnmarshalEffect(data []byte, eff *pb.Effect) error {
 	if err := proto.Unmarshal(data, eff); err != nil {
 		return err
 	}
-	if snap := eff.GetSnapshot(); snap != nil && snap.State != nil {
-		desanitizeReducedKeys(snap.State)
+
+	if snap := eff.GetSnapshot(); snap != nil && snap.GetState() != nil {
+		desanitizeReducedKeys(snap.GetState())
 	}
+
 	return nil
 }
 
@@ -66,27 +70,31 @@ func UnmarshalEffect(data []byte, eff *pb.Effect) error {
 // any map keys (i.e. whether the effect carries a non-empty snapshot state).
 func needsKeySanitize(eff *pb.Effect) bool {
 	snap := eff.GetSnapshot()
-	if snap == nil || snap.State == nil {
+	if snap == nil || snap.GetState() == nil {
 		return false
 	}
-	return len(snap.State.NetAdds) > 0 || len(snap.State.NetRemoves) > 0
+
+	return len(snap.GetState().GetNetAdds()) > 0 || len(snap.GetState().GetNetRemoves()) > 0
 }
 
 // sanitizeReducedKeys hex-encodes the keys of NetAdds and NetRemoves in
 // place. Mutates r — callers must clone first if r is shared.
 func sanitizeReducedKeys(r *pb.ReducedEffect) {
-	if len(r.NetAdds) > 0 {
-		out := make(map[string]*pb.ReducedElement, len(r.NetAdds))
-		for k, v := range r.NetAdds {
+	if len(r.GetNetAdds()) > 0 {
+		out := make(map[string]*pb.ReducedElement, len(r.GetNetAdds()))
+		for k, v := range r.GetNetAdds() {
 			out[hex.EncodeToString([]byte(k))] = v
 		}
+
 		r.NetAdds = out
 	}
-	if len(r.NetRemoves) > 0 {
-		out := make(map[string]bool, len(r.NetRemoves))
-		for k, v := range r.NetRemoves {
+
+	if len(r.GetNetRemoves()) > 0 {
+		out := make(map[string]bool, len(r.GetNetRemoves()))
+		for k, v := range r.GetNetRemoves() {
 			out[hex.EncodeToString([]byte(k))] = v
 		}
+
 		r.NetRemoves = out
 	}
 }
@@ -96,26 +104,29 @@ func sanitizeReducedKeys(r *pb.ReducedEffect) {
 // the wire-encoding scheme or are corrupt — either way, dropping them
 // silently would lose data).
 func desanitizeReducedKeys(r *pb.ReducedEffect) {
-	if len(r.NetAdds) > 0 {
-		out := make(map[string]*pb.ReducedElement, len(r.NetAdds))
-		for k, v := range r.NetAdds {
+	if len(r.GetNetAdds()) > 0 {
+		out := make(map[string]*pb.ReducedElement, len(r.GetNetAdds()))
+		for k, v := range r.GetNetAdds() {
 			if b, err := hex.DecodeString(k); err == nil {
 				out[string(b)] = v
 			} else {
 				out[k] = v
 			}
 		}
+
 		r.NetAdds = out
 	}
-	if len(r.NetRemoves) > 0 {
-		out := make(map[string]bool, len(r.NetRemoves))
-		for k, v := range r.NetRemoves {
+
+	if len(r.GetNetRemoves()) > 0 {
+		out := make(map[string]bool, len(r.GetNetRemoves()))
+		for k, v := range r.GetNetRemoves() {
 			if b, err := hex.DecodeString(k); err == nil {
 				out[string(b)] = v
 			} else {
 				out[k] = v
 			}
 		}
+
 		r.NetRemoves = out
 	}
 }

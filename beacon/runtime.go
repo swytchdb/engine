@@ -170,7 +170,9 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 	// from these two derivations, and no config copy retains the master.
 	passphrase := cfg.ClusterPassphrase
 	cloudEnabled := cfg.ConnectionSecret != ""
+
 	var cloudSync *cluster.CloudSync
+
 	if cloudEnabled {
 		if cfg.ClusterPassphrase != "" {
 			return nil, errors.Join(
@@ -178,18 +180,23 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 				closeEngineOnError(engine),
 			)
 		}
+
 		if cfg.OnLocalEffect != nil || cfg.CloudReader != nil || cfg.CDNFetcher != nil {
 			return nil, errors.Join(
 				fmt.Errorf("ConnectionSecret is exclusive with the embedder durability seams"),
 				closeEngineOnError(engine),
 			)
 		}
+
 		passphrase = cluster.DeriveClusterPassphrase(cfg.ConnectionSecret)
+
 		var err error
+
 		cloudSync, err = cluster.NewCloudSync(engine, cfg.ConnectionSecret)
 		if err != nil {
 			return nil, errors.Join(err, closeEngineOnError(engine))
 		}
+
 		cfg.ConnectionSecret = ""
 	}
 
@@ -198,9 +205,11 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 	if cfg.OnLocalEffect != nil {
 		engine.SetOnLocalEffect(cfg.OnLocalEffect)
 	}
+
 	if cfg.OnKeyDataAdded != nil {
 		engine.OnKeyDataAdded = cfg.OnKeyDataAdded
 	}
+
 	if cfg.CloudReader != nil {
 		engine.SetCloudReader(cfg.CloudReader)
 	}
@@ -214,6 +223,7 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 	// Single-node mode: done.
 	if passphrase == "" {
 		log.Debug("no cluster passphrase, running single-node")
+
 		return rt, nil
 	}
 
@@ -232,6 +242,7 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 		detected, err := DetectAdvertiseAddr(cfg.JoinAddr, cfg.ClusterPort)
 		if err != nil {
 			log.Warn("failed to auto-detect advertise address, using 0.0.0.0", "error", err)
+
 			advertise = fmt.Sprintf("0.0.0.0:%d", cfg.ClusterPort)
 		} else {
 			advertise = detected
@@ -240,10 +251,10 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 	}
 
 	peerCfg := &cluster.ClusterConfig{
-		NodeID: cluster.NodeId(engine.NodeID()),
+		NodeID: engine.NodeID(),
 		Nodes: []cluster.NodeConfig{
 			{
-				ID:      cluster.NodeId(engine.NodeID()),
+				ID:      engine.NodeID(),
 				Address: advertise,
 			},
 		},
@@ -260,11 +271,13 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 			closeRuntimeOnError(rt),
 		)
 	}
+
 	rt.PeerManager = pm
 	// Key filters ride the peer connections: our filter is advertised at
 	// connection establishment, and a peer counts as "holds everything"
 	// until its filter arrives.
 	pm.SetKeyFilterProvider(engine)
+
 	if err := pm.Start(ctx); err != nil {
 		return nil, errors.Join(
 			fmt.Errorf("failed to start peer manager: %w", err),
@@ -287,6 +300,7 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 		// treating the read as a miss (tiered storage).
 		engine.SetCloudReader(cloudSync)
 	}
+
 	if cfg.CDNFetcher != nil {
 		pm.SetCDNFetcher(cfg.CDNFetcher)
 	}
@@ -326,6 +340,7 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 		if prevOnKeyDataAdded != nil {
 			prevOnKeyDataAdded(key)
 		}
+
 		if key == MembershipKey {
 			b.NotifyMembershipChanged()
 		}
@@ -352,6 +367,7 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 				closeRuntimeOnError(rt),
 			)
 		}
+
 		rt.Beacon = b
 	}
 
@@ -377,27 +393,34 @@ func (r *Runtime) Stop() error {
 	if r.joinCancel != nil {
 		r.joinCancel()
 	}
+
 	r.joinWG.Wait()
 
 	var errs []error
+
 	if r.Beacon != nil {
 		r.Beacon.Stop()
 		r.Beacon = nil
 	}
+
 	if r.CloudSync != nil {
 		r.CloudSync.Stop()
 		r.CloudSync = nil
 	}
+
 	if r.PeerManager != nil {
 		r.PeerManager.Stop()
 		r.PeerManager = nil
 	}
+
 	if r.Engine != nil {
 		if err := r.Engine.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("close engine: %w", err))
 		}
+
 		r.Engine = nil
 	}
+
 	return errors.Join(errs...)
 }
 
@@ -415,24 +438,30 @@ func closeEngineOnError(engine *effects.Engine) error {
 	if err := engine.Close(); err != nil {
 		return fmt.Errorf("close engine: %w", err)
 	}
+
 	return nil
 }
 
 func closeRuntimeOnError(r *Runtime) error {
 	var errs []error
+
 	if r.Beacon != nil {
 		r.Beacon.Stop()
 	}
+
 	if r.CloudSync != nil {
 		r.CloudSync.Stop()
 	}
+
 	if r.PeerManager != nil {
 		r.PeerManager.Stop()
 	}
+
 	if r.Engine != nil {
 		if err := r.Engine.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("close engine: %w", err))
 		}
 	}
+
 	return errors.Join(errs...)
 }

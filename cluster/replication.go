@@ -74,6 +74,7 @@ type ReplicationFuture struct {
 // Wait blocks until the replication future is resolved and returns any error.
 func (f *ReplicationFuture) Wait() error {
 	<-f.done
+
 	return f.Err()
 }
 
@@ -87,6 +88,7 @@ func (f *ReplicationFuture) Err() error {
 	if p := f.err.Load(); p != nil {
 		return *p
 	}
+
 	return nil
 }
 
@@ -95,6 +97,7 @@ func (f *ReplicationFuture) Nacks() []*pb.NackNotify {
 	if p := f.nacks.Load(); p != nil {
 		return *p
 	}
+
 	return nil
 }
 
@@ -115,6 +118,7 @@ func (f *ReplicationFuture) reject(err error) {
 func rejectedFuture(err error) *ReplicationFuture {
 	f := &ReplicationFuture{done: make(chan struct{})}
 	f.reject(err)
+
 	return f
 }
 
@@ -143,8 +147,7 @@ type trackedRequest struct {
 	// ReplicateTo) the sweep uses the deadline-based give-up below.
 	retransmit bool
 
-	nacks        []*pb.NackNotify // NACKs received in a NACK response (status=0x01)
-	traceContext []byte           // OTel trace context for correlating ACK spans
+	traceContext []byte // OTel trace context for correlating ACK spans
 }
 
 // Resolve resolves the future for the given request ID. First call wins.
@@ -152,8 +155,10 @@ type trackedRequest struct {
 func (rt *requestTracker) Resolve(requestID uint64) *trackedRequest {
 	if tr, ok := rt.pending.LoadAndDelete(requestID); ok {
 		tr.future.resolve()
+
 		return tr
 	}
+
 	return nil
 }
 
@@ -168,9 +173,11 @@ func (rt *requestTracker) rejectDeadlineExpired() {
 		if tr.retransmit || nowNano <= tr.deadline {
 			return true
 		}
+
 		rt.pending.Delete(key)
 		tr.future.reject(ErrReplicationTimeout)
 		RecordRetransmissionGiveUp(tr.peerID)
+
 		return true
 	})
 }
@@ -207,6 +214,7 @@ func NewReplicator(
 	if replicationTimeout <= 0 {
 		replicationTimeout = 30 * time.Second
 	}
+
 	return &Replicator{
 		nodeID:             nodeID,
 		localRegion:        localRegion,
@@ -236,6 +244,7 @@ func (r *Replicator) Stop() {
 func (r *Replicator) AddPeer(nodeID NodeId, region string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
 	r.peerRegions[nodeID] = region
 }
 
@@ -243,6 +252,7 @@ func (r *Replicator) AddPeer(nodeID NodeId, region string) {
 func (r *Replicator) RemovePeer(nodeID NodeId) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
 	delete(r.peerRegions, nodeID)
 }
 
@@ -253,6 +263,7 @@ func (r *Replicator) AllRegionPeersReachable() bool {
 	regions := make(map[NodeId]string, len(r.peerRegions))
 	maps.Copy(regions, r.peerRegions)
 	r.mu.RUnlock(token)
+
 	return r.healthTable.AllRegionPeersReachable(r.localRegion, regions)
 }
 
@@ -263,6 +274,7 @@ func (r *Replicator) InMajorityPartition() bool {
 	regions := make(map[NodeId]string, len(r.peerRegions))
 	maps.Copy(regions, r.peerRegions)
 	r.mu.RUnlock(token)
+
 	return r.healthTable.InMajorityPartition(r.localRegion, regions)
 }
 
@@ -272,8 +284,10 @@ func (r *Replicator) InMajorityPartition() bool {
 // Cross-region peers receive the notification fire-and-forget.
 func (r *Replicator) Replicate(notify *pb.OffsetNotify, wireData []byte) *ReplicationFuture {
 	var sendSpan trace.Span
+
 	if tracing.Enabled() {
 		remoteCtx := tracing.ExtractFromBytes(notify.GetTraceContext())
+
 		_, sendSpan = tracing.Tracer().Start(remoteCtx, "replication.send",
 			trace.WithAttributes(attribute.String("effect.key", string(notify.GetKey()))))
 		defer sendSpan.End()
@@ -318,6 +332,7 @@ func (r *Replicator) Replicate(notify *pb.OffsetNotify, wireData []byte) *Replic
 	// completes before we set setupDone).
 	var wg sync.WaitGroup
 	wg.Add(len(targets))
+
 	for _, targetID := range targets {
 		go func(targetID NodeId) {
 			defer wg.Done()
@@ -351,18 +366,23 @@ func (r *Replicator) Replicate(notify *pb.OffsetNotify, wireData []byte) *Replic
 			if err != nil {
 				slog.Debug("same-region send failed, holding for retransmit",
 					"peer", targetID, "error", err)
+
 				return
 			}
+
 			tr.packetSize = wireSize
+
 			RecordNotificationSent()
 		}(targetID)
 	}
+
 	wg.Wait()
 
 	// Finalize expected so NotSubscribed responses and sweep give-ups can
 	// resolve the future. Re-check here covers the race where every tracked
 	// peer responded before we set setupDone.
 	future.setupDone.Store(true)
+
 	if future.dropped.Load() == future.expected.Load() {
 		future.reject(ErrAllPeersNotSubscribed)
 	}
@@ -390,8 +410,10 @@ func (r *Replicator) sendCrossRegion(notify *pb.OffsetNotify, regions map[NodeId
 			marshalled, err := proto.Marshal(notify)
 			if err != nil {
 				slog.Error("failed to marshal cross-region notify packet", "error", err)
+
 				return
 			}
+
 			body = marshalled
 			nullFuture = &ReplicationFuture{done: make(chan struct{})}
 			nullFuture.resolve()
@@ -416,9 +438,12 @@ func (r *Replicator) sendCrossRegion(notify *pb.OffsetNotify, regions map[NodeId
 			r.tracker.pending.Delete(requestID)
 			slog.Error("cross-region send failed, notification dropped",
 				"peer", peerID, "error", err)
+
 			continue
 		}
+
 		tr.packetSize = wireSize
+
 		RecordNotificationSent()
 	}
 }
@@ -427,8 +452,10 @@ func (r *Replicator) sendCrossRegion(notify *pb.OffsetNotify, regions map[NodeId
 // It applies the effect and sends an ACK or NACK response back via QUIC.
 func (r *Replicator) HandleNotify(peerID NodeId, requestID uint64, notify *pb.OffsetNotify) {
 	var recvSpan trace.Span
+
 	if tracing.Enabled() {
 		remoteCtx := tracing.ExtractFromBytes(notify.GetTraceContext())
+
 		_, recvSpan = tracing.Tracer().Start(remoteCtx, "replication.receive",
 			trace.WithAttributes(
 				attribute.Int("peer.id", int(peerID)),
@@ -445,8 +472,10 @@ func (r *Replicator) HandleNotify(peerID NodeId, requestID uint64, notify *pb.Of
 	RecordNotificationReceived()
 
 	var nacks []*pb.NackNotify
+
 	if r.handler != nil && notify != nil {
 		var err error
+
 		nacks, err = r.handler.HandleOffsetNotify(notify)
 		if err != nil {
 			slog.Debug("HandleNotify: handler error",
@@ -486,6 +515,7 @@ func (r *Replicator) HandleNotifyACK(peerID NodeId, requestID uint64, status byt
 	if tr == nil {
 		slog.Debug("HandleNotifyACK: late ACK (already timed out or resolved)",
 			"peer", peerID, "requestID", requestID)
+
 		return
 	}
 
@@ -517,6 +547,7 @@ func (r *Replicator) HandleNotifyACKWithData(peerID NodeId, requestID uint64, st
 	if !ok {
 		slog.Debug("HandleNotifyACKWithData: late NACK (already timed out or resolved)",
 			"peer", peerID, "requestID", requestID)
+
 		return
 	}
 
@@ -531,11 +562,13 @@ func (r *Replicator) HandleNotifyACKWithData(peerID NodeId, requestID uint64, st
 	// Parse and store NACKs BEFORE resolving the future so callers
 	// of Wait()/Nacks() see them immediately.
 	notSubscribed := false
+
 	if status == 0x01 && len(fullPacket) > 22 {
 		nacks, err := parseNotifyNACKPayload(fullPacket[22:])
 		if err != nil {
 			slog.Debug("failed to parse NACK payload", "peer", peerID, "error", err)
 		}
+
 		if len(nacks) > 0 {
 			tr.future.nacks.Store(&nacks)
 			notSubscribed = allNotSubscribed(nacks)
@@ -551,6 +584,7 @@ func (r *Replicator) HandleNotifyACKWithData(peerID NodeId, requestID uint64, st
 		if tr.future.setupDone.Load() && dropped == tr.future.expected.Load() {
 			tr.future.reject(ErrAllPeersNotSubscribed)
 		}
+
 		return
 	}
 
@@ -567,6 +601,7 @@ func allNotSubscribed(nacks []*pb.NackNotify) bool {
 			return false
 		}
 	}
+
 	return len(nacks) > 0
 }
 
@@ -579,6 +614,7 @@ func (r *Replicator) ReplicateTo(notify *pb.OffsetNotify, wireData []byte, targe
 	if err != nil {
 		return nil, fmt.Errorf("marshal notify packet: %w", err)
 	}
+
 	return r.replicateBody(body, targetPeerID)
 }
 
@@ -620,8 +656,10 @@ func (r *Replicator) replicateBody(notifyBody []byte, targetPeerID NodeId) ([]*p
 	wireSize, err := r.transport.Send(targetPeerID, notifyPkt)
 	if err != nil {
 		r.tracker.pending.Delete(requestID)
+
 		return nil, fmt.Errorf("send to peer %d: %w", targetPeerID, err)
 	}
+
 	tr.packetSize = wireSize
 
 	RecordNotificationSent()
@@ -651,6 +689,7 @@ func (r *Replicator) SendOneWay(notify *pb.OffsetNotify, wireData []byte, target
 	}
 
 	RecordNotificationSent()
+
 	return nil
 }
 
@@ -659,6 +698,7 @@ func (r *Replicator) SendNack(nack *pb.NackNotify, targetPeerID NodeId) {
 	pkt, err := MarshalNackPacket(nack)
 	if err != nil {
 		slog.Error("failed to marshal NACK packet", "error", err)
+
 		return
 	}
 
@@ -671,6 +711,7 @@ func (r *Replicator) SendNack(nack *pb.NackNotify, targetPeerID NodeId) {
 // deadline-mode ones.
 func (r *Replicator) sweepLoop() {
 	defer r.wg.Done()
+
 	ticker := time.NewTicker(sweepInterval)
 	defer ticker.Stop()
 
@@ -680,8 +721,10 @@ func (r *Replicator) sweepLoop() {
 			r.tracker.pending.Range(func(key uint64, tr *trackedRequest) bool {
 				r.tracker.pending.Delete(key)
 				tr.future.reject(ErrReplicationTimeout)
+
 				return true
 			})
+
 			return
 		case <-ticker.C:
 			r.sweep()
@@ -702,6 +745,7 @@ func (r *Replicator) sweep() {
 	r.tracker.rejectDeadlineExpired()
 
 	now := time.Now().UnixNano()
+
 	r.tracker.pending.Range(func(key uint64, tr *trackedRequest) bool {
 		if !tr.retransmit {
 			return true
@@ -722,20 +766,25 @@ func (r *Replicator) sweep() {
 			if tr.future.setupDone.Load() && dropped == tr.future.expected.Load() {
 				tr.future.reject(ErrNoPeers)
 			}
+
 			return true
 		}
 
 		if now-tr.lastSentAt.Load() < int64(sweepInterval) {
 			return true
 		}
+
 		tr.lastSentAt.Store(now)
+
 		if wireSize, err := r.transport.Send(tr.peerID, tr.packetData); err != nil {
 			slog.Debug("retransmit failed (peer connection not up yet)",
 				"peer", tr.peerID, "error", err)
 		} else {
 			tr.packetSize = wireSize
+
 			RecordNotificationSent()
 		}
+
 		return true
 	})
 }

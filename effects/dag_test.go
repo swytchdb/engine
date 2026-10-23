@@ -34,10 +34,12 @@ import (
 
 func orderedAppend(log *snapshotLog, hlcNanos int64, nodeID uint64, id string, value []byte, deps ...Tip) Tip {
 	hlc := timestamppb.New(sTs(hlcNanos).AsTime())
+
 	var pbDeps []*pb.EffectRef
 	for _, d := range deps {
 		pbDeps = append(pbDeps, toPbRef(d))
 	}
+
 	return log.putEffect(&pb.Effect{
 		Key:            []byte("k"),
 		Hlc:            hlc,
@@ -59,10 +61,12 @@ func orderedValues(r *pb.ReducedEffect) []string {
 	if r == nil {
 		return nil
 	}
+
 	var vals []string
-	for _, elem := range r.OrderedElements {
-		vals = append(vals, string(elem.Data.GetRaw()))
+	for _, elem := range r.GetOrderedElements() {
+		vals = append(vals, string(elem.GetData().GetRaw()))
 	}
+
 	return vals
 }
 
@@ -70,11 +74,13 @@ func strSliceEqual(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
 	}
+
 	for i := range a {
 		if a[i] != b[i] {
 			return false
 		}
 	}
+
 	return true
 }
 
@@ -83,6 +89,7 @@ func positionMap(vals []string) map[string]int {
 	for i, v := range vals {
 		m[v] = i
 	}
+
 	return m
 }
 
@@ -90,20 +97,26 @@ func isContiguous(result []string, branch []string) bool {
 	if len(branch) == 0 {
 		return true
 	}
+
 	branchSet := make(map[string]bool, len(branch))
 	for _, v := range branch {
 		branchSet[v] = true
 	}
+
 	start := -1
+
 	for i, v := range result {
 		if branchSet[v] {
 			start = i
+
 			break
 		}
 	}
+
 	if start == -1 {
 		return false
 	}
+
 	idx := 0
 	for i := start; i < len(result) && idx < len(branch); i++ {
 		if branchSet[result[i]] {
@@ -112,6 +125,7 @@ func isContiguous(result []string, branch []string) bool {
 			return false
 		}
 	}
+
 	return idx == len(branch)
 }
 
@@ -130,7 +144,9 @@ func TestOrdered_LinearChain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	got := orderedValues(r)
+
 	want := []string{"a", "b", "c"}
 	if !strSliceEqual(got, want) {
 		t.Fatalf("linear chain: got %v, want %v", got, want)
@@ -155,6 +171,7 @@ func TestOrdered_ForkPreservesCausalOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	got := orderedValues(r)
 	if len(got) != 5 {
 		t.Fatalf("expected 5 elements, got %v", got)
@@ -164,9 +181,11 @@ func TestOrdered_ForkPreservesCausalOrder(t *testing.T) {
 	if pos["a"] >= pos["b"] {
 		t.Errorf("'a' must be before 'b'; got %v", got)
 	}
+
 	if pos["b"] >= pos["c"] {
 		t.Errorf("'b' must be before 'c'; got %v", got)
 	}
+
 	if pos["c"] >= pos["d"] {
 		t.Errorf("'c' must be before 'd'; got %v", got)
 	}
@@ -185,7 +204,9 @@ func TestOrdered_StableUnderGrowth(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	got1 := orderedValues(r1)
+
 	want1 := []string{"a", "b", "c"}
 	if !strSliceEqual(got1, want1) {
 		t.Fatalf("initial: got %v, want %v", got1, want1)
@@ -200,6 +221,7 @@ func TestOrdered_StableUnderGrowth(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	got2 := orderedValues(r2)
 	if len(got2) != 5 {
 		t.Fatalf("grown: expected 5 elements, got %v", got2)
@@ -210,9 +232,11 @@ func TestOrdered_StableUnderGrowth(t *testing.T) {
 	if pos["a"] >= pos["b"] {
 		t.Errorf("grown: 'a' must be before 'b'; got %v", got2)
 	}
+
 	if pos["b"] >= pos["c"] {
 		t.Errorf("grown: 'b' must be before 'c'; got %v", got2)
 	}
+
 	if pos["d"] >= pos["e"] {
 		t.Errorf("grown: 'd' must be before 'e'; got %v", got2)
 	}
@@ -231,10 +255,12 @@ func TestOrdered_DeterministicAcrossViews(t *testing.T) {
 	// View 1: tips = [d, f]
 	e1 := newSnapshotEngine(log)
 	e1.index.Insert("k", nil, keytrie.NewTipSet(d, f))
+
 	r1, _, _, err := e1.GetSnapshot("k")
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	got1 := orderedValues(r1)
 
 	// View 2: same effects, different tip set (subscription merges them)
@@ -247,10 +273,12 @@ func TestOrdered_DeterministicAcrossViews(t *testing.T) {
 	})
 	e2 := newSnapshotEngine(log)
 	e2.index.Insert("k", nil, keytrie.NewTipSet(sub))
+
 	r2, _, _, err := e2.GetSnapshot("k")
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	got2 := orderedValues(r2)
 
 	if !strSliceEqual(got1, got2) {
@@ -272,27 +300,34 @@ func TestOrdered_BranchContiguity_TwoBranches(t *testing.T) {
 	b3 := orderedAppend(log, 41, 2, "id-b3", []byte("b3"), b2)
 
 	e.index.Insert("k", nil, keytrie.NewTipSet(a3, b3))
+
 	r, _, _, err := e.GetSnapshot("k")
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	got := orderedValues(r)
 	if len(got) != 7 {
 		t.Fatalf("expected 7 elements, got %v", got)
 	}
+
 	if got[0] != "x" {
 		t.Fatalf("expected 'x' first, got %v", got)
 	}
+
 	if !isContiguous(got, []string{"a1", "a2", "a3"}) {
 		t.Errorf("branch A not contiguous in %v", got)
 	}
+
 	if !isContiguous(got, []string{"b1", "b2", "b3"}) {
 		t.Errorf("branch B not contiguous in %v", got)
 	}
+
 	pos := positionMap(got)
 	if pos["a1"] >= pos["a2"] || pos["a2"] >= pos["a3"] {
 		t.Errorf("branch A order broken in %v", got)
 	}
+
 	if pos["b1"] >= pos["b2"] || pos["b2"] >= pos["b3"] {
 		t.Errorf("branch B order broken in %v", got)
 	}
@@ -311,20 +346,25 @@ func TestOrdered_BranchContiguity_ThreeBranches(t *testing.T) {
 	c2 := orderedAppend(log, 32, 3, "id-c2", []byte("c2"), c1)
 
 	e.index.Insert("k", nil, keytrie.NewTipSet(a2, b2, c2))
+
 	r, _, _, err := e.GetSnapshot("k")
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	got := orderedValues(r)
 	if len(got) != 7 {
 		t.Fatalf("expected 7 elements, got %v", got)
 	}
+
 	if !isContiguous(got, []string{"a1", "a2"}) {
 		t.Errorf("branch A not contiguous in %v", got)
 	}
+
 	if !isContiguous(got, []string{"b1", "b2"}) {
 		t.Errorf("branch B not contiguous in %v", got)
 	}
+
 	if !isContiguous(got, []string{"c1", "c2"}) {
 		t.Errorf("branch C not contiguous in %v", got)
 	}
@@ -342,10 +382,12 @@ func TestOrdered_MergeTipDoesNotChangeOrdering(t *testing.T) {
 	// Without merge node: multi-tip
 	e1 := newSnapshotEngine(log)
 	e1.index.Insert("k", nil, keytrie.NewTipSet(a2, b2))
+
 	r1, _, _, err := e1.GetSnapshot("k")
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	got1 := orderedValues(r1)
 
 	// With merge node: subscription merges both tips
@@ -358,10 +400,12 @@ func TestOrdered_MergeTipDoesNotChangeOrdering(t *testing.T) {
 	})
 	e2 := newSnapshotEngine(log)
 	e2.index.Insert("k", nil, keytrie.NewTipSet(merge))
+
 	r2, _, _, err := e2.GetSnapshot("k")
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	got2 := orderedValues(r2)
 
 	if !strSliceEqual(got1, got2) {
@@ -444,10 +488,12 @@ func TestCrossTxnDepsMustNotConfirm(t *testing.T) {
 	})
 
 	e.index.Insert("k", nil, keytrie.NewTipSet(txBBind))
+
 	r, _, _, err := e.GetSnapshot("k")
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	got := orderedValues(r)
 
 	// "from-A" must NOT appear — txn A has no bind
@@ -458,14 +504,17 @@ func TestCrossTxnDepsMustNotConfirm(t *testing.T) {
 	}
 	// "root" and "from-B" must appear
 	hasRoot, hasB := false, false
+
 	for _, v := range got {
 		if v == "root" {
 			hasRoot = true
 		}
+
 		if v == "from-B" {
 			hasB = true
 		}
 	}
+
 	if !hasRoot || !hasB {
 		t.Fatalf("expected [root, from-B], got %v", got)
 	}
@@ -542,13 +591,14 @@ func TestLCA_SnapshotOnOneBranchMustNotSkipOtherBranch(t *testing.T) {
 	})
 
 	e.index.Insert("k", nil, keytrie.NewTipSet(tip1, tip2))
+
 	r, _, _, err := e.GetSnapshot("k")
 	if err != nil {
 		t.Fatal(err)
 	}
 	// R(10) + Y(7) + A(1) + B(2) + tip1(3) + tip2(0) = 23
-	if r.Scalar.GetIntVal() != 23 {
-		t.Fatalf("expected 23, got %d (snapshot on one branch skipped Y on the other)", r.Scalar.GetIntVal())
+	if r.GetScalar().GetIntVal() != 23 {
+		t.Fatalf("expected 23, got %d (snapshot on one branch skipped Y on the other)", r.GetScalar().GetIntVal())
 	}
 }
 
@@ -640,6 +690,7 @@ func TestCompetingBinds_FirstWins(t *testing.T) {
 	// Determine which transaction wins fork-choice (lower hash)
 	hashA := ComputeForkChoiceHash(2, sTs(25))
 	hashB := ComputeForkChoiceHash(3, sTs(35))
+
 	var expectedVal int64
 	if ForkChoiceLess(hashA, hashB) {
 		expectedVal = 11 // root(10) + txA(1)
@@ -647,9 +698,9 @@ func TestCompetingBinds_FirstWins(t *testing.T) {
 		expectedVal = 12 // root(10) + txB(2)
 	}
 
-	if r.Scalar.GetIntVal() != expectedVal {
+	if r.GetScalar().GetIntVal() != expectedVal {
 		t.Fatalf("expected %d (only winner visible), got %d (both txns applied = %d)",
-			expectedVal, r.Scalar.GetIntVal(), 10+1+2)
+			expectedVal, r.GetScalar().GetIntVal(), 10+1+2)
 	}
 }
 
@@ -739,6 +790,7 @@ func TestCompetingBinds_LoserDependentsInvisible(t *testing.T) {
 	// Winner's txn effect + both non-txn effects should be visible
 	hashA := ComputeForkChoiceHash(2, sTs(25))
 	hashB := ComputeForkChoiceHash(3, sTs(35))
+
 	var expectedVal int64
 	if ForkChoiceLess(hashA, hashB) {
 		expectedVal = 10 + 1 + 100 + 200 // root + txA(winner) + afterA + afterB
@@ -746,8 +798,8 @@ func TestCompetingBinds_LoserDependentsInvisible(t *testing.T) {
 		expectedVal = 10 + 2 + 100 + 200 // root + txB(winner) + afterA + afterB
 	}
 
-	if r.Scalar.GetIntVal() != expectedVal {
-		t.Fatalf("expected %d, got %d", expectedVal, r.Scalar.GetIntVal())
+	if r.GetScalar().GetIntVal() != expectedVal {
+		t.Fatalf("expected %d, got %d", expectedVal, r.GetScalar().GetIntVal())
 	}
 }
 
@@ -864,9 +916,9 @@ func TestCompetingBinds_NonOverlappingPredicatesBothVisible(t *testing.T) {
 	}
 
 	// Both transactions should be visible: root(10) + txA(1) + txB(2) = 13
-	if r.Scalar.GetIntVal() != 13 {
+	if r.GetScalar().GetIntVal() != 13 {
 		t.Fatalf("expected 13 (both txns visible, non-overlapping predicates), got %d",
-			r.Scalar.GetIntVal())
+			r.GetScalar().GetIntVal())
 	}
 }
 
@@ -887,6 +939,7 @@ func TestCompaction_SnapshotAppearsInDAG(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("emit %d: %v", i, err)
 		}
+
 		if err := ctx.Flush(); err != nil {
 			t.Fatalf("flush %d: %v", i, err)
 		}
@@ -894,13 +947,16 @@ func TestCompaction_SnapshotAppearsInDAG(t *testing.T) {
 
 	// Next GetSnapshot should trigger compaction and emit a snapshot.
 	ctx := e.NewContext()
+
 	r, _, err := ctx.GetSnapshot("k")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r == nil || r.Scalar.GetIntVal() != 60 {
+
+	if r == nil || r.GetScalar().GetIntVal() != 60 {
 		t.Fatalf("expected 60, got %v", r)
 	}
+
 	if err := ctx.Flush(); err != nil {
 		t.Fatal(err)
 	}
@@ -911,8 +967,10 @@ func TestCompaction_SnapshotAppearsInDAG(t *testing.T) {
 	if tips == nil {
 		t.Fatal("no tips in index")
 	}
+
 	d := newDag(e, "k", "")
 	d.visited = make(map[Tip]bool, 64)
+
 	d.nodes = make(map[Tip]*pb.Effect, 64)
 	if err := d.bfs(tips.Tips(), &d.lcaTip); err != nil {
 		t.Fatal(err)
@@ -920,12 +978,15 @@ func TestCompaction_SnapshotAppearsInDAG(t *testing.T) {
 
 	// Check that we collected a snapshot node
 	hasSnapshot := false
+
 	for _, eff := range d.nodes {
 		if eff.GetSnapshot() != nil {
 			hasSnapshot = true
+
 			break
 		}
 	}
+
 	if !hasSnapshot {
 		t.Fatal("no snapshot found in collected nodes after compaction")
 	}
@@ -940,13 +1001,13 @@ func TestCompaction_SnapshotAppearsInDAG(t *testing.T) {
 }
 
 func TestCompaction_BeaconPattern(t *testing.T) {
-
 	log := newSnapshotLog()
 	e := newSnapshotEngine(log)
 
 	nodeIDBytes := func(id uint64) []byte {
 		b := make([]byte, 8)
 		binary.LittleEndian.PutUint64(b, id)
+
 		return b
 	}
 
@@ -967,12 +1028,14 @@ func TestCompaction_BeaconPattern(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
+
 		if err := ctx.Emit(&pb.Effect{
 			Key:  []byte(key),
 			Kind: &pb.Effect_Meta{Meta: &pb.MetaEffect{TypeTag: pb.ValueType_TYPE_HASH}},
 		}); err != nil {
 			t.Fatal(err)
 		}
+
 		if err := ctx.Emit(&pb.Effect{
 			Key: []byte(key),
 			Kind: &pb.Effect_Meta{Meta: &pb.MetaEffect{
@@ -982,6 +1045,7 @@ func TestCompaction_BeaconPattern(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
+
 		if err := ctx.Flush(); err != nil {
 			t.Fatal(err)
 		}
@@ -990,10 +1054,12 @@ func TestCompaction_BeaconPattern(t *testing.T) {
 	// Beacon refresh loop: GetSnapshot → meta TTL refresh → flush
 	for i := range 80 {
 		ctx := e.NewContext()
+
 		_, _, err := ctx.GetSnapshot(key)
 		if err != nil {
 			t.Fatalf("tick %d GetSnapshot: %v", i, err)
 		}
+
 		if err := ctx.Emit(&pb.Effect{
 			Key: []byte(key),
 			Kind: &pb.Effect_Meta{Meta: &pb.MetaEffect{
@@ -1003,6 +1069,7 @@ func TestCompaction_BeaconPattern(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("tick %d Emit: %v", i, err)
 		}
+
 		if err := ctx.Flush(); err != nil {
 			t.Fatalf("tick %d Flush: %v", i, err)
 		}
@@ -1022,7 +1089,7 @@ func TestCompaction_BeaconPattern(t *testing.T) {
 				SubscriberNodeId: 2,
 			}},
 		}
-		eff.ForkChoiceHash = ComputeForkChoiceHash(2, eff.Hlc)
+		eff.ForkChoiceHash = ComputeForkChoiceHash(2, eff.GetHlc())
 		oldNID := log.nodeID
 		log.nodeID = 2
 		subTip := log.putEffect(eff)
@@ -1039,29 +1106,36 @@ func TestCompaction_BeaconPattern(t *testing.T) {
 	if tips == nil {
 		t.Fatal("no tips in index")
 	}
+
 	d := newDag(e, key, "")
 	d.visited = make(map[Tip]bool, 256)
+
 	d.nodes = make(map[Tip]*pb.Effect, 256)
 	if err := d.bfs(tips.Tips(), &d.lcaTip); err != nil {
 		t.Fatal(err)
 	}
 
 	hasSnapshot := false
+
 	for _, eff := range d.nodes {
 		if eff.GetSnapshot() != nil {
 			hasSnapshot = true
+
 			break
 		}
 	}
 
 	var zero Tip
+
 	if !hasSnapshot {
 		t.Fatalf("no snapshot in DAG after 80 ticks\ntips: %v\nnodes: %d\nencoded: %s",
 			tips.Tips(), len(d.nodes), d.encode(tips.Tips()))
 	}
+
 	if d.lcaTip == zero {
 		t.Fatalf("snapshot exists but not detected as LCA\nnodes: %d\nencoded: %s",
 			len(d.nodes), d.encode(tips.Tips()))
 	}
+
 	t.Logf("LCA at %v, %d nodes", d.lcaTip, len(d.nodes))
 }

@@ -41,9 +41,11 @@ type EffectSeq [2]uint64
 // NewNodeID generates a fresh ephemeral node ID.
 func NewNodeID() NodeID {
 	var buf [4]byte
+
 	_, _ = rand.Read(buf[:])
 	random := uint64(binary.LittleEndian.Uint32(buf[:]))
 	seconds := uint64(time.Now().Unix())
+
 	return NodeID((seconds << 32) | random)
 }
 
@@ -59,7 +61,7 @@ func NewEffectSeq(nodeID NodeID, offset uint64) EffectSeq {
 // ToRef converts an EffectSeq to its protobuf representation.
 func (e EffectSeq) ToRef() *EffectRef {
 	return &EffectRef{
-		NodeId: uint64(e[0]),
+		NodeId: e[0],
 		Offset: e[1],
 	}
 }
@@ -69,5 +71,6 @@ func EffectSeqFromRef(ref *EffectRef) EffectSeq {
 	if ref == nil {
 		return EffectSeq{}
 	}
-	return EffectSeq{ref.NodeId, ref.Offset}
+
+	return EffectSeq{ref.GetNodeId(), ref.GetOffset()}
 }

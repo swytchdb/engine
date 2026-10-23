@@ -66,6 +66,7 @@ import (
 // and exactly what the emitted data effect's Deps already resolved to.
 func TestBindConsumedTipsSubstitutesForeignInflightTip(t *testing.T) {
 	const key = "el-1"
+
 	const foreignNode = pb.NodeID(7) // the op-801 origin (.92) analog
 
 	bc := &txnMockBroadcaster{}
@@ -116,10 +117,12 @@ func TestBindConsumedTipsSubstitutesForeignInflightTip(t *testing.T) {
 			Value:      &pb.DataEffect_Raw{Raw: []byte("31947")}, // the dirty element
 		}},
 	}
+
 	foreignData, err := MarshalEffect(foreignEff)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	notify := BuildOffsetNotify(foreignNode, foreignInflight, foreignEff, foreignData, nil)
 	if _, err := e.HandleRemote(notify); err != nil {
 		t.Fatal(err)
@@ -132,10 +135,12 @@ func TestBindConsumedTipsSubstitutesForeignInflightTip(t *testing.T) {
 		t.Fatalf("foreign in-flight tip %v is not a live index tip; tips=%v",
 			foreignInflight, idx)
 	}
+
 	preTxDeps, ok := e.pendingTxTips.Load(foreignInflight)
 	if !ok {
 		t.Fatalf("foreign in-flight tip %v not tracked in pendingTxTips", foreignInflight)
 	}
+
 	if len(preTxDeps) != 1 || preTxDeps[0] != base {
 		t.Fatalf("pendingTxTips[%v] = %v; want pre-tx dep [%v]",
 			foreignInflight, preTxDeps, base)
@@ -145,9 +150,11 @@ func TestBindConsumedTipsSubstitutesForeignInflightTip(t *testing.T) {
 	// No subscribers → flushTx commits immediately and emits the bind.
 	ctx := e.NewContext()
 	ctx.BeginTx()
+
 	if err := ctx.Emit(dataEffect(key)); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := ctx.flushTx(); err != nil {
 		t.Fatalf("local txn did not commit: %v", err)
 	}
@@ -158,9 +165,11 @@ func TestBindConsumedTipsSubstitutesForeignInflightTip(t *testing.T) {
 
 	// Inspect its ConsumedTips for the key.
 	var consumed []Tip
-	for _, kb := range bind.Keys {
-		if string(kb.Key) == key {
-			consumed = fromPbRefs(kb.ConsumedTips)
+
+	for _, kb := range bind.GetKeys() {
+		if string(kb.GetKey()) == key {
+			consumed = fromPbRefs(kb.GetConsumedTips())
+
 			break
 		}
 	}
@@ -190,19 +199,24 @@ func TestBindConsumedTipsSubstitutesForeignInflightTip(t *testing.T) {
 // tip on key, failing the test if none is present.
 func findBindOnKey(t *testing.T, e *Engine, key string) *pb.TransactionalBindEffect {
 	t.Helper()
+
 	tips := e.index.Contains(key)
 	if tips == nil {
 		t.Fatalf("no index entry for key %q after commit", key)
 	}
+
 	for _, off := range tips.Tips() {
 		eff, ok := e.effectCache.Get(off)
 		if !ok {
 			continue
 		}
+
 		if bind := eff.GetTxnBind(); bind != nil {
 			return bind
 		}
 	}
+
 	t.Fatalf("no TxnBind among index tips for key %q: %v", key, tips.Tips())
+
 	return nil
 }

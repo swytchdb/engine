@@ -48,6 +48,7 @@ func TestTipSetEmpty(t *testing.T) {
 	if ts.Len() != 0 {
 		t.Fatalf("Expected 0 tips, got %d", ts.Len())
 	}
+
 	if ts.Contains(r(1)) {
 		t.Error("Empty tip set should not contain anything")
 	}
@@ -58,9 +59,11 @@ func TestTipSetContains(t *testing.T) {
 	if !ts.Contains(r(10)) {
 		t.Error("Expected to contain 10")
 	}
+
 	if !ts.Contains(r(30)) {
 		t.Error("Expected to contain 30")
 	}
+
 	if ts.Contains(r(15)) {
 		t.Error("Should not contain 15")
 	}
@@ -71,9 +74,11 @@ func TestTipSetContainsAll(t *testing.T) {
 	if !ts.ContainsAll([]EffectRef{r(10), r(30)}) {
 		t.Error("Expected to contain all of {10, 30}")
 	}
+
 	if ts.ContainsAll([]EffectRef{r(10), r(25)}) {
 		t.Error("Should not contain all of {10, 25}")
 	}
+
 	if !ts.ContainsAll(nil) {
 		t.Error("Should contain all of empty set")
 	}
@@ -81,18 +86,21 @@ func TestTipSetContainsAll(t *testing.T) {
 
 func TestTipSetSingle(t *testing.T) {
 	ts1 := NewTipSet(r(42))
+
 	v, ok := ts1.Single()
 	if !ok || v != r(42) {
 		t.Errorf("Expected ({0,42}, true), got (%v, %v)", v, ok)
 	}
 
 	ts2 := NewTipSet(r(1), r(2))
+
 	_, ok = ts2.Single()
 	if ok {
 		t.Error("Multi-tip set should not be single")
 	}
 
 	var ts3 *TipSet
+
 	_, ok = ts3.Single()
 	if ok {
 		t.Error("Nil tip set should not be single")
@@ -104,15 +112,19 @@ func TestTipSetNilReceiver(t *testing.T) {
 	if ts.Len() != 0 {
 		t.Error("Nil TipSet Len should be 0")
 	}
+
 	if ts.Contains(r(1)) {
 		t.Error("Nil TipSet should not contain anything")
 	}
+
 	if !ts.ContainsAll(nil) {
 		t.Error("Nil TipSet should ContainsAll of empty")
 	}
+
 	if ts.ContainsAll([]EffectRef{r(1)}) {
 		t.Error("Nil TipSet should not ContainsAll of non-empty")
 	}
+
 	if ts.Tips() != nil {
 		t.Error("Nil TipSet Tips should be nil")
 	}
@@ -128,36 +140,44 @@ func TestCritbitBasicOperations(t *testing.T) {
 	if c.Size() != 0 {
 		t.Errorf("Expected size 0, got %d", c.Size())
 	}
+
 	if ts := c.Contains("foo"); ts != nil {
 		t.Error("Expected nil for non-existent key")
 	}
 
 	// Insert new key (old=nil)
 	ts100 := NewTipSet(r(100))
+
 	conflict, ok := c.Insert("foo", nil, ts100)
 	if !ok {
 		t.Fatalf("Insert new key failed, conflict=%v", conflict)
 	}
+
 	if c.Size() != 1 {
 		t.Errorf("Expected size 1, got %d", c.Size())
 	}
+
 	ts := c.Contains("foo")
 	if ts == nil {
 		t.Fatal("Expected tip set for 'foo'")
 	}
+
 	if !ts.Contains(r(100)) {
 		t.Error("Expected tip set to contain 100")
 	}
 
 	// Update existing key (CAS with correct old)
 	ts200 := NewTipSet(r(200))
+
 	conflict, ok = c.Insert("foo", ts100, ts200)
 	if !ok {
 		t.Fatalf("Insert update failed, conflict=%v", conflict)
 	}
+
 	if c.Size() != 1 {
 		t.Errorf("Expected size 1 after update, got %d", c.Size())
 	}
+
 	ts = c.Contains("foo")
 	if !ts.Contains(r(200)) {
 		t.Error("Expected tip set to contain 200 after update")
@@ -167,9 +187,11 @@ func TestCritbitBasicOperations(t *testing.T) {
 	if !c.Delete("foo", c.Contains("foo")) {
 		t.Error("Expected delete to return true")
 	}
+
 	if c.Size() != 0 {
 		t.Errorf("Expected size 0 after delete, got %d", c.Size())
 	}
+
 	if ts := c.Contains("foo"); ts != nil {
 		t.Error("Expected nil for deleted key")
 	}
@@ -183,13 +205,16 @@ func TestCritbitBasicOperations(t *testing.T) {
 	// tips to nil, so revival uses old=nil — matching what Contains
 	// returns for a deleted key. A stale non-nil old would fail.
 	ts300 := NewTipSet(r(300))
+
 	conflict, ok = c.Insert("foo", nil, ts300)
 	if !ok {
 		t.Fatalf("Insert revive failed, conflict=%v", conflict)
 	}
+
 	if c.Size() != 1 {
 		t.Errorf("Expected size 1 after re-insert, got %d", c.Size())
 	}
+
 	ts = c.Contains("foo")
 	if ts == nil || !ts.Contains(r(300)) {
 		t.Error("Expected key to be revived with 300")
@@ -205,16 +230,20 @@ func TestCritbitLoadData(t *testing.T) {
 	}()
 
 	c.Insert("key", nil, NewTipSet(r(1)))
+
 	if got := c.LoadData("key"); got != nil {
 		t.Fatalf("LoadData before install = %v, want nil", *got)
 	}
+
 	payload := 42
 	if got, loaded := c.LoadOrStoreData("key", &payload); loaded || got != &payload {
 		t.Fatalf("LoadOrStoreData = (%v, %v), want (&payload, false)", got, loaded)
 	}
+
 	if got := c.LoadData("key"); got != &payload {
 		t.Fatalf("LoadData = %v, want &payload", got)
 	}
+
 	if got := c.LoadData("missing"); got != nil {
 		t.Fatalf("LoadData missing = %v, want nil", *got)
 	}
@@ -229,13 +258,16 @@ func TestCritbitInsertCASFailure(t *testing.T) {
 
 	// Try to update with wrong old pointer — should fail
 	wrongOld := NewTipSet(r(999))
+
 	conflict, ok := c.Insert("foo", wrongOld, NewTipSet(r(200)))
 	if ok {
 		t.Fatal("Expected CAS failure with wrong old pointer")
 	}
+
 	if conflict == nil {
 		t.Fatal("Expected conflicting tip set on CAS failure")
 	}
+
 	if conflict != ts1 {
 		t.Error("Expected conflict to be the current tip set")
 	}
@@ -252,10 +284,12 @@ func TestCritbitInsertNewKeySuccess(t *testing.T) {
 	defer c.Close()
 
 	ts := NewTipSet(r(42))
+
 	conflict, ok := c.Insert("newkey", nil, ts)
 	if !ok {
 		t.Fatalf("Insert new key failed, conflict=%v", conflict)
 	}
+
 	if conflict != nil {
 		t.Error("Expected nil conflict on success")
 	}
@@ -271,9 +305,11 @@ func TestCritbitCloseBehavior(t *testing.T) {
 
 	ts := NewTipSet(r(100))
 	c.Insert("foo", nil, ts)
+
 	if err := c.Close(); err != nil {
 		t.Fatalf("close failed: %v", err)
 	}
+
 	if err := c.Close(); err != nil {
 		t.Fatalf("second close failed: %v", err)
 	}
@@ -281,9 +317,11 @@ func TestCritbitCloseBehavior(t *testing.T) {
 	if c.Size() != 0 {
 		t.Fatalf("expected size 0 after close, got %d", c.Size())
 	}
+
 	if c.Contains("foo") != nil {
 		t.Fatal("expected contains to return nil after close")
 	}
+
 	if c.Delete("foo", c.Contains("foo")) {
 		t.Fatal("expected delete to return false after close")
 	}
@@ -308,6 +346,7 @@ func TestCritbitMultipleKeys(t *testing.T) {
 	defer c.Close()
 
 	keys := []string{"apple", "banana", "cherry", "date", "elderberry"}
+
 	tipSets := make([]*TipSet, len(keys))
 	for i, key := range keys {
 		tipSets[i] = NewTipSet(r(uint64(i * 100)))
@@ -322,8 +361,10 @@ func TestCritbitMultipleKeys(t *testing.T) {
 		ts := c.Contains(key)
 		if ts == nil {
 			t.Errorf("Key %s not found", key)
+
 			continue
 		}
+
 		if !ts.Contains(r(uint64(i * 100))) {
 			t.Errorf("Key %s: expected tip %d", key, i*100)
 		}
@@ -340,8 +381,10 @@ func TestCritbitRange(t *testing.T) {
 	}
 
 	var result []string
+
 	c.Range(func(key string) bool {
 		result = append(result, key)
+
 		return true
 	})
 
@@ -349,6 +392,7 @@ func TestCritbitRange(t *testing.T) {
 	if len(result) != len(expected) {
 		t.Fatalf("Expected %d keys, got %d", len(expected), len(result))
 	}
+
 	for i, key := range expected {
 		if result[i] != key {
 			t.Errorf("Position %d: expected %s, got %s", i, key, result[i])
@@ -368,8 +412,10 @@ func TestCritbitRangeWithDeleted(t *testing.T) {
 	c.Delete("d", c.Contains("d"))
 
 	var result []string
+
 	c.Range(func(key string) bool {
 		result = append(result, key)
+
 		return true
 	})
 
@@ -377,6 +423,7 @@ func TestCritbitRangeWithDeleted(t *testing.T) {
 	if len(result) != len(expected) {
 		t.Fatalf("Expected %d keys, got %d: %v", len(expected), len(result), result)
 	}
+
 	for i, key := range expected {
 		if result[i] != key {
 			t.Errorf("Position %d: expected %s, got %s", i, key, result[i])
@@ -394,10 +441,13 @@ func TestCritbitRangeFrom(t *testing.T) {
 
 	// From "b" should yield c, d, e
 	var result []string
+
 	c.RangeFrom("b", func(key string) bool {
 		result = append(result, key)
+
 		return true
 	})
+
 	if expected := []string{"c", "d", "e"}; len(result) != len(expected) {
 		t.Fatalf("RangeFrom(b): expected %v, got %v", expected, result)
 	} else {
@@ -410,40 +460,52 @@ func TestCritbitRangeFrom(t *testing.T) {
 
 	// From "" should yield all keys (same as Range)
 	result = nil
+
 	c.RangeFrom("", func(key string) bool {
 		result = append(result, key)
+
 		return true
 	})
+
 	if len(result) != 5 {
 		t.Fatalf("RangeFrom(empty): expected 5 keys, got %d", len(result))
 	}
 
 	// From "e" should yield nothing (no keys after last)
 	result = nil
+
 	c.RangeFrom("e", func(key string) bool {
 		result = append(result, key)
+
 		return true
 	})
+
 	if len(result) != 0 {
 		t.Fatalf("RangeFrom(e): expected 0 keys, got %v", result)
 	}
 
 	// From "aa" should yield b, c, d, e
 	result = nil
+
 	c.RangeFrom("aa", func(key string) bool {
 		result = append(result, key)
+
 		return true
 	})
+
 	if expected := []string{"b", "c", "d", "e"}; len(result) != len(expected) {
 		t.Fatalf("RangeFrom(aa): expected %v, got %v", expected, result)
 	}
 
 	// Early stop
 	result = nil
+
 	c.RangeFrom("b", func(key string) bool {
 		result = append(result, key)
+
 		return len(result) < 2
 	})
+
 	if expected := []string{"c", "d"}; len(result) != len(expected) {
 		t.Fatalf("RangeFrom(b) with stop: expected %v, got %v", expected, result)
 	}
@@ -456,13 +518,17 @@ func TestCritbitRangeFromWithDeleted(t *testing.T) {
 	for _, key := range []string{"a", "b", "c", "d", "e"} {
 		c.Insert(key, nil, NewTipSet(EffectRef{0, 0}))
 	}
+
 	c.Delete("c", c.Contains("c"))
 
 	var result []string
+
 	c.RangeFrom("b", func(key string) bool {
 		result = append(result, key)
+
 		return true
 	})
+
 	if expected := []string{"d", "e"}; len(result) != len(expected) {
 		t.Fatalf("RangeFrom(b) with deleted c: expected %v, got %v", expected, result)
 	}
@@ -478,8 +544,10 @@ func TestCritbitRangePrefix(t *testing.T) {
 	}
 
 	var result []string
+
 	c.RangePrefix("foo:", func(key string) bool {
 		result = append(result, key)
+
 		return true
 	})
 
@@ -522,6 +590,7 @@ func TestCritbitFirstWithDeletedLeaf(t *testing.T) {
 	if !ok {
 		t.Fatal("Expected to find a key with prefix memtier-")
 	}
+
 	if first != "memtier-2" {
 		t.Errorf("Expected first=memtier-2 after deleting memtier-1, got %s", first)
 	}
@@ -532,6 +601,7 @@ func TestCritbitFirstWithDeletedLeaf(t *testing.T) {
 	if !ok {
 		t.Fatal("Expected to find a key with prefix memtier-")
 	}
+
 	if first != "memtier-3" {
 		t.Errorf("Expected first=memtier-3, got %s", first)
 	}
@@ -551,6 +621,7 @@ func TestCritbitLastWithDeletedLeaf(t *testing.T) {
 	if !ok {
 		t.Fatal("Expected to find a key with prefix memtier-")
 	}
+
 	if last != "memtier-2" {
 		t.Errorf("Expected last=memtier-2 after deleting memtier-3, got %s", last)
 	}
@@ -598,18 +669,22 @@ func TestCritbitClaim(t *testing.T) {
 	if !exists {
 		t.Fatal("Expected key to exist")
 	}
+
 	if release == nil {
 		t.Fatal("Expected release function")
 	}
+
 	release()
 
 	exists2, release2 := c.TryClaimKey("foo")
 	if !exists2 {
 		t.Error("Expected key to exist")
 	}
+
 	if release2 == nil {
 		t.Error("Expected release function")
 	}
+
 	if release2 != nil {
 		release2()
 	}
@@ -626,6 +701,7 @@ func TestCritbitClaimDeletedKey(t *testing.T) {
 	if exists {
 		t.Error("Expected deleted key to not exist for claim")
 	}
+
 	if release != nil {
 		t.Error("Expected nil release for deleted key")
 	}
@@ -635,8 +711,10 @@ func TestCritbitConcurrentInsert(t *testing.T) {
 	c := NewCritbit[struct{}]()
 	defer c.Close()
 
-	const numGoroutines = 10
-	const keysPerGoroutine = 100
+	const (
+		numGoroutines    = 10
+		keysPerGoroutine = 100
+	)
 
 	var wg sync.WaitGroup
 	wg.Add(numGoroutines)
@@ -644,6 +722,7 @@ func TestCritbitConcurrentInsert(t *testing.T) {
 	for g := range numGoroutines {
 		go func(gid int) {
 			defer wg.Done()
+
 			for i := range keysPerGoroutine {
 				key := fmt.Sprintf("g%d:key%d", gid, i)
 				ts := NewTipSet(r(uint64(gid*1000 + i)))
@@ -665,8 +744,10 @@ func TestCritbitConcurrentInsertDelete(t *testing.T) {
 	c := NewCritbit[struct{}]()
 	defer c.Close()
 
-	const numGoroutines = 10
-	const iterations = 100
+	const (
+		numGoroutines = 10
+		iterations    = 100
+	)
 
 	var wg sync.WaitGroup
 	wg.Add(numGoroutines * 2)
@@ -675,12 +756,14 @@ func TestCritbitConcurrentInsertDelete(t *testing.T) {
 	for g := range numGoroutines {
 		go func(gid int) {
 			defer wg.Done()
+
 			for i := range iterations {
 				key := fmt.Sprintf("key%d", i%20)
 				ts := NewTipSet(r(uint64(gid*1000 + i)))
 				// Try insert; on CAS failure just retry with current
 				for {
 					old := c.Contains(key)
+
 					_, ok := c.Insert(key, old, ts)
 					if ok {
 						break
@@ -694,6 +777,7 @@ func TestCritbitConcurrentInsertDelete(t *testing.T) {
 	for range numGoroutines {
 		go func() {
 			defer wg.Done()
+
 			for i := range iterations {
 				key := fmt.Sprintf("key%d", i%20)
 				c.Delete(key, c.Contains(key))
@@ -711,8 +795,10 @@ func TestCritbitConcurrentInsertThenContains(t *testing.T) {
 	for iter := range 100 {
 		c := NewCritbit[struct{}]()
 
-		const numGoroutines = 10
-		const keysPerGoroutine = 10
+		const (
+			numGoroutines    = 10
+			keysPerGoroutine = 10
+		)
 
 		keys := make([][]string, numGoroutines)
 		for g := range numGoroutines {
@@ -724,15 +810,18 @@ func TestCritbitConcurrentInsertThenContains(t *testing.T) {
 
 		var wg sync.WaitGroup
 		wg.Add(numGoroutines)
+
 		for g := range numGoroutines {
 			go func(gid int) {
 				defer wg.Done()
+
 				for i, key := range keys[gid] {
 					ts := NewTipSet(r(uint64(gid*100 + i)))
 					c.Insert(key, nil, ts)
 				}
 			}(g)
 		}
+
 		wg.Wait()
 
 		for g := range numGoroutines {
@@ -753,8 +842,10 @@ func TestCritbitConcurrentInsertCASStress(t *testing.T) {
 	defer c.Close()
 
 	// Single key, many concurrent writers — all should eventually succeed
-	const numGoroutines = 10
-	const key = "contested"
+	const (
+		numGoroutines = 10
+		key           = "contested"
+	)
 
 	// Seed the key
 	c.Insert(key, nil, NewTipSet(EffectRef{0, 0}))
@@ -765,9 +856,12 @@ func TestCritbitConcurrentInsertCASStress(t *testing.T) {
 	for g := range numGoroutines {
 		go func(gid int) {
 			defer wg.Done()
+
 			newTS := NewTipSet(r(uint64(gid + 1)))
+
 			for range 1000 {
 				old := c.Contains(key)
+
 				conflict, ok := c.Insert(key, old, newTS)
 				if ok {
 					return
@@ -775,6 +869,7 @@ func TestCritbitConcurrentInsertCASStress(t *testing.T) {
 				// CAS failed — conflict should be a valid tip set
 				if conflict == nil {
 					t.Errorf("goroutine %d: CAS failure returned nil conflict", gid)
+
 					return
 				}
 			}
@@ -821,6 +916,7 @@ func TestCritbitEdgeCases(t *testing.T) {
 
 	// Empty string key
 	c.Insert("", nil, NewTipSet(EffectRef{0, 0}))
+
 	if ts := c.Contains(""); ts == nil {
 		t.Error("Expected empty string key to work")
 	}
@@ -828,6 +924,7 @@ func TestCritbitEdgeCases(t *testing.T) {
 	// Single character keys
 	c.Insert("a", nil, NewTipSet(r(1)))
 	c.Insert("b", nil, NewTipSet(r(2)))
+
 	ts := c.Contains("a")
 	if ts == nil || !ts.Contains(r(1)) {
 		t.Error("Single char key 'a' not found correctly")
@@ -841,6 +938,7 @@ func TestCritbitEdgeCases(t *testing.T) {
 	if ts := c.Contains("test"); ts == nil || !ts.Contains(r(10)) {
 		t.Error("Prefix key 'test' not found correctly")
 	}
+
 	if ts := c.Contains("testing"); ts == nil || !ts.Contains(r(11)) {
 		t.Error("Key 'testing' not found correctly")
 	}
@@ -878,6 +976,7 @@ func BenchmarkCritbitInsert(b *testing.B) {
 	defer c.Close()
 
 	b.ResetTimer()
+
 	for i := 0; i < b.N; i++ {
 		ts := NewTipSet(r(uint64(i)))
 		c.Insert(fmt.Sprintf("key%d", i), nil, ts)
@@ -893,6 +992,7 @@ func BenchmarkCritbitContains(b *testing.B) {
 	}
 
 	b.ResetTimer()
+
 	for i := 0; i < b.N; i++ {
 		c.Contains(fmt.Sprintf("key%d", i%10000))
 	}
@@ -907,6 +1007,7 @@ func BenchmarkCritbitDelete(b *testing.B) {
 	}
 
 	b.ResetTimer()
+
 	for i := 0; i < b.N; i++ {
 		key := fmt.Sprintf("key%d", i)
 		c.Delete(key, c.Contains(key))
@@ -935,6 +1036,7 @@ func TestCritbitBinaryKeys(t *testing.T) {
 		buf[13] = byte(seq >> 16)
 		buf[14] = byte(seq >> 8)
 		buf[15] = byte(seq)
+
 		return string(buf)
 	}
 
@@ -950,6 +1052,7 @@ func TestCritbitBinaryKeys(t *testing.T) {
 	if !found {
 		t.Fatal("FirstWithPrefix returned not found")
 	}
+
 	if first != makeKey(1, 0) {
 		t.Errorf("Expected first to be 1-0, got different key")
 	}
@@ -958,13 +1061,16 @@ func TestCritbitBinaryKeys(t *testing.T) {
 	if !found {
 		t.Fatal("LastWithPrefix returned not found")
 	}
+
 	if last != makeKey(3, 0) {
 		t.Errorf("Expected last to be 3-0, got different key")
 	}
 
 	var keys []string
+
 	c.Range(func(key string) bool {
 		keys = append(keys, key)
+
 		return true
 	})
 
@@ -983,6 +1089,7 @@ func TestCritbitBinaryKeys(t *testing.T) {
 	if !found {
 		t.Fatal("NextWithPrefix returned not found")
 	}
+
 	if next != makeKey(2, 0) {
 		t.Errorf("Expected next after 1-0 to be 2-0")
 	}
@@ -991,6 +1098,7 @@ func TestCritbitBinaryKeys(t *testing.T) {
 	if !found {
 		t.Fatal("PrevWithPrefix returned not found")
 	}
+
 	if prev != makeKey(2, 0) {
 		t.Errorf("Expected prev before 3-0 to be 2-0")
 	}
@@ -1018,6 +1126,7 @@ func TestCritbitBinaryKeysDebug(t *testing.T) {
 		buf[13] = byte(seq >> 16)
 		buf[14] = byte(seq >> 8)
 		buf[15] = byte(seq)
+
 		return string(buf)
 	}
 
@@ -1025,10 +1134,12 @@ func TestCritbitBinaryKeysDebug(t *testing.T) {
 		if len(key) != 16 {
 			return 0, 0
 		}
+
 		ms := uint64(key[0])<<56 | uint64(key[1])<<48 | uint64(key[2])<<40 | uint64(key[3])<<32 |
 			uint64(key[4])<<24 | uint64(key[5])<<16 | uint64(key[6])<<8 | uint64(key[7])
 		seq := uint64(key[8])<<56 | uint64(key[9])<<48 | uint64(key[10])<<40 | uint64(key[11])<<32 |
 			uint64(key[12])<<24 | uint64(key[13])<<16 | uint64(key[14])<<8 | uint64(key[15])
+
 		return ms, seq
 	}
 
@@ -1055,31 +1166,40 @@ func TestCritbitBinaryKeysDebug(t *testing.T) {
 	if !found {
 		t.Fatal("FirstWithPrefix returned not found")
 	}
+
 	ms, seq := parseKey(first)
 	t.Logf("FirstWithPrefix: %d-%d", ms, seq)
+
 	if ms != 1 || seq != 0 {
 		t.Errorf("Expected first to be 1-0, got %d-%d", ms, seq)
 	}
 
 	t.Log("Range iteration:")
+
 	var count int
+
 	c.Range(func(key string) bool {
 		ms, seq := parseKey(key)
 		t.Logf("  [%d] %d-%d", count, ms, seq)
 		count++
+
 		return true
 	})
+
 	if count != 3 {
 		t.Errorf("Range returned %d keys, expected 3", count)
 	}
 
 	zeroKey := makeKey(0, 0)
+
 	next, found, _ := c.NextWithPrefix("", zeroKey, false)
 	if !found {
 		t.Fatal("NextWithPrefix from 0-0 returned not found")
 	}
+
 	ms, seq = parseKey(next)
 	t.Logf("NextWithPrefix from 0-0: %d-%d", ms, seq)
+
 	if ms != 1 || seq != 0 {
 		t.Errorf("Expected NextWithPrefix(0-0) to return 1-0, got %d-%d", ms, seq)
 	}
@@ -1197,14 +1317,19 @@ func TestCritbitBinaryKeys0xFF(t *testing.T) {
 
 	// Verify lexicographic order
 	expected := []string{"\x00", "\x00\xFF", "\xFF", "\xFF\x00", "\xFF\xFF"}
+
 	var got []string
+
 	c.Range(func(key string) bool {
 		got = append(got, key)
+
 		return true
 	})
+
 	if len(got) != len(expected) {
 		t.Fatalf("Range returned %d keys, expected %d", len(got), len(expected))
 	}
+
 	for i := range expected {
 		if got[i] != expected[i] {
 			t.Errorf("Range[%d] = %q, want %q", i, got[i], expected[i])
@@ -1227,6 +1352,7 @@ func TestCritbitBinaryKeysFullByteRange(t *testing.T) {
 
 	for i := range 256 {
 		key := string([]byte{0x00, byte(i)})
+
 		ts := c.Contains(key)
 		if ts == nil {
 			t.Errorf("Contains(0x00 0x%02X) returned nil", i)
@@ -1236,13 +1362,17 @@ func TestCritbitBinaryKeysFullByteRange(t *testing.T) {
 	}
 
 	var got []string
+
 	c.Range(func(key string) bool {
 		got = append(got, key)
+
 		return true
 	})
+
 	if len(got) != 256 {
 		t.Fatalf("Range returned %d keys, expected 256", len(got))
 	}
+
 	for i := range 256 {
 		want := string([]byte{0x00, byte(i)})
 		if got[i] != want {
@@ -1262,18 +1392,23 @@ func TestCritbitBinaryKeyDelete(t *testing.T) {
 	if !c.Delete("\x00\x02", c.Contains("\x00\x02")) {
 		t.Fatal("Delete returned false for existing key")
 	}
+
 	if c.Contains("\x00\x02") != nil {
 		t.Error("Contains should return nil after delete")
 	}
+
 	if c.Size() != 2 {
 		t.Errorf("Expected size 2, got %d", c.Size())
 	}
 
 	var got []string
+
 	c.Range(func(key string) bool {
 		got = append(got, key)
+
 		return true
 	})
+
 	if len(got) != 2 || got[0] != "\x00\x01" || got[1] != "\x00\x03" {
 		t.Errorf("Range after delete = %q, want [\\x00\\x01, \\x00\\x03]", got)
 	}
@@ -1288,10 +1423,12 @@ func TestCritbitBinaryKeyDelete(t *testing.T) {
 	if !ok {
 		t.Fatal("Re-insert after delete failed")
 	}
+
 	ts := c.Contains("\x00\x02")
 	if ts == nil || !ts.Contains(r(22)) {
 		t.Error("Re-inserted key has wrong TipSet")
 	}
+
 	if c.Size() != 3 {
 		t.Errorf("Expected size 3 after re-insert, got %d", c.Size())
 	}
@@ -1338,6 +1475,7 @@ func TestCritbitBinaryKeysVaryingLength(t *testing.T) {
 	if c.Size() != 6 {
 		t.Fatalf("Expected size 6, got %d", c.Size())
 	}
+
 	for i, key := range keys {
 		ts := c.Contains(key)
 		if ts == nil {
@@ -1349,13 +1487,17 @@ func TestCritbitBinaryKeysVaryingLength(t *testing.T) {
 
 	// Verify ordering: "" < "\x01" < "\x01\x02" < "\x01\x02\x03\x04" < ...
 	var got []string
+
 	c.Range(func(key string) bool {
 		got = append(got, key)
+
 		return true
 	})
+
 	if len(got) != 6 {
 		t.Fatalf("Range returned %d keys, expected 6", len(got))
 	}
+
 	for i := 1; i < len(got); i++ {
 		if got[i] <= got[i-1] {
 			t.Errorf("Range not sorted: [%d]=%q >= [%d]=%q", i-1, got[i-1], i, got[i])
@@ -1367,6 +1509,7 @@ func TestCritbitBinaryKeysVaryingLength(t *testing.T) {
 	if !found {
 		t.Fatal("FirstWithPrefix returned not found")
 	}
+
 	if first != "" {
 		t.Errorf("FirstWithPrefix = %q, want empty string", first)
 	}
@@ -1383,6 +1526,7 @@ func TestCritbitBinaryKeysPrefixOfEachOther(t *testing.T) {
 	if c.Size() != 3 {
 		t.Fatalf("Expected size 3, got %d", c.Size())
 	}
+
 	for _, key := range []string{"\x01\x02", "\x01\x02\x03", "\x01\x02\x03\x04"} {
 		if c.Contains(key) == nil {
 			t.Errorf("Contains(%q) returned nil", key)
@@ -1391,13 +1535,17 @@ func TestCritbitBinaryKeysPrefixOfEachOther(t *testing.T) {
 
 	// RangePrefix with the shared prefix
 	var got []string
+
 	c.RangePrefix("\x01\x02", func(key string) bool {
 		got = append(got, key)
+
 		return true
 	})
+
 	if len(got) != 3 {
 		t.Fatalf("RangePrefix(\\x01\\x02) returned %d keys, want 3", len(got))
 	}
+
 	expected := []string{"\x01\x02", "\x01\x02\x03", "\x01\x02\x03\x04"}
 	for i := range expected {
 		if got[i] != expected[i] {
@@ -1415,18 +1563,23 @@ func TestCritbitBinaryKeysPrefixOfEachOther(t *testing.T) {
 	if c2.Size() != 2 {
 		t.Fatalf("Expected size 2, got %d", c2.Size())
 	}
+
 	if c2.Contains("\x01") == nil {
 		t.Error("Contains(\\x01) returned nil")
 	}
+
 	if c2.Contains("\x01\x00") == nil {
 		t.Error("Contains(\\x01\\x00) returned nil")
 	}
 
 	var got2 []string
+
 	c2.Range(func(key string) bool {
 		got2 = append(got2, key)
+
 		return true
 	})
+
 	if len(got2) != 2 || got2[0] != "\x01" || got2[1] != "\x01\x00" {
 		t.Errorf("Range = %q, want [\\x01, \\x01\\x00]", got2)
 	}
@@ -1449,6 +1602,7 @@ func TestCritbitBinaryKeysEmbeddedNulls(t *testing.T) {
 	if c.Size() != 4 {
 		t.Fatalf("Expected size 4, got %d", c.Size())
 	}
+
 	for key, v := range keys {
 		ts := c.Contains(key)
 		if ts == nil {
@@ -1460,14 +1614,19 @@ func TestCritbitBinaryKeysEmbeddedNulls(t *testing.T) {
 
 	// Verify ordering: \x00abc < ab\x00c < abc < abc\x00
 	expected := []string{"\x00abc", "ab\x00c", "abc", "abc\x00"}
+
 	var got []string
+
 	c.Range(func(key string) bool {
 		got = append(got, key)
+
 		return true
 	})
+
 	if len(got) != 4 {
 		t.Fatalf("Range returned %d keys, expected 4", len(got))
 	}
+
 	for i := range expected {
 		if got[i] != expected[i] {
 			t.Errorf("Range[%d] = %q, want %q", i, got[i], expected[i])
@@ -1476,9 +1635,11 @@ func TestCritbitBinaryKeysEmbeddedNulls(t *testing.T) {
 
 	// Delete one with embedded null, verify others remain
 	c.Delete("ab\x00c", c.Contains("ab\x00c"))
+
 	if c.Contains("ab\x00c") != nil {
 		t.Error("Deleted key should not be found")
 	}
+
 	if c.Contains("\x00abc") == nil || c.Contains("abc") == nil || c.Contains("abc\x00") == nil {
 		t.Error("Non-deleted keys should still be found")
 	}
@@ -1496,13 +1657,17 @@ func TestCritbitBinaryPrefixOperations(t *testing.T) {
 
 	// RangePrefix(\x01) → 3 keys
 	var got []string
+
 	c.RangePrefix("\x01", func(key string) bool {
 		got = append(got, key)
+
 		return true
 	})
+
 	if len(got) != 3 {
 		t.Fatalf("RangePrefix(\\x01) = %d keys, want 3", len(got))
 	}
+
 	expected := []string{"\x01\x00\x01", "\x01\x00\x02", "\x01\x01\x01"}
 	for i := range expected {
 		if got[i] != expected[i] {
@@ -1512,30 +1677,39 @@ func TestCritbitBinaryPrefixOperations(t *testing.T) {
 
 	// RangePrefix(\x01\x00) → 2 keys
 	got = nil
+
 	c.RangePrefix("\x01\x00", func(key string) bool {
 		got = append(got, key)
+
 		return true
 	})
+
 	if len(got) != 2 {
 		t.Fatalf("RangePrefix(\\x01\\x00) = %d keys, want 2", len(got))
 	}
 
 	// RangePrefix(\x02) → 2 keys
 	got = nil
+
 	c.RangePrefix("\x02", func(key string) bool {
 		got = append(got, key)
+
 		return true
 	})
+
 	if len(got) != 2 {
 		t.Fatalf("RangePrefix(\\x02) = %d keys, want 2", len(got))
 	}
 
 	// RangePrefix(\x03) → 0 keys
 	got = nil
+
 	c.RangePrefix("\x03", func(key string) bool {
 		got = append(got, key)
+
 		return true
 	})
+
 	if len(got) != 0 {
 		t.Errorf("RangePrefix(\\x03) = %d keys, want 0", len(got))
 	}
@@ -1545,6 +1719,7 @@ func TestCritbitBinaryPrefixOperations(t *testing.T) {
 	if !found || first != "\x01\x00\x01" {
 		t.Errorf("FirstWithPrefix(\\x01) = %q, found=%v", first, found)
 	}
+
 	last, found, _ := c.LastWithPrefix("\x01", false)
 	if !found || last != "\x01\x01\x01" {
 		t.Errorf("LastWithPrefix(\\x01) = %q, found=%v", last, found)
@@ -1561,13 +1736,17 @@ func TestCritbitRangeFromBinaryKeys(t *testing.T) {
 
 	// RangeFrom(\x02) → \x03, \x04, \x05 (strictly after)
 	var got []string
+
 	c.RangeFrom("\x02", func(key string) bool {
 		got = append(got, key)
+
 		return true
 	})
+
 	if len(got) != 3 {
 		t.Fatalf("RangeFrom(\\x02) = %d keys, want 3", len(got))
 	}
+
 	for i, want := range []string{"\x03", "\x04", "\x05"} {
 		if got[i] != want {
 			t.Errorf("RangeFrom(\\x02)[%d] = %q, want %q", i, got[i], want)
@@ -1576,40 +1755,52 @@ func TestCritbitRangeFromBinaryKeys(t *testing.T) {
 
 	// RangeFrom(\x00) → all 5
 	got = nil
+
 	c.RangeFrom("\x00", func(key string) bool {
 		got = append(got, key)
+
 		return true
 	})
+
 	if len(got) != 5 {
 		t.Errorf("RangeFrom(\\x00) = %d keys, want 5", len(got))
 	}
 
 	// RangeFrom(\x05) → nothing
 	got = nil
+
 	c.RangeFrom("\x05", func(key string) bool {
 		got = append(got, key)
+
 		return true
 	})
+
 	if len(got) != 0 {
 		t.Errorf("RangeFrom(\\x05) = %d keys, want 0", len(got))
 	}
 
 	// RangeFrom with between-key cursor of different length
 	got = nil
+
 	c.RangeFrom("\x02\x80", func(key string) bool {
 		got = append(got, key)
+
 		return true
 	})
+
 	if len(got) != 3 {
 		t.Errorf("RangeFrom(\\x02\\x80) = %d keys, want 3", len(got))
 	}
 
 	// RangeFrom("") → all 5 (falls through to Range)
 	got = nil
+
 	c.RangeFrom("", func(key string) bool {
 		got = append(got, key)
+
 		return true
 	})
+
 	if len(got) != 5 {
 		t.Errorf("RangeFrom(\"\") = %d keys, want 5", len(got))
 	}
@@ -1631,6 +1822,7 @@ func TestCritbitBinaryKeysSingleBitDifference(t *testing.T) {
 	if c.Size() != 9 {
 		t.Fatalf("Expected size 9, got %d", c.Size())
 	}
+
 	for i, key := range singleBitKeys {
 		ts := c.Contains(key)
 		if ts == nil {
@@ -1642,13 +1834,17 @@ func TestCritbitBinaryKeysSingleBitDifference(t *testing.T) {
 
 	// Verify order: 0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80
 	var got []string
+
 	c.Range(func(key string) bool {
 		got = append(got, key)
+
 		return true
 	})
+
 	if len(got) != 9 {
 		t.Fatalf("Range returned %d keys, expected 9", len(got))
 	}
+
 	for i := 1; i < len(got); i++ {
 		if got[i] <= got[i-1] {
 			t.Errorf("Range not sorted: [%d]=0x%02X >= [%d]=0x%02X", i-1, got[i-1][0], i, got[i][0])
@@ -1660,6 +1856,7 @@ func TestCritbitBinaryKeysSingleBitDifference(t *testing.T) {
 	if !found || next != "\x08" {
 		t.Errorf("NextWithPrefix after \\x04 = %q, want \\x08", next)
 	}
+
 	prev, found, _ := c.PrevWithPrefix("", "\x08", false)
 	if !found || prev != "\x04" {
 		t.Errorf("PrevWithPrefix before \\x08 = %q, want \\x04", prev)
@@ -1668,6 +1865,7 @@ func TestCritbitBinaryKeysSingleBitDifference(t *testing.T) {
 	// Also test two-byte keys differing in bit 0 of second byte
 	c.Insert("\x01\x00", nil, NewTipSet(r(100)))
 	c.Insert("\x01\x01", nil, NewTipSet(r(101)))
+
 	if c.Contains("\x01\x00") == nil || c.Contains("\x01\x01") == nil {
 		t.Error("Two-byte keys differing in one bit should both exist")
 	}
@@ -1689,22 +1887,27 @@ func TestCritbitBinaryKeysNavigationStress(t *testing.T) {
 
 	// Walk forward
 	var forward []string
+
 	current, found, _ := c.FirstWithPrefix("", false)
 	if !found {
 		t.Fatal("FirstWithPrefix returned not found")
 	}
+
 	forward = append(forward, current)
 	for {
 		next, ok, _ := c.NextWithPrefix("", current, false)
 		if !ok {
 			break
 		}
+
 		forward = append(forward, next)
 		current = next
 	}
+
 	if len(forward) != 50 {
 		t.Fatalf("Forward walk got %d keys, want 50", len(forward))
 	}
+
 	for i := 1; i < len(forward); i++ {
 		if forward[i] <= forward[i-1] {
 			t.Errorf("Forward walk not strictly ascending at %d", i)
@@ -1713,19 +1916,23 @@ func TestCritbitBinaryKeysNavigationStress(t *testing.T) {
 
 	// Walk backward
 	var backward []string
+
 	current, found, _ = c.LastWithPrefix("", false)
 	if !found {
 		t.Fatal("LastWithPrefix returned not found")
 	}
+
 	backward = append(backward, current)
 	for {
 		prev, ok, _ := c.PrevWithPrefix("", current, false)
 		if !ok {
 			break
 		}
+
 		backward = append(backward, prev)
 		current = prev
 	}
+
 	if len(backward) != 50 {
 		t.Fatalf("Backward walk got %d keys, want 50", len(backward))
 	}
@@ -1739,19 +1946,23 @@ func TestCritbitBinaryKeysNavigationStress(t *testing.T) {
 
 	// Walk with binary prefix \x01 → should only yield 10 keys (i=10..19, first byte=1)
 	var prefixed []string
+
 	current, found, _ = c.FirstWithPrefix("\x01", false)
 	if !found {
 		t.Fatal("FirstWithPrefix(\\x01) returned not found")
 	}
+
 	prefixed = append(prefixed, current)
 	for {
 		next, ok, _ := c.NextWithPrefix("\x01", current, false)
 		if !ok {
 			break
 		}
+
 		prefixed = append(prefixed, next)
 		current = next
 	}
+
 	if len(prefixed) != 10 {
 		t.Fatalf("Prefixed walk got %d keys, want 10", len(prefixed))
 	}
@@ -1767,6 +1978,7 @@ func TestCritbitMixedBinaryAndASCII(t *testing.T) {
 	for i, key := range ascii {
 		c.Insert(key, nil, NewTipSet(r(uint64(i+1))))
 	}
+
 	for i, key := range binary {
 		c.Insert(key, nil, NewTipSet(r(uint64(i+10))))
 	}
@@ -1774,6 +1986,7 @@ func TestCritbitMixedBinaryAndASCII(t *testing.T) {
 	if c.Size() != 6 {
 		t.Fatalf("Expected size 6, got %d", c.Size())
 	}
+
 	for _, key := range append(ascii, binary...) {
 		if c.Contains(key) == nil {
 			t.Errorf("Contains(%q) returned nil", key)
@@ -1782,34 +1995,43 @@ func TestCritbitMixedBinaryAndASCII(t *testing.T) {
 
 	// Binary keys with low bytes should come before ASCII keys
 	var got []string
+
 	c.Range(func(key string) bool {
 		got = append(got, key)
+
 		return true
 	})
 	// \x00\x00\x00 and \x00\x01\x02 come first (byte 0 < 'f','h','w')
 	if len(got) != 6 {
 		t.Fatalf("Range returned %d keys", len(got))
 	}
+
 	if got[0][0] != 0x00 {
 		t.Errorf("First key should start with \\x00, got %q", got[0])
 	}
 
 	// RangePrefix for ASCII
 	var fooPrefixed []string
+
 	c.RangePrefix("foo:", func(key string) bool {
 		fooPrefixed = append(fooPrefixed, key)
+
 		return true
 	})
+
 	if len(fooPrefixed) != 1 || fooPrefixed[0] != "foo:bar" {
 		t.Errorf("RangePrefix(foo:) = %q, want [foo:bar]", fooPrefixed)
 	}
 
 	// RangePrefix for binary
 	var nullPrefixed []string
+
 	c.RangePrefix("\x00", func(key string) bool {
 		nullPrefixed = append(nullPrefixed, key)
+
 		return true
 	})
+
 	if len(nullPrefixed) != 2 {
 		t.Errorf("RangePrefix(\\x00) = %d keys, want 2", len(nullPrefixed))
 	}
@@ -1838,6 +2060,7 @@ func TestCritbitMatchPatternBinaryKeys(t *testing.T) {
 
 	// \x01\x02? — ? matches single byte → 2 matches
 	pattern := "\x01\x02?"
+
 	matches := c.MatchPattern(pattern)
 	if len(matches) != 2 {
 		t.Errorf("MatchPattern(\\x01\\x02?) = %d, want 2: %q", len(matches), matches)
@@ -1867,6 +2090,7 @@ func TestCritbitTryClaimBinaryKeys(t *testing.T) {
 	if !exists || release == nil {
 		t.Error("TryClaimKey for existing binary key should return true")
 	}
+
 	release() // should not panic
 
 	exists, release = c.TryClaimKey("\xFF\xFE")
@@ -1882,6 +2106,7 @@ func TestCritbitTryClaimBinaryKeys(t *testing.T) {
 
 	// Deleted key
 	c.Delete("\x00\x01", c.Contains("\x00\x01"))
+
 	exists, release = c.TryClaimKey("\x00\x01")
 	if exists || release != nil {
 		t.Error("TryClaimKey for deleted key should return false, nil")
@@ -1902,6 +2127,7 @@ func TestCritbitSnapshotBinaryKeys(t *testing.T) {
 	if snap.Size() != 3 {
 		t.Fatalf("Snapshot size = %d, want 3", snap.Size())
 	}
+
 	for _, key := range []string{"\x00\x01", "\x80\x80", "\xFF\xFF"} {
 		if snap.Contains(key) == nil {
 			t.Errorf("Snapshot missing key %q", key)
@@ -1910,22 +2136,26 @@ func TestCritbitSnapshotBinaryKeys(t *testing.T) {
 
 	// Mutation isolation: insert into original
 	c.Insert("\xAA\xBB", nil, NewTipSet(r(4)))
+
 	if snap.Contains("\xAA\xBB") != nil {
 		t.Error("Snapshot should not see key inserted after snapshot")
 	}
 
 	// Mutation isolation: delete from original
 	c.Delete("\x00\x01", c.Contains("\x00\x01"))
+
 	if snap.Contains("\x00\x01") == nil {
 		t.Error("Snapshot should still have key deleted from original")
 	}
 
 	// Verify snapshot keys in order
 	expected := []string{"\x00\x01", "\x80\x80", "\xFF\xFF"}
+
 	got := snap.Keys()
 	if len(got) != 3 {
 		t.Fatalf("Snapshot Keys() = %d, want 3", len(got))
 	}
+
 	for i := range expected {
 		if got[i] != expected[i] {
 			t.Errorf("Snapshot Keys()[%d] = %q, want %q", i, got[i], expected[i])
@@ -1941,23 +2171,28 @@ func TestCritbitRemoveTipsBinaryKeys(t *testing.T) {
 
 	// Remove one tip
 	c.RemoveTips("\x00\x01", []EffectRef{r(20)})
+
 	ts := c.Contains("\x00\x01")
 	if ts == nil {
 		t.Fatal("Key should still exist after RemoveTips")
 	}
+
 	if ts.Contains(r(20)) {
 		t.Error("Removed tip should not be present")
 	}
+
 	if !ts.Contains(r(10)) || !ts.Contains(r(30)) {
 		t.Error("Non-removed tips should still be present")
 	}
 
 	// Remove remaining tips
 	c.RemoveTips("\x00\x01", []EffectRef{r(10), r(30)})
+
 	ts = c.Contains("\x00\x01")
 	if ts == nil {
 		t.Fatal("Key should still exist even with no tips")
 	}
+
 	if ts.Len() != 0 {
 		t.Errorf("Expected 0 tips, got %d", ts.Len())
 	}
@@ -1988,6 +2223,7 @@ func TestReap_SingleDeletedRoot(t *testing.T) {
 	for c.reapRunning.Load() {
 		runtime.Gosched()
 	}
+
 	if c.root.Load() != nil {
 		t.Fatal("root should be nil after auto-reap of single deleted leaf")
 	}
@@ -1996,9 +2232,11 @@ func TestReap_SingleDeletedRoot(t *testing.T) {
 func TestReap_SingleLiveRoot(t *testing.T) {
 	c := NewCritbit[struct{}]()
 	c.Insert("a", nil, NewTipSet(r(1)))
+
 	if n := c.reap(); n != 0 {
 		t.Fatalf("expected 0 reaped from live root, got %d", n)
 	}
+
 	if c.Contains("a") == nil {
 		t.Fatal("live key should still exist")
 	}
@@ -2024,9 +2262,11 @@ func TestReap_UnlinksDeletedLeaf(t *testing.T) {
 	if dc := c.deletedCount.Load(); dc != 0 {
 		t.Fatalf("deleted leaf not reaped: deletedCount=%d", dc)
 	}
+
 	if c.Contains("b") == nil {
 		t.Fatal("live key 'b' should survive reap")
 	}
+
 	if c.Contains("a") != nil {
 		t.Fatal("deleted key 'a' should not be reachable after reap")
 	}
@@ -2060,6 +2300,7 @@ func TestReap_PreservesAllLiveKeys(t *testing.T) {
 			t.Errorf("deleted key %q still reachable after reap", key)
 		}
 	}
+
 	if c.Size() != 50 {
 		t.Errorf("expected size 50, got %d", c.Size())
 	}
@@ -2084,6 +2325,7 @@ func TestReap_MultiplePassesNeeded(t *testing.T) {
 	if c.Contains("k19") == nil {
 		t.Fatal("sole survivor k19 should still exist")
 	}
+
 	if c.Size() != 1 {
 		t.Errorf("expected size 1, got %d", c.Size())
 	}
@@ -2100,10 +2342,12 @@ func TestReap_ReinsertAfterReap(t *testing.T) {
 
 	// Re-insert the deleted key
 	c.Insert("a", nil, NewTipSet(r(10)))
+
 	ts := c.Contains("a")
 	if ts == nil {
 		t.Fatal("re-inserted key should exist")
 	}
+
 	if ts.Tips()[0] != r(10) {
 		t.Fatalf("expected tip r(10), got %v", ts.Tips()[0])
 	}
@@ -2153,10 +2397,13 @@ func TestReap_ConcurrentInsertAndReap(t *testing.T) {
 
 	// Tree should still be valid — no panics, all surviving keys accessible
 	count := int64(0)
+
 	c.Range(func(key string) bool {
 		count++
+
 		return true
 	})
+
 	if count != c.Size() {
 		t.Errorf("Range count %d != Size %d", count, c.Size())
 	}

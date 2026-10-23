@@ -49,31 +49,35 @@ func ReduceBranch(effects []*pb.Effect) *pb.ReducedEffect {
 // virtual and each partition reduces independently via reduceFlat, with a root
 // key-level DEL wiping all partitions (it deletes the whole key).
 func ReduceChain(seed *pb.ReducedEffect, effects []*pb.Effect) *pb.ReducedEffect {
-	if (seed == nil || len(seed.Partitions) == 0) && !hasVirtualEffects(effects) {
+	if (seed == nil || len(seed.GetPartitions()) == 0) && !hasVirtualEffects(effects) {
 		return reduceFlat(seed, effects)
 	}
+
 	return reducePartitioned(seed, effects)
 }
 
 // hasVirtualEffects reports whether any effect addresses a non-root partition.
 func hasVirtualEffects(effects []*pb.Effect) bool {
 	for _, e := range effects {
-		if len(e.Virtual) > 0 {
+		if len(e.GetVirtual()) > 0 {
 			return true
 		}
 	}
+
 	return false
 }
 
 // isRootKeyDel reports whether e is a key-level delete (REMOVE on a root-virtual
 // SCALAR with no element id) — it tombstones the whole key, all partitions.
 func isRootKeyDel(e *pb.Effect) bool {
-	if len(e.Virtual) > 0 {
+	if len(e.GetVirtual()) > 0 {
 		return false
 	}
+
 	d := e.GetData()
-	return d != nil && d.Op == pb.EffectOp_REMOVE_OP &&
-		d.Collection == pb.CollectionKind_SCALAR && len(d.Id) == 0
+
+	return d != nil && d.GetOp() == pb.EffectOp_REMOVE_OP &&
+		d.GetCollection() == pb.CollectionKind_SCALAR && len(d.GetId()) == 0
 }
 
 // reducePartitioned reduces a chain that touches virtual partitions. Root
@@ -84,20 +88,24 @@ func reducePartitioned(seed *pb.ReducedEffect, effects []*pb.Effect) *pb.Reduced
 	// A root key-level DEL wipes everything before it (seed + all partitions);
 	// split at the last one so the live tail reduces from a clean slate.
 	liveSeed := seed
+
 	live := effects
 	for i, effect := range slices.Backward(effects) {
 		if isRootKeyDel(effect) {
 			liveSeed = nil
 			live = effects[i:]
+
 			break
 		}
 	}
 
 	// Partition the live effects by virtual, preserving order within each.
 	var rootChain []*pb.Effect
+
 	partChains := make(map[string][]*pb.Effect)
+
 	for _, e := range live {
-		if v := string(e.Virtual); v == "" {
+		if v := string(e.GetVirtual()); v == "" {
 			rootChain = append(rootChain, e)
 		} else {
 			partChains[v] = append(partChains[v], e)
@@ -111,11 +119,13 @@ func reducePartitioned(seed *pb.ReducedEffect, effects []*pb.Effect) *pb.Reduced
 
 	// Non-root partitions: reduce new effects on top of the carried seed state.
 	parts := make(map[string]*pb.ReducedEffect)
+
 	for v, chain := range partChains {
 		var base *pb.ReducedEffect
 		if liveSeed != nil {
-			base = liveSeed.Partitions[v]
+			base = liveSeed.GetPartitions()[v]
 		}
+
 		if rp := reduceFlat(base, chain); rp != nil {
 			parts[v] = rp
 		}
@@ -127,7 +137,7 @@ func reducePartitioned(seed *pb.ReducedEffect, effects []*pb.Effect) *pb.Reduced
 	// Deep-cloning it here was the per-effect O(document) cost that made
 	// reconstructing a partitioned key quadratic in its write count.
 	if liveSeed != nil {
-		for v, sp := range liveSeed.Partitions {
+		for v, sp := range liveSeed.GetPartitions() {
 			if _, touched := partChains[v]; !touched {
 				parts[v] = sp
 			}
@@ -137,10 +147,13 @@ func reducePartitioned(seed *pb.ReducedEffect, effects []*pb.Effect) *pb.Reduced
 	if len(parts) == 0 {
 		return root
 	}
+
 	if root == nil {
 		root = &pb.ReducedEffect{}
 	}
+
 	root.Partitions = parts
+
 	return root
 }
 
@@ -150,6 +163,7 @@ func reduceFlat(seed *pb.ReducedEffect, effects []*pb.Effect) *pb.ReducedEffect 
 	if seed == nil && len(effects) == 0 {
 		return nil
 	}
+
 	return reduceFlatOwned(cloneReducedFlat(seed), effects)
 }
 
@@ -162,9 +176,10 @@ func reduceFlat(seed *pb.ReducedEffect, effects []*pb.Effect) *pb.ReducedEffect 
 // can reduce in place. A partitioned chain has to split by virtual key, so it
 // routes through reducePartitioned and gives up the ownership optimization.
 func reduceChainOwned(seed *pb.ReducedEffect, effects []*pb.Effect) *pb.ReducedEffect {
-	if (seed == nil || len(seed.Partitions) == 0) && !hasVirtualEffects(effects) {
+	if (seed == nil || len(seed.GetPartitions()) == 0) && !hasVirtualEffects(effects) {
 		return reduceFlatOwned(seed, effects)
 	}
+
 	return reducePartitioned(seed, effects)
 }
 
@@ -174,7 +189,7 @@ func reduceFlatOwned(r *pb.ReducedEffect, effects []*pb.Effect) *pb.ReducedEffec
 	hadDel := false
 
 	// A REMOVE_OP seed is a DEL marker — subsequent effects start fresh.
-	if r != nil && r.Op == pb.EffectOp_REMOVE_OP && len(effects) > 0 {
+	if r != nil && r.GetOp() == pb.EffectOp_REMOVE_OP && len(effects) > 0 {
 		r = nil
 		hadDel = true
 	}
@@ -184,9 +199,10 @@ func reduceFlatOwned(r *pb.ReducedEffect, effects []*pb.Effect) *pb.ReducedEffec
 		meta := e.GetMeta()
 
 		// Key-level DEL: op=REMOVE on a SCALAR with no element ID
-		if data != nil && data.Op == pb.EffectOp_REMOVE_OP && data.Collection == pb.CollectionKind_SCALAR {
+		if data != nil && data.GetOp() == pb.EffectOp_REMOVE_OP && data.GetCollection() == pb.CollectionKind_SCALAR {
 			r = nil
 			hadDel = true
+
 			continue
 		}
 
@@ -195,30 +211,33 @@ func reduceFlatOwned(r *pb.ReducedEffect, effects []*pb.Effect) *pb.ReducedEffec
 			if r == nil {
 				r = &pb.ReducedEffect{}
 			}
-			if meta.TypeTag != pb.ValueType_TYPE_UNSPECIFIED {
-				r.TypeTag = meta.TypeTag
+
+			if meta.GetTypeTag() != pb.ValueType_TYPE_UNSPECIFIED {
+				r.TypeTag = meta.GetTypeTag()
 			}
-			if len(meta.ElementId) > 0 {
+
+			if len(meta.GetElementId()) > 0 {
 				// Per-element TTL set or persist. Replace the element, never
 				// mutate it: element pointers are shared with cached snapshot
 				// state (see cloneReduced), so an in-place ExpiresAt write
 				// would leak into every observer of the cached copy.
 				if r.NetAdds != nil {
-					if elem, ok := r.NetAdds[string(meta.ElementId)]; ok {
-						r.NetAdds[string(meta.ElementId)] = &pb.ReducedElement{
-							Data:           elem.Data,
-							Hlc:            elem.Hlc,
-							NodeId:         elem.NodeId,
-							ForkChoiceHash: elem.ForkChoiceHash,
-							ExpiresAt:      meta.ExpiresAt,
+					if elem, ok := r.GetNetAdds()[string(meta.GetElementId())]; ok {
+						r.NetAdds[string(meta.GetElementId())] = &pb.ReducedElement{
+							Data:           elem.GetData(),
+							Hlc:            elem.GetHlc(),
+							NodeId:         elem.GetNodeId(),
+							ForkChoiceHash: elem.GetForkChoiceHash(),
+							ExpiresAt:      meta.GetExpiresAt(),
 						}
 					}
 				}
-			} else if meta.ExpiresAt != nil || meta.TypeTag == pb.ValueType_TYPE_UNSPECIFIED {
+			} else if meta.GetExpiresAt() != nil || meta.GetTypeTag() == pb.ValueType_TYPE_UNSPECIFIED {
 				// Key-level TTL set (ExpiresAt>0) or persist (ExpiresAt=0 with no TypeTag).
 				// Skip when ExpiresAt=0 and TypeTag is set — that's just a type tag update.
-				r.ExpiresAt = meta.ExpiresAt
+				r.ExpiresAt = meta.GetExpiresAt()
 			}
+
 			continue
 		}
 
@@ -235,12 +254,14 @@ func reduceFlatOwned(r *pb.ReducedEffect, effects []*pb.Effect) *pb.ReducedEffec
 			if r == nil {
 				r = &pb.ReducedEffect{Commutative: true}
 			}
-			if ser.Release {
+
+			if ser.GetRelease() {
 				r.SerializationLeader = nil
 			} else {
-				id := ser.LeaderNodeId
+				id := ser.GetLeaderNodeId()
 				r.SerializationLeader = &id
 			}
+
 			continue
 		}
 
@@ -251,6 +272,7 @@ func reduceFlatOwned(r *pb.ReducedEffect, effects []*pb.Effect) *pb.ReducedEffec
 
 		if r == nil {
 			r = reduceFirst(e, data)
+
 			continue
 		}
 
@@ -260,10 +282,11 @@ func reduceFlatOwned(r *pb.ReducedEffect, effects []*pb.Effect) *pb.ReducedEffec
 	// DEL was the last effective operation
 	if r == nil && hadDel {
 		last := effects[len(effects)-1]
+
 		return &pb.ReducedEffect{
 			Op:     pb.EffectOp_REMOVE_OP,
-			Hlc:    last.Hlc,
-			NodeId: last.NodeId,
+			Hlc:    last.GetHlc(),
+			NodeId: last.GetNodeId(),
 		}
 	}
 
@@ -273,9 +296,9 @@ func reduceFlatOwned(r *pb.ReducedEffect, effects []*pb.Effect) *pb.ReducedEffec
 	// a1 vs b1 — where it diverged — not by the tip.
 	if r != nil && len(effects) > 0 {
 		last := effects[len(effects)-1]
-		r.Hlc = last.Hlc
-		r.NodeId = last.NodeId
-		r.ForkChoiceHash = effects[0].ForkChoiceHash
+		r.Hlc = last.GetHlc()
+		r.NodeId = last.GetNodeId()
+		r.ForkChoiceHash = effects[0].GetForkChoiceHash()
 	}
 
 	return r
@@ -283,24 +306,25 @@ func reduceFlatOwned(r *pb.ReducedEffect, effects []*pb.Effect) *pb.ReducedEffec
 
 func reduceFirst(e *pb.Effect, d *pb.DataEffect) *pb.ReducedEffect {
 	r := &pb.ReducedEffect{
-		Op:             d.Op,
-		Merge:          d.Merge,
-		Collection:     d.Collection,
-		Hlc:            e.Hlc,
-		NodeId:         e.NodeId,
-		Commutative:    isCommutative(d.Merge),
-		ForkChoiceHash: e.ForkChoiceHash,
+		Op:             d.GetOp(),
+		Merge:          d.GetMerge(),
+		Collection:     d.GetCollection(),
+		Hlc:            e.GetHlc(),
+		NodeId:         e.GetNodeId(),
+		Commutative:    isCommutative(d.GetMerge()),
+		ForkChoiceHash: e.GetForkChoiceHash(),
 	}
 
-	switch d.Collection {
+	switch d.GetCollection() {
 	case pb.CollectionKind_SCALAR:
 		r.Scalar = cloneData(d)
 
 	case pb.CollectionKind_KEYED:
 		r.NetAdds = make(map[string]*pb.ReducedElement)
 		r.NetRemoves = make(map[string]bool)
-		key := string(d.Id)
-		if d.Op == pb.EffectOp_INSERT_OP {
+
+		key := string(d.GetId())
+		if d.GetOp() == pb.EffectOp_INSERT_OP {
 			r.NetAdds[key] = elementFromData(e, d)
 		} else {
 			r.NetRemoves[key] = true
@@ -308,7 +332,7 @@ func reduceFirst(e *pb.Effect, d *pb.DataEffect) *pb.ReducedEffect {
 
 	case pb.CollectionKind_ORDERED:
 		r.NetRemoves = make(map[string]bool)
-		if d.Op == pb.EffectOp_INSERT_OP {
+		if d.GetOp() == pb.EffectOp_INSERT_OP {
 			r.OrderedElements = []*pb.ReducedElement{elementFromData(e, d)}
 		}
 	}
@@ -320,7 +344,7 @@ func reduceAccumulate(r *pb.ReducedEffect, e *pb.Effect, d *pb.DataEffect) *pb.R
 	// When switching to SCALAR, clear KEYED/ORDERED overlay state.
 	// A SCALAR write (SET, BITOP) replaces the entire value — any
 	// previous KEYED toggles or ORDERED elements are stale.
-	if d.Collection == pb.CollectionKind_SCALAR && r.Collection != pb.CollectionKind_SCALAR {
+	if d.GetCollection() == pb.CollectionKind_SCALAR && r.GetCollection() != pb.CollectionKind_SCALAR {
 		r.NetAdds = nil
 		r.NetRemoves = nil
 		r.OrderedElements = nil
@@ -329,9 +353,9 @@ func reduceAccumulate(r *pb.ReducedEffect, e *pb.Effect, d *pb.DataEffect) *pb.R
 	// Update collection kind to match the data effect. This is necessary
 	// when a MetaEffect created the ReducedEffect first (defaulting Collection
 	// to SCALAR/0) and subsequent data effects use a different collection.
-	r.Collection = d.Collection
+	r.Collection = d.GetCollection()
 
-	switch d.Collection {
+	switch d.GetCollection() {
 	case pb.CollectionKind_SCALAR:
 		reduceScalar(r, e, d)
 	case pb.CollectionKind_KEYED:
@@ -339,31 +363,36 @@ func reduceAccumulate(r *pb.ReducedEffect, e *pb.Effect, d *pb.DataEffect) *pb.R
 	case pb.CollectionKind_ORDERED:
 		reduceOrdered(r, e, d)
 	}
+
 	return r
 }
 
 func reduceScalar(r *pb.ReducedEffect, _ *pb.Effect, d *pb.DataEffect) {
-	if r.Scalar == nil {
+	if r.GetScalar() == nil {
 		r.Scalar = cloneData(d)
-		r.Merge = d.Merge
+		r.Merge = d.GetMerge()
+
 		return
 	}
-	switch d.Merge {
+
+	switch d.GetMerge() {
 	case pb.MergeRule_ADDITIVE_INT:
-		if r.Merge == pb.MergeRule_ADDITIVE_INT {
-			r.Scalar.Value = &pb.DataEffect_IntVal{IntVal: r.Scalar.GetIntVal() + d.GetIntVal()}
-		} else if r.Merge == pb.MergeRule_LAST_WRITE_WINS {
-			r.Scalar.Value = &pb.DataEffect_IntVal{IntVal: scalarIntBase(r.Scalar) + d.GetIntVal()}
+		switch r.GetMerge() {
+		case pb.MergeRule_ADDITIVE_INT:
+			r.Scalar.Value = &pb.DataEffect_IntVal{IntVal: r.GetScalar().GetIntVal() + d.GetIntVal()}
+		case pb.MergeRule_LAST_WRITE_WINS:
+			r.Scalar.Value = &pb.DataEffect_IntVal{IntVal: scalarIntBase(r.GetScalar()) + d.GetIntVal()}
 			r.Scalar.Merge = pb.MergeRule_LAST_WRITE_WINS
 			r.Merge = pb.MergeRule_LAST_WRITE_WINS
 			r.Commutative = false
 		}
 
 	case pb.MergeRule_ADDITIVE_FLOAT:
-		if r.Merge == pb.MergeRule_ADDITIVE_FLOAT {
-			r.Scalar.Value = &pb.DataEffect_FloatVal{FloatVal: r.Scalar.GetFloatVal() + d.GetFloatVal()}
-		} else if r.Merge == pb.MergeRule_LAST_WRITE_WINS {
-			r.Scalar.Value = &pb.DataEffect_FloatVal{FloatVal: scalarFloatBase(r.Scalar) + d.GetFloatVal()}
+		switch r.GetMerge() {
+		case pb.MergeRule_ADDITIVE_FLOAT:
+			r.Scalar.Value = &pb.DataEffect_FloatVal{FloatVal: r.GetScalar().GetFloatVal() + d.GetFloatVal()}
+		case pb.MergeRule_LAST_WRITE_WINS:
+			r.Scalar.Value = &pb.DataEffect_FloatVal{FloatVal: scalarFloatBase(r.GetScalar()) + d.GetFloatVal()}
 			r.Scalar.Merge = pb.MergeRule_LAST_WRITE_WINS
 			r.Merge = pb.MergeRule_LAST_WRITE_WINS
 			r.Commutative = false
@@ -378,12 +407,12 @@ func reduceScalar(r *pb.ReducedEffect, _ *pb.Effect, d *pb.DataEffect) {
 		r.ExpiresAt = nil
 
 	case pb.MergeRule_MAX_INT:
-		if d.GetIntVal() > r.Scalar.GetIntVal() {
+		if d.GetIntVal() > r.GetScalar().GetIntVal() {
 			r.Scalar.Value = &pb.DataEffect_IntVal{IntVal: d.GetIntVal()}
 		}
 
 	case pb.MergeRule_MAX_BYTES:
-		a := r.Scalar.Decompress()
+		a := r.GetScalar().Decompress()
 		b := d.Decompress()
 		// a may alias the stored effect's bytes (cloneData shares byte
 		// slices, and Decompress returns the raw arm as-is), so never fold
@@ -392,11 +421,13 @@ func reduceScalar(r *pb.ReducedEffect, _ *pb.Effect, d *pb.DataEffect) {
 		// bytes missing from the shorter side reduce as zero.
 		result := make([]byte, max(len(a), len(b)))
 		copy(result, a)
+
 		for i := range b {
 			if b[i] > result[i] {
 				result[i] = b[i]
 			}
 		}
+
 		r.Scalar.Value = &pb.DataEffect_Raw{Raw: result}
 	}
 }
@@ -405,59 +436,62 @@ func reduceKeyed(r *pb.ReducedEffect, e *pb.Effect, d *pb.DataEffect) {
 	if r.NetAdds == nil {
 		r.NetAdds = make(map[string]*pb.ReducedElement)
 	}
+
 	if r.NetRemoves == nil {
 		r.NetRemoves = make(map[string]bool)
 	}
 
-	key := string(d.Id)
+	key := string(d.GetId())
 
-	if d.Op == pb.EffectOp_REMOVE_OP {
-		if _, inAdds := r.NetAdds[key]; inAdds {
-			delete(r.NetAdds, key)
+	if d.GetOp() == pb.EffectOp_REMOVE_OP {
+		if _, inAdds := r.GetNetAdds()[key]; inAdds {
+			delete(r.GetNetAdds(), key)
 		} else {
 			r.NetRemoves[key] = true
 		}
+
 		return
 	}
 
 	// INSERT
-	existing, exists := r.NetAdds[key]
+	existing, exists := r.GetNetAdds()[key]
 	if !exists {
 		r.NetAdds[key] = elementFromData(e, d)
-		delete(r.NetRemoves, key)
+		delete(r.GetNetRemoves(), key)
+
 		return
 	}
 
 	// Accumulate into existing element — always create a new element to
 	// avoid mutating shared pointers (e.g. snapshot state in the effect cache).
-	switch d.Merge {
+	switch d.GetMerge() {
 	case pb.MergeRule_ADDITIVE_INT:
-		base := scalarIntBase(existing.Data)
+		base := scalarIntBase(existing.GetData())
 		newElem := &pb.ReducedElement{
-			Data:      cloneData(existing.Data),
-			Hlc:       existing.Hlc,
-			NodeId:    existing.NodeId,
-			ExpiresAt: existing.ExpiresAt,
+			Data:      cloneData(existing.GetData()),
+			Hlc:       existing.GetHlc(),
+			NodeId:    existing.GetNodeId(),
+			ExpiresAt: existing.GetExpiresAt(),
 		}
 		newElem.Data.Value = &pb.DataEffect_IntVal{IntVal: base + d.GetIntVal()}
 		r.NetAdds[key] = newElem
 	case pb.MergeRule_ADDITIVE_FLOAT:
-		base := scalarFloatBase(existing.Data)
+		base := scalarFloatBase(existing.GetData())
 		newElem := &pb.ReducedElement{
-			Data:      cloneData(existing.Data),
-			Hlc:       existing.Hlc,
-			NodeId:    existing.NodeId,
-			ExpiresAt: existing.ExpiresAt,
+			Data:      cloneData(existing.GetData()),
+			Hlc:       existing.GetHlc(),
+			NodeId:    existing.GetNodeId(),
+			ExpiresAt: existing.GetExpiresAt(),
 		}
 		newElem.Data.Value = &pb.DataEffect_FloatVal{FloatVal: base + d.GetFloatVal()}
 		r.NetAdds[key] = newElem
 	case pb.MergeRule_MAX_INT:
-		if d.GetIntVal() > existing.Data.GetIntVal() {
+		if d.GetIntVal() > existing.GetData().GetIntVal() {
 			newElem := &pb.ReducedElement{
-				Data:      cloneData(existing.Data),
-				Hlc:       existing.Hlc,
-				NodeId:    existing.NodeId,
-				ExpiresAt: existing.ExpiresAt,
+				Data:      cloneData(existing.GetData()),
+				Hlc:       existing.GetHlc(),
+				NodeId:    existing.GetNodeId(),
+				ExpiresAt: existing.GetExpiresAt(),
 			}
 			newElem.Data.Value = &pb.DataEffect_IntVal{IntVal: d.GetIntVal()}
 			r.NetAdds[key] = newElem
@@ -475,41 +509,42 @@ func reduceOrdered(r *pb.ReducedEffect, e *pb.Effect, d *pb.DataEffect) {
 		r.NetRemoves = make(map[string]bool)
 	}
 
-	id := string(d.Id)
+	id := string(d.GetId())
 
-	if d.Op == pb.EffectOp_REMOVE_OP {
-		idx := findOrderedByID(r.OrderedElements, d.Id)
+	if d.GetOp() == pb.EffectOp_REMOVE_OP {
+		idx := findOrderedByID(r.GetOrderedElements(), d.GetId())
 		if idx >= 0 {
-			r.OrderedElements = slices.Delete(r.OrderedElements, idx, idx+1)
+			r.OrderedElements = slices.Delete(r.GetOrderedElements(), idx, idx+1)
 		} else {
 			// Element from before this branch — track for merge
 			r.NetRemoves[id] = true
 		}
+
 		return
 	}
 
 	elem := elementFromData(e, d)
 
-	switch d.Placement {
+	switch d.GetPlacement() {
 	case pb.Placement_PLACE_HEAD:
-		r.OrderedElements = slices.Insert(r.OrderedElements, 0, elem)
+		r.OrderedElements = slices.Insert(r.GetOrderedElements(), 0, elem)
 
 	case pb.Placement_PLACE_TAIL, pb.Placement_PLACE_NONE:
 		r.OrderedElements = append(r.OrderedElements, elem)
 
 	case pb.Placement_PLACE_BEFORE:
-		idx := findOrderedByID(r.OrderedElements, d.Reference)
+		idx := findOrderedByID(r.GetOrderedElements(), d.GetReference())
 		if idx >= 0 {
-			r.OrderedElements = slices.Insert(r.OrderedElements, idx, elem)
+			r.OrderedElements = slices.Insert(r.GetOrderedElements(), idx, elem)
 		} else {
 			// Reference not found, treat as head (conservative)
-			r.OrderedElements = slices.Insert(r.OrderedElements, 0, elem)
+			r.OrderedElements = slices.Insert(r.GetOrderedElements(), 0, elem)
 		}
 
 	case pb.Placement_PLACE_AFTER:
-		idx := findOrderedByID(r.OrderedElements, d.Reference)
+		idx := findOrderedByID(r.GetOrderedElements(), d.GetReference())
 		if idx >= 0 {
-			r.OrderedElements = slices.Insert(r.OrderedElements, idx+1, elem)
+			r.OrderedElements = slices.Insert(r.GetOrderedElements(), idx+1, elem)
 		} else {
 			// Reference not found, treat as tail (conservative)
 			r.OrderedElements = append(r.OrderedElements, elem)
@@ -517,7 +552,7 @@ func reduceOrdered(r *pb.ReducedEffect, e *pb.Effect, d *pb.DataEffect) {
 
 	case pb.Placement_PLACE_SELF:
 		// Update existing element in place (LSET)
-		idx := findOrderedByID(r.OrderedElements, d.Id)
+		idx := findOrderedByID(r.GetOrderedElements(), d.GetId())
 		if idx >= 0 {
 			r.OrderedElements[idx] = elem
 		}
@@ -526,10 +561,11 @@ func reduceOrdered(r *pb.ReducedEffect, e *pb.Effect, d *pb.DataEffect) {
 
 func findOrderedByID(elements []*pb.ReducedElement, id []byte) int {
 	for i, elem := range elements {
-		if bytes.Equal(elem.Data.Id, id) {
+		if bytes.Equal(elem.GetData().GetId(), id) {
 			return i
 		}
 	}
+
 	return -1
 }
 
@@ -553,12 +589,14 @@ func cloneReduced(r *pb.ReducedEffect) *pb.ReducedEffect {
 	if c == nil {
 		return nil
 	}
+
 	if r.Partitions != nil {
-		c.Partitions = make(map[string]*pb.ReducedEffect, len(r.Partitions))
-		for k, v := range r.Partitions {
+		c.Partitions = make(map[string]*pb.ReducedEffect, len(r.GetPartitions()))
+		for k, v := range r.GetPartitions() {
 			c.Partitions[k] = cloneReduced(v)
 		}
 	}
+
 	return c
 }
 
@@ -571,32 +609,36 @@ func cloneReducedFlat(r *pb.ReducedEffect) *pb.ReducedEffect {
 	if r == nil {
 		return nil
 	}
+
 	c := &pb.ReducedEffect{
-		Op:                  r.Op,
-		Merge:               r.Merge,
-		Collection:          r.Collection,
-		Hlc:                 r.Hlc,
-		NodeId:              r.NodeId,
-		Commutative:         r.Commutative,
-		TypeTag:             r.TypeTag,
-		ExpiresAt:           r.ExpiresAt,
+		Op:                  r.GetOp(),
+		Merge:               r.GetMerge(),
+		Collection:          r.GetCollection(),
+		Hlc:                 r.GetHlc(),
+		NodeId:              r.GetNodeId(),
+		Commutative:         r.GetCommutative(),
+		TypeTag:             r.GetTypeTag(),
+		ExpiresAt:           r.GetExpiresAt(),
 		SerializationLeader: r.SerializationLeader,
-		ForkChoiceHash:      r.ForkChoiceHash,
+		ForkChoiceHash:      r.GetForkChoiceHash(),
 	}
-	if r.Scalar != nil {
-		c.Scalar = cloneData(r.Scalar)
+	if r.GetScalar() != nil {
+		c.Scalar = cloneData(r.GetScalar())
 	}
+
 	if r.NetAdds != nil {
-		c.NetAdds = make(map[string]*pb.ReducedElement, len(r.NetAdds))
-		maps.Copy(c.NetAdds, r.NetAdds)
+		c.NetAdds = make(map[string]*pb.ReducedElement, len(r.GetNetAdds()))
+		maps.Copy(c.GetNetAdds(), r.GetNetAdds())
 	}
+
 	if r.NetRemoves != nil {
-		c.NetRemoves = make(map[string]bool, len(r.NetRemoves))
-		maps.Copy(c.NetRemoves, r.NetRemoves)
+		c.NetRemoves = make(map[string]bool, len(r.GetNetRemoves()))
+		maps.Copy(c.GetNetRemoves(), r.GetNetRemoves())
 	}
+
 	if r.OrderedElements != nil {
-		c.OrderedElements = make([]*pb.ReducedElement, len(r.OrderedElements))
-		copy(c.OrderedElements, r.OrderedElements)
+		c.OrderedElements = make([]*pb.ReducedElement, len(r.GetOrderedElements()))
+		copy(c.GetOrderedElements(), r.GetOrderedElements())
 	}
 	// Subscribers is intentionally NOT cloned: it is not part of the read/data
 	// reduction pipeline. A snapshot's State.Subscribers is read directly from
@@ -608,14 +650,14 @@ func cloneReducedFlat(r *pb.ReducedEffect) *pb.ReducedEffect {
 // cloneData creates a shallow copy of a DataEffect, sharing byte slices.
 func cloneData(d *pb.DataEffect) *pb.DataEffect {
 	result := &pb.DataEffect{
-		Op:         d.Op,
-		Merge:      d.Merge,
-		Collection: d.Collection,
-		Placement:  d.Placement,
-		Reference:  d.Reference,
-		Id:         d.Id,
+		Op:         d.GetOp(),
+		Merge:      d.GetMerge(),
+		Collection: d.GetCollection(),
+		Placement:  d.GetPlacement(),
+		Reference:  d.GetReference(),
+		Id:         d.GetId(),
 	}
-	switch v := d.Value.(type) {
+	switch v := d.GetValue().(type) {
 	case *pb.DataEffect_Raw:
 		result.Value = &pb.DataEffect_Raw{Raw: v.Raw}
 	case *pb.DataEffect_IntVal:
@@ -629,15 +671,16 @@ func cloneData(d *pb.DataEffect) *pb.DataEffect {
 	case *pb.DataEffect_Child:
 		result.Value = &pb.DataEffect_Child{Child: v.Child}
 	}
+
 	return result
 }
 
 func elementFromData(e *pb.Effect, d *pb.DataEffect) *pb.ReducedElement {
 	return &pb.ReducedElement{
 		Data:           cloneData(d),
-		Hlc:            e.Hlc,
-		NodeId:         e.NodeId,
-		ForkChoiceHash: e.ForkChoiceHash,
+		Hlc:            e.GetHlc(),
+		NodeId:         e.GetNodeId(),
+		ForkChoiceHash: e.GetForkChoiceHash(),
 	}
 }
 
@@ -648,6 +691,7 @@ func scalarIntBase(d *pb.DataEffect) int64 {
 	if _, ok := d.GetValue().(*pb.DataEffect_IntVal); ok {
 		return d.GetIntVal()
 	}
+
 	return rawToInt(d.Decompress())
 }
 
@@ -656,6 +700,7 @@ func scalarFloatBase(d *pb.DataEffect) float64 {
 	if _, ok := d.GetValue().(*pb.DataEffect_FloatVal); ok {
 		return d.GetFloatVal()
 	}
+
 	return rawToFloat(d.Decompress())
 }
 
@@ -663,7 +708,9 @@ func rawToInt(b []byte) int64 {
 	if len(b) == 0 {
 		return 0
 	}
+
 	v, _ := parseInt(b)
+
 	return v
 }
 
@@ -671,6 +718,8 @@ func rawToFloat(b []byte) float64 {
 	if len(b) == 0 {
 		return 0
 	}
+
 	v, _ := parseFloat(b)
+
 	return v
 }

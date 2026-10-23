@@ -33,18 +33,22 @@ import (
 func getCounterValue(c prometheus.Counter) float64 {
 	var m dto.Metric
 	c.Write(&m)
+
 	return m.GetCounter().GetValue()
 }
 
 func getGaugeValue(g prometheus.Gauge) float64 {
 	var m dto.Metric
 	g.Write(&m)
+
 	return m.GetGauge().GetValue()
 }
 
 func TestRecordNotificationSent(t *testing.T) {
 	before := getCounterValue(NotificationsSentTotal)
+
 	RecordNotificationSent()
+
 	after := getCounterValue(NotificationsSentTotal)
 	if after != before+1 {
 		t.Fatalf("expected counter to increment by 1, got %f -> %f", before, after)
@@ -53,7 +57,9 @@ func TestRecordNotificationSent(t *testing.T) {
 
 func TestRecordNotificationReceived(t *testing.T) {
 	before := getCounterValue(NotificationsReceivedTotal)
+
 	RecordNotificationReceived()
+
 	after := getCounterValue(NotificationsReceivedTotal)
 	if after != before+1 {
 		t.Fatalf("expected counter to increment by 1, got %f -> %f", before, after)
@@ -62,7 +68,9 @@ func TestRecordNotificationReceived(t *testing.T) {
 
 func TestRecordFetchServed(t *testing.T) {
 	before := getCounterValue(FetchesServedTotal)
+
 	RecordFetchServed()
+
 	after := getCounterValue(FetchesServedTotal)
 	if after != before+1 {
 		t.Fatalf("expected counter to increment by 1, got %f -> %f", before, after)
@@ -71,13 +79,16 @@ func TestRecordFetchServed(t *testing.T) {
 
 func TestRecordPeerConnectedDisconnected(t *testing.T) {
 	RecordPeerConnected(1)
+
 	g := peerConnected.WithLabelValues("1")
+
 	val := getGaugeValue(g)
 	if val != 1 {
 		t.Fatalf("expected peer_connected=1, got %f", val)
 	}
 
 	RecordPeerDisconnected(1)
+
 	val = getGaugeValue(g)
 	if val != 0 {
 		t.Fatalf("expected peer_connected=0, got %f", val)
@@ -86,9 +97,12 @@ func TestRecordPeerConnectedDisconnected(t *testing.T) {
 
 func TestRecordNotificationDropped(t *testing.T) {
 	RecordNotificationDropped(5)
+
 	c := peerNotificationsDroppedTotal.WithLabelValues("5")
+
 	var m dto.Metric
 	c.Write(&m)
+
 	if m.GetCounter().GetValue() < 1 {
 		t.Fatal("expected notifications_dropped counter >= 1")
 	}
@@ -96,9 +110,12 @@ func TestRecordNotificationDropped(t *testing.T) {
 
 func TestRecordPeerReconnect(t *testing.T) {
 	RecordPeerReconnect(3)
+
 	c := peerReconnectsTotal.WithLabelValues("3")
+
 	var m dto.Metric
 	c.Write(&m)
+
 	if m.GetCounter().GetValue() < 1 {
 		t.Fatal("expected reconnects counter >= 1")
 	}

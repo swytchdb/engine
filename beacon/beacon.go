@@ -95,6 +95,7 @@ func New(cfg Config, engine *effects.Engine, pm *cluster.PeerManager) *Beacon {
 	if cfg.Cloud != nil {
 		cfg.Cloud.SetMemberRemoveHandler(b.removeMember)
 	}
+
 	return b
 }
 
@@ -106,6 +107,7 @@ func (b *Beacon) removeMember(nodeID uint64) {
 	b.removeMu.Lock()
 	b.removeQ = append(b.removeQ, nodeID)
 	b.removeMu.Unlock()
+
 	select {
 	case b.removeSignal <- struct{}{}:
 	default:
@@ -115,12 +117,14 @@ func (b *Beacon) removeMember(nodeID uint64) {
 // memberRemoveLoop applies queued cloud-pushed removals in batches.
 func (b *Beacon) memberRemoveLoop() {
 	defer b.wg.Done()
+
 	for {
 		select {
 		case <-b.ctx.Done():
 			return
 		case <-b.removeSignal:
 		}
+
 		b.applyQueuedRemovals()
 	}
 }
@@ -139,6 +143,7 @@ func (b *Beacon) applyQueuedRemovals() {
 	batch := b.removeQ
 	b.removeQ = nil
 	b.removeMu.Unlock()
+
 	if len(batch) == 0 {
 		return
 	}
@@ -150,6 +155,7 @@ func (b *Beacon) applyQueuedRemovals() {
 	// effect per sweep. On a failed roster read the batch applies unfiltered:
 	// redundant effects are the safe direction, a dropped removal is not.
 	var present map[uint64]bool
+
 	roster, _, err := b.engine.NewReadOnlyContext().GetSnapshot(MembershipKey)
 	if err != nil {
 		slog.Warn("beacon: roster read before removals failed, applying unfiltered", "error", err)
@@ -159,6 +165,7 @@ func (b *Beacon) applyQueuedRemovals() {
 			present[m.NodeID] = true
 		}
 	}
+
 	toApply := batch
 	if present != nil {
 		toApply = make([]uint64, 0, len(batch))
@@ -167,8 +174,10 @@ func (b *Beacon) applyQueuedRemovals() {
 				toApply = append(toApply, nodeID)
 			}
 		}
+
 		if len(toApply) == 0 {
 			slog.Debug("beacon: member removals already absent", "offered", len(batch))
+
 			return
 		}
 	}
@@ -179,10 +188,13 @@ func (b *Beacon) applyQueuedRemovals() {
 			slog.Error("beacon: member remove emit failed", "node_id", nodeID, "error", err)
 		}
 	}
+
 	if err := ctx.Flush(); err != nil {
 		slog.Error("beacon: member remove flush failed", "batch", len(toApply), "error", err)
+
 		return
 	}
+
 	slog.Info("beacon: applied member removals",
 		"batch", len(toApply), "skipped_absent", len(batch)-len(toApply))
 
@@ -190,6 +202,7 @@ func (b *Beacon) applyQueuedRemovals() {
 	if _, _, err := cctx.GetSnapshot(MembershipKey); err != nil {
 		slog.Error("beacon: post-removal compaction read failed", "error", err)
 	}
+
 	if err := cctx.Flush(); err != nil {
 		slog.Error("beacon: post-removal compaction flush failed", "error", err)
 	}
@@ -229,7 +242,9 @@ func (b *Beacon) Start(ctx context.Context) (err error) {
 		// Required so registerSelf's SafeMode replication has valid targets.
 		symCtx, symCancel := context.WithTimeout(b.ctx, 10*time.Second)
 		err := b.waitForSymmetricPeers(symCtx)
+
 		symCancel()
+
 		if err != nil {
 			slog.Warn("beacon: no symmetric peers available, skipping prime subscription", "error", err)
 		} else {
@@ -275,6 +290,7 @@ func (b *Beacon) Start(ctx context.Context) (err error) {
 		"join", b.cfg.JoinAddr,
 		"cloud", b.cfg.Cloud != nil,
 	)
+
 	return nil
 }
 
@@ -286,6 +302,7 @@ func (b *Beacon) Stop() {
 		if b.cancel != nil {
 			b.cancel()
 		}
+
 		b.wg.Wait()
 
 		slog.Info("beacon stopped", "node_id", b.cfg.NodeID)
@@ -296,8 +313,10 @@ func (b *Beacon) Stop() {
 func (b *Beacon) Members() []Member {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
+
 	out := make([]Member, len(b.members))
 	copy(out, b.members)
+
 	return out
 }
 
@@ -308,10 +327,12 @@ func (b *Beacon) waitForSymmetricPeers(ctx context.Context) error {
 	if ht == nil {
 		return nil
 	}
+
 	for {
 		if len(ht.AlivePeerIDs()) > 0 {
 			return nil
 		}
+
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -326,10 +347,12 @@ func (b *Beacon) waitForSymmetricPeers(ctx context.Context) error {
 // will be retried during waitForMembershipConverged.
 func (b *Beacon) primeSubscription() {
 	ctx := b.engine.NewContext()
+
 	_, _, err := ctx.GetSnapshot(MembershipKey)
 	if err != nil {
 		slog.Debug("beacon: prime subscription incomplete (will retry)", "error", err)
 	}
+
 	ctx.Flush()
 }
 
@@ -347,13 +370,17 @@ func (b *Beacon) registerSelf() error {
 	if err := ctx.Emit(buildMemberInsert(uint64(b.cfg.NodeID), b.cfg.AdvertiseAddr)); err != nil {
 		return err
 	}
+
 	if err := ctx.Emit(buildMemberTypeTag()); err != nil {
 		return err
 	}
+
 	if err := ctx.Flush(); err != nil {
 		return err
 	}
+
 	b.selfRegistered = true
+
 	return nil
 }
 
@@ -370,12 +397,16 @@ func (b *Beacon) unregisterSelf() {
 	ctx := b.engine.NewContext()
 	if err := ctx.Emit(buildMemberRemove(uint64(b.cfg.NodeID))); err != nil {
 		slog.Error("beacon: departure remove emit failed", "node_id", b.cfg.NodeID, "error", err)
+
 		return
 	}
+
 	if err := ctx.Flush(); err != nil {
 		slog.Error("beacon: departure remove flush failed", "node_id", b.cfg.NodeID, "error", err)
+
 		return
 	}
+
 	b.selfRegistered = false
 }
 
@@ -438,10 +469,12 @@ func (b *Beacon) NotifyMembershipChanged() {
 // ping-pong the way compensating re-inserts did.
 func (b *Beacon) refreshTopology() {
 	ctx := b.engine.NewContext()
+
 	snapshot, _, err := ctx.GetSnapshot(MembershipKey)
 	if err != nil {
 		ctx.Flush()
 		slog.Debug("beacon: membership snapshot read failed", "error", err)
+
 		return
 	}
 
@@ -450,12 +483,14 @@ func (b *Beacon) refreshTopology() {
 		if m.Addr == b.cfg.AdvertiseAddr && m.NodeID != selfID {
 			slog.Info("beacon: evicting dead predecessor at our address",
 				"old_node_id", m.NodeID, "addr", m.Addr)
+
 			if err := ctx.Emit(buildMemberRemove(m.NodeID)); err != nil {
 				slog.Error("beacon: predecessor eviction emit failed",
 					"old_node_id", m.NodeID, "error", err)
 			}
 		}
 	}
+
 	if err := ctx.Flush(); err != nil {
 		slog.Error("beacon: topology refresh flush failed", "error", err)
 	}
@@ -469,6 +504,7 @@ func (b *Beacon) syncMembership(snapshot *pb.ReducedEffect) {
 	members := parseMembership(snapshot)
 
 	b.mu.Lock()
+
 	changed := !membersEqual(b.members, members)
 	if changed {
 		b.members = members
@@ -491,7 +527,7 @@ func (b *Beacon) updateTopology(members []Member) {
 	}
 
 	cfg := &cluster.ClusterConfig{
-		NodeID:        cluster.NodeId(b.cfg.NodeID),
+		NodeID:        b.cfg.NodeID,
 		Nodes:         nodes,
 		TLSPassphrase: b.cfg.Passphrase,
 	}
@@ -507,6 +543,7 @@ func (b *Beacon) updateTopology(members []Member) {
 // correct IP SAN.
 func DetectAdvertiseAddr(joinAddr string, clusterPort int) (string, error) {
 	target := "8.8.8.8:53"
+
 	if joinAddr != "" {
 		addrs, err := ResolveJoinAddr(context.Background(), nil, joinAddr, clusterPort)
 		if err == nil && len(addrs) > 0 {
@@ -534,15 +571,18 @@ func membersEqual(a, b []Member) bool {
 	if len(a) != len(b) {
 		return false
 	}
+
 	set := make(map[uint64]string, len(a))
 	for _, m := range a {
 		set[m.NodeID] = m.Addr
 	}
+
 	for _, m := range b {
 		if addr, ok := set[m.NodeID]; !ok || addr != m.Addr {
 			return false
 		}
 	}
+
 	return true
 }
 

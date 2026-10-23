@@ -118,27 +118,33 @@ func (t *QUICNotifyTransport) Send(peerID NodeId, plaintext []byte) (wireSize in
 	// [8:senderNodeID LE][1:compressionFlag] so the receiver can identify us
 	// and know whether the body is compressed.
 	body := plaintext
+
 	var header [9]byte
 	binary.LittleEndian.PutUint64(header[:8], uint64(t.nodeID))
 	header[8] = wireRaw
+
 	if len(plaintext) >= compressThreshold {
 		if compressed := effects.Compress(plaintext); len(compressed) < len(plaintext) {
 			header[8] = wireZstd
 			body = compressed
 		}
 	}
+
 	if _, err := stream.Write(header[:]); err != nil {
 		stream.CancelWrite(1)
+
 		return 0, err
 	}
 
 	if _, err := stream.Write(body); err != nil {
 		stream.CancelWrite(1)
+
 		return 0, err
 	}
 
 	stream.Close() // sends FIN
 	RecordQUICStreamOpened()
+
 	return len(body) + len(header), nil
 }
 
@@ -147,6 +153,7 @@ func (t *QUICNotifyTransport) Send(peerID NodeId, plaintext []byte) (wireSize in
 // message gets its own independent stream.
 func (t *QUICNotifyTransport) SendDirect(peerID NodeId, plaintext []byte) error {
 	_, err := t.Send(peerID, plaintext)
+
 	return err
 }
 
@@ -160,6 +167,7 @@ func (t *QUICNotifyTransport) AcceptUniStreams(conn *quic.Conn) {
 		if err != nil {
 			return // connection closed
 		}
+
 		go t.handleInboundUniStream(conn, stream)
 	}
 }
@@ -172,8 +180,10 @@ func (t *QUICNotifyTransport) handleInboundUniStream(conn *quic.Conn, stream *qu
 	if _, err := io.ReadFull(stream, header[:]); err != nil {
 		slog.Debug("failed to read uni-stream sender header", "error", err)
 		RecordQUICStreamError()
+
 		return
 	}
+
 	peerID := NodeId(binary.LittleEndian.Uint64(header[:]))
 
 	// Now that we know the peer's real NodeID, register the inbound
@@ -192,6 +202,7 @@ func (t *QUICNotifyTransport) handleInboundUniStream(conn *quic.Conn, stream *qu
 			slog.Debug("failed to read uni-stream data", "peer", peerID, "error", err)
 			RecordQUICStreamError()
 		}
+
 		return
 	}
 
@@ -201,6 +212,7 @@ func (t *QUICNotifyTransport) handleInboundUniStream(conn *quic.Conn, stream *qu
 		if err != nil {
 			slog.Debug("failed to decompress uni-stream data", "peer", peerID, "error", err)
 			RecordQUICStreamError()
+
 			return
 		}
 	}
@@ -213,19 +225,25 @@ func (t *QUICNotifyTransport) dispatchPlaintext(peerID NodeId, plaintext []byte)
 	// Reachable remotely: a zstd frame can decompress to zero bytes.
 	if len(plaintext) == 0 {
 		slog.Debug("empty uni-stream payload", "peer", peerID)
+
 		return
 	}
+
 	switch plaintext[0] {
 	case PacketTypeClockTick:
 		tick, err := ParseClockTick(plaintext)
 		if err != nil {
 			slog.Debug("malformed clock tick", "peer", peerID, "error", err)
+
 			return
 		}
+
 		if tick.NodeID != peerID {
 			slog.Warn("clock tick payload nodeID mismatch", "payload", tick.NodeID, "sender", peerID)
+
 			return
 		}
+
 		if t.handler != nil {
 			t.handler.HandleClockTick(peerID, tick)
 		}
@@ -234,8 +252,10 @@ func (t *QUICNotifyTransport) dispatchPlaintext(peerID NodeId, plaintext []byte)
 		requestID, notify, err := parseNotifyPacket(plaintext)
 		if err != nil {
 			slog.Debug("invalid notify packet", "peer", peerID, "error", err)
+
 			return
 		}
+
 		if t.handler != nil {
 			go t.handler.HandleNotify(peerID, requestID, notify)
 		}
@@ -244,12 +264,16 @@ func (t *QUICNotifyTransport) dispatchPlaintext(peerID NodeId, plaintext []byte)
 		ackPeerID, requestID, status, credits, err := parseNotifyACKPacket(plaintext)
 		if err != nil {
 			slog.Debug("invalid notify ACK packet", "peer", peerID, "error", err)
+
 			return
 		}
+
 		if ackPeerID != peerID {
 			slog.Warn("notify ACK payload nodeID mismatch", "payload", ackPeerID, "sender", peerID)
+
 			return
 		}
+
 		if t.handler != nil {
 			if status == 0x01 {
 				t.handler.HandleNotifyACKWithData(peerID, requestID, status, credits, plaintext)
@@ -262,8 +286,10 @@ func (t *QUICNotifyTransport) dispatchPlaintext(peerID NodeId, plaintext []byte)
 		nack := &pb.NackNotify{}
 		if err := proto.Unmarshal(plaintext[1:], nack); err != nil {
 			slog.Debug("invalid nack packet", "peer", peerID, "error", err)
+
 			return
 		}
+
 		if t.handler != nil {
 			t.handler.HandleNackNotify(peerID, nack)
 		}
@@ -272,8 +298,10 @@ func (t *QUICNotifyTransport) dispatchPlaintext(peerID NodeId, plaintext []byte)
 		version, filter, err := parseKeyFilterPacket(plaintext)
 		if err != nil {
 			slog.Debug("invalid key filter packet", "peer", peerID, "error", err)
+
 			return
 		}
+
 		if t.handler != nil {
 			t.handler.HandleKeyFilter(peerID, version, filter)
 		}

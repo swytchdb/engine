@@ -227,6 +227,7 @@ func NewCloudSync(engine *effects.Engine, connectionSecret string) (*CloudSync, 
 	if err != nil {
 		return nil, fmt.Errorf("cloud sync: derive encryption keypair: %w", err)
 	}
+
 	authKey := DeriveAuthKeyBytes(DeriveCloudSecret(connectionSecret))
 	cs := &CloudSync{
 		engine:      engine,
@@ -257,19 +258,24 @@ func NewCloudSync(engine *effects.Engine, connectionSecret string) (*CloudSync, 
 		Timeout:             10 * time.Second,
 		PermitWithoutStream: true,
 	})
+
 	conn, err := grpc.NewClient(cs.target, grpc.WithTransportCredentials(creds), recvCap, kal)
 	if err != nil {
 		return nil, fmt.Errorf("cloud sync: dial %s: %w", cs.target, err)
 	}
+
 	streamConn, err := grpc.NewClient(cs.target, grpc.WithTransportCredentials(creds), recvCap, kal)
 	if err != nil {
 		err = errors.Join(err, conn.Close())
+
 		return nil, fmt.Errorf("cloud sync: dial %s (stream): %w", cs.target, err)
 	}
+
 	cs.conn = conn
 	cs.client = dp.NewDataPlaneClient(conn)
 	cs.streamConn = streamConn
 	cs.streamClient = dp.NewDataPlaneClient(streamConn)
+
 	return cs, nil
 }
 
@@ -277,10 +283,12 @@ func NewCloudSync(engine *effects.Engine, connectionSecret string) (*CloudSync, 
 func (cs *CloudSync) Start() error {
 	cs.ctx, cs.cancel = context.WithCancel(context.Background())
 	cs.engine.SetOnLocalEffect(cs.handleLocalEffect)
+
 	cs.wg.Add(3)
 	go cs.run()
 	go cs.reconcileLoop()
 	go cs.progressLoop()
+
 	return nil
 }
 
@@ -289,9 +297,12 @@ func (cs *CloudSync) Start() error {
 // log that reports the stall must not share its loop.
 func (cs *CloudSync) progressLoop() {
 	defer cs.wg.Done()
+
 	t := time.NewTicker(cloudProgressInterval)
 	defer t.Stop()
+
 	lastSent, lastAcked := cs.sentCount.Load(), cs.ackedCount.Load()
+
 	for {
 		select {
 		case <-cs.ctx.Done():
@@ -316,10 +327,13 @@ func (cs *CloudSync) Stop() {
 	// cannot race with a late enqueue while the sender is being cancelled.
 	cs.engine.SetOnLocalEffect(nil)
 	cs.waitDrained(cloudDrainTimeout)
+
 	if cs.cancel != nil {
 		cs.cancel()
 	}
+
 	cs.wg.Wait()
+
 	for _, conn := range []*grpc.ClientConn{cs.conn, cs.streamConn} {
 		if conn != nil {
 			if err := conn.Close(); err != nil {
@@ -335,21 +349,27 @@ func (cs *CloudSync) Stop() {
 func (cs *CloudSync) waitDrained(timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	last := -1
+
 	for {
 		cs.mu.Lock()
 		n := len(cs.pending)
 		cs.mu.Unlock()
+
 		if n == 0 {
 			return
 		}
+
 		if n != last {
 			deadline = time.Now().Add(timeout)
 			last = n
 		}
+
 		if time.Now().After(deadline) {
 			slog.Warn("cloud sync: shutdown drain stalled, abandoning outbox", "pending", n)
+
 			return
 		}
+
 		time.Sleep(50 * time.Millisecond)
 	}
 }
@@ -359,9 +379,10 @@ func (cs *CloudSync) waitDrained(timeout time.Duration) {
 // never a dep the ancestry walk reaches; the guard keeps a future mint-path
 // change from silently uploading them.
 func cloudUploadable(eff *pb.Effect) bool {
-	if sub := eff.GetSubscription(); sub != nil && (sub.Discovery || sub.Ephemeral) {
+	if sub := eff.GetSubscription(); sub != nil && (sub.GetDiscovery() || sub.GetEphemeral()) {
 		return false
 	}
+
 	return eff.GetPubsubMessage() == nil
 }
 
@@ -387,6 +408,7 @@ func (cs *CloudSync) handleLocalEffect(offset effects.Tip, eff *pb.Effect) {
 	if !cs.enqueueUpload(offset, eff, true, true) {
 		panic(fmt.Sprintf("cloud sync: outbox enqueue failed for just-emitted %v — vertex missing, claimed, or already queued at emit time", offset))
 	}
+
 	cs.wakeSender()
 }
 
@@ -413,7 +435,7 @@ func (cs *CloudSync) enqueueUpload(tip effects.Tip, eff *pb.Effect, frontier, ex
 	// missed, turning every first-touch read into a wasted consult of a
 	// stateless chain.
 	if eff.GetSubscription() == nil {
-		name := CloudKeyName(cs.keyNameKey, eff.Key)
+		name := CloudKeyName(cs.keyNameKey, eff.GetKey())
 		cs.filterMu.Lock()
 		cs.filterOwn.add(name)
 		cs.filterMu.Unlock()
@@ -424,21 +446,27 @@ func (cs *CloudSync) enqueueUpload(tip effects.Tip, eff *pb.Effect, frontier, ex
 	if !cs.engine.EffectCache().Incref(tip) {
 		return false
 	}
+
 	cs.mu.Lock()
 	if _, dup := cs.pending[tip]; dup {
 		cs.mu.Unlock()
 		cs.engine.EffectCache().Decref(tip)
+
 		return false
 	}
+
 	cs.pending[tip] = eff
 	if expand {
 		if cs.expandable == nil {
 			cs.expandable = make(map[effects.Tip]struct{})
 		}
+
 		cs.expandable[tip] = struct{}{}
 	}
+
 	if frontier {
-		k := string(eff.Key)
+		k := string(eff.GetKey())
+
 		entry := cs.pendingKeys[k]
 		if entry == nil {
 			// First un-acked upload on this key: hold it in the index until the
@@ -455,8 +483,10 @@ func (cs *CloudSync) enqueueUpload(tip effects.Tip, eff *pb.Effect, frontier, ex
 			}
 			cs.pendingKeys[k] = entry
 		}
+
 		entry.tips[tip] = struct{}{}
 	}
+
 	cs.sendQ = append(cs.sendQ, tip)
 	backlog := len(cs.pending)
 	cs.mu.Unlock()
@@ -466,6 +496,7 @@ func (cs *CloudSync) enqueueUpload(tip effects.Tip, eff *pb.Effect, frontier, ex
 	if backlog%backlogWarnEvery == 0 {
 		slog.Warn("cloud sync: upload backlog growing", "pending", backlog)
 	}
+
 	return true
 }
 
@@ -491,6 +522,7 @@ func (cs *CloudSync) enqueueUpload(tip effects.Tip, eff *pb.Effect, frontier, ex
 // the closure resumes on reconnect instead of restarting into evicted ancestry.
 func (cs *CloudSync) expandAncestry(eff *pb.Effect) []effects.Tip {
 	var queued []effects.Tip
+
 	for _, dep := range eff.GetDeps() {
 		// A node owes Cloud only the history it authored. Peer effects enter this
 		// outbox exclusively through an explicit FetchRequest; merely naming one
@@ -498,22 +530,28 @@ func (cs *CloudSync) expandAncestry(eff *pb.Effect) []effects.Tip {
 		if dep.GetNodeId() != uint64(cs.engine.NodeID()) {
 			continue
 		}
+
 		tip := effects.Tip{dep.GetNodeId(), dep.GetOffset()}
 		if cs.cloudHolds(tip) {
 			continue
 		}
+
 		anc, ok := cs.engine.EffectCache().Get(tip)
 		if !ok {
 			continue
 		}
+
 		if !cloudUploadable(anc) {
 			continue
 		}
+
 		if cs.enqueueUpload(tip, anc, false, true) {
 			cloudAncestryUploadedTotal.Inc()
+
 			queued = append(queued, tip)
 		}
 	}
+
 	return queued
 }
 
@@ -530,16 +568,20 @@ func (cs *CloudSync) deferUploadBehind(tip effects.Tip, deps []effects.Tip) {
 	cs.mu.Lock()
 	deferred := make([]effects.Tip, 0, len(cs.sendQ)+1)
 	deferred = append(deferred, deps...)
+
 	deferred = append(deferred, tip)
 	for _, queued := range cs.sendQ {
 		if queued == tip {
 			continue
 		}
+
 		if _, moved := depSet[queued]; moved {
 			continue
 		}
+
 		deferred = append(deferred, queued)
 	}
+
 	cs.sendQ = deferred
 	cs.mu.Unlock()
 }
@@ -556,9 +598,11 @@ func (s *tipGenSet) add(t effects.Tip) {
 	if s.cur == nil {
 		s.cur = make(map[effects.Tip]struct{})
 	}
+
 	if len(s.cur) >= cloudHasGenSize {
 		s.prev, s.cur = s.cur, make(map[effects.Tip]struct{})
 	}
+
 	s.cur[t] = struct{}{}
 }
 
@@ -566,7 +610,9 @@ func (s *tipGenSet) has(t effects.Tip) bool {
 	if _, ok := s.cur[t]; ok {
 		return true
 	}
+
 	_, ok := s.prev[t]
+
 	return ok
 }
 
@@ -581,6 +627,7 @@ func (cs *CloudSync) markCloudHolds(tip effects.Tip) {
 func (cs *CloudSync) cloudHolds(tip effects.Tip) bool {
 	cs.knownMu.Lock()
 	defer cs.knownMu.Unlock()
+
 	return cs.knownInCloud.has(tip)
 }
 
@@ -599,10 +646,12 @@ func (cs *CloudSync) retire(tip effects.Tip) bool {
 	eff, held := cs.pending[tip]
 	delete(cs.pending, tip)
 	delete(cs.expandable, tip)
+
 	if held {
-		k := string(eff.Key)
+		k := string(eff.GetKey())
 		if entry := cs.pendingKeys[k]; entry != nil {
 			delete(entry.tips, tip)
+
 			if len(entry.tips) == 0 {
 				delete(cs.pendingKeys, k)
 				// Last un-acked upload on this key drained: the key is
@@ -613,12 +662,15 @@ func (cs *CloudSync) retire(tip effects.Tip) bool {
 			}
 		}
 	}
+
 	backlog := len(cs.pending)
 	cs.mu.Unlock()
+
 	if held {
 		cloudOutboxPending.Set(float64(backlog))
 		cs.engine.EffectCache().Decref(tip)
 	}
+
 	return held
 }
 
@@ -628,22 +680,28 @@ func (cs *CloudSync) retire(tip effects.Tip) bool {
 func (cs *CloudSync) pendingTipsFor(key string) []effects.Tip {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
+
 	entry := cs.pendingKeys[key]
 	if entry == nil || len(entry.tips) == 0 {
 		return nil
 	}
+
 	tips := make([]effects.Tip, 0, len(entry.tips))
 	for tip := range entry.tips {
 		tips = append(tips, tip)
 	}
+
 	return tips
 }
 
 func (cs *CloudSync) run() {
 	defer cs.wg.Done()
+
 	backoff := cloudRetryMin
+
 	for cs.ctx.Err() == nil {
 		started := time.Now()
+
 		err := cs.runStream()
 		if cs.ctx.Err() != nil {
 			return
@@ -653,13 +711,16 @@ func (cs *CloudSync) run() {
 		if time.Since(started) > time.Minute {
 			backoff = cloudRetryMin
 		}
+
 		cloudStreamReconnectsTotal.Inc()
 		slog.Warn("cloud sync: stream ended, reconnecting", "error", err, "retry_in", backoff)
+
 		select {
 		case <-cs.ctx.Done():
 			return
 		case <-time.After(backoff):
 		}
+
 		backoff = min(backoff*2, cloudRetryMax)
 	}
 }
@@ -677,10 +738,12 @@ func (cs *CloudSync) runStream() error {
 		nodeIDMetadataKey, strconv.FormatUint(uint64(cs.engine.NodeID()), 10),
 		nodeVersionMetadataKey, Version,
 	)
+
 	stream, err := cs.streamClient.WriteEffects(ctx)
 	if err != nil {
 		return err
 	}
+
 	if err := stream.Send(&dp.WriteEffectsRequest{
 		Payload: &dp.WriteEffectsRequest_AuthKey{AuthKey: cs.authKey},
 	}); err != nil {
@@ -688,6 +751,7 @@ func (cs *CloudSync) runStream() error {
 	}
 
 	cs.mu.Lock()
+
 	cs.sendQ = cs.sendQ[:0]
 	for tip := range cs.pending {
 		cs.sendQ = append(cs.sendQ, tip)
@@ -704,17 +768,21 @@ func (cs *CloudSync) runStream() error {
 			if err := stream.CloseSend(); err != nil {
 				slog.Debug("cloud sync: close send", "error", err)
 			}
+
 			<-readerErr
+
 			return cs.ctx.Err()
 		case err := <-readerErr:
 			return err
 		case <-cs.wake:
 		}
+
 		for {
 			env, ok := cs.nextEnvelope()
 			if !ok {
 				break
 			}
+
 			if err := stream.Send(&dp.WriteEffectsRequest{
 				Payload: &dp.WriteEffectsRequest_Effect{Effect: env},
 			}); err != nil {
@@ -734,9 +802,11 @@ func (cs *CloudSync) logOutboxProgress(lastSent, lastAcked uint64) (uint64, uint
 	pending := len(cs.pending)
 	queued := len(cs.sendQ)
 	cs.mu.Unlock()
+
 	if pending == 0 && queued == 0 {
 		return sent, acked
 	}
+
 	if sent == lastSent && acked == lastAcked {
 		slog.Warn("cloud sync: outbox stalled",
 			"pending", pending, "queued", queued,
@@ -747,6 +817,7 @@ func (cs *CloudSync) logOutboxProgress(lastSent, lastAcked uint64) (uint64, uint
 			"sent_delta", sent-lastSent, "acked_delta", acked-lastAcked,
 			"interval", cloudProgressInterval)
 	}
+
 	return sent, acked
 }
 
@@ -764,13 +835,16 @@ func (cs *CloudSync) nextEnvelope() (*dp.Effect, bool) {
 		cs.mu.Lock()
 		if len(cs.sendQ) == 0 || remaining == 0 {
 			cs.mu.Unlock()
+
 			return nil, false
 		}
+
 		tip := cs.sendQ[0]
 		cs.sendQ = cs.sendQ[1:]
 		eff := cs.pending[tip]
 		_, expand := cs.expandable[tip]
 		cs.mu.Unlock()
+
 		remaining--
 
 		if eff == nil {
@@ -786,6 +860,7 @@ func (cs *CloudSync) nextEnvelope() (*dp.Effect, bool) {
 				// each newly pinned vertex once so a final-slot expansion cannot leave
 				// ancestry queued with nobody left to wake the sender.
 				remaining += len(deps)
+
 				continue
 			}
 		}
@@ -796,17 +871,21 @@ func (cs *CloudSync) nextEnvelope() (*dp.Effect, bool) {
 		// from the outbox. Independent effects can still fill the pipeline.
 		cs.mu.Lock()
 		blocked := false
+
 		for _, dep := range eff.GetDeps() {
 			depTip := effects.Tip{dep.GetNodeId(), dep.GetOffset()}
 			if _, pending := cs.pending[depTip]; pending {
 				blocked = true
+
 				break
 			}
 		}
+
 		if blocked {
 			cs.sendQ = append(cs.sendQ, tip)
 		}
 		cs.mu.Unlock()
+
 		if blocked {
 			continue
 		}
@@ -827,10 +906,13 @@ func (cs *CloudSync) nextEnvelope() (*dp.Effect, bool) {
 				cs.mu.Unlock()
 				cs.wakeSender()
 			})
+
 			continue
 		}
+
 		cloudEffectsSentTotal.Inc()
 		cs.sentCount.Add(1)
+
 		return env, true
 	}
 }
@@ -841,6 +923,7 @@ func (cs *CloudSync) readLoop(stream dp.DataPlane_WriteEffectsClient) error {
 		if err != nil {
 			return err
 		}
+
 		switch m := resp.GetMsg().(type) {
 		case *dp.WriteResponse_Ack:
 			cs.handleAck(m.Ack)
@@ -863,21 +946,25 @@ func (cs *CloudSync) handleAck(ack *dp.WriteAck) {
 		// Marked before the retire: an acked effect is one
 		// the ancestry walk must stop at, whichever path put it on the wire.
 		cs.markCloudHolds(tip)
+
 		if cs.retire(tip) {
 			cloudEffectsAckedTotal.Inc()
 			cs.ackedCount.Add(1)
 			// A descendant may be waiting for this dependency to become durable.
 			cs.wakeSender()
 		}
+
 		return
 	}
 
 	cs.mu.Lock()
 	_, held := cs.pending[tip]
 	cs.mu.Unlock()
+
 	if !held {
 		return
 	}
+
 	cloudEffectsNackedTotal.Inc()
 	slog.Warn("cloud sync: cloud failed to store effect, will retry",
 		"tip", tip, "error", ack.GetError())
@@ -899,10 +986,12 @@ func (cs *CloudSync) handleAck(ack *dp.WriteAck) {
 func (cs *CloudSync) handleFetch(req *dp.FetchRequest) {
 	ref := req.GetRef()
 	tip := effects.Tip{ref.GetNodeId(), ref.GetOffset()}
+
 	eff, ok := cs.engine.EffectCache().Get(tip)
 	if !ok {
 		return
 	}
+
 	if !cs.enqueueUpload(tip, eff, false, false) {
 		// Already pending means the request is scheduled or in flight. Any
 		// other failure means the vertex could not be pinned long enough for an
@@ -923,11 +1012,14 @@ func (cs *CloudSync) handleFetch(req *dp.FetchRequest) {
 // run through here.
 func (cs *CloudSync) cloudMayHold(name []byte) bool {
 	h := effects.BloomHash(name)
+
 	cs.filterMu.RLock()
 	defer cs.filterMu.RUnlock()
+
 	if cs.filterBulk == nil {
 		return true
 	}
+
 	return cs.filterBulk.HasHash(h) || cs.filterOwn.has(h)
 }
 
@@ -937,8 +1029,10 @@ func (cs *CloudSync) cloudMayHold(name []byte) bool {
 func (cs *CloudSync) SetMemberRemoveHandler(fn func(nodeID uint64)) {
 	if fn == nil {
 		cs.memberRemoveHandler.Store(nil)
+
 		return
 	}
+
 	cs.memberRemoveHandler.Store(&fn)
 }
 
@@ -946,9 +1040,11 @@ func (cs *CloudSync) SetMemberRemoveHandler(fn func(nodeID uint64)) {
 // the membership removal path via the wired handler.
 func (cs *CloudSync) handleMemberRemove(mr *dp.MemberRemove) {
 	nodeID := mr.GetNodeId()
+
 	fn := cs.memberRemoveHandler.Load()
 	if fn == nil || *fn == nil {
 		slog.Warn("cloud sync: member remove received with no handler wired, dropping", "node_id", nodeID)
+
 		return
 	}
 	// Debug, not Info: dashboard cleanups push these in bursts of thousands;
@@ -965,8 +1061,10 @@ func (cs *CloudSync) handleFilter(kf *dp.KeyFilter) {
 	decoded, err := effects.ParseBloomFrame(kf.GetFilter())
 	if err != nil {
 		slog.Warn("cloud sync: undecodable key filter frame, keeping previous", "error", err)
+
 		return
 	}
+
 	cs.filterMu.Lock()
 	cs.filterBulk = decoded
 	cs.filterMu.Unlock()
@@ -985,15 +1083,18 @@ type ownFilter struct {
 
 func (f *ownFilter) add(name []byte) {
 	h := effects.BloomHash(name)
+
 	n := len(f.blooms)
 	if n == 0 || f.blooms[n-1].Fill() > 0.5 {
 		size := effects.BloomMinBytes
 		if n > 0 {
 			size = f.blooms[n-1].SizeBytes() * 2
 		}
+
 		f.blooms = append(f.blooms, effects.NewBloom(size))
 		n++
 	}
+
 	f.blooms[n-1].SetHash(h)
 }
 
@@ -1003,6 +1104,7 @@ func (f *ownFilter) has(h uint64) bool {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -1018,29 +1120,33 @@ func (cs *CloudSync) buildEnvelope(tip effects.Tip, eff *pb.Effect) (*dp.Effect,
 	if err != nil {
 		return nil, fmt.Errorf("marshal: %w", err)
 	}
+
 	sealed, err := cs.enc.SealAndCompress(raw, cloudEffectInfo)
 	if err != nil {
 		return nil, fmt.Errorf("seal: %w", err)
 	}
 
-	deps := make([]*dp.EffectRef, len(eff.Deps))
-	for i, d := range eff.Deps {
-		deps[i] = &dp.EffectRef{NodeId: d.NodeId, Offset: d.Offset}
+	deps := make([]*dp.EffectRef, len(eff.GetDeps()))
+	for i, d := range eff.GetDeps() {
+		deps[i] = &dp.EffectRef{NodeId: d.GetNodeId(), Offset: d.GetOffset()}
 	}
+
 	var timeLocal int64
-	if eff.Hlc != nil {
-		timeLocal = eff.Hlc.AsTime().UnixNano()
+	if eff.GetHlc() != nil {
+		timeLocal = eff.GetHlc().AsTime().UnixNano()
 	}
+
 	snap := eff.GetSnapshot()
+
 	return &dp.Effect{
 		Id:                    &dp.EffectRef{NodeId: tip[0], Offset: tip[1]},
 		Deps:                  deps,
-		Key:                   CloudKeyName(cs.keyNameKey, eff.Key),
+		Key:                   CloudKeyName(cs.keyNameKey, eff.GetKey()),
 		RawEffect:             sealed,
 		RawSize:               uint64(len(raw)) + effects.InflatedSizeDelta(eff),
 		TimeLocal:             timeLocal,
 		EffectType:            cloudEffectType(eff),
-		SnapshotStateCarrying: snap != nil && snap.State != nil,
+		SnapshotStateCarrying: snap != nil && snap.GetState() != nil,
 	}, nil
 }
 
@@ -1053,6 +1159,7 @@ func (cs *CloudSync) FetchFromCDN(ctx context.Context, ref *pb.EffectRef) ([]byt
 	if err != nil {
 		return nil, err
 	}
+
 	return MarshalEffectWire(eff)
 }
 
@@ -1088,7 +1195,9 @@ func (cs *CloudSync) DiscoverMembers(ctx context.Context, membershipKey string) 
 		AuthKey: cs.authKey,
 		Keys:    [][]byte{CloudKeyName(cs.keyNameKey, []byte(membershipKey))},
 	})
+
 	cancel() // unary: resp is fully materialized, nothing streams past here
+
 	if err != nil {
 		return nil, fmt.Errorf("cloud get tips: %w", err)
 	}
@@ -1104,11 +1213,14 @@ func (cs *CloudSync) DiscoverMembers(ctx context.Context, membershipKey string) 
 	// reducing a truncated sub-DAG resurrects any member whose REMOVE was cut
 	// while its INSERT survived, and the cluster then redials the dead.
 	sidecar := map[effects.Tip]*pb.Effect{}
+
 	var initialTips []effects.Tip
+
 	for _, kt := range resp.GetKeys() {
 		for _, ce := range cs.peelSidecar(kt) {
 			sidecar[ce.Tip] = ce.Eff
 		}
+
 		for _, ref := range kt.GetTips() {
 			initialTips = append(initialTips, effects.Tip{ref.GetNodeId(), ref.GetOffset()})
 		}
@@ -1122,14 +1234,18 @@ func (cs *CloudSync) DiscoverMembers(ctx context.Context, membershipKey string) 
 		if eff, ok := sidecar[t]; ok {
 			return eff, nil
 		}
+
 		eff, err := cs.fetchEffect(ctx, t)
 		if err != nil {
 			return nil, err
 		}
+
 		sidecar[t] = eff
+
 		return eff, nil
 	}
 	candidateCount := len(initialTips)
+
 	var superseded []effects.Tip
 	// DiscoverMembers is deliberately zero-engine-interaction (see the doc
 	// comment above), so there is no local frontier to seed normalization
@@ -1138,6 +1254,7 @@ func (cs *CloudSync) DiscoverMembers(ctx context.Context, membershipKey string) 
 	if err != nil {
 		return nil, fmt.Errorf("cloud discover: normalize candidate frontier: %w", err)
 	}
+
 	if len(superseded) > 0 {
 		slog.Info("cloud discover: normalized candidate markers to real tips",
 			"candidates", candidateCount, "real_tips", len(initialTips), "superseded", len(superseded))
@@ -1153,7 +1270,9 @@ type cloudEffectLoader func(effects.Tip) (*pb.Effect, error)
 // whether independently readable sibling candidates make fork choice possible.
 func reduceDiscoveredTips(initialTips []effects.Tip, load cloudEffectLoader) (*pb.ReducedEffect, error) {
 	visited := map[effects.Tip]bool{}
+
 	var queue []effects.Tip
+
 	enqueue := func(t effects.Tip) {
 		if !visited[t] {
 			visited[t] = true
@@ -1173,21 +1292,29 @@ func reduceDiscoveredTips(initialTips []effects.Tip, load cloudEffectLoader) (*p
 		if err != nil {
 			return nil, fmt.Errorf("cloud discover: fetch real tip %v: %w", t, err)
 		}
+
 		if discoverySkipsTip(eff) {
 			visited[t] = true
+
 			continue
 		}
+
 		enqueue(t)
 	}
+
 	fetched := map[effects.Tip]*pb.Effect{}
+
 	var lcaTip effects.Tip
+
 	lcaFound := false
 	walkStarted := time.Now()
 	lastProgress := walkStarted
 	progressed := false
+
 	for len(queue) > 0 {
 		tip := queue[0]
 		queue = queue[1:]
+
 		eff, err := load(tip)
 		if err != nil {
 			// A skipped fetch drops the tip's whole dep subtree, which is
@@ -1195,13 +1322,16 @@ func reduceDiscoveredTips(initialTips []effects.Tip, load cloudEffectLoader) (*p
 			// instead; the caller retries with backoff.
 			return nil, fmt.Errorf("cloud discover: fetch %v: %w", tip, err)
 		}
+
 		fetched[tip] = eff
-		if snap := eff.GetSnapshot(); snap != nil && snap.State != nil && len(queue) == 0 {
+		if snap := eff.GetSnapshot(); snap != nil && snap.GetState() != nil && len(queue) == 0 {
 			lcaTip, lcaFound = tip, true
+
 			break
 		}
-		for _, dep := range eff.Deps {
-			enqueue(effects.Tip{dep.NodeId, dep.Offset})
+
+		for _, dep := range eff.GetDeps() {
+			enqueue(effects.Tip{dep.GetNodeId(), dep.GetOffset()})
 		}
 		// A prune of thousands of dead members leaves a chain that takes
 		// minutes to walk. Without this the node is opaque for the whole of
@@ -1212,14 +1342,17 @@ func reduceDiscoveredTips(initialTips []effects.Tip, load cloudEffectLoader) (*p
 		if time.Since(lastProgress) >= discoverWalkProgressInterval {
 			slog.Info("cloud discover: membership walk in progress",
 				"fetched", len(fetched), "queued", len(queue), "elapsed", time.Since(walkStarted))
+
 			lastProgress = time.Now()
 			progressed = true
 		}
 	}
+
 	if progressed {
 		slog.Info("cloud discover: membership walk complete",
 			"fetched", len(fetched), "elapsed", time.Since(walkStarted))
 	}
+
 	if len(fetched) == 0 {
 		return nil, nil // fresh cluster: nothing in the cloud yet
 	}
@@ -1229,11 +1362,13 @@ func reduceDiscoveredTips(initialTips []effects.Tip, load cloudEffectLoader) (*p
 	// walk converged fetched effects already folded into it, and reducing
 	// them again double-counts (mirrors dag.trimAncestorsOfLCA).
 	var seed *pb.ReducedEffect
+
 	if lcaFound {
 		trimAncestry(fetched, fetched[lcaTip])
-		seed = fetched[lcaTip].GetSnapshot().State
+		seed = fetched[lcaTip].GetSnapshot().GetState()
 		delete(fetched, lcaTip)
 	}
+
 	return effects.ReduceChain(seed, topoOrder(fetched)), nil
 }
 
@@ -1241,25 +1376,32 @@ func reduceDiscoveredTips(initialTips []effects.Tip, load cloudEffectLoader) (*p
 // dep-ancestry of eff. Only already-fetched entries are removed; nothing new
 // is fetched.
 func trimAncestry(fetched map[effects.Tip]*pb.Effect, eff *pb.Effect) {
-	stack := make([]effects.Tip, 0, len(eff.Deps))
-	for _, dep := range eff.Deps {
-		stack = append(stack, effects.Tip{dep.NodeId, dep.Offset})
+	stack := make([]effects.Tip, 0, len(eff.GetDeps()))
+	for _, dep := range eff.GetDeps() {
+		stack = append(stack, effects.Tip{dep.GetNodeId(), dep.GetOffset()})
 	}
+
 	seen := map[effects.Tip]struct{}{}
+
 	for len(stack) > 0 {
 		cur := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
+
 		if _, ok := seen[cur]; ok {
 			continue
 		}
+
 		seen[cur] = struct{}{}
+
 		e, ok := fetched[cur]
 		if !ok {
 			continue
 		}
+
 		delete(fetched, cur)
-		for _, dep := range e.Deps {
-			stack = append(stack, effects.Tip{dep.NodeId, dep.Offset})
+
+		for _, dep := range e.GetDeps() {
+			stack = append(stack, effects.Tip{dep.GetNodeId(), dep.GetOffset()})
 		}
 	}
 }
@@ -1292,10 +1434,12 @@ func (cs *CloudSync) CloudTips(ctx context.Context, key string) ([]effects.Tip, 
 	if !cs.cloudMayHold(name) {
 		return nil, nil, nil, nil
 	}
+
 	tips := cs.pendingTipsFor(key)
 
 	ctx, cancel := context.WithTimeout(ctx, cloudBackstopTimeout)
 	defer cancel()
+
 	resp, err := cs.client.GetTips(ctx, &dp.GetTipsRequest{
 		AuthKey: cs.authKey,
 		Keys:    [][]byte{name},
@@ -1310,16 +1454,23 @@ func (cs *CloudSync) CloudTips(ctx context.Context, key string) ([]effects.Tip, 
 			// frontier into the DAG.
 			slog.Warn("cloud sync: get tips failed, serving outbox frontier", "key", key, "error", err)
 			cs.MarkPending(key)
+
 			return tips, nil, nil, nil
 		}
+
 		return nil, nil, nil, fmt.Errorf("cloud get tips: %w", err)
 	}
+
 	seen := make(map[effects.Tip]struct{}, len(tips))
 	for _, t := range tips {
 		seen[t] = struct{}{}
 	}
-	var sidecar []effects.CloudEffect
-	var missing []effects.Tip
+
+	var (
+		sidecar []effects.CloudEffect
+		missing []effects.Tip
+	)
+
 	for _, kt := range resp.GetKeys() {
 		for _, ref := range kt.GetTips() {
 			t := effects.Tip{ref.GetNodeId(), ref.GetOffset()}
@@ -1328,11 +1479,13 @@ func (cs *CloudSync) CloudTips(ctx context.Context, key string) ([]effects.Tip, 
 				tips = append(tips, t)
 			}
 		}
+
 		sidecar = append(sidecar, cs.peelSidecar(kt)...)
 		for _, ref := range kt.GetMissing() {
 			missing = append(missing, effects.Tip{ref.GetNodeId(), ref.GetOffset()})
 		}
 	}
+
 	return tips, sidecar, missing, nil
 }
 
@@ -1350,13 +1503,16 @@ func (cs *CloudSync) MarkPending(key string) {
 func (cs *CloudSync) reconcileKeys() []string {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
+
 	if len(cs.reconcile) == 0 {
 		return nil
 	}
+
 	keys := make([]string, 0, len(cs.reconcile))
 	for k := range cs.reconcile {
 		keys = append(keys, k)
 	}
+
 	return keys
 }
 
@@ -1374,19 +1530,23 @@ func (cs *CloudSync) clearReconcile(key string) {
 // installs cleanly.
 func (cs *CloudSync) reconcileLoop() {
 	defer cs.wg.Done()
+
 	ticker := time.NewTicker(cloudReconcileRetry)
 	defer ticker.Stop()
+
 	for {
 		select {
 		case <-cs.ctx.Done():
 			return
 		case <-ticker.C:
 		}
+
 		keys := cs.reconcileKeys()
 		for start := 0; start < len(keys); start += cloudReconcileBatch {
 			if cs.ctx.Err() != nil {
 				return
 			}
+
 			end := min(start+cloudReconcileBatch, len(keys))
 			cs.reconcileBatch(keys[start:end])
 		}
@@ -1401,6 +1561,7 @@ func (cs *CloudSync) reconcileLoop() {
 // next tick. The whole RPC failing (cloud still unreachable) clears nothing.
 func (cs *CloudSync) reconcileBatch(keys []string) {
 	names := make([][]byte, len(keys))
+
 	byName := make(map[string]string, len(keys))
 	for i, key := range keys {
 		name := CloudKeyName(cs.keyNameKey, []byte(key))
@@ -1410,6 +1571,7 @@ func (cs *CloudSync) reconcileBatch(keys []string) {
 
 	ctx, cancel := context.WithTimeout(cs.ctx, cloudBackstopTimeout)
 	defer cancel()
+
 	resp, err := cs.client.GetTips(ctx, &dp.GetTipsRequest{AuthKey: cs.authKey, Keys: names})
 	if err != nil {
 		return // cloud still down; keep every key pending
@@ -1420,26 +1582,35 @@ func (cs *CloudSync) reconcileBatch(keys []string) {
 		if !ok {
 			continue
 		}
+
 		var tips, missing []effects.Tip
 		for _, ref := range kt.GetTips() {
 			tips = append(tips, effects.Tip{ref.GetNodeId(), ref.GetOffset()})
 		}
+
 		if len(tips) == 0 {
 			cs.clearReconcile(key) // the cloud holds nothing we haven't already served
+
 			continue
 		}
+
 		for _, ref := range kt.GetMissing() {
 			missing = append(missing, effects.Tip{ref.GetNodeId(), ref.GetOffset()})
 		}
+
 		pending, err := cs.engine.InstallCloudTips(key, tips, cs.peelSidecar(kt), missing)
 		if err != nil {
 			slog.Warn("cloud reconcile: install failed; will retry", "key", key, "error", err)
+
 			continue
 		}
+
 		if len(pending) > 0 {
 			slog.Warn("cloud reconcile: frontier partially holed; leaving pending", "key", key, "pending", pending)
+
 			continue
 		}
+
 		slog.Info("cloud reconcile: merged cloud frontier", "key", key, "tips", len(tips))
 		cs.clearReconcile(key)
 	}
@@ -1454,10 +1625,11 @@ func (cs *CloudSync) reconcileBatch(keys []string) {
 // ForkChoiceHash ascending, mirroring dag.walk.
 func topoOrder(fetched map[effects.Tip]*pb.Effect) []*pb.Effect {
 	indeg := make(map[effects.Tip]int, len(fetched))
+
 	dependents := make(map[effects.Tip][]effects.Tip, len(fetched))
 	for tip, eff := range fetched {
-		for _, d := range eff.Deps {
-			dt := effects.Tip{d.NodeId, d.Offset}
+		for _, d := range eff.GetDeps() {
+			dt := effects.Tip{d.GetNodeId(), d.GetOffset()}
 			if _, ok := fetched[dt]; ok {
 				indeg[tip]++
 				dependents[dt] = append(dependents[dt], tip)
@@ -1466,19 +1638,22 @@ func topoOrder(fetched map[effects.Tip]*pb.Effect) []*pb.Effect {
 	}
 
 	var ready []effects.Tip
+
 	for tip := range fetched {
 		if indeg[tip] == 0 {
 			ready = append(ready, tip)
 		}
 	}
+
 	chain := make([]*pb.Effect, 0, len(fetched))
 	for len(ready) > 0 {
 		next := 0
 		for i := 1; i < len(ready); i++ {
-			if effects.ForkChoiceLess(fetched[ready[i]].ForkChoiceHash, fetched[ready[next]].ForkChoiceHash) {
+			if effects.ForkChoiceLess(fetched[ready[i]].GetForkChoiceHash(), fetched[ready[next]].GetForkChoiceHash()) {
 				next = i
 			}
 		}
+
 		tip := ready[next]
 		ready[next] = ready[len(ready)-1]
 		ready = ready[:len(ready)-1]
@@ -1491,6 +1666,7 @@ func topoOrder(fetched map[effects.Tip]*pb.Effect) []*pb.Effect {
 			}
 		}
 	}
+
 	return chain
 }
 
@@ -1506,27 +1682,34 @@ func (cs *CloudSync) fetchEffect(ctx context.Context, tip effects.Tip) (*pb.Effe
 	cs.mu.Lock()
 	eff := cs.pending[tip]
 	cs.mu.Unlock()
+
 	if eff != nil {
 		return eff, nil
 	}
 
 	url := fmt.Sprintf("%s/%s/%016x-%016x", CloudCDNEndpoint, cs.folder, tip[0], tip[1])
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
+
 	cloudCDNFetchesTotal.Inc()
+
 	resp, err := cs.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, fmt.Errorf("cdn fetch %s: %w", url, effects.ErrCDNBlobMissing)
 	}
+
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("cdn fetch %s: status %d", url, resp.StatusCode)
 	}
+
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
@@ -1536,12 +1719,14 @@ func (cs *CloudSync) fetchEffect(ctx context.Context, tip effects.Tip) (*pb.Effe
 	if err := gproto.Unmarshal(body, &env); err != nil {
 		return nil, fmt.Errorf("cdn blob decode: %w", err)
 	}
+
 	fetched, _, err := cs.peelEnvelope(&env)
 	if err != nil {
 		return nil, err
 	}
 	// The CDN served it, so the cloud holds it: the ancestry walk stops here.
 	cs.markCloudHolds(tip)
+
 	return fetched, nil
 }
 
@@ -1553,10 +1738,12 @@ func (cs *CloudSync) peelEnvelope(env *dp.Effect) (*pb.Effect, int, error) {
 	if err != nil {
 		return nil, 0, fmt.Errorf("cloud blob open: %w", err)
 	}
+
 	eff := &pb.Effect{}
 	if err := effects.UnmarshalEffect(raw, eff); err != nil {
 		return nil, 0, err
 	}
+
 	return eff, len(raw), nil
 }
 
@@ -1568,14 +1755,17 @@ func (cs *CloudSync) peelSidecar(kt *dp.KeyTips) []effects.CloudEffect {
 	if len(closure) == 0 {
 		return nil
 	}
+
 	sidecar := make([]effects.CloudEffect, 0, len(closure))
 	for _, env := range closure {
 		eff, protoLen, err := cs.peelEnvelope(env)
 		if err != nil {
 			slog.Warn("cloud sync: sidecar envelope unusable, walk will fetch it",
 				"tip", effects.Tip{env.GetId().GetNodeId(), env.GetId().GetOffset()}, "error", err)
+
 			continue
 		}
+
 		tip := effects.Tip{env.GetId().GetNodeId(), env.GetId().GetOffset()}
 		// The cloud handed us this effect, so it holds it: stop the ancestry
 		// walk here rather than re-uploading a whole rehydrated chain on the
@@ -1587,7 +1777,9 @@ func (cs *CloudSync) peelSidecar(kt *dp.KeyTips) []effects.CloudEffect {
 			ProtoLen: protoLen,
 		})
 	}
+
 	cloudSidecarEffectsTotal.Add(float64(len(sidecar)))
+
 	return sidecar
 }
 

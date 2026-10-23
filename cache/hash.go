@@ -31,6 +31,7 @@ import (
 
 func hashKey[K Key](key K) uint64 {
 	ptr := (*byte)(unsafe.Pointer(&key))
+
 	return xxh3.Hash(unsafe.Slice(ptr, unsafe.Sizeof(key)))
 }
 

@@ -32,10 +32,12 @@ import (
 // negative into durable data no read ever sees.
 func TestBloomNoFalseNegatives(t *testing.T) {
 	const n = 100_000
+
 	b := NewBloomForCount(n)
 	for i := range n {
 		b.Set(fmt.Appendf(nil, "key-%d", i))
 	}
+
 	for i := range n {
 		if !b.Has(fmt.Appendf(nil, "key-%d", i)) {
 			t.Fatalf("false negative for key-%d", i)
@@ -47,20 +49,25 @@ func TestBloomNoFalseNegatives(t *testing.T) {
 // threshold's ~2% bound.
 func TestBloomFalsePositiveRate(t *testing.T) {
 	const n = 100_000
+
 	b := NewBloomForCount(n)
 	for i := range n {
 		b.Set(fmt.Appendf(nil, "key-%d", i))
 	}
+
 	if f := b.Fill(); f > 0.5 {
 		t.Fatalf("fill %.3f above build target", f)
 	}
+
 	fp := 0
+
 	const probes = 100_000
 	for i := range probes {
 		if b.Has(fmt.Appendf(nil, "absent-%d", i)) {
 			fp++
 		}
 	}
+
 	if rate := float64(fp) / probes; rate > 0.02 {
 		t.Fatalf("FP rate %.4f exceeds 2%%", rate)
 	}
@@ -72,6 +79,7 @@ func TestBloomSetReportsFlips(t *testing.T) {
 	if !b.Set([]byte("fresh")) {
 		t.Fatal("first Set of a name reported no flip")
 	}
+
 	if b.Set([]byte("fresh")) {
 		t.Fatal("re-Set of a covered name reported a flip")
 	}
@@ -81,6 +89,7 @@ func TestBloomSetReportsFlips(t *testing.T) {
 // set-bit count driving the resize signal.
 func TestBloomFrameRoundTrip(t *testing.T) {
 	b := NewBloom(BloomMinBytes)
+
 	names := [][]byte{[]byte("alpha"), []byte("bravo"), []byte("charlie")}
 	for _, name := range names {
 		b.Set(name)
@@ -90,14 +99,17 @@ func TestBloomFrameRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseBloomFrame: %v", err)
 	}
+
 	for _, name := range names {
 		if !got.Has(name) {
 			t.Fatalf("round trip lost %q", name)
 		}
 	}
+
 	if got.Has([]byte("never-seen-name")) {
 		t.Fatal("round trip fabricated a name (FP on a near-empty filter is effectively impossible)")
 	}
+
 	if got.Fill() != b.Fill() {
 		t.Fatalf("fill diverged: %v != %v", got.Fill(), b.Fill())
 	}
@@ -123,6 +135,7 @@ func TestBloomSizing(t *testing.T) {
 	if got := NewBloom(0).SizeBytes(); got != BloomMinBytes {
 		t.Fatalf("zero-size request: got %d, want floor %d", got, BloomMinBytes)
 	}
+
 	if got := NewBloom(BloomMinBytes + 1).SizeBytes(); got != 2*BloomMinBytes {
 		t.Fatalf("floor+1 request: got %d, want %d", got, 2*BloomMinBytes)
 	}

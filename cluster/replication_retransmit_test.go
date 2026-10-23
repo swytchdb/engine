@@ -47,8 +47,10 @@ import (
 // through the failed initial send and a retransmit while the peer is alive,
 // and (2) it only rejects once the peer is declared dead.
 func TestReplicate_HeldThroughSendFailure_GivenUpWhenPeerDies(t *testing.T) {
-	const self = NodeId(1)
-	const peer = NodeId(2)
+	const (
+		self = NodeId(1)
+		peer = NodeId(2)
+	)
 
 	health := NewPeerHealthTable(ClockConfig{})
 	ph := health.GetOrCreate(peer)
@@ -56,8 +58,10 @@ func TestReplicate_HeldThroughSendFailure_GivenUpWhenPeerDies(t *testing.T) {
 	ph.symmetric.Store(true) // a valid replication target...
 
 	var sendAttempts atomic.Int32
+
 	connFunc := func(NodeId) *quic.Conn {
 		sendAttempts.Add(1)
+
 		return nil // ...whose connection isn't up yet → Send returns ErrPeerUnavailable
 	}
 	transport := NewQUICNotifyTransport(self, nil, connFunc, nil)
@@ -76,6 +80,7 @@ func TestReplicate_HeldThroughSendFailure_GivenUpWhenPeerDies(t *testing.T) {
 	if attempts := sendAttempts.Load(); attempts != 1 {
 		t.Fatalf("expected 1 initial send attempt, got %d", attempts)
 	}
+
 	select {
 	case <-future.Done():
 		t.Fatalf("future resolved on send failure to a live peer — request was dropped, not held: %v", future.Err())
@@ -87,12 +92,15 @@ func TestReplicate_HeldThroughSendFailure_GivenUpWhenPeerDies(t *testing.T) {
 	// abandoned.
 	r.tracker.pending.Range(func(_ uint64, tr *trackedRequest) bool {
 		tr.lastSentAt.Store(0)
+
 		return true
 	})
 	r.sweep()
+
 	if attempts := sendAttempts.Load(); attempts != 2 {
 		t.Fatalf("expected a retransmit while peer alive (2 attempts), got %d", attempts)
 	}
+
 	select {
 	case <-future.Done():
 		t.Fatalf("future resolved while peer still alive: %v", future.Err())
@@ -109,15 +117,19 @@ func TestReplicate_HeldThroughSendFailure_GivenUpWhenPeerDies(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("future did not reject after peer declared dead")
 	}
+
 	if err := future.Err(); !errors.Is(err, ErrNoPeers) {
 		t.Fatalf("expected ErrNoPeers after peer died, got: %v", err)
 	}
 
 	pendingCount := 0
+
 	r.tracker.pending.Range(func(uint64, *trackedRequest) bool {
 		pendingCount++
+
 		return true
 	})
+
 	if pendingCount != 0 {
 		t.Fatalf("given-up request was not removed from the pending tracker: %d left", pendingCount)
 	}

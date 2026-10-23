@@ -38,12 +38,15 @@ func TestClockWindow(t *testing.T) {
 	w.push(30)
 	w.push(10)
 	w.push(20)
+
 	if w.len() != 3 || w.min() != 10 {
 		t.Fatalf("len=%d min=%d, expected 3, 10", w.len(), w.min())
 	}
+
 	if got := w.quantile(0.5); got != 20 {
 		t.Fatalf("median %d, expected 20", got)
 	}
+
 	if got := w.quantile(1.0); got != 30 {
 		t.Fatalf("max quantile %d, expected 30", got)
 	}
@@ -52,14 +55,17 @@ func TestClockWindow(t *testing.T) {
 	w.push(40)
 	w.push(50)
 	w.push(60)
+
 	if w.len() != 4 {
 		t.Fatalf("wrapped len %d, expected 4", w.len())
 	}
+
 	if w.min() != 20 {
 		t.Fatalf("wrapped min %d, expected 20", w.min())
 	}
 
 	w.reset()
+
 	if w.len() != 0 {
 		t.Fatalf("reset len %d, expected 0", w.len())
 	}
@@ -112,6 +118,7 @@ func TestSkewAndRTTDerivation(t *testing.T) {
 	if st.SkewEst != wantSkew {
 		t.Fatalf("SkewEst = %v, expected %v", st.SkewEst, wantSkew)
 	}
+
 	if errBound := st.RTTMin / 2; st.SkewEst-skew > errBound {
 		t.Fatalf("skew error %v exceeds RTT_min/2 bound %v", st.SkewEst-skew, errBound)
 	}
@@ -137,6 +144,7 @@ func TestLivenessTimeoutFormula(t *testing.T) {
 		at := now.Add(time.Duration(i) * 100 * time.Millisecond)
 		s.observeTick(&ClockTick{NodeID: 2, Seq: uint64(i + 1), WallClock: at.UnixNano()}, at)
 	}
+
 	if _, ok := s.livenessTimeout(cfg); ok {
 		t.Fatal("timeout should not be adaptive before the window is primed")
 	}
@@ -149,12 +157,14 @@ func TestLivenessTimeoutFormula(t *testing.T) {
 	if !ok {
 		t.Fatal("timeout should be adaptive once primed")
 	}
+
 	if want := 300 * time.Millisecond; timeout != want {
 		t.Fatalf("adaptive timeout = %v, expected %v", timeout, want)
 	}
 
 	// Clamping to MaxTimeout.
 	cfgTight := cfg
+
 	cfgTight.MaxTimeout = 150 * time.Millisecond
 	if timeout, _ := s.livenessTimeout(cfgTight); timeout != 150*time.Millisecond {
 		t.Fatalf("clamped timeout = %v, expected 150ms", timeout)
@@ -195,17 +205,22 @@ func TestAdjustInterval(t *testing.T) {
 		0, // converged: no further change
 	}
 	for stepIdx, want := range expected {
-		var next time.Duration
-		var changed bool
+		var (
+			next    time.Duration
+			changed bool
+		)
 		for range intervalAdjustEvery {
 			next, changed = hm.adjustInterval()
 		}
+
 		if want == 0 {
 			if changed {
 				t.Fatalf("step %d: interval changed past convergence to %v", stepIdx, next)
 			}
+
 			continue
 		}
+
 		if !changed || next != want {
 			t.Fatalf("step %d: interval (%v, %v), expected (%v, true)", stepIdx, next, changed, want)
 		}

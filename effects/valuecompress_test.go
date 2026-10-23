@@ -38,6 +38,7 @@ func compressibleValue(n int) []byte {
 	for i := range b {
 		b[i] = byte('A' + i%26)
 	}
+
 	return b
 }
 
@@ -63,15 +64,19 @@ func TestCompressDataValueRoundTrip(t *testing.T) {
 	if cv == nil {
 		t.Fatal("compressible value did not move to the compressed arm")
 	}
+
 	if d.GetRaw() != nil {
 		t.Fatal("raw arm still readable after compression")
 	}
+
 	if cv.GetRawLen() != uint64(len(val)) {
 		t.Fatalf("raw_len = %d, want %d", cv.GetRawLen(), len(val))
 	}
+
 	if len(cv.GetData()) >= len(val) {
 		t.Fatalf("stored %d bytes for a %d-byte compressible value", len(cv.GetData()), len(val))
 	}
+
 	if !bytes.Equal(d.Decompress(), val) {
 		t.Fatal("Decompress did not restore the original bytes")
 	}
@@ -84,9 +89,11 @@ func TestCompressStoreIfSmaller(t *testing.T) {
 	rand.New(rand.NewSource(42)).Read(v)
 	d := rawScalar(v)
 	compressDataValue(d)
+
 	if d.GetCompressed() != nil {
 		t.Fatal("incompressible value was stored compressed")
 	}
+
 	if !bytes.Equal(d.GetRaw(), v) {
 		t.Fatal("raw value changed")
 	}
@@ -97,6 +104,7 @@ func TestCompressStoreIfSmaller(t *testing.T) {
 func TestCompressSkipsSmallValues(t *testing.T) {
 	d := rawScalar(compressibleValue(compressMinBytes - 1))
 	compressDataValue(d)
+
 	if d.GetCompressed() != nil {
 		t.Fatal("sub-threshold value was compressed")
 	}
@@ -122,21 +130,24 @@ func TestCompressReducedStateNeverMutatesShared(t *testing.T) {
 
 	out := compressReducedState(orig)
 
-	if orig.Scalar.GetCompressed() != nil || orig.NetAdds["big"].Data.GetCompressed() != nil ||
-		orig.OrderedElements[0].Data.GetCompressed() != nil {
+	if orig.GetScalar().GetCompressed() != nil || orig.GetNetAdds()["big"].GetData().GetCompressed() != nil ||
+		orig.GetOrderedElements()[0].GetData().GetCompressed() != nil {
 		t.Fatal("compression wrote through the shared input state")
 	}
-	if out.Scalar.GetCompressed() == nil || out.NetAdds["big"].Data.GetCompressed() == nil ||
-		out.OrderedElements[0].Data.GetCompressed() == nil {
+
+	if out.GetScalar().GetCompressed() == nil || out.GetNetAdds()["big"].GetData().GetCompressed() == nil ||
+		out.GetOrderedElements()[0].GetData().GetCompressed() == nil {
 		t.Fatal("compressible values not compressed in the output state")
 	}
-	if out.NetAdds["tiny"].Data.GetCompressed() != nil {
+
+	if out.GetNetAdds()["tiny"].GetData().GetCompressed() != nil {
 		t.Fatal("sub-threshold element compressed")
 	}
+
 	for name, got := range map[string][]byte{
-		"scalar":  out.Scalar.Decompress(),
-		"big":     out.NetAdds["big"].Data.Decompress(),
-		"ordered": out.OrderedElements[0].Data.Decompress(),
+		"scalar":  out.GetScalar().Decompress(),
+		"big":     out.GetNetAdds()["big"].GetData().Decompress(),
+		"ordered": out.GetOrderedElements()[0].GetData().Decompress(),
 	} {
 		if !bytes.Equal(got, big) {
 			t.Fatalf("%s did not round-trip", name)
@@ -151,15 +162,17 @@ func TestReduceOverCompressedEffects(t *testing.T) {
 	val := compressibleValue(2048)
 	set := &pb.Effect{Key: []byte("k"), Kind: &pb.Effect_Data{Data: rawScalar(bytes.Clone(val))}}
 	CompressEffectValues(set)
+
 	if set.GetData().GetCompressed() == nil {
 		t.Fatal("setup: value did not compress")
 	}
 
 	r := ReduceBranch([]*pb.Effect{set})
-	if r.Scalar.GetCompressed() == nil {
+	if r.GetScalar().GetCompressed() == nil {
 		t.Fatal("reduction inflated the value; reduced state should stay compressed")
 	}
-	if !bytes.Equal(r.Scalar.Decompress(), val) {
+
+	if !bytes.Equal(r.GetScalar().Decompress(), val) {
 		t.Fatal("reduced value did not round-trip")
 	}
 
@@ -169,18 +182,21 @@ func TestReduceOverCompressedEffects(t *testing.T) {
 	digits := append(bytes.Repeat([]byte("0"), 126), []byte("42")...)
 	setNum := &pb.Effect{Key: []byte("n"), Kind: &pb.Effect_Data{Data: rawScalar(digits)}}
 	CompressEffectValues(setNum)
+
 	if setNum.GetData().GetCompressed() == nil {
 		t.Fatal("setup: numeric value did not compress")
 	}
+
 	incr := &pb.Effect{Key: []byte("n"), Kind: &pb.Effect_Data{Data: &pb.DataEffect{
 		Op:         pb.EffectOp_INSERT_OP,
 		Merge:      pb.MergeRule_ADDITIVE_INT,
 		Collection: pb.CollectionKind_SCALAR,
 		Value:      &pb.DataEffect_IntVal{IntVal: 1},
 	}}}
+
 	rn := ReduceBranch([]*pb.Effect{setNum, incr})
-	if rn.Scalar.GetIntVal() != 43 {
-		t.Fatalf("INCR over compressed base = %d, want 43", rn.Scalar.GetIntVal())
+	if rn.GetScalar().GetIntVal() != 43 {
+		t.Fatalf("INCR over compressed base = %d, want 43", rn.GetScalar().GetIntVal())
 	}
 }
 
@@ -196,10 +212,12 @@ func TestEngineCompressValuesEndToEnd(t *testing.T) {
 	}()
 
 	val := compressibleValue(8192)
+
 	ctx := e.NewContext()
 	if err := ctx.Emit(&pb.Effect{Key: []byte("k"), Kind: &pb.Effect_Data{Data: rawScalar(bytes.Clone(val))}}); err != nil {
 		t.Fatalf("emit: %v", err)
 	}
+
 	if err := ctx.Flush(); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
@@ -208,13 +226,16 @@ func TestEngineCompressValuesEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get snapshot: %v", err)
 	}
-	if r == nil || r.Scalar == nil {
+
+	if r == nil || r.GetScalar() == nil {
 		t.Fatal("no reduced state")
 	}
-	if r.Scalar.GetCompressed() == nil {
+
+	if r.GetScalar().GetCompressed() == nil {
 		t.Fatal("value not stored compressed under CompressValues")
 	}
-	if !bytes.Equal(r.Scalar.Decompress(), val) {
+
+	if !bytes.Equal(r.GetScalar().Decompress(), val) {
 		t.Fatal("read did not round-trip the value")
 	}
 }
@@ -230,6 +251,7 @@ func TestInflatedSizeDelta(t *testing.T) {
 	eff := &pb.Effect{Kind: &pb.Effect_Data{Data: rawScalar(compressibleValue(4096))}}
 	CompressEffectValues(eff)
 	cv := eff.GetData().GetCompressed()
+
 	want := cv.GetRawLen() - uint64(len(cv.GetData()))
 	if got := InflatedSizeDelta(eff); got != want {
 		t.Fatalf("data delta = %d, want %d", got, want)
@@ -244,8 +266,9 @@ func TestInflatedSizeDelta(t *testing.T) {
 		},
 	}}}
 	CompressEffectValues(snap)
-	st := snap.GetSnapshot().State
-	scv, ecv := st.Scalar.GetCompressed(), st.NetAdds["e"].Data.GetCompressed()
+	st := snap.GetSnapshot().GetState()
+	scv, ecv := st.GetScalar().GetCompressed(), st.GetNetAdds()["e"].GetData().GetCompressed()
+
 	want = scv.GetRawLen() - uint64(len(scv.GetData())) + ecv.GetRawLen() - uint64(len(ecv.GetData()))
 	if got := InflatedSizeDelta(snap); got != want {
 		t.Fatalf("snapshot delta = %d, want %d", got, want)

@@ -33,12 +33,14 @@ func TestGetAvailableMemory(t *testing.T) {
 	if mem == 0 {
 		t.Fatal("GetAvailableMemory returned 0")
 	}
+
 	t.Logf("available memory: %s", FormatMemory(mem))
 
 	// Sanity check: should be at least 64MB and less than 1TB
 	if mem < 64*1024*1024 {
 		t.Errorf("available memory suspiciously low: %d bytes", mem)
 	}
+
 	if mem > 1024*1024*1024*1024 {
 		t.Errorf("available memory suspiciously high: %d bytes", mem)
 	}
@@ -54,6 +56,7 @@ func TestEnforceMemoryTarget_SetsGOMEMLIMIT(t *testing.T) {
 
 	cfg := ConfigFromCapacity(10000)
 	cfg.CollectStats = true
+
 	c := NewCloxCache[string, []byte](cfg)
 	defer c.Close()
 
@@ -73,6 +76,7 @@ func TestEnforceMemoryTarget_SetsGOMEMLIMIT(t *testing.T) {
 		t.Errorf("GOMEMLIMIT %d not close to expected %d (50%% of %d)",
 			newLimit, expectedLimit, availMem)
 	}
+
 	t.Logf("GOMEMLIMIT set to %s (target 50%% of %s = %s)",
 		FormatMemory(uint64(newLimit)), FormatMemory(availMem), FormatMemory(uint64(expectedLimit)))
 }
@@ -87,6 +91,7 @@ func TestEnforceMemoryTarget_DoesNotOverrideExistingGOMEMLIMIT(t *testing.T) {
 	debug.SetMemoryLimit(customLimit)
 
 	cfg := ConfigFromCapacity(10000)
+
 	c := NewCloxCache[string, []byte](cfg)
 	defer c.Close()
 
@@ -101,6 +106,7 @@ func TestEnforceMemoryTarget_DoesNotOverrideExistingGOMEMLIMIT(t *testing.T) {
 
 func TestEnforceMemoryTarget_InvalidPercent(t *testing.T) {
 	cfg := ConfigFromCapacity(1000)
+
 	c := NewCloxCache[string, []byte](cfg)
 	defer c.Close()
 
@@ -114,6 +120,7 @@ func TestEnforceMemoryTarget_AdjustsCapacity(t *testing.T) {
 	cfg := ConfigFromCapacity(100000)
 	cfg.CollectStats = true
 	c := NewCloxCache[string, []byte](cfg)
+
 	c.SetSizeFunc(func(k string, v []byte) int64 {
 		return int64(len(k) + len(v))
 	})
@@ -121,6 +128,7 @@ func TestEnforceMemoryTarget_AdjustsCapacity(t *testing.T) {
 
 	// Fill the cache with data
 	value := make([]byte, 1024) // 1KB values
+
 	for i := range 80000 {
 		key := string(rune('A'+i%26)) + string(rune('0'+i/26%10)) + string(rune(i))
 		c.Put(key, value)
@@ -159,6 +167,7 @@ func TestEnforceMemoryTarget_AdjustsCapacity(t *testing.T) {
 
 func TestEnforceMemoryTarget_StoresMemoryLimit(t *testing.T) {
 	cfg := ConfigFromCapacity(1000)
+
 	c := NewCloxCache[string, []byte](cfg)
 	defer c.Close()
 
@@ -176,5 +185,6 @@ func TestEnforceMemoryTarget_StoresMemoryLimit(t *testing.T) {
 	if limit < expected*85/100 || limit > expected*115/100 {
 		t.Errorf("memory limit %d not close to expected %d", limit, expected)
 	}
+
 	t.Logf("memory limit: %s (80%% of %s)", FormatMemory(uint64(limit)), FormatMemory(availMem))
 }

@@ -50,14 +50,17 @@ func compressDataValue(d *pb.DataEffect) {
 	if d == nil {
 		return
 	}
-	v, ok := d.Value.(*pb.DataEffect_Raw)
+
+	v, ok := d.GetValue().(*pb.DataEffect_Raw)
 	if !ok || len(v.Raw) < compressMinBytes {
 		return
 	}
+
 	z := Compress(v.Raw)
 	if len(z) >= len(v.Raw) {
 		return
 	}
+
 	d.Value = &pb.DataEffect_Compressed{Compressed: &pb.CompressedValue{
 		Codec:  pb.Compression_COMPRESSION_ZSTD,
 		RawLen: uint64(len(v.Raw)),
@@ -73,10 +76,12 @@ func compressDataValue(d *pb.DataEffect) {
 func CompressEffectValues(eff *pb.Effect) {
 	if data := eff.GetData(); data != nil {
 		compressDataValue(data)
+
 		return
 	}
-	if snap := eff.GetSnapshot(); snap != nil && snap.State != nil {
-		snap.State = compressReducedState(snap.State)
+
+	if snap := eff.GetSnapshot(); snap != nil && snap.GetState() != nil {
+		snap.State = compressReducedState(snap.GetState())
 	}
 }
 
@@ -94,22 +99,27 @@ func compressReducedState(r *pb.ReducedEffect) *pb.ReducedEffect {
 		}
 	}
 
-	if compressibleData(r.Scalar) {
+	if compressibleData(r.GetScalar()) {
 		ensureOwned()
-		compressDataValue(out.Scalar) // cloneReduced deep-copies Scalar
+		compressDataValue(out.GetScalar()) // cloneReduced deep-copies Scalar
 	}
-	for id, elem := range r.NetAdds {
-		if compressibleData(elem.Data) {
+
+	for id, elem := range r.GetNetAdds() {
+		if compressibleData(elem.GetData()) {
 			ensureOwned()
+
 			out.NetAdds[id] = compressedElement(elem)
 		}
 	}
-	for i, elem := range r.OrderedElements {
-		if compressibleData(elem.Data) {
+
+	for i, elem := range r.GetOrderedElements() {
+		if compressibleData(elem.GetData()) {
 			ensureOwned()
+
 			out.OrderedElements[i] = compressedElement(elem)
 		}
 	}
+
 	return out
 }
 
@@ -121,7 +131,9 @@ func compressibleData(d *pb.DataEffect) bool {
 	if d == nil {
 		return false
 	}
-	v, ok := d.Value.(*pb.DataEffect_Raw)
+
+	v, ok := d.GetValue().(*pb.DataEffect_Raw)
+
 	return ok && len(v.Raw) >= compressMinBytes
 }
 
@@ -129,14 +141,15 @@ func compressibleData(d *pb.DataEffect) bool {
 // element updates: a new element around a compressed copy of the data,
 // leaving the shared original untouched.
 func compressedElement(elem *pb.ReducedElement) *pb.ReducedElement {
-	data := cloneData(elem.Data)
+	data := cloneData(elem.GetData())
 	compressDataValue(data)
+
 	return &pb.ReducedElement{
 		Data:           data,
-		Hlc:            elem.Hlc,
-		NodeId:         elem.NodeId,
-		ForkChoiceHash: elem.ForkChoiceHash,
-		ExpiresAt:      elem.ExpiresAt,
+		Hlc:            elem.GetHlc(),
+		NodeId:         elem.GetNodeId(),
+		ForkChoiceHash: elem.GetForkChoiceHash(),
+		ExpiresAt:      elem.GetExpiresAt(),
 	}
 }
 
@@ -146,26 +159,32 @@ func compressedElement(elem *pb.ReducedElement) *pb.ReducedElement {
 // customer's bytes" no matter how well their data compresses.
 func InflatedSizeDelta(eff *pb.Effect) uint64 {
 	var delta uint64
+
 	add := func(d *pb.DataEffect) {
 		cv := d.GetCompressed()
-		if cv != nil && cv.RawLen > uint64(len(cv.Data)) {
-			delta += cv.RawLen - uint64(len(cv.Data))
+		if cv != nil && cv.GetRawLen() > uint64(len(cv.GetData())) {
+			delta += cv.GetRawLen() - uint64(len(cv.GetData()))
 		}
 	}
 	if data := eff.GetData(); data != nil {
 		add(data)
+
 		return delta
 	}
-	if snap := eff.GetSnapshot(); snap != nil && snap.State != nil {
-		if snap.State.Scalar != nil {
-			add(snap.State.Scalar)
+
+	if snap := eff.GetSnapshot(); snap != nil && snap.GetState() != nil {
+		if snap.GetState().GetScalar() != nil {
+			add(snap.GetState().GetScalar())
 		}
-		for _, elem := range snap.State.NetAdds {
-			add(elem.Data)
+
+		for _, elem := range snap.GetState().GetNetAdds() {
+			add(elem.GetData())
 		}
-		for _, elem := range snap.State.OrderedElements {
-			add(elem.Data)
+
+		for _, elem := range snap.GetState().GetOrderedElements() {
+			add(elem.GetData())
 		}
 	}
+
 	return delta
 }

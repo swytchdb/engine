@@ -40,15 +40,19 @@ func ParseMemoryLimit(s string) (bytes int64, percent float64, err error) {
 		if _, scanErr := fmt.Sscanf(s[:len(s)-1], "%d", &n); scanErr != nil {
 			return 0, 0, fmt.Errorf("invalid percent %q: %w", s, scanErr)
 		}
+
 		if n <= 0 || n > 100 {
 			return 0, 0, fmt.Errorf("percent %d%% out of range (1-100)", n)
 		}
+
 		return 0, float64(n) / 100, nil
 	}
+
 	b, err := ParseSize(s)
 	if err != nil {
 		return 0, 0, err
 	}
+
 	return b, 0, nil
 }
 
@@ -65,9 +69,11 @@ func ParseSize(s string) (int64, error) {
 	for i, c := range s {
 		if c < '0' || c > '9' {
 			numEnd = i
+
 			break
 		}
 	}
+
 	if numEnd == 0 {
 		return 0, fmt.Errorf("invalid size: %s", s)
 	}
@@ -78,7 +84,9 @@ func ParseSize(s string) (int64, error) {
 	}
 
 	suffix := strings.TrimSpace(s[numEnd:])
+
 	var multiplier int64
+
 	switch suffix {
 	case "", "b":
 		multiplier = 1

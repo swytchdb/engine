@@ -37,11 +37,11 @@ func rTs(nanos int64) *timestamppb.Timestamp {
 	return timestamppb.New(time.Unix(0, nanos))
 }
 
-func makeDataEffect(key string, hlcNanos int64, nodeID uint64, d *pb.DataEffect) *pb.Effect {
+func makeDataEffect(hlcNanos int64, d *pb.DataEffect) *pb.Effect {
 	return &pb.Effect{
-		Key:    []byte(key),
+		Key:    []byte("k"),
 		Hlc:    rTs(hlcNanos),
-		NodeId: nodeID,
+		NodeId: 1,
 		Kind:   &pb.Effect_Data{Data: d},
 	}
 }
@@ -171,119 +171,134 @@ func TestReduceBranch_Empty(t *testing.T) {
 
 func TestReduceBranch_SingleStringSet(t *testing.T) {
 	effects := []*pb.Effect{
-		makeDataEffect("k", 1, 1, scalarInsertRaw([]byte("hello"))),
+		makeDataEffect(1, scalarInsertRaw([]byte("hello"))),
 	}
+
 	r := ReduceBranch(effects)
 	if r == nil {
 		t.Fatal("expected non-nil")
 	}
-	if string(r.Scalar.GetRaw()) != "hello" {
-		t.Fatalf("expected 'hello', got %q", r.Scalar.GetRaw())
+
+	if string(r.GetScalar().GetRaw()) != "hello" {
+		t.Fatalf("expected 'hello', got %q", r.GetScalar().GetRaw())
 	}
-	if r.Commutative {
+
+	if r.GetCommutative() {
 		t.Fatal("LWW should not be commutative")
 	}
-	if r.Collection != pb.CollectionKind_SCALAR {
-		t.Fatalf("expected SCALAR, got %v", r.Collection)
+
+	if r.GetCollection() != pb.CollectionKind_SCALAR {
+		t.Fatalf("expected SCALAR, got %v", r.GetCollection())
 	}
 }
 
 func TestReduceBranch_StringOverwrite(t *testing.T) {
 	effects := []*pb.Effect{
-		makeDataEffect("k", 1, 1, scalarInsertRaw([]byte("first"))),
-		makeDataEffect("k", 2, 1, scalarInsertRaw([]byte("second"))),
+		makeDataEffect(1, scalarInsertRaw([]byte("first"))),
+		makeDataEffect(2, scalarInsertRaw([]byte("second"))),
 	}
+
 	r := ReduceBranch(effects)
-	if string(r.Scalar.GetRaw()) != "second" {
-		t.Fatalf("expected 'second', got %q", r.Scalar.GetRaw())
+	if string(r.GetScalar().GetRaw()) != "second" {
+		t.Fatalf("expected 'second', got %q", r.GetScalar().GetRaw())
 	}
 }
 
 func TestReduceBranch_IncrDeltas(t *testing.T) {
 	effects := []*pb.Effect{
-		makeDataEffect("k", 1, 1, scalarInsertInt(pb.MergeRule_ADDITIVE_INT, 5)),
-		makeDataEffect("k", 2, 1, scalarInsertInt(pb.MergeRule_ADDITIVE_INT, 3)),
-		makeDataEffect("k", 3, 1, scalarInsertInt(pb.MergeRule_ADDITIVE_INT, -1)),
+		makeDataEffect(1, scalarInsertInt(pb.MergeRule_ADDITIVE_INT, 5)),
+		makeDataEffect(2, scalarInsertInt(pb.MergeRule_ADDITIVE_INT, 3)),
+		makeDataEffect(3, scalarInsertInt(pb.MergeRule_ADDITIVE_INT, -1)),
 	}
+
 	r := ReduceBranch(effects)
-	if r.Scalar.GetIntVal() != 7 {
-		t.Fatalf("expected 7, got %d", r.Scalar.GetIntVal())
+	if r.GetScalar().GetIntVal() != 7 {
+		t.Fatalf("expected 7, got %d", r.GetScalar().GetIntVal())
 	}
-	if !r.Commutative {
+
+	if !r.GetCommutative() {
 		t.Fatal("ADDITIVE_INT should be commutative")
 	}
 }
 
 func TestReduceBranch_FloatDeltas(t *testing.T) {
 	effects := []*pb.Effect{
-		makeDataEffect("k", 1, 1, scalarInsertFloat(pb.MergeRule_ADDITIVE_FLOAT, 1.5)),
-		makeDataEffect("k", 2, 1, scalarInsertFloat(pb.MergeRule_ADDITIVE_FLOAT, 2.5)),
+		makeDataEffect(1, scalarInsertFloat(pb.MergeRule_ADDITIVE_FLOAT, 1.5)),
+		makeDataEffect(2, scalarInsertFloat(pb.MergeRule_ADDITIVE_FLOAT, 2.5)),
 	}
+
 	r := ReduceBranch(effects)
-	if r.Scalar.GetFloatVal() != 4.0 {
-		t.Fatalf("expected 4.0, got %f", r.Scalar.GetFloatVal())
+	if r.GetScalar().GetFloatVal() != 4.0 {
+		t.Fatalf("expected 4.0, got %f", r.GetScalar().GetFloatVal())
 	}
 }
 
 func TestReduceBranch_SetThenIncr(t *testing.T) {
 	effects := []*pb.Effect{
-		makeDataEffect("k", 1, 1, scalarInsertRaw([]byte("100"))),
-		makeDataEffect("k", 2, 1, scalarInsertInt(pb.MergeRule_ADDITIVE_INT, 5)),
+		makeDataEffect(1, scalarInsertRaw([]byte("100"))),
+		makeDataEffect(2, scalarInsertInt(pb.MergeRule_ADDITIVE_INT, 5)),
 	}
+
 	r := ReduceBranch(effects)
-	if r.Scalar.GetIntVal() != 105 {
-		t.Fatalf("expected 105, got %d", r.Scalar.GetIntVal())
+	if r.GetScalar().GetIntVal() != 105 {
+		t.Fatalf("expected 105, got %d", r.GetScalar().GetIntVal())
 	}
-	if r.Commutative {
+
+	if r.GetCommutative() {
 		t.Fatal("SET+INCR should be non-commutative")
 	}
 }
 
 func TestReduceBranch_DelTruncates(t *testing.T) {
 	effects := []*pb.Effect{
-		makeDataEffect("k", 1, 1, scalarInsertRaw([]byte("old"))),
-		makeDataEffect("k", 2, 1, scalarRemove()),
-		makeDataEffect("k", 3, 1, scalarInsertRaw([]byte("new"))),
+		makeDataEffect(1, scalarInsertRaw([]byte("old"))),
+		makeDataEffect(2, scalarRemove()),
+		makeDataEffect(3, scalarInsertRaw([]byte("new"))),
 	}
+
 	r := ReduceBranch(effects)
-	if string(r.Scalar.GetRaw()) != "new" {
-		t.Fatalf("expected 'new' after DEL+SET, got %q", r.Scalar.GetRaw())
+	if string(r.GetScalar().GetRaw()) != "new" {
+		t.Fatalf("expected 'new' after DEL+SET, got %q", r.GetScalar().GetRaw())
 	}
 }
 
 func TestReduceBranch_DelIsLast(t *testing.T) {
 	effects := []*pb.Effect{
-		makeDataEffect("k", 1, 1, scalarInsertRaw([]byte("value"))),
-		makeDataEffect("k", 2, 1, scalarRemove()),
+		makeDataEffect(1, scalarInsertRaw([]byte("value"))),
+		makeDataEffect(2, scalarRemove()),
 	}
+
 	r := ReduceBranch(effects)
-	if r.Op != pb.EffectOp_REMOVE_OP {
-		t.Fatalf("expected REMOVE_OP, got %v", r.Op)
+	if r.GetOp() != pb.EffectOp_REMOVE_OP {
+		t.Fatalf("expected REMOVE_OP, got %v", r.GetOp())
 	}
 }
 
 func TestReduceBranch_MetaEffectCapturesTypeTag(t *testing.T) {
 	effects := []*pb.Effect{
 		makeMetaEffect("k", 1, 1, &pb.MetaEffect{TypeTag: pb.ValueType_TYPE_HASH}),
-		makeDataEffect("k", 2, 1, keyedInsertRaw("field1", []byte("val1"))),
+		makeDataEffect(2, keyedInsertRaw("field1", []byte("val1"))),
 	}
+
 	r := ReduceBranch(effects)
-	if r.TypeTag != pb.ValueType_TYPE_HASH {
-		t.Fatalf("expected TYPE_HASH, got %v", r.TypeTag)
+	if r.GetTypeTag() != pb.ValueType_TYPE_HASH {
+		t.Fatalf("expected TYPE_HASH, got %v", r.GetTypeTag())
 	}
-	if _, ok := r.NetAdds["field1"]; !ok {
+
+	if _, ok := r.GetNetAdds()["field1"]; !ok {
 		t.Fatal("expected field1 in NetAdds")
 	}
 }
 
 func TestReduceBranch_MetaEffectCapturesTTL(t *testing.T) {
 	effects := []*pb.Effect{
-		makeDataEffect("k", 1, 1, scalarInsertRaw([]byte("val"))),
+		makeDataEffect(1, scalarInsertRaw([]byte("val"))),
 		makeMetaEffect("k", 2, 1, &pb.MetaEffect{ExpiresAt: timestamppb.New(time.UnixMilli(1000))}),
 	}
+
 	r := ReduceBranch(effects)
-	if r.ExpiresAt.AsTime().UnixMilli() != 1000 {
-		t.Fatalf("expected ExpiresAt=1000ms, got %v", r.ExpiresAt)
+	if r.GetExpiresAt().AsTime().UnixMilli() != 1000 {
+		t.Fatalf("expected ExpiresAt=1000ms, got %v", r.GetExpiresAt())
 	}
 }
 
@@ -291,93 +306,106 @@ func TestReduceBranch_MetaEffectCapturesTTL(t *testing.T) {
 
 func TestReduceBranch_HashFields(t *testing.T) {
 	effects := []*pb.Effect{
-		makeDataEffect("k", 1, 1, keyedInsertRaw("f1", []byte("v1"))),
-		makeDataEffect("k", 2, 1, keyedInsertRaw("f2", []byte("v2"))),
-		makeDataEffect("k", 3, 1, keyedInsertRaw("f1", []byte("v1-updated"))),
+		makeDataEffect(1, keyedInsertRaw("f1", []byte("v1"))),
+		makeDataEffect(2, keyedInsertRaw("f2", []byte("v2"))),
+		makeDataEffect(3, keyedInsertRaw("f1", []byte("v1-updated"))),
 	}
+
 	r := ReduceBranch(effects)
-	if len(r.NetAdds) != 2 {
-		t.Fatalf("expected 2 fields, got %d", len(r.NetAdds))
+	if len(r.GetNetAdds()) != 2 {
+		t.Fatalf("expected 2 fields, got %d", len(r.GetNetAdds()))
 	}
-	if string(r.NetAdds["f1"].Data.GetRaw()) != "v1-updated" {
-		t.Fatalf("expected f1=v1-updated, got %q", r.NetAdds["f1"].Data.GetRaw())
+
+	if string(r.GetNetAdds()["f1"].GetData().GetRaw()) != "v1-updated" {
+		t.Fatalf("expected f1=v1-updated, got %q", r.GetNetAdds()["f1"].GetData().GetRaw())
 	}
-	if string(r.NetAdds["f2"].Data.GetRaw()) != "v2" {
-		t.Fatalf("expected f2=v2, got %q", r.NetAdds["f2"].Data.GetRaw())
+
+	if string(r.GetNetAdds()["f2"].GetData().GetRaw()) != "v2" {
+		t.Fatalf("expected f2=v2, got %q", r.GetNetAdds()["f2"].GetData().GetRaw())
 	}
 }
 
 func TestReduceBranch_HashFieldRemove(t *testing.T) {
 	effects := []*pb.Effect{
-		makeDataEffect("k", 1, 1, keyedInsertRaw("f1", []byte("v1"))),
-		makeDataEffect("k", 2, 1, keyedInsertRaw("f2", []byte("v2"))),
-		makeDataEffect("k", 3, 1, keyedRemove("f1")),
+		makeDataEffect(1, keyedInsertRaw("f1", []byte("v1"))),
+		makeDataEffect(2, keyedInsertRaw("f2", []byte("v2"))),
+		makeDataEffect(3, keyedRemove("f1")),
 	}
+
 	r := ReduceBranch(effects)
-	if len(r.NetAdds) != 1 {
-		t.Fatalf("expected 1 field after remove, got %d", len(r.NetAdds))
+	if len(r.GetNetAdds()) != 1 {
+		t.Fatalf("expected 1 field after remove, got %d", len(r.GetNetAdds()))
 	}
-	if _, ok := r.NetAdds["f1"]; ok {
+
+	if _, ok := r.GetNetAdds()["f1"]; ok {
 		t.Fatal("f1 should have been removed")
 	}
 }
 
 func TestReduceBranch_SetMembers(t *testing.T) {
 	effects := []*pb.Effect{
-		makeDataEffect("k", 1, 1, keyedInsertRaw("m1", nil)),
-		makeDataEffect("k", 2, 1, keyedInsertRaw("m2", nil)),
-		makeDataEffect("k", 3, 1, keyedRemove("m1")),
-		makeDataEffect("k", 4, 1, keyedInsertRaw("m3", nil)),
+		makeDataEffect(1, keyedInsertRaw("m1", nil)),
+		makeDataEffect(2, keyedInsertRaw("m2", nil)),
+		makeDataEffect(3, keyedRemove("m1")),
+		makeDataEffect(4, keyedInsertRaw("m3", nil)),
 	}
+
 	r := ReduceBranch(effects)
-	if len(r.NetAdds) != 2 {
-		t.Fatalf("expected 2 members, got %d", len(r.NetAdds))
+	if len(r.GetNetAdds()) != 2 {
+		t.Fatalf("expected 2 members, got %d", len(r.GetNetAdds()))
 	}
-	if _, ok := r.NetAdds["m2"]; !ok {
+
+	if _, ok := r.GetNetAdds()["m2"]; !ok {
 		t.Fatal("expected m2")
 	}
-	if _, ok := r.NetAdds["m3"]; !ok {
+
+	if _, ok := r.GetNetAdds()["m3"]; !ok {
 		t.Fatal("expected m3")
 	}
 }
 
 func TestReduceBranch_ZSetIncrBy(t *testing.T) {
 	effects := []*pb.Effect{
-		makeDataEffect("k", 1, 1, keyedInsertFloat("member", pb.MergeRule_ADDITIVE_FLOAT, 1.5)),
-		makeDataEffect("k", 2, 1, keyedInsertFloat("member", pb.MergeRule_ADDITIVE_FLOAT, 2.5)),
+		makeDataEffect(1, keyedInsertFloat("member", pb.MergeRule_ADDITIVE_FLOAT, 1.5)),
+		makeDataEffect(2, keyedInsertFloat("member", pb.MergeRule_ADDITIVE_FLOAT, 2.5)),
 	}
 	r := ReduceBranch(effects)
-	elem := r.NetAdds["member"]
+
+	elem := r.GetNetAdds()["member"]
 	if elem == nil {
 		t.Fatal("expected member in NetAdds")
 	}
-	if elem.Data.GetFloatVal() != 4.0 {
-		t.Fatalf("expected 4.0, got %f", elem.Data.GetFloatVal())
+
+	if elem.GetData().GetFloatVal() != 4.0 {
+		t.Fatalf("expected 4.0, got %f", elem.GetData().GetFloatVal())
 	}
 }
 
 func TestReduceBranch_HLLMaxInt(t *testing.T) {
 	effects := []*pb.Effect{
-		makeDataEffect("k", 1, 1, keyedInsertInt("reg0", pb.MergeRule_MAX_INT, 3)),
-		makeDataEffect("k", 2, 1, keyedInsertInt("reg0", pb.MergeRule_MAX_INT, 7)),
-		makeDataEffect("k", 3, 1, keyedInsertInt("reg0", pb.MergeRule_MAX_INT, 5)),
+		makeDataEffect(1, keyedInsertInt("reg0", pb.MergeRule_MAX_INT, 3)),
+		makeDataEffect(2, keyedInsertInt("reg0", pb.MergeRule_MAX_INT, 7)),
+		makeDataEffect(3, keyedInsertInt("reg0", pb.MergeRule_MAX_INT, 5)),
 	}
 	r := ReduceBranch(effects)
-	elem := r.NetAdds["reg0"]
+
+	elem := r.GetNetAdds()["reg0"]
 	if elem == nil {
 		t.Fatal("expected reg0 in NetAdds")
 	}
-	if elem.Data.GetIntVal() != 7 {
-		t.Fatalf("expected 7, got %d", elem.Data.GetIntVal())
+
+	if elem.GetData().GetIntVal() != 7 {
+		t.Fatalf("expected 7, got %d", elem.GetData().GetIntVal())
 	}
 }
 
 func TestReduceBranch_RemoveUnknownKeyed(t *testing.T) {
 	effects := []*pb.Effect{
-		makeDataEffect("k", 1, 1, keyedRemove("ghost")),
+		makeDataEffect(1, keyedRemove("ghost")),
 	}
+
 	r := ReduceBranch(effects)
-	if !r.NetRemoves["ghost"] {
+	if !r.GetNetRemoves()["ghost"] {
 		t.Fatal("expected ghost in NetRemoves")
 	}
 }
@@ -387,22 +415,25 @@ func TestReduceBranch_RemoveUnknownKeyed(t *testing.T) {
 func TestReduceBranch_ListHeadPush(t *testing.T) {
 	// LPUSH a, LPUSH b, LPUSH c → [c, b, a]
 	effects := []*pb.Effect{
-		makeDataEffect("k", 1, 1, orderedInsert(pb.Placement_PLACE_HEAD, "e1", []byte("a"))),
-		makeDataEffect("k", 2, 1, orderedInsert(pb.Placement_PLACE_HEAD, "e2", []byte("b"))),
-		makeDataEffect("k", 3, 1, orderedInsert(pb.Placement_PLACE_HEAD, "e3", []byte("c"))),
+		makeDataEffect(1, orderedInsert(pb.Placement_PLACE_HEAD, "e1", []byte("a"))),
+		makeDataEffect(2, orderedInsert(pb.Placement_PLACE_HEAD, "e2", []byte("b"))),
+		makeDataEffect(3, orderedInsert(pb.Placement_PLACE_HEAD, "e3", []byte("c"))),
 	}
+
 	r := ReduceBranch(effects)
-	if len(r.OrderedElements) != 3 {
-		t.Fatalf("expected 3 elements, got %d", len(r.OrderedElements))
+	if len(r.GetOrderedElements()) != 3 {
+		t.Fatalf("expected 3 elements, got %d", len(r.GetOrderedElements()))
 	}
-	if r.Collection != pb.CollectionKind_ORDERED {
-		t.Fatalf("expected ORDERED, got %v", r.Collection)
+
+	if r.GetCollection() != pb.CollectionKind_ORDERED {
+		t.Fatalf("expected ORDERED, got %v", r.GetCollection())
 	}
 	// HEAD pushes: each goes to front, so order is c, b, a
-	got := make([]string, len(r.OrderedElements))
-	for i, elem := range r.OrderedElements {
-		got[i] = string(elem.Data.GetRaw())
+	got := make([]string, len(r.GetOrderedElements()))
+	for i, elem := range r.GetOrderedElements() {
+		got[i] = string(elem.GetData().GetRaw())
 	}
+
 	want := []string{"c", "b", "a"}
 	for i := range want {
 		if got[i] != want[i] {
@@ -414,18 +445,21 @@ func TestReduceBranch_ListHeadPush(t *testing.T) {
 func TestReduceBranch_ListTailPush(t *testing.T) {
 	// RPUSH a, RPUSH b, RPUSH c → [a, b, c]
 	effects := []*pb.Effect{
-		makeDataEffect("k", 1, 1, orderedInsert(pb.Placement_PLACE_TAIL, "e1", []byte("a"))),
-		makeDataEffect("k", 2, 1, orderedInsert(pb.Placement_PLACE_TAIL, "e2", []byte("b"))),
-		makeDataEffect("k", 3, 1, orderedInsert(pb.Placement_PLACE_TAIL, "e3", []byte("c"))),
+		makeDataEffect(1, orderedInsert(pb.Placement_PLACE_TAIL, "e1", []byte("a"))),
+		makeDataEffect(2, orderedInsert(pb.Placement_PLACE_TAIL, "e2", []byte("b"))),
+		makeDataEffect(3, orderedInsert(pb.Placement_PLACE_TAIL, "e3", []byte("c"))),
 	}
+
 	r := ReduceBranch(effects)
-	if len(r.OrderedElements) != 3 {
-		t.Fatalf("expected 3 elements, got %d", len(r.OrderedElements))
+	if len(r.GetOrderedElements()) != 3 {
+		t.Fatalf("expected 3 elements, got %d", len(r.GetOrderedElements()))
 	}
-	got := make([]string, len(r.OrderedElements))
-	for i, elem := range r.OrderedElements {
-		got[i] = string(elem.Data.GetRaw())
+
+	got := make([]string, len(r.GetOrderedElements()))
+	for i, elem := range r.GetOrderedElements() {
+		got[i] = string(elem.GetData().GetRaw())
 	}
+
 	want := []string{"a", "b", "c"}
 	for i := range want {
 		if got[i] != want[i] {
@@ -437,15 +471,17 @@ func TestReduceBranch_ListTailPush(t *testing.T) {
 func TestReduceBranch_ListMixedHeadTail(t *testing.T) {
 	// LPUSH a, RPUSH b, LPUSH c → [c, a, b]
 	effects := []*pb.Effect{
-		makeDataEffect("k", 1, 1, orderedInsert(pb.Placement_PLACE_HEAD, "e1", []byte("a"))),
-		makeDataEffect("k", 2, 1, orderedInsert(pb.Placement_PLACE_TAIL, "e2", []byte("b"))),
-		makeDataEffect("k", 3, 1, orderedInsert(pb.Placement_PLACE_HEAD, "e3", []byte("c"))),
+		makeDataEffect(1, orderedInsert(pb.Placement_PLACE_HEAD, "e1", []byte("a"))),
+		makeDataEffect(2, orderedInsert(pb.Placement_PLACE_TAIL, "e2", []byte("b"))),
+		makeDataEffect(3, orderedInsert(pb.Placement_PLACE_HEAD, "e3", []byte("c"))),
 	}
 	r := ReduceBranch(effects)
-	got := make([]string, len(r.OrderedElements))
-	for i, elem := range r.OrderedElements {
-		got[i] = string(elem.Data.GetRaw())
+
+	got := make([]string, len(r.GetOrderedElements()))
+	for i, elem := range r.GetOrderedElements() {
+		got[i] = string(elem.GetData().GetRaw())
 	}
+
 	want := []string{"c", "a", "b"}
 	for i := range want {
 		if got[i] != want[i] {
@@ -457,15 +493,17 @@ func TestReduceBranch_ListMixedHeadTail(t *testing.T) {
 func TestReduceBranch_ListInsertAfter(t *testing.T) {
 	// RPUSH a, RPUSH b, LINSERT AFTER a x → [a, x, b]
 	effects := []*pb.Effect{
-		makeDataEffect("k", 1, 1, orderedInsert(pb.Placement_PLACE_TAIL, "e1", []byte("a"))),
-		makeDataEffect("k", 2, 1, orderedInsert(pb.Placement_PLACE_TAIL, "e2", []byte("b"))),
-		makeDataEffect("k", 3, 1, orderedInsertRef(pb.Placement_PLACE_AFTER, "e3", []byte("x"), []byte("e1"))),
+		makeDataEffect(1, orderedInsert(pb.Placement_PLACE_TAIL, "e1", []byte("a"))),
+		makeDataEffect(2, orderedInsert(pb.Placement_PLACE_TAIL, "e2", []byte("b"))),
+		makeDataEffect(3, orderedInsertRef(pb.Placement_PLACE_AFTER, "e3", []byte("x"), []byte("e1"))),
 	}
 	r := ReduceBranch(effects)
-	got := make([]string, len(r.OrderedElements))
-	for i, elem := range r.OrderedElements {
-		got[i] = string(elem.Data.GetRaw())
+
+	got := make([]string, len(r.GetOrderedElements()))
+	for i, elem := range r.GetOrderedElements() {
+		got[i] = string(elem.GetData().GetRaw())
 	}
+
 	want := []string{"a", "x", "b"}
 	for i := range want {
 		if got[i] != want[i] {
@@ -477,15 +515,17 @@ func TestReduceBranch_ListInsertAfter(t *testing.T) {
 func TestReduceBranch_ListInsertBefore(t *testing.T) {
 	// RPUSH a, RPUSH b, LINSERT BEFORE b x → [a, x, b]
 	effects := []*pb.Effect{
-		makeDataEffect("k", 1, 1, orderedInsert(pb.Placement_PLACE_TAIL, "e1", []byte("a"))),
-		makeDataEffect("k", 2, 1, orderedInsert(pb.Placement_PLACE_TAIL, "e2", []byte("b"))),
-		makeDataEffect("k", 3, 1, orderedInsertRef(pb.Placement_PLACE_BEFORE, "e3", []byte("x"), []byte("e2"))),
+		makeDataEffect(1, orderedInsert(pb.Placement_PLACE_TAIL, "e1", []byte("a"))),
+		makeDataEffect(2, orderedInsert(pb.Placement_PLACE_TAIL, "e2", []byte("b"))),
+		makeDataEffect(3, orderedInsertRef(pb.Placement_PLACE_BEFORE, "e3", []byte("x"), []byte("e2"))),
 	}
 	r := ReduceBranch(effects)
-	got := make([]string, len(r.OrderedElements))
-	for i, elem := range r.OrderedElements {
-		got[i] = string(elem.Data.GetRaw())
+
+	got := make([]string, len(r.GetOrderedElements()))
+	for i, elem := range r.GetOrderedElements() {
+		got[i] = string(elem.GetData().GetRaw())
 	}
+
 	want := []string{"a", "x", "b"}
 	for i := range want {
 		if got[i] != want[i] {
@@ -497,19 +537,22 @@ func TestReduceBranch_ListInsertBefore(t *testing.T) {
 func TestReduceBranch_ListRemove(t *testing.T) {
 	// RPUSH a, RPUSH b, RPUSH c, LREM b → [a, c]
 	effects := []*pb.Effect{
-		makeDataEffect("k", 1, 1, orderedInsert(pb.Placement_PLACE_TAIL, "e1", []byte("a"))),
-		makeDataEffect("k", 2, 1, orderedInsert(pb.Placement_PLACE_TAIL, "e2", []byte("b"))),
-		makeDataEffect("k", 3, 1, orderedInsert(pb.Placement_PLACE_TAIL, "e3", []byte("c"))),
-		makeDataEffect("k", 4, 1, orderedRemove("e2")),
+		makeDataEffect(1, orderedInsert(pb.Placement_PLACE_TAIL, "e1", []byte("a"))),
+		makeDataEffect(2, orderedInsert(pb.Placement_PLACE_TAIL, "e2", []byte("b"))),
+		makeDataEffect(3, orderedInsert(pb.Placement_PLACE_TAIL, "e3", []byte("c"))),
+		makeDataEffect(4, orderedRemove("e2")),
 	}
+
 	r := ReduceBranch(effects)
-	if len(r.OrderedElements) != 2 {
-		t.Fatalf("expected 2 elements, got %d", len(r.OrderedElements))
+	if len(r.GetOrderedElements()) != 2 {
+		t.Fatalf("expected 2 elements, got %d", len(r.GetOrderedElements()))
 	}
-	got := make([]string, len(r.OrderedElements))
-	for i, elem := range r.OrderedElements {
-		got[i] = string(elem.Data.GetRaw())
+
+	got := make([]string, len(r.GetOrderedElements()))
+	for i, elem := range r.GetOrderedElements() {
+		got[i] = string(elem.GetData().GetRaw())
 	}
+
 	want := []string{"a", "c"}
 	for i := range want {
 		if got[i] != want[i] {
@@ -521,14 +564,16 @@ func TestReduceBranch_ListRemove(t *testing.T) {
 func TestReduceBranch_ListRemoveUnknown(t *testing.T) {
 	// Remove an element from before the fork — goes into NetRemoves
 	effects := []*pb.Effect{
-		makeDataEffect("k", 1, 1, orderedInsert(pb.Placement_PLACE_TAIL, "e1", []byte("a"))),
-		makeDataEffect("k", 2, 1, orderedRemove("pre-fork-elem")),
+		makeDataEffect(1, orderedInsert(pb.Placement_PLACE_TAIL, "e1", []byte("a"))),
+		makeDataEffect(2, orderedRemove("pre-fork-elem")),
 	}
+
 	r := ReduceBranch(effects)
-	if len(r.OrderedElements) != 1 {
-		t.Fatalf("expected 1 element, got %d", len(r.OrderedElements))
+	if len(r.GetOrderedElements()) != 1 {
+		t.Fatalf("expected 1 element, got %d", len(r.GetOrderedElements()))
 	}
-	if !r.NetRemoves["pre-fork-elem"] {
+
+	if !r.GetNetRemoves()["pre-fork-elem"] {
 		t.Fatal("expected pre-fork-elem in NetRemoves")
 	}
 }
@@ -536,16 +581,18 @@ func TestReduceBranch_ListRemoveUnknown(t *testing.T) {
 func TestReduceBranch_ListSelfUpdate(t *testing.T) {
 	// RPUSH a, RPUSH b, LSET e1 "a-updated" → [a-updated, b]
 	effects := []*pb.Effect{
-		makeDataEffect("k", 1, 1, orderedInsert(pb.Placement_PLACE_TAIL, "e1", []byte("a"))),
-		makeDataEffect("k", 2, 1, orderedInsert(pb.Placement_PLACE_TAIL, "e2", []byte("b"))),
-		makeDataEffect("k", 3, 1, orderedInsert(pb.Placement_PLACE_SELF, "e1", []byte("a-updated"))),
+		makeDataEffect(1, orderedInsert(pb.Placement_PLACE_TAIL, "e1", []byte("a"))),
+		makeDataEffect(2, orderedInsert(pb.Placement_PLACE_TAIL, "e2", []byte("b"))),
+		makeDataEffect(3, orderedInsert(pb.Placement_PLACE_SELF, "e1", []byte("a-updated"))),
 	}
+
 	r := ReduceBranch(effects)
-	if len(r.OrderedElements) != 2 {
-		t.Fatalf("expected 2 elements, got %d", len(r.OrderedElements))
+	if len(r.GetOrderedElements()) != 2 {
+		t.Fatalf("expected 2 elements, got %d", len(r.GetOrderedElements()))
 	}
-	if string(r.OrderedElements[0].Data.GetRaw()) != "a-updated" {
-		t.Fatalf("expected 'a-updated', got %q", r.OrderedElements[0].Data.GetRaw())
+
+	if string(r.GetOrderedElements()[0].GetData().GetRaw()) != "a-updated" {
+		t.Fatalf("expected 'a-updated', got %q", r.GetOrderedElements()[0].GetData().GetRaw())
 	}
 }
 
@@ -553,13 +600,14 @@ func TestReduceBranch_ListSelfUpdate(t *testing.T) {
 
 func TestReduceBranch_SkipsNonDataEffects(t *testing.T) {
 	effects := []*pb.Effect{
-		makeDataEffect("k", 1, 1, scalarInsertRaw([]byte("val"))),
+		makeDataEffect(1, scalarInsertRaw([]byte("val"))),
 		{Key: []byte("k"), Hlc: rTs(2), NodeId: 1, Kind: &pb.Effect_Noop{Noop: &pb.NoopEffect{}}},
 		{Key: []byte("k"), Hlc: rTs(3), NodeId: 1, Kind: &pb.Effect_Subscription{Subscription: &pb.SubscriptionEffect{}}},
 	}
+
 	r := ReduceBranch(effects)
-	if string(r.Scalar.GetRaw()) != "val" {
-		t.Fatalf("expected 'val', got %q", r.Scalar.GetRaw())
+	if string(r.GetScalar().GetRaw()) != "val" {
+		t.Fatalf("expected 'val', got %q", r.GetScalar().GetRaw())
 	}
 }
 
@@ -569,11 +617,12 @@ func TestReduceBranch_SkipsNonDataEffects(t *testing.T) {
 
 func TestReduceBranch_SerializationRequest(t *testing.T) {
 	effects := []*pb.Effect{
-		makeDataEffect("k", 1, 1, scalarInsertRaw([]byte("val"))),
+		makeDataEffect(1, scalarInsertRaw([]byte("val"))),
 		{Key: []byte("k"), Hlc: rTs(2), NodeId: 1, Kind: &pb.Effect_Serialization{Serialization: &pb.SerializationEffect{LeaderNodeId: 5}}},
 	}
+
 	r := ReduceBranch(effects)
-	if r.SerializationLeader == nil || *r.SerializationLeader != 5 {
+	if r.SerializationLeader == nil || r.GetSerializationLeader() != 5 {
 		t.Fatalf("expected leader=5, got %v", r.SerializationLeader)
 	}
 }
@@ -583,9 +632,10 @@ func TestReduceBranch_SerializationRelease(t *testing.T) {
 		{Key: []byte("k"), Hlc: rTs(1), NodeId: 1, Kind: &pb.Effect_Serialization{Serialization: &pb.SerializationEffect{LeaderNodeId: 5}}},
 		{Key: []byte("k"), Hlc: rTs(2), NodeId: 1, Kind: &pb.Effect_Serialization{Serialization: &pb.SerializationEffect{LeaderNodeId: 5, Release: true}}},
 	}
+
 	r := ReduceBranch(effects)
 	if r.SerializationLeader != nil {
-		t.Fatalf("expected nil leader after release, got %v", *r.SerializationLeader)
+		t.Fatalf("expected nil leader after release, got %v", r.GetSerializationLeader())
 	}
 }
 
@@ -593,23 +643,26 @@ func TestReduceBranch_SerializationOnly(t *testing.T) {
 	effects := []*pb.Effect{
 		{Key: []byte("k"), Hlc: rTs(1), NodeId: 1, Kind: &pb.Effect_Serialization{Serialization: &pb.SerializationEffect{LeaderNodeId: 3}}},
 	}
+
 	r := ReduceBranch(effects)
 	if r == nil {
 		t.Fatal("expected non-nil for serialization-only branch")
 	}
-	if r.SerializationLeader == nil || *r.SerializationLeader != 3 {
+
+	if r.SerializationLeader == nil || r.GetSerializationLeader() != 3 {
 		t.Fatalf("expected leader=3, got %v", r.SerializationLeader)
 	}
 }
 
 func TestReduceBranch_MaxInt(t *testing.T) {
 	effects := []*pb.Effect{
-		makeDataEffect("k", 1, 1, scalarInsertInt(pb.MergeRule_MAX_INT, 3)),
-		makeDataEffect("k", 2, 1, scalarInsertInt(pb.MergeRule_MAX_INT, 7)),
-		makeDataEffect("k", 3, 1, scalarInsertInt(pb.MergeRule_MAX_INT, 5)),
+		makeDataEffect(1, scalarInsertInt(pb.MergeRule_MAX_INT, 3)),
+		makeDataEffect(2, scalarInsertInt(pb.MergeRule_MAX_INT, 7)),
+		makeDataEffect(3, scalarInsertInt(pb.MergeRule_MAX_INT, 5)),
 	}
+
 	r := ReduceBranch(effects)
-	if r.Scalar.GetIntVal() != 7 {
-		t.Fatalf("expected 7, got %d", r.Scalar.GetIntVal())
+	if r.GetScalar().GetIntVal() != 7 {
+		t.Fatalf("expected 7, got %d", r.GetScalar().GetIntVal())
 	}
 }

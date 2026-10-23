@@ -37,6 +37,7 @@ func TestNodeIDBytes_Roundtrip(t *testing.T) {
 		if len(b) != 8 {
 			t.Fatalf("expected 8 bytes, got %d", len(b))
 		}
+
 		got := nodeIDFromBytes(b)
 		if got != id {
 			t.Fatalf("roundtrip failed: %d -> %d", id, got)
@@ -48,6 +49,7 @@ func TestNodeIDFromBytes_InvalidLength(t *testing.T) {
 	if nodeIDFromBytes(nil) != 0 {
 		t.Fatal("expected 0 for nil")
 	}
+
 	if nodeIDFromBytes([]byte{1, 2, 3}) != 0 {
 		t.Fatal("expected 0 for wrong length")
 	}
@@ -55,25 +57,28 @@ func TestNodeIDFromBytes_InvalidLength(t *testing.T) {
 
 func TestBuildMemberInsert(t *testing.T) {
 	eff := buildMemberInsert(12345, "10.0.0.1:7379")
-	if string(eff.Key) != MembershipKey {
-		t.Fatalf("expected key %q, got %q", MembershipKey, eff.Key)
+	if string(eff.GetKey()) != MembershipKey {
+		t.Fatalf("expected key %q, got %q", MembershipKey, eff.GetKey())
 	}
 
 	data := eff.GetData()
 	if data == nil {
 		t.Fatal("expected DataEffect")
 	}
-	if data.Op != pb.EffectOp_INSERT_OP {
-		t.Fatalf("expected INSERT_OP, got %v", data.Op)
-	}
-	if data.Merge != pb.MergeRule_LAST_WRITE_WINS {
-		t.Fatalf("expected LAST_WRITE_WINS, got %v", data.Merge)
-	}
-	if data.Collection != pb.CollectionKind_KEYED {
-		t.Fatalf("expected KEYED, got %v", data.Collection)
+
+	if data.GetOp() != pb.EffectOp_INSERT_OP {
+		t.Fatalf("expected INSERT_OP, got %v", data.GetOp())
 	}
 
-	gotID := binary.LittleEndian.Uint64(data.Id)
+	if data.GetMerge() != pb.MergeRule_LAST_WRITE_WINS {
+		t.Fatalf("expected LAST_WRITE_WINS, got %v", data.GetMerge())
+	}
+
+	if data.GetCollection() != pb.CollectionKind_KEYED {
+		t.Fatalf("expected KEYED, got %v", data.GetCollection())
+	}
+
+	gotID := binary.LittleEndian.Uint64(data.GetId())
 	if gotID != 12345 {
 		t.Fatalf("expected nodeID 12345, got %d", gotID)
 	}
@@ -86,17 +91,21 @@ func TestBuildMemberInsert(t *testing.T) {
 
 func TestBuildMemberRemove(t *testing.T) {
 	eff := buildMemberRemove(999)
+
 	data := eff.GetData()
 	if data == nil {
 		t.Fatal("expected DataEffect")
 	}
-	if data.Op != pb.EffectOp_REMOVE_OP {
-		t.Fatalf("expected REMOVE_OP, got %v", data.Op)
+
+	if data.GetOp() != pb.EffectOp_REMOVE_OP {
+		t.Fatalf("expected REMOVE_OP, got %v", data.GetOp())
 	}
-	if data.Collection != pb.CollectionKind_KEYED {
-		t.Fatalf("expected KEYED, got %v", data.Collection)
+
+	if data.GetCollection() != pb.CollectionKind_KEYED {
+		t.Fatalf("expected KEYED, got %v", data.GetCollection())
 	}
-	gotID := binary.LittleEndian.Uint64(data.Id)
+
+	gotID := binary.LittleEndian.Uint64(data.GetId())
 	if gotID != 999 {
 		t.Fatalf("expected nodeID 999, got %d", gotID)
 	}
@@ -113,6 +122,7 @@ func TestParseMembership_Empty(t *testing.T) {
 	reduced := &pb.ReducedEffect{
 		NetAdds: map[string]*pb.ReducedElement{},
 	}
+
 	members := parseMembership(reduced)
 	if len(members) != 0 {
 		t.Fatalf("expected empty, got %d members", len(members))
@@ -162,6 +172,7 @@ func TestParseMembership(t *testing.T) {
 	if byID[100] != "10.0.0.1:7379" {
 		t.Fatalf("expected node 100 at 10.0.0.1:7379, got %q", byID[100])
 	}
+
 	if byID[200] != "10.0.0.2:7379" {
 		t.Fatalf("expected node 200 at 10.0.0.2:7379, got %q", byID[200])
 	}

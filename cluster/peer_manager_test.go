@@ -40,6 +40,7 @@ func TestPeerManagerStartStop(t *testing.T) {
 
 	handler := &recordingHandler{}
 	logReader := &mockLogReader{data: []byte("test-effect")}
+
 	pm, err := NewPeerManager(cfg, handler, logReader)
 	if err != nil {
 		t.Fatalf("failed to create peer manager: %v", err)
@@ -182,6 +183,7 @@ func TestPeerManagerUpdateTopology(t *testing.T) {
 	if len(ids) != 1 {
 		t.Fatalf("expected 1 peer after remove, got %d", len(ids))
 	}
+
 	if ids[0] != 2 {
 		t.Fatal("expected peer 2 to remain")
 	}
