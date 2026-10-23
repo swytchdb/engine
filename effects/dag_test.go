@@ -35,7 +35,7 @@ import (
 func orderedAppend(log *snapshotLog, hlcNanos int64, nodeID uint64, id string, value []byte, deps ...Tip) Tip {
 	hlc := timestamppb.New(sTs(hlcNanos).AsTime())
 
-	var pbDeps []*pb.EffectRef
+	pbDeps := make([]*pb.EffectRef, 0, len(deps))
 	for _, d := range deps {
 		pbDeps = append(pbDeps, toPbRef(d))
 	}

@@ -64,7 +64,7 @@ func TestConcurrentRowWritesSharedBase_WeWin(t *testing.T) {
 
 	setupTips := e.index.Contains("k")
 
-	var sharedBase []*pb.EffectRef
+	sharedBase := make([]*pb.EffectRef, 0, setupTips.Len())
 	for _, tp := range setupTips.Tips() {
 		sharedBase = append(sharedBase, toPbRef(tp))
 	}

@@ -371,11 +371,10 @@ func (b *Beacon) filterSelf(candidates []string) []string {
 // These are temporary — once real membership effects arrive, the topology
 // is replaced with actual NodeIDs.
 func (b *Beacon) setTemporaryTopology(candidates []string) {
-	nodes := []cluster.NodeConfig{
-		{
-			ID:      b.cfg.NodeID,
-			Address: b.cfg.AdvertiseAddr,
-		},
+	nodes := make([]cluster.NodeConfig, 1, 1+len(candidates))
+	nodes[0] = cluster.NodeConfig{
+		ID:      b.cfg.NodeID,
+		Address: b.cfg.AdvertiseAddr,
 	}
 
 	for i, addr := range candidates {

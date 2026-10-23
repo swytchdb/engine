@@ -211,8 +211,8 @@ type TopologyDiff struct {
 }
 
 // DiffTopology computes the difference between two cluster configurations.
-// Either old or new may be nil (treated as empty).
-func DiffTopology(old, new *ClusterConfig) TopologyDiff {
+// Either old or updated may be nil (treated as empty).
+func DiffTopology(old, updated *ClusterConfig) TopologyDiff {
 	var diff TopologyDiff
 
 	oldPeers := make(map[NodeId]NodeConfig)
@@ -224,8 +224,8 @@ func DiffTopology(old, new *ClusterConfig) TopologyDiff {
 		}
 	}
 
-	if new != nil {
-		for _, p := range new.Peers() {
+	if updated != nil {
+		for _, p := range updated.Peers() {
 			newPeers[p.ID] = p
 		}
 	}

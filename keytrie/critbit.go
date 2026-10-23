@@ -541,7 +541,7 @@ func getDirection(key string, bytePos uint32, otherbits uint8) int {
 //
 // On success: returns (nil, true).
 // On CAS failure: returns (currentTips, false) — the conflicting tip set.
-func (c *Critbit[T]) Insert(key string, old *TipSet, new *TipSet) (*TipSet, bool) {
+func (c *Critbit[T]) Insert(key string, old *TipSet, newTips *TipSet) (*TipSet, bool) {
 	if c.closed.Load() {
 		return nil, false
 	}
@@ -564,12 +564,12 @@ func (c *Critbit[T]) Insert(key string, old *TipSet, new *TipSet) (*TipSet, bool
 		rootNode := c.root.Load()
 
 		if rootNode == nil {
-			newNode := c.allocLeafNode(key, new) // deleted=true, pop under the read lock
+			newNode := c.allocLeafNode(key, newTips) // deleted=true, pop under the read lock
 			if c.root.CompareAndSwap(nil, newNode) {
 				newNode.deleted.Store(false) // publish only after linking
 				c.reapMu.RUnlock(rt)
 				c.size.Add(1)
-				c.fireTipDelta(old, new, nil)
+				c.fireTipDelta(old, newTips, nil)
 
 				return nil, true
 			}
@@ -601,7 +601,7 @@ func (c *Critbit[T]) Insert(key string, old *TipSet, new *TipSet) (*TipSet, bool
 				old = current
 			}
 
-			if bestLeaf.tips.CompareAndSwap(old, new) {
+			if bestLeaf.tips.CompareAndSwap(old, newTips) {
 				if bestLeaf.deleted.CompareAndSwap(true, false) {
 					c.size.Add(1)
 					// A ghost (freq < 0) was never counted as a deleted leaf;
@@ -614,7 +614,7 @@ func (c *Critbit[T]) Insert(key string, old *TipSet, new *TipSet) (*TipSet, bool
 				}
 
 				c.reapMu.RUnlock(rt)
-				c.fireTipDelta(old, new, nil)
+				c.fireTipDelta(old, newTips, nil)
 
 				return nil, true
 			}
@@ -633,7 +633,7 @@ func (c *Critbit[T]) Insert(key string, old *TipSet, new *TipSet) (*TipSet, bool
 				old = current
 			}
 
-			if bestLeaf.tips.CompareAndSwap(old, new) {
+			if bestLeaf.tips.CompareAndSwap(old, newTips) {
 				if bestLeaf.deleted.CompareAndSwap(true, false) {
 					c.size.Add(1)
 					// A ghost (freq < 0) was never counted as a deleted leaf;
@@ -646,7 +646,7 @@ func (c *Critbit[T]) Insert(key string, old *TipSet, new *TipSet) (*TipSet, bool
 				}
 
 				c.reapMu.RUnlock(rt)
-				c.fireTipDelta(old, new, nil)
+				c.fireTipDelta(old, newTips, nil)
 
 				return nil, true
 			}
@@ -658,7 +658,7 @@ func (c *Critbit[T]) Insert(key string, old *TipSet, new *TipSet) (*TipSet, bool
 			return tips, false
 		}
 
-		newLeafNode := c.allocLeafNode(key, new) // deleted=true
+		newLeafNode := c.allocLeafNode(key, newTips) // deleted=true
 		newInternal := c.allocInternalNode(bytePos, otherbits)
 
 		newDir := getDirection(key, bytePos, otherbits)
@@ -669,7 +669,7 @@ func (c *Critbit[T]) Insert(key string, old *TipSet, new *TipSet) (*TipSet, bool
 			newLeafNode.deleted.Store(false) // publish after linking, before releasing the read lock
 			c.reapMu.RUnlock(rt)
 			c.size.Add(1)
-			c.fireTipDelta(old, new, nil)
+			c.fireTipDelta(old, newTips, nil)
 
 			return nil, true
 		}
@@ -984,11 +984,11 @@ func (c *Critbit[T]) LoadOrStoreData(key string, def *T) (*T, bool) {
 	return leaf.data.Load(), true
 }
 
-// tipSetDiff returns the tips added (in new, not old) and removed (in old, not
-// new) for an old→new transition. Tip sets are small, so a linear scan is cheap.
-func tipSetDiff(old, new *TipSet) (added, removed []EffectRef) {
-	if new != nil {
-		for _, t := range new.tips {
+// tipSetDiff returns the tips added (in newTips, not old) and removed (in old,
+// not newTips) for a tip-set transition. Tip sets are small, so a linear scan is cheap.
+func tipSetDiff(old, newTips *TipSet) (added, removed []EffectRef) {
+	if newTips != nil {
+		for _, t := range newTips.tips {
 			if old == nil || !old.Contains(t) {
 				added = append(added, t)
 			}
@@ -997,7 +997,7 @@ func tipSetDiff(old, new *TipSet) (added, removed []EffectRef) {
 
 	if old != nil {
 		for _, t := range old.tips {
-			if new == nil || !new.Contains(t) {
+			if newTips == nil || !newTips.Contains(t) {
 				removed = append(removed, t)
 			}
 		}
@@ -1008,12 +1008,12 @@ func tipSetDiff(old, new *TipSet) (added, removed []EffectRef) {
 
 // fireTipDelta reports a leaf tip-set transition to the refDelta hook (if any).
 // droppedData is the leaf payload released by a delete/eviction, else nil.
-func (c *Critbit[T]) fireTipDelta(old, new *TipSet, droppedData *T) {
+func (c *Critbit[T]) fireTipDelta(old, newTips *TipSet, droppedData *T) {
 	if c.refDelta == nil {
 		return
 	}
 
-	added, removed := tipSetDiff(old, new)
+	added, removed := tipSetDiff(old, newTips)
 	if len(added) > 0 || len(removed) > 0 || droppedData != nil {
 		c.refDelta(added, removed, droppedData)
 	}

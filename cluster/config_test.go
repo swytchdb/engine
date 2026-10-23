@@ -89,7 +89,7 @@ func TestDiffTopologyAdded(t *testing.T) {
 			{ID: 1, Address: "10.0.0.2:7000", Region: "us-east"},
 		},
 	}
-	new := &ClusterConfig{
+	updated := &ClusterConfig{
 		NodeID: 0,
 		Nodes: []NodeConfig{
 			{ID: 0, Address: "10.0.0.1:7000", Region: "us-east"},
@@ -98,7 +98,7 @@ func TestDiffTopologyAdded(t *testing.T) {
 		},
 	}
 
-	diff := DiffTopology(old, new)
+	diff := DiffTopology(old, updated)
 	if len(diff.Added) != 1 || diff.Added[0].ID != 2 {
 		t.Fatalf("expected 1 added node (ID=2), got %+v", diff.Added)
 	}
@@ -121,7 +121,7 @@ func TestDiffTopologyRemoved(t *testing.T) {
 			{ID: 2, Address: "10.0.0.3:7000", Region: "eu-west"},
 		},
 	}
-	new := &ClusterConfig{
+	updated := &ClusterConfig{
 		NodeID: 0,
 		Nodes: []NodeConfig{
 			{ID: 0, Address: "10.0.0.1:7000", Region: "us-east"},
@@ -129,7 +129,7 @@ func TestDiffTopologyRemoved(t *testing.T) {
 		},
 	}
 
-	diff := DiffTopology(old, new)
+	diff := DiffTopology(old, updated)
 	if len(diff.Added) != 0 {
 		t.Fatalf("expected 0 added, got %+v", diff.Added)
 	}
@@ -147,7 +147,7 @@ func TestDiffTopologyChanged(t *testing.T) {
 			{ID: 1, Address: "10.0.0.2:7000", Region: "us-east"},
 		},
 	}
-	new := &ClusterConfig{
+	updated := &ClusterConfig{
 		NodeID: 0,
 		Nodes: []NodeConfig{
 			{ID: 0, Address: "10.0.0.1:7000", Region: "us-east"},
@@ -155,14 +155,14 @@ func TestDiffTopologyChanged(t *testing.T) {
 		},
 	}
 
-	diff := DiffTopology(old, new)
+	diff := DiffTopology(old, updated)
 	if len(diff.Changed) != 1 || diff.Changed[0].Address != "10.0.0.99:7000" {
 		t.Fatalf("expected 1 changed with new address, got %+v", diff.Changed)
 	}
 }
 
 func TestDiffTopologyNilOld(t *testing.T) {
-	new := &ClusterConfig{
+	updated := &ClusterConfig{
 		NodeID: 0,
 		Nodes: []NodeConfig{
 			{ID: 0, Address: "10.0.0.1:7000", Region: "us-east"},
@@ -170,7 +170,7 @@ func TestDiffTopologyNilOld(t *testing.T) {
 		},
 	}
 
-	diff := DiffTopology(nil, new)
+	diff := DiffTopology(nil, updated)
 	if len(diff.Added) != 1 {
 		t.Fatalf("expected 1 added peer, got %+v", diff.Added)
 	}

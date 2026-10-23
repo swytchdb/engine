@@ -39,7 +39,7 @@ func TestNormalizeCloudTipCandidatesDropsMissingStaleMarker(t *testing.T) {
 	realTip := Tip{222, 2}
 	realEff := &pb.Effect{Deps: []*pb.EffectRef{toPbRef(stale)}}
 
-	real, superseded, err := NormalizeCloudTipCandidates("k", []Tip{stale, realTip}, nil, func(tip Tip) (*pb.Effect, error) {
+	realTips, superseded, err := NormalizeCloudTipCandidates("k", []Tip{stale, realTip}, nil, func(tip Tip) (*pb.Effect, error) {
 		if tip == realTip {
 			return realEff, nil
 		}
@@ -50,8 +50,8 @@ func TestNormalizeCloudTipCandidatesDropsMissingStaleMarker(t *testing.T) {
 		t.Fatalf("normalize candidates: %v", err)
 	}
 
-	if !slices.Equal(real, []Tip{realTip}) {
-		t.Fatalf("real tips = %v, want %v", real, []Tip{realTip})
+	if !slices.Equal(realTips, []Tip{realTip}) {
+		t.Fatalf("real tips = %v, want %v", realTips, []Tip{realTip})
 	}
 
 	if !slices.Equal(superseded, []Tip{stale}) {
@@ -69,7 +69,7 @@ func TestNormalizeCloudTipCandidatesDropsMarkerCoveredByLocalAncestry(t *testing
 	localTip := Tip{222, 2}
 	localEff := &pb.Effect{Deps: []*pb.EffectRef{toPbRef(stale)}}
 
-	real, superseded, err := NormalizeCloudTipCandidates("k", []Tip{stale}, []Tip{localTip}, func(tip Tip) (*pb.Effect, error) {
+	realTips, superseded, err := NormalizeCloudTipCandidates("k", []Tip{stale}, []Tip{localTip}, func(tip Tip) (*pb.Effect, error) {
 		if tip == localTip {
 			return localEff, nil
 		}
@@ -80,8 +80,8 @@ func TestNormalizeCloudTipCandidatesDropsMarkerCoveredByLocalAncestry(t *testing
 		t.Fatalf("normalize candidates: %v", err)
 	}
 
-	if len(real) != 0 {
-		t.Fatalf("real tips = %v, want none: the only candidate is covered by local ancestry", real)
+	if len(realTips) != 0 {
+		t.Fatalf("real tips = %v, want none: the only candidate is covered by local ancestry", realTips)
 	}
 
 	if !slices.Equal(superseded, []Tip{stale}) {

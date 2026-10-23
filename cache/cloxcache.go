@@ -125,7 +125,7 @@ type Cache[K Key, V any] interface {
 
 	// CompareAndSwap atomically swaps the value if it matches expected (pointer equality).
 	// Returns (swapped, currentValue, exists, offset).
-	CompareAndSwap(key K, expected, new V) (swapped bool, current V, exists bool, offset uint64)
+	CompareAndSwap(key K, expected, replacement V) (swapped bool, current V, exists bool, offset uint64)
 
 	// Stats returns hit, miss, and eviction counts
 	Stats() (hits, misses, evictions uint64)
@@ -619,7 +619,7 @@ func (c *CloxCache[K, V]) PutBack(key K, value V, oldSize int64) (success bool, 
 // CompareAndSwap atomically swaps the value if it matches expected.
 // Returns (swapped, currentValue, exists, offset). If swapped is false and exists is true,
 // currentValue contains the actual value so the caller can retry.
-func (c *CloxCache[K, V]) CompareAndSwap(key K, expected, new V) (swapped bool, current V, exists bool, offset uint64) {
+func (c *CloxCache[K, V]) CompareAndSwap(key K, expected, replacement V) (swapped bool, current V, exists bool, offset uint64) {
 	var zero V
 
 	hash := hashKey(key)
@@ -635,10 +635,10 @@ func (c *CloxCache[K, V]) CompareAndSwap(key K, expected, new V) (swapped bool, 
 			f := node.freq.Load()
 			if f > 0 {
 				// Use atomic CAS - truly atomic, no interleaving
-				if node.value.CompareAndSwap(expected, new) {
+				if node.value.CompareAndSwap(expected, replacement) {
 					node.lastAccess.Store(shard.timestamp.Add(1))
 
-					return true, new, true, 0
+					return true, replacement, true, 0
 				}
 				// CAS failed - return current value for retry
 				return false, node.value.Load().(V), true, 0

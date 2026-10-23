@@ -494,7 +494,7 @@ func TestDiscoverMembersNormalizesCandidateMarkersBeforeMissingVerdict(t *testin
 	}
 
 	stale := effects.Tip{77, 1}
-	real := effects.Tip{88, 2}
+	realTip := effects.Tip{88, 2}
 	wantState := &pb.ReducedEffect{
 		Collection: pb.CollectionKind_SCALAR,
 		Scalar: &pb.DataEffect{
@@ -513,7 +513,7 @@ func TestDiscoverMembersNormalizesCandidateMarkersBeforeMissingVerdict(t *testin
 		folder:     "test-folder",
 	}
 
-	realEnv, err := cs.buildEnvelope(real, realEff)
+	realEnv, err := cs.buildEnvelope(realTip, realEff)
 	if err != nil {
 		t.Fatalf("build envelope: %v", err)
 	}
@@ -521,7 +521,7 @@ func TestDiscoverMembersNormalizesCandidateMarkersBeforeMissingVerdict(t *testin
 	cs.client = &staticTipsClient{response: &dp.GetTipsResponse{Keys: []*dp.KeyTips{{
 		Tips: []*dp.EffectRef{
 			{NodeId: stale[0], Offset: stale[1]},
-			{NodeId: real[0], Offset: real[1]},
+			{NodeId: realTip[0], Offset: realTip[1]},
 		},
 		Closure: []*dp.Effect{realEnv},
 	}}}}
@@ -939,7 +939,7 @@ func TestUnsentAncestryUploadsOldestFirst(t *testing.T) {
 
 	cs.handleLocalEffect(ours, oursEff)
 
-	var got []effects.Tip
+	got := make([]effects.Tip, 0, 3)
 
 	for range 3 {
 		env, ok := cs.nextEnvelope()

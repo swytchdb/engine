@@ -29,7 +29,7 @@ type KeyIndex interface {
 	// old is the expected current TipSet (nil for new keys).
 	// On success: returns (nil, true).
 	// On CAS failure: returns (currentTips, false).
-	Insert(key string, old *TipSet, new *TipSet) (*TipSet, bool)
+	Insert(key string, old *TipSet, newTips *TipSet) (*TipSet, bool)
 
 	// Delete removes a key only if its current tips match old (CAS).
 	// Returns true if the key was deleted.

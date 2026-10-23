@@ -668,7 +668,7 @@ var ErrCDNBlobMissing = errors.New("cdn blob missing")
 // proven non-maximal when another candidate's or local root's readable
 // ancestry names it. Any missing candidate that cannot be so proven remains a
 // real tip and the caller's classification decides what to do with it.
-func NormalizeCloudTipCandidates(key string, candidates, localRoots []Tip, load func(Tip) (*pb.Effect, error)) (real, superseded []Tip, err error) {
+func NormalizeCloudTipCandidates(key string, candidates, localRoots []Tip, load func(Tip) (*pb.Effect, error)) (realTips, superseded []Tip, err error) {
 	candidateSet := make(map[Tip]struct{}, len(candidates))
 
 	unique := make([]Tip, 0, len(candidates))
@@ -734,11 +734,11 @@ func NormalizeCloudTipCandidates(key string, candidates, localRoots []Tip, load 
 		if _, stale := supersededSet[candidate]; stale {
 			superseded = append(superseded, candidate)
 		} else {
-			real = append(real, candidate)
+			realTips = append(realTips, candidate)
 		}
 	}
 
-	return real, superseded, nil
+	return realTips, superseded, nil
 }
 
 // hydrateFromCloud is the tiered-storage rehydrate on a read-miss: it asks
@@ -878,7 +878,7 @@ func (e *Engine) classifyCloudTips(key string, tips []Tip, sidecar []CloudEffect
 
 	var classification cloudTipClassification
 
-	real, superseded, err := NormalizeCloudTipCandidates(key, tips, localRoots, load)
+	realTips, superseded, err := NormalizeCloudTipCandidates(key, tips, localRoots, load)
 	if err != nil {
 		return classification, fmt.Errorf("normalize cloud candidates for %q: %w", key, err)
 	}
@@ -888,8 +888,8 @@ func (e *Engine) classifyCloudTips(key string, tips []Tip, sidecar []CloudEffect
 	// Dependency-less subscriptions are frontier metadata, not state
 	// branches: they install unconditionally, since they carry no ancestry
 	// for a hole to hide in. State tips still need walk validation below.
-	stateTips := make([]Tip, 0, len(real))
-	for _, tip := range real {
+	stateTips := make([]Tip, 0, len(realTips))
+	for _, tip := range realTips {
 		eff, getErr := load(tip)
 		switch {
 		case getErr == nil:
