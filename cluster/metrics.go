@@ -30,6 +30,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
+const peerLabelName = "peer"
+
 // --- 9.3 Throughput ---
 
 var (
@@ -119,17 +121,17 @@ var (
 	peerConnected = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "cluster_peer_connected",
 		Help: "1 if stream is up, 0 if down",
-	}, []string{"peer"})
+	}, []string{peerLabelName})
 
 	peerReconnectsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "cluster_peer_reconnects_total",
 		Help: "Number of reconnections",
-	}, []string{"peer"})
+	}, []string{peerLabelName})
 
 	peerNotificationsDroppedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "cluster_peer_notifications_dropped_total",
 		Help: "Notifications dropped due to buffer full or disconnected peer",
-	}, []string{"peer"})
+	}, []string{peerLabelName})
 )
 
 // --- 9.6 Clock & UDP Fast Path ---
@@ -138,7 +140,7 @@ var (
 	clockTicksReceivedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "cluster_clock_ticks_received_total",
 		Help: "Clock ticks received per peer; rate() is the peer's effective tick rate at this node (shortfall vs its interval = loss)",
-	}, []string{"peer"})
+	}, []string{peerLabelName})
 
 	clockTickIntervalMs = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "cluster_clock_tick_interval_ms",
@@ -148,42 +150,42 @@ var (
 	peerSymmetricGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "cluster_peer_symmetric",
 		Help: "1 if peer path is symmetric, 0 if asymmetric",
-	}, []string{"peer"})
+	}, []string{peerLabelName})
 
 	peerAliveGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "cluster_peer_alive",
 		Help: "1 if peer is alive (clock tick within its liveness timeout), 0 if dead",
-	}, []string{"peer"})
+	}, []string{peerLabelName})
 
 	peerRttMsGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "cluster_peer_rtt_ms",
 		Help: "Min-filtered RTT to peer in milliseconds (from clock ticks)",
-	}, []string{"peer"})
+	}, []string{peerLabelName})
 
 	peerClockSkewMsGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "cluster_peer_clock_skew_ms",
 		Help: "Estimated peer wall-clock skew in milliseconds (positive: peer ahead); error bounded by half the path asymmetry",
-	}, []string{"peer"})
+	}, []string{peerLabelName})
 
 	peerStalenessBoundMsGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "cluster_peer_staleness_bound_ms",
 		Help: "Standing staleness bound ε for the peer in milliseconds (tick interval + RTT_min)",
-	}, []string{"peer"})
+	}, []string{peerLabelName})
 
 	peerTickIntervalMsGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "cluster_peer_tick_interval_ms",
 		Help: "Median inter-arrival gap of the peer's clock ticks in milliseconds (δ_B)",
-	}, []string{"peer"})
+	}, []string{peerLabelName})
 
 	peerLivenessTimeoutMsGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "cluster_peer_liveness_timeout_ms",
 		Help: "Effective failure-detection timeout for the peer in milliseconds (adaptive M·δ_B + jitter margin, or warm-up fallback)",
-	}, []string{"peer"})
+	}, []string{peerLabelName})
 
 	peerClockJumpsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "cluster_peer_clock_jumps_total",
 		Help: "Total wall-clock jumps reported by the peer in its clock ticks",
-	}, []string{"peer"})
+	}, []string{peerLabelName})
 
 	udpNotifyAckLatencyMs = promauto.NewHistogram(prometheus.HistogramOpts{
 		Name:    "cluster_udp_notify_ack_latency_ms",
@@ -284,7 +286,7 @@ var (
 	retransmissionGiveUpsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "cluster_retransmission_giveups_total",
 		Help: "Total retransmission give-ups (max retries exhausted) per peer",
-	}, []string{"peer"})
+	}, []string{peerLabelName})
 )
 
 // RecordRetransmissionGiveUp increments the give-up counter for a peer.

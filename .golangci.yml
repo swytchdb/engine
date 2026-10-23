@@ -29,3 +29,6 @@ linters:
     - unparam
     - usestdlibvars
     - wastedassign
+  settings:
+    goconst:
+      ignore-tests: true
