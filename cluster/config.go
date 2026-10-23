@@ -60,18 +60,23 @@ func (c ClockConfig) withDefaults() ClockConfig {
 	if c.Interval <= 0 {
 		c.Interval = time.Second
 	}
+
 	if c.WindowSize <= 0 {
 		c.WindowSize = 64
 	}
+
 	if c.MissedIntervals <= 0 {
 		c.MissedIntervals = 3
 	}
+
 	if c.MinTimeout <= 0 {
 		c.MinTimeout = time.Second
 	}
+
 	if c.MaxTimeout <= 0 {
 		c.MaxTimeout = 10 * time.Second
 	}
+
 	return c
 }
 
@@ -92,6 +97,7 @@ func (c *ClusterConfig) Peers() []NodeConfig {
 			peers = append(peers, n)
 		}
 	}
+
 	return peers
 }
 
@@ -102,6 +108,7 @@ func (c *ClusterConfig) Self() *NodeConfig {
 			return &c.Nodes[i]
 		}
 	}
+
 	return nil
 }
 
@@ -204,8 +211,8 @@ type TopologyDiff struct {
 }
 
 // DiffTopology computes the difference between two cluster configurations.
-// Either old or new may be nil (treated as empty).
-func DiffTopology(old, new *ClusterConfig) TopologyDiff {
+// Either old or updated may be nil (treated as empty).
+func DiffTopology(old, updated *ClusterConfig) TopologyDiff {
 	var diff TopologyDiff
 
 	oldPeers := make(map[NodeId]NodeConfig)
@@ -216,8 +223,9 @@ func DiffTopology(old, new *ClusterConfig) TopologyDiff {
 			oldPeers[p.ID] = p
 		}
 	}
-	if new != nil {
-		for _, p := range new.Peers() {
+
+	if updated != nil {
+		for _, p := range updated.Peers() {
 			newPeers[p.ID] = p
 		}
 	}

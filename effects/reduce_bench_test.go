@@ -42,6 +42,7 @@ func pKeyedSized(m int, fch byte) *pb.ReducedEffect {
 			},
 		}
 	}
+
 	return &pb.ReducedEffect{Collection: pb.CollectionKind_KEYED, NetAdds: na, ForkChoiceHash: []byte{fch}}
 }
 
@@ -65,6 +66,7 @@ func seedWithPartitions(nParts, m int) *pb.ReducedEffect {
 	for i := range nParts {
 		parts["p"+strconv.Itoa(i)] = pKeyedSized(m, byte(i))
 	}
+
 	return branchWithPartitions(0x01, parts)
 }
 
@@ -75,6 +77,7 @@ func accumulate(seed *pb.ReducedEffect, chain []*pb.Effect) *pb.ReducedEffect {
 	for _, eff := range chain {
 		acc = ReduceChain(acc, []*pb.Effect{eff})
 	}
+
 	return acc
 }
 
@@ -86,12 +89,15 @@ func BenchmarkReducePartitionedChain(b *testing.B) {
 	const nParts, chainLen = 64, 200
 	for _, m := range []int{8, 256} {
 		seed := seedWithPartitions(nParts, m)
+
 		chain := make([]*pb.Effect, chainLen)
 		for i := range chain {
 			chain[i] = rootKeyedInsert("k"+strconv.Itoa(i), byte(i))
 		}
+
 		b.Run("elemsPerPartition="+strconv.Itoa(m), func(b *testing.B) {
 			b.ReportAllocs()
+
 			for n := 0; n < b.N; n++ {
 				_ = accumulate(seed, chain)
 			}

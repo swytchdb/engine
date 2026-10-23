@@ -71,6 +71,7 @@ type heldSnapshot struct {
 
 func newGatedPairedBus(t *testing.T) *gatedPairedBus {
 	t.Helper()
+
 	return &gatedPairedBus{
 		engines:  make(map[pb.NodeID]*effects.Engine),
 		hold:     make(map[pb.NodeID]bool),
@@ -82,12 +83,14 @@ func newGatedPairedBus(t *testing.T) *gatedPairedBus {
 func (b *gatedPairedBus) registerEngine(e *effects.Engine) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
 	b.engines[e.NodeID()] = e
 }
 
 func (b *gatedPairedBus) holdSnapshotsTo(target pb.NodeID, hold bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
 	b.hold[target] = hold
 }
 
@@ -100,9 +103,11 @@ func (b *gatedPairedBus) releaseHeldSnapshots(target pb.NodeID) {
 	b.hold[target] = false
 	dest := b.engines[target]
 	b.mu.Unlock()
+
 	if dest == nil {
 		return
 	}
+
 	for _, h := range held {
 		if _, err := dest.HandleRemote(h.notify); err != nil {
 			slog.Warn("gatedPairedBus: HandleRemote on released snapshot failed",
@@ -116,9 +121,11 @@ func (b *gatedPairedBus) releaseHeldSnapshots(target pb.NodeID) {
 // straight through.
 func (b *gatedPairedBus) deliver(target pb.NodeID, notify *pb.OffsetNotify, wireData []byte) ([]*pb.NackNotify, error) {
 	b.mu.Lock()
+
 	dest, ok := b.engines[target]
 	if !ok {
 		b.mu.Unlock()
+
 		return nil, fmt.Errorf("gatedPairedBus: unknown target %v", target)
 	}
 
@@ -128,8 +135,9 @@ func (b *gatedPairedBus) deliver(target pb.NodeID, notify *pb.OffsetNotify, wire
 	if shouldHold(notify, b.hold[target]) {
 		b.heldSnap[target] = append(b.heldSnap[target], heldSnapshot{notify: notify, data: wireData})
 		slog.Debug("gatedPairedBus: holding snapshot delivery",
-			"target", target, "origin", notify.Origin)
+			"target", target, "origin", notify.GetOrigin())
 		b.mu.Unlock()
+
 		return nil, nil
 	}
 	b.mu.Unlock()
@@ -143,30 +151,36 @@ func shouldHold(notify *pb.OffsetNotify, holding bool) bool {
 	if !holding {
 		return false
 	}
+
 	if notify.EffectData == nil {
 		return false
 	}
 	// Parse wire format.
-	if len(notify.EffectData) < 4 {
+	if len(notify.GetEffectData()) < 4 {
 		return false
 	}
-	keyLen := int(notify.EffectData[0]) |
-		int(notify.EffectData[1])<<8 |
-		int(notify.EffectData[2])<<16 |
-		int(notify.EffectData[3])<<24
-	if keyLen < 0 || 4+keyLen > len(notify.EffectData) {
+
+	keyLen := int(notify.GetEffectData()[0]) |
+		int(notify.GetEffectData()[1])<<8 |
+		int(notify.GetEffectData()[2])<<16 |
+		int(notify.GetEffectData()[3])<<24
+	if keyLen < 0 || 4+keyLen > len(notify.GetEffectData()) {
 		return false
 	}
-	protoData := notify.EffectData[4+keyLen:]
+
+	protoData := notify.GetEffectData()[4+keyLen:]
+
 	eff := &pb.Effect{}
 	if err := effects.UnmarshalEffect(protoData, eff); err != nil {
 		return false
 	}
+
 	snap := eff.GetSnapshot()
 	if snap == nil {
 		return false
 	}
-	return len(snap.TxnVerdicts) > 0
+
+	return len(snap.GetTxnVerdicts()) > 0
 }
 
 // gatedBroadcaster is the per-engine view of the bus that satisfies the
@@ -188,7 +202,7 @@ func newGatedBroadcaster(bus *gatedPairedBus, self, peer pb.NodeID) *gatedBroadc
 }
 
 func (g *gatedBroadcaster) Broadcast(notify *pb.OffsetNotify) {
-	_, _ = g.bus.deliver(g.peer, notify, notify.EffectData)
+	_, _ = g.bus.deliver(g.peer, notify, notify.GetEffectData())
 }
 
 func (g *gatedBroadcaster) BroadcastWithData(notify *pb.OffsetNotify, _ []byte) {
@@ -197,20 +211,21 @@ func (g *gatedBroadcaster) BroadcastWithData(notify *pb.OffsetNotify, _ []byte) 
 	// the peer can reconstruct from notify.EffectData). Routing through
 	// the wire-format payload keeps the receive path identical to the
 	// production transport.
-	_, _ = g.bus.deliver(g.peer, notify, notify.EffectData)
+	_, _ = g.bus.deliver(g.peer, notify, notify.GetEffectData())
 }
 
 func (g *gatedBroadcaster) Replicate(notify *pb.OffsetNotify, _ []byte) error {
-	_, err := g.bus.deliver(g.peer, notify, notify.EffectData)
+	_, err := g.bus.deliver(g.peer, notify, notify.GetEffectData())
+
 	return err
 }
 
 func (g *gatedBroadcaster) ReplicateMarshalled(notify *pb.OffsetNotify, _ []byte, target pb.NodeID) ([]*pb.NackNotify, error) {
-	return g.ReplicateTo(notify, notify.EffectData, target)
+	return g.ReplicateTo(notify, notify.GetEffectData(), target)
 }
 
 func (g *gatedBroadcaster) ReplicateTo(notify *pb.OffsetNotify, _ []byte, target pb.NodeID) ([]*pb.NackNotify, error) {
-	return g.bus.deliver(target, notify, notify.EffectData)
+	return g.bus.deliver(target, notify, notify.GetEffectData())
 }
 
 func (g *gatedBroadcaster) SendNack(_ *pb.NackNotify, _ pb.NodeID) {
@@ -223,23 +238,27 @@ func (g *gatedBroadcaster) FetchFromAny(ref *pb.EffectRef, _ effects.FetchHint) 
 	g.bus.mu.Lock()
 	peer, ok := g.bus.engines[g.peer]
 	g.bus.mu.Unlock()
+
 	if !ok {
 		return nil, fmt.Errorf("gatedBroadcaster: peer %v not registered", g.peer)
 	}
+
 	cache := peer.EffectCache()
 	if cache == nil {
 		return nil, fmt.Errorf("gatedBroadcaster: peer %v has no effect cache", g.peer)
 	}
-	eff, ok := cache.Get(effects.Tip{ref.NodeId, ref.Offset})
+
+	eff, ok := cache.Get(effects.Tip{ref.GetNodeId(), ref.GetOffset()})
 	if !ok {
 		return nil, fmt.Errorf("gatedBroadcaster: peer %v missing effect %+v", g.peer, ref)
 	}
+
 	data, err := effects.MarshalEffect(eff)
 	if err != nil {
 		return nil, err
 	}
 	// Wire format: [4-byte LE keyLen][key][protoData]
-	keyBytes := eff.Key
+	keyBytes := eff.GetKey()
 	wire := make([]byte, 4+len(keyBytes)+len(data))
 	wire[0] = byte(len(keyBytes))
 	wire[1] = byte(len(keyBytes) >> 8)
@@ -247,6 +266,7 @@ func (g *gatedBroadcaster) FetchFromAny(ref *pb.EffectRef, _ effects.FetchHint) 
 	wire[3] = byte(len(keyBytes) >> 24)
 	copy(wire[4:4+len(keyBytes)], keyBytes)
 	copy(wire[4+len(keyBytes):], data)
+
 	return wire, nil
 }
 
@@ -269,16 +289,20 @@ func extractOrderedIDs(r *pb.ReducedEffect) []string {
 	if r == nil {
 		return nil
 	}
-	if r.Collection != pb.CollectionKind_ORDERED {
+
+	if r.GetCollection() != pb.CollectionKind_ORDERED {
 		return nil
 	}
-	ids := make([]string, 0, len(r.OrderedElements))
-	for _, el := range r.OrderedElements {
-		if el == nil || el.Data == nil {
+
+	ids := make([]string, 0, len(r.GetOrderedElements()))
+	for _, el := range r.GetOrderedElements() {
+		if el == nil || el.GetData() == nil {
 			continue
 		}
-		ids = append(ids, string(el.Data.Id))
+
+		ids = append(ids, string(el.GetData().GetId()))
 	}
+
 	return ids
 }
 
@@ -287,11 +311,13 @@ func isPrefix(prefix, full []string) bool {
 	if len(prefix) > len(full) {
 		return false
 	}
+
 	for i, s := range prefix {
 		if full[i] != s {
 			return false
 		}
 	}
+
 	return true
 }
 
@@ -356,10 +382,12 @@ func orderedTailInsert(id string, value []byte) *pb.DataEffect {
 // post-promotion read. The fix surface is for in-txn reads to wait for
 // in-ancestry HorizonSet binds to resolve before returning a value.
 func TestInTxnReadObservesInconsistentSnapshotAcrossHorizon(t *testing.T) {
-	const key = "el-0"
-	const idBase = "base"
-	const idA = "XA"
-	const idB = "XB"
+	const (
+		key    = "el-0"
+		idBase = "base"
+		idA    = "XA"
+		idB    = "XB"
+	)
 
 	bus := newGatedPairedBus(t)
 
@@ -394,6 +422,7 @@ func TestInTxnReadObservesInconsistentSnapshotAcrossHorizon(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("baseline emit on A: %v", err)
 	}
+
 	if err := ctxA.Flush(); err != nil {
 		t.Fatalf("baseline flush on A: %v", err)
 	}
@@ -403,6 +432,7 @@ func TestInTxnReadObservesInconsistentSnapshotAcrossHorizon(t *testing.T) {
 	// data effect went through BroadcastWithData which is synchronous in
 	// our bus).
 	var baseIDs []string
+
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		r, tips, _, err := engB.GetSnapshot(key)
@@ -412,9 +442,12 @@ func TestInTxnReadObservesInconsistentSnapshotAcrossHorizon(t *testing.T) {
 				break
 			}
 		}
+
 		time.Sleep(20 * time.Millisecond)
 	}
+
 	t.Logf("B baseline read of %s: %v", key, baseIDs)
+
 	if len(baseIDs) == 0 {
 		t.Fatalf("setup: B should see at least the baseline element after A's broadcast")
 	}
@@ -429,12 +462,14 @@ func TestInTxnReadObservesInconsistentSnapshotAcrossHorizon(t *testing.T) {
 	// commits and broadcasts the verdict snapshot — held by the bus.
 	ctxA2 := engA.NewContext()
 	ctxA2.BeginTx()
+
 	if err := ctxA2.Emit(&pb.Effect{
 		Key:  []byte(key),
 		Kind: &pb.Effect_Data{Data: orderedTailInsert(idA, []byte("v_XA"))},
 	}); err != nil {
 		t.Fatalf("A txn emit: %v", err)
 	}
+
 	if err := ctxA2.Flush(); err != nil {
 		t.Fatalf("A txn flush: %v", err)
 	}
@@ -462,16 +497,19 @@ func TestInTxnReadObservesInconsistentSnapshotAcrossHorizon(t *testing.T) {
 
 	ctxB := engB.NewContext()
 	ctxB.BeginTx()
+
 	if err := ctxB.Emit(&pb.Effect{
 		Key:  []byte(key),
 		Kind: &pb.Effect_Data{Data: orderedTailInsert(idB, []byte("v_XB"))},
 	}); err != nil {
 		t.Fatalf("B txn emit: %v", err)
 	}
+
 	inBindReduced, _, err := ctxB.GetSnapshot(key)
 	if err != nil {
 		t.Fatalf("B in-bind GetSnapshot: %v", err)
 	}
+
 	inBindIDs := extractOrderedIDs(inBindReduced)
 	t.Logf("B in-bind read of %s returned ordered IDs: %v", key, inBindIDs)
 
@@ -486,11 +524,13 @@ func TestInTxnReadObservesInconsistentSnapshotAcrossHorizon(t *testing.T) {
 		r, _, _, err := engB.GetSnapshot(key)
 		if err == nil {
 			ids := extractOrderedIDs(r)
+
 			containsXA := slices.Contains(ids, idA)
 			if containsXA {
 				break
 			}
 		}
+
 		time.Sleep(20 * time.Millisecond)
 	}
 
@@ -499,6 +539,7 @@ func TestInTxnReadObservesInconsistentSnapshotAcrossHorizon(t *testing.T) {
 	if err != nil {
 		t.Fatalf("B post-promotion GetSnapshot: %v", err)
 	}
+
 	postIDs := extractOrderedIDs(postReduced)
 	t.Logf("B post-promotion read of %s returned ordered IDs: %v", key, postIDs)
 
@@ -510,6 +551,7 @@ func TestInTxnReadObservesInconsistentSnapshotAcrossHorizon(t *testing.T) {
 	// in the Jepsen run.
 	if isPrefix(inBindIDs, postIDs) || isPrefix(postIDs, inBindIDs) {
 		t.Logf("reads were prefix-comparable: in-bind=%v post=%v", inBindIDs, postIDs)
+
 		return
 	}
 

@@ -58,6 +58,7 @@ var (
 func DeriveCAFromPassphrase(passphrase string) (ed25519.PrivateKey, *x509.Certificate, error) {
 	// HKDF-SHA256: passphrase → 32-byte Ed25519 seed
 	hkdfReader := hkdf.New(sha256.New, []byte(passphrase), []byte("swytch-cluster-ca-v1"), []byte("ca-key"))
+
 	seed := make([]byte, ed25519.SeedSize)
 	if _, err := hkdfReader.Read(seed); err != nil {
 		return nil, nil, fmt.Errorf("HKDF derivation failed: %w", err)
@@ -115,6 +116,7 @@ func GenerateLeafCert(caKey crypto.Signer, caCert *x509.Certificate, nodeAddr st
 	if _, err := rand.Read(serialBytes); err != nil {
 		return tls.Certificate{}, fmt.Errorf("failed to generate serial: %w", err)
 	}
+
 	serial := new(big.Int).SetBytes(serialBytes)
 
 	now := time.Now()
@@ -168,6 +170,7 @@ func newLeafSource(caKey crypto.Signer, caCert *x509.Certificate, nodeAddr strin
 	if err := s.mint(); err != nil {
 		return nil, err
 	}
+
 	return s, nil
 }
 
@@ -177,7 +180,9 @@ func (s *leafSource) mint() error {
 	if err != nil {
 		return err
 	}
+
 	s.leaf = &leaf
+
 	return nil
 }
 
@@ -187,11 +192,13 @@ func (s *leafSource) mint() error {
 func (s *leafSource) current() (*tls.Certificate, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	if time.Until(s.leaf.Leaf.NotAfter) < leafValidity/2 {
 		if err := s.mint(); err != nil {
 			return nil, err
 		}
 	}
+
 	return s.leaf, nil
 }
 
@@ -203,6 +210,7 @@ func GeneratePassphrase() (string, error) {
 	if _, err := rand.Read(b); err != nil {
 		return "", fmt.Errorf("failed to generate random bytes: %w", err)
 	}
+
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
@@ -214,5 +222,6 @@ type deterministicReader struct{}
 
 func (deterministicReader) Read(b []byte) (int, error) {
 	clear(b)
+
 	return len(b), nil
 }

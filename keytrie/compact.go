@@ -81,17 +81,22 @@ func (c *Critbit[T]) maybeCompact() {
 	if c.closed.Load() {
 		return
 	}
+
 	var node critNode[T]
+
 	nodeSize := int64(unsafe.Sizeof(node))
 	arenaBytes := c.leafArena.bytes() + c.internalArena.bytes()
 	// Linked estimate: live + deleted-pending + ghost leaves, and one internal
 	// per leaf (a crit-bit tree has exactly leaves-1 internals).
 	linked := 2 * (c.size.Load() + c.deletedCount.Load() + c.ghostCount.Load()) * nodeSize
+
 	waste := arenaBytes - linked
 	if waste < compactMinWasteBytes || waste*4 < arenaBytes {
 		return
 	}
+
 	leafDropped := c.compactLeafChunks(compactMaxChunksPerPass)
+
 	internalDropped := c.compactInternalChunks(compactMaxChunksPerPass)
 	if leafDropped+internalDropped > 0 {
 		slog.Debug("keytrie: compacted arenas",
@@ -112,6 +117,7 @@ func (c *Critbit[T]) compactLeafChunks(maxChunks int) int {
 	// survivors land); never evacuate it.
 	tail := int(c.leafArena.next.Load() / chunkSize)
 	threshold := int(chunkSize) * compactOccupancyPct / 100
+
 	evacuated := 0
 	for ci := 0; ci < len(chunks) && ci < tail && evacuated < maxChunks; ci++ {
 		chunk := chunks[ci]
@@ -126,19 +132,24 @@ func (c *Critbit[T]) compactLeafChunks(maxChunks int) int {
 		if list.outstanding[ci].Load() > 0 {
 			continue
 		}
+
 		live := 0
+
 		for i := range chunk {
 			if !chunk[i].deleted.Load() {
 				live++
 			}
 		}
+
 		if live > threshold {
 			continue
 		}
+
 		if c.evacuateLeafChunk(chunk) {
 			evacuated++
 		}
 	}
+
 	return evacuated
 }
 
@@ -155,9 +166,11 @@ func (c *Critbit[T]) compactLeafChunks(maxChunks int) int {
 func (c *Critbit[T]) evacuateLeafChunk(chunk []critNode[T]) bool {
 	c.reapMu.Lock()
 	defer c.reapMu.Unlock()
+
 	if c.closed.Load() {
 		return false
 	}
+
 	for i := range chunk {
 		n := &chunk[i]
 		if n.deleted.Load() {
@@ -167,6 +180,7 @@ func (c *Critbit[T]) evacuateLeafChunk(chunk []critNode[T]) bool {
 				// unlinkLeaf's decrement up front and revert if it wasn't linked.
 				c.deletedCount.Add(1)
 				n.freq.Store(0)
+
 				if c.unlinkLeaf(n) {
 					c.ghostCount.Add(-1)
 				} else {
@@ -177,10 +191,13 @@ func (c *Critbit[T]) evacuateLeafChunk(chunk []critNode[T]) bool {
 				// orphan (identity check fails, no-op now).
 				c.unlinkLeaf(n)
 			}
+
 			continue
 		}
+
 		c.relocateLeaf(n)
 	}
+
 	return true
 }
 
@@ -196,21 +213,29 @@ func (c *Critbit[T]) relocateLeaf(old *critNode[T]) bool {
 	if root == nil {
 		return false
 	}
-	var p *critNode[T]
-	var pDir int
+
+	var (
+		p    *critNode[T]
+		pDir int
+	)
+
 	cur := root
 	for !cur.isLeaf {
 		dir := getDirection(old.key, cur.bytePos, cur.otherbits)
 		p, pDir = cur, dir
+
 		next := cur.child[dir].Load()
 		if next == nil {
 			return false
 		}
+
 		cur = next
 	}
+
 	if cur != old {
 		return false // an orphan husk; a different leaf owns this key path
 	}
+
 	n2, ci := c.leafArena.alloc() // born deleted=true via the arena init hook
 	n2.chunkIdx = ci
 	n2.key = old.key
@@ -224,12 +249,15 @@ func (c *Critbit[T]) relocateLeaf(old *critNode[T]) bool {
 	// excludes the sweep, so no scanner can see it early — while a lock-free
 	// reader arriving through the new parent pointer must find deleted=false.
 	n2.deleted.Store(false)
+
 	if p == nil {
 		c.root.Store(n2)
 	} else {
 		p.child[pDir].Store(n2)
 	}
+
 	c.leafArena.recordReaped(old.chunkIdx)
+
 	return true
 }
 
@@ -244,6 +272,7 @@ func (c *Critbit[T]) relocateLeaf(old *critNode[T]) bool {
 func (c *Critbit[T]) compactInternalChunks(maxChunks int) int {
 	list := c.internalArena.list.Load()
 	chunks, chunkSize := list.chunks, c.internalArena.chunkSize
+
 	tail := int(c.internalArena.next.Load() / chunkSize)
 	if tail == 0 {
 		return 0
@@ -253,31 +282,40 @@ func (c *Critbit[T]) compactInternalChunks(maxChunks int) int {
 	// per chunk.
 	counts := make([]int, len(chunks))
 	rt := c.reapMu.RLock()
+
 	root := c.root.Load()
 	if root == nil {
 		c.reapMu.RUnlock(rt)
+
 		return 0
 	}
+
 	stack := make([]*critNode[T], 0, 64)
+
 	stack = append(stack, root)
 	for len(stack) > 0 {
 		n := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
+
 		if n.isLeaf {
 			continue
 		}
+
 		if int(n.chunkIdx) < len(counts) {
 			counts[n.chunkIdx]++
 		}
+
 		for dir := range 2 {
 			if ch := n.child[dir].Load(); ch != nil && !ch.isLeaf {
 				stack = append(stack, ch)
 			}
 		}
 	}
+
 	c.reapMu.RUnlock(rt)
 
 	threshold := int(chunkSize) * compactOccupancyPct / 100
+
 	victims := make(map[uint32]bool)
 	for ci := 0; ci < len(chunks) && ci < tail && len(victims) < maxChunks; ci++ {
 		if chunks[ci] == nil {
@@ -288,10 +326,12 @@ func (c *Critbit[T]) compactInternalChunks(maxChunks int) int {
 		if list.outstanding[ci].Load() > 0 {
 			continue
 		}
+
 		if counts[ci] <= threshold {
 			victims[uint32(ci)] = true
 		}
 	}
+
 	if len(victims) == 0 {
 		return 0
 	}
@@ -299,39 +339,49 @@ func (c *Critbit[T]) compactInternalChunks(maxChunks int) int {
 	// Pass 2 (write lock): collect victim members with parents, relocate, drop.
 	c.reapMu.Lock()
 	defer c.reapMu.Unlock()
+
 	if c.closed.Load() {
 		return 0
 	}
+
 	root = c.root.Load()
 	if root == nil {
 		return 0
 	}
+
 	type frame struct {
 		node   *critNode[T]
 		parent *critNode[T]
 		dir    int
 	}
+
 	var moves []frame
+
 	fstack := make([]frame, 0, 64)
+
 	fstack = append(fstack, frame{node: root})
 	for len(fstack) > 0 {
 		f := fstack[len(fstack)-1]
 		fstack = fstack[:len(fstack)-1]
+
 		if f.node.isLeaf {
 			continue
 		}
+
 		if victims[f.node.chunkIdx] {
 			// DFS is pre-order, so an ancestor always precedes its descendants
 			// in moves — the replacement map below can therefore always resolve
 			// a relocated parent before its child splices through it.
 			moves = append(moves, f)
 		}
+
 		for dir := range 2 {
 			if ch := f.node.child[dir].Load(); ch != nil && !ch.isLeaf {
 				fstack = append(fstack, frame{node: ch, parent: f.node, dir: dir})
 			}
 		}
 	}
+
 	replaced := make(map[*critNode[T]]*critNode[T], len(moves))
 	for _, m := range moves {
 		n2, ci := c.internalArena.alloc()
@@ -340,6 +390,7 @@ func (c *Critbit[T]) compactInternalChunks(maxChunks int) int {
 		n2.otherbits = m.node.otherbits
 		n2.child[0].Store(m.node.child[0].Load())
 		n2.child[1].Store(m.node.child[1].Load())
+
 		if m.parent == nil {
 			c.root.Store(n2)
 		} else {
@@ -347,10 +398,13 @@ func (c *Critbit[T]) compactInternalChunks(maxChunks int) int {
 			if rp, ok := replaced[p]; ok {
 				p = rp
 			}
+
 			p.child[m.dir].Store(n2)
 		}
+
 		replaced[m.node] = n2
 		c.internalArena.recordReaped(m.node.chunkIdx)
 	}
+
 	return len(victims)
 }

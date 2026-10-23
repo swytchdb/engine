@@ -45,6 +45,7 @@ func NewTipSet(refs ...EffectRef) *TipSet {
 	if len(refs) == 0 {
 		return &TipSet{}
 	}
+
 	deduped := make([]EffectRef, 0, len(refs))
 	if len(refs) <= smallTipSetDedup {
 		for _, r := range refs {
@@ -52,8 +53,10 @@ func NewTipSet(refs ...EffectRef) *TipSet {
 				deduped = append(deduped, r)
 			}
 		}
+
 		return &TipSet{tips: deduped}
 	}
+
 	seen := make(map[EffectRef]struct{}, len(refs))
 	for _, r := range refs {
 		if _, ok := seen[r]; !ok {
@@ -61,6 +64,7 @@ func NewTipSet(refs ...EffectRef) *TipSet {
 			deduped = append(deduped, r)
 		}
 	}
+
 	return &TipSet{tips: deduped}
 }
 
@@ -69,6 +73,7 @@ func (ts *TipSet) Tips() []EffectRef {
 	if ts == nil {
 		return nil
 	}
+
 	return ts.tips
 }
 
@@ -77,6 +82,7 @@ func (ts *TipSet) Len() int {
 	if ts == nil {
 		return 0
 	}
+
 	return len(ts.tips)
 }
 
@@ -85,6 +91,7 @@ func (ts *TipSet) Contains(ref EffectRef) bool {
 	if ts == nil {
 		return false
 	}
+
 	return slices.Contains(ts.tips, ref)
 }
 
@@ -93,6 +100,7 @@ func (ts *TipSet) Single() (EffectRef, bool) {
 	if ts == nil || len(ts.tips) != 1 {
 		return EffectRef{}, false
 	}
+
 	return ts.tips[0], true
 }
 
@@ -101,11 +109,13 @@ func (ts *TipSet) ContainsAll(refs []EffectRef) bool {
 	if ts == nil {
 		return len(refs) == 0
 	}
+
 	for _, r := range refs {
 		if !ts.Contains(r) {
 			return false
 		}
 	}
+
 	return true
 }
 

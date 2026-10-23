@@ -40,6 +40,7 @@ func init() {
 	if err != nil {
 		panic(fmt.Sprintf("value zstd decoder init: %v", err))
 	}
+
 	valueZDec = dec
 }
 
@@ -57,21 +58,27 @@ func (d *DataEffect) Decompress() []byte {
 	if d == nil {
 		return nil
 	}
-	switch v := d.Value.(type) {
+
+	switch v := d.GetValue().(type) {
 	case *DataEffect_Raw:
 		return v.Raw
 	case *DataEffect_Compressed:
 		cv := v.Compressed
 		if cv.GetCodec() != Compression_COMPRESSION_ZSTD {
 			slog.Error("value decompress: unknown codec", "codec", cv.GetCodec())
+
 			return nil
 		}
+
 		out, err := valueZDec.DecodeAll(cv.GetData(), nil)
 		if err != nil {
 			slog.Error("value decompress: corrupt compressed value", "error", err)
+
 			return nil
 		}
+
 		return out
 	}
+
 	return nil
 }

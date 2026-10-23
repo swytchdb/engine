@@ -53,6 +53,7 @@ func buildOcc(trace []uint64) occIndex {
 	for i, k := range trace {
 		occ[k] = append(occ[k], i)
 	}
+
 	return occ
 }
 
@@ -63,6 +64,7 @@ func (o occIndex) nextAfter(key uint64, pos int) int {
 	if i := sort.SearchInts(lst, pos+1); i < len(lst) {
 		return lst[i]
 	}
+
 	return math.MaxInt
 }
 
@@ -78,6 +80,7 @@ func (m decisionMetrics) victimReturnRate() float64 {
 	if m.evictions == 0 {
 		return 0
 	}
+
 	return float64(m.victimReturns) / float64(m.evictions)
 }
 
@@ -85,6 +88,7 @@ func (m decisionMetrics) suboptRate() float64 {
 	if m.evictions == 0 {
 		return 0
 	}
+
 	return float64(m.suboptEvicts) / float64(m.evictions)
 }
 
@@ -92,6 +96,7 @@ func (m decisionMetrics) meanTimeToReturn() float64 {
 	if m.victimReturns == 0 {
 		return 0
 	}
+
 	return float64(m.ttrSum) / float64(m.victimReturns)
 }
 
@@ -111,10 +116,12 @@ func (s *scorer) admit(key uint64) { s.resident[key] = struct{}{} }
 func (s *scorer) evict(key uint64, pos int) {
 	delete(s.resident, key)
 	s.m.evictions++
+
 	vNext := s.occ.nextAfter(key, pos)
 	if vNext == math.MaxInt {
 		return
 	}
+
 	s.m.victimReturns++
 	s.m.ttrSum += int64(vNext - pos)
 	// Suboptimal iff some still-resident key's next use is farther than the
@@ -122,6 +129,7 @@ func (s *scorer) evict(key uint64, pos int) {
 	for rk := range s.resident {
 		if s.occ.nextAfter(rk, pos) > vNext {
 			s.m.suboptEvicts++
+
 			return
 		}
 	}
@@ -133,12 +141,16 @@ func replayLRU(trace []uint64, capacity int, occ occIndex) (int, decisionMetrics
 	l := list.New()
 	elems := make(map[uint64]*list.Element, capacity)
 	hits := 0
+
 	for i, k := range trace {
 		if el, ok := elems[k]; ok {
 			hits++
+
 			l.MoveToFront(el)
+
 			continue
 		}
+
 		if l.Len() >= capacity {
 			back := l.Back()
 			victim := back.Value.(uint64)
@@ -146,9 +158,11 @@ func replayLRU(trace []uint64, capacity int, occ occIndex) (int, decisionMetrics
 			l.Remove(back)
 			s.evict(victim, i)
 		}
+
 		elems[k] = l.PushFront(k)
 		s.admit(k)
 	}
+
 	return hits, s.m
 }
 
@@ -160,6 +174,7 @@ func replayLRU(trace []uint64, capacity int, occ occIndex) (int, decisionMetrics
 func replayOPT(trace []uint64, capacity int) int {
 	// next[i] = position of the next request for trace[i], or MaxInt.
 	next := make([]int, len(trace))
+
 	lastSeen := make(map[uint64]int, capacity)
 	for i := len(trace) - 1; i >= 0; i-- {
 		if p, ok := lastSeen[trace[i]]; ok {
@@ -167,34 +182,44 @@ func replayOPT(trace []uint64, capacity int) int {
 		} else {
 			next[i] = math.MaxInt
 		}
+
 		lastSeen[trace[i]] = i
 	}
 
 	resident := make(map[uint64]int, capacity) // key → next use
 	hits := 0
+
 	for i, k := range trace {
 		if _, ok := resident[k]; ok {
 			hits++
 			resident[k] = next[i]
+
 			continue
 		}
+
 		if len(resident) < capacity {
 			resident[k] = next[i]
+
 			continue
 		}
+
 		var worstKey uint64
+
 		worst := -1
 		for rk, rn := range resident {
 			if rn > worst {
 				worst, worstKey = rn, rk
 			}
 		}
+
 		if next[i] >= worst {
 			continue // bypass: the incoming key is the farthest-future of them all
 		}
+
 		delete(resident, worstKey)
 		resident[k] = next[i]
 	}
+
 	return hits
 }
 
@@ -207,18 +232,24 @@ func replayClox(trace []uint64, cfg Config, occ occIndex) (int, decisionMetrics)
 
 	s := newScorer(occ, cfg.Capacity)
 	pos := 0
+
 	c.SetEvictNotify(func(k uint64, _ int) { s.evict(k, pos) })
 
 	hits := 0
+
 	for i, k := range trace {
 		pos = i
+
 		if _, ok := c.Get(k, 0); ok {
 			hits++
+
 			continue
 		}
+
 		c.Put(k, 0)
 		s.admit(k)
 	}
+
 	return hits, s.m
 }
 
@@ -232,6 +263,7 @@ func replayCfg() Config {
 
 func logReplay(t *testing.T, name string, ops, lruHits, cloxHits, optHits int, lruM, cloxM decisionMetrics) {
 	t.Helper()
+
 	pct := func(h int) float64 { return 100 * float64(h) / float64(ops) }
 	t.Logf("%s: hit rate LRU %.1f%% / clox %.1f%% / OPT %.1f%%", name, pct(lruHits), pct(cloxHits), pct(optHits))
 	t.Logf("%s: excess misses over OPT: LRU %d, clox %d", name, optHits-lruHits, optHits-cloxHits)
@@ -239,6 +271,7 @@ func logReplay(t *testing.T, name string, ops, lruHits, cloxHits, optHits int, l
 		name, 100*lruM.suboptRate(), 100*cloxM.suboptRate(),
 		100*lruM.victimReturnRate(), 100*cloxM.victimReturnRate(),
 		lruM.meanTimeToReturn(), cloxM.meanTimeToReturn())
+
 	if cloxHits > optHits {
 		t.Fatalf("%s: clox hits %d exceed OPT's %d — the harness itself is broken", name, cloxHits, optHits)
 	}
@@ -255,18 +288,24 @@ func TestReplayScanBurst(t *testing.T) {
 		burstGap  = 1000
 		burstBase = uint64(1) << 32 // one-shot ids, disjoint from the hot set
 	)
+
 	rng := rand.New(rand.NewSource(1))
+
 	var trace []uint64
+
 	oneShot := burstBase
+
 	for len(trace) < ops {
 		for range burstGap {
 			trace = append(trace, uint64(rng.Intn(hotKeys)))
 		}
+
 		for range burstLen {
 			trace = append(trace, oneShot)
 			oneShot++
 		}
 	}
+
 	trace = trace[:ops]
 
 	occ := buildOcc(trace)
@@ -284,8 +323,10 @@ func TestReplayScanBurst(t *testing.T) {
 // modestly over LRU by holding the head of the distribution.
 func TestReplayZipf(t *testing.T) {
 	const ops = 60000
+
 	rng := rand.New(rand.NewSource(2))
 	zipf := rand.NewZipf(rng, 1.2, 1, 2047)
+
 	trace := make([]uint64, ops)
 	for i := range trace {
 		trace[i] = zipf.Uint64()
@@ -314,7 +355,9 @@ func TestReplaySlidingWindowDrift(t *testing.T) {
 		windowKeys = 320 // capacity/working-set ≈ 0.8
 		slideEvery = 32  // window advances one key every N ops
 	)
+
 	rng := rand.New(rand.NewSource(3))
+
 	trace := make([]uint64, ops)
 	for i := range trace {
 		trace[i] = uint64(i/slideEvery + rng.Intn(windowKeys))

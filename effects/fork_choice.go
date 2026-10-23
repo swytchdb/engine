@@ -40,6 +40,7 @@ func ComputeForkChoiceHash(nodeID proto.NodeID, hlc *timestamppb.Timestamp) []by
 	binary.LittleEndian.PutUint64(buf[:8], uint64(nodeID))
 	binary.LittleEndian.PutUint64(buf[8:], uint64(hlc.AsTime().UnixNano()))
 	h := sha256.Sum256(buf[:])
+
 	return h[:]
 }
 

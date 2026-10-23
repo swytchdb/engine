@@ -54,11 +54,12 @@ func TestIntegration_TwoNodeNotification(t *testing.T) {
 	}
 
 	msgs := handler1.getAll()
-	if string(msgs[0].Key) != "foo" {
-		t.Fatalf("expected key 'foo', got %q", msgs[0].Key)
+	if string(msgs[0].GetKey()) != "foo" {
+		t.Fatalf("expected key 'foo', got %q", msgs[0].GetKey())
 	}
-	if msgs[0].Origin.Offset != 100 {
-		t.Fatalf("unexpected origin: offset=%d", msgs[0].Origin.Offset)
+
+	if msgs[0].GetOrigin().GetOffset() != 100 {
+		t.Fatalf("unexpected origin: offset=%d", msgs[0].GetOrigin().GetOffset())
 	}
 }
 
@@ -81,14 +82,15 @@ func TestIntegration_ThreeNodeFanOut(t *testing.T) {
 	if !handler1.waitForCount(1, 3*time.Second) {
 		t.Fatal("node 1 did not receive notification")
 	}
+
 	if !handler2.waitForCount(1, 3*time.Second) {
 		t.Fatal("node 2 did not receive notification")
 	}
 
 	for i, h := range []*recordingHandler{handler1, handler2} {
 		msgs := h.getAll()
-		if string(msgs[0].Key) != "fanout-key" {
-			t.Fatalf("node %d: expected key 'fanout-key', got %q", i+1, msgs[0].Key)
+		if string(msgs[0].GetKey()) != "fanout-key" {
+			t.Fatalf("node %d: expected key 'fanout-key', got %q", i+1, msgs[0].GetKey())
 		}
 	}
 }
@@ -112,6 +114,7 @@ func TestIntegration_FetchBetweenNodes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fetch failed: %v", err)
 	}
+
 	if string(data) != string(effectData) {
 		t.Fatalf("expected %q, got %q", effectData, data)
 	}
@@ -135,6 +138,7 @@ func TestIntegration_FetchFromAny(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FetchFromAny failed: %v", err)
 	}
+
 	if string(data) != "found-it" {
 		t.Fatalf("expected 'found-it', got %q", data)
 	}
@@ -155,6 +159,7 @@ func TestIntegration_BidirectionalBroadcast(t *testing.T) {
 
 	go func() {
 		defer wg.Done()
+
 		pms[0].Broadcast(&pb.OffsetNotify{
 			Origin: &pb.EffectRef{NodeId: 0, Offset: 10},
 			Key:    []byte("from-node-0"),
@@ -162,28 +167,31 @@ func TestIntegration_BidirectionalBroadcast(t *testing.T) {
 	}()
 	go func() {
 		defer wg.Done()
+
 		pms[1].Broadcast(&pb.OffsetNotify{
 			Origin: &pb.EffectRef{NodeId: 1, Offset: 20},
 			Key:    []byte("from-node-1"),
 		})
 	}()
+
 	wg.Wait()
 
 	if !handler0.waitForCount(1, 3*time.Second) {
 		t.Fatal("node 0 did not receive notification from node 1")
 	}
+
 	if !handler1.waitForCount(1, 3*time.Second) {
 		t.Fatal("node 1 did not receive notification from node 0")
 	}
 
 	msgs0 := handler0.getAll()
-	if string(msgs0[0].Key) != "from-node-1" {
-		t.Fatalf("node 0: expected key 'from-node-1', got %q", msgs0[0].Key)
+	if string(msgs0[0].GetKey()) != "from-node-1" {
+		t.Fatalf("node 0: expected key 'from-node-1', got %q", msgs0[0].GetKey())
 	}
 
 	msgs1 := handler1.getAll()
-	if string(msgs1[0].Key) != "from-node-0" {
-		t.Fatalf("node 1: expected key 'from-node-0', got %q", msgs1[0].Key)
+	if string(msgs1[0].GetKey()) != "from-node-0" {
+		t.Fatalf("node 1: expected key 'from-node-0', got %q", msgs1[0].GetKey())
 	}
 }
 
@@ -208,17 +216,21 @@ func TestIntegration_TopologyHotReload(t *testing.T) {
 			{ID: 2, Address: "127.0.0.1:0", Region: "test"},
 		},
 	}
+
 	pm2, pmErr := NewPeerManager(cfg2, handler2, lr)
 	if pmErr != nil {
 		t.Fatalf("failed to create pm2: %v", pmErr)
 	}
+
 	pm2.serverTLS = clusterTLS
 	pm2.clientTLS = clusterTLS
+
 	pmCtx, pmCancel := context.WithCancel(context.Background())
 	if err := pm2.Start(pmCtx); err != nil {
 		pmCancel()
 		t.Fatalf("start pm2: %v", err)
 	}
+
 	t.Cleanup(func() {
 		pmCancel()
 		pm2.Stop()
@@ -251,6 +263,7 @@ func TestIntegration_TopologyHotReload(t *testing.T) {
 				break
 			}
 		}
+
 		time.Sleep(100 * time.Millisecond)
 	}
 
@@ -265,8 +278,8 @@ func TestIntegration_TopologyHotReload(t *testing.T) {
 	}
 
 	msgs := handler2.getAll()
-	if string(msgs[0].Key) != "hot-reload-key" {
-		t.Fatalf("expected key 'hot-reload-key', got %q", msgs[0].Key)
+	if string(msgs[0].GetKey()) != "hot-reload-key" {
+		t.Fatalf("expected key 'hot-reload-key', got %q", msgs[0].GetKey())
 	}
 }
 
@@ -297,13 +310,15 @@ func TestIntegration_MultipleNotifications(t *testing.T) {
 	if len(msgs) != numNotifications {
 		seen := make(map[string]int)
 		for _, m := range msgs {
-			seen[string(m.Key)]++
+			seen[string(m.GetKey())]++
 		}
+
 		for k, c := range seen {
 			if c > 1 {
 				t.Logf("duplicate key %q appeared %d times", k, c)
 			}
 		}
+
 		t.Fatalf("expected %d messages, got %d", numNotifications, len(msgs))
 	}
 }
@@ -332,10 +347,11 @@ func TestIntegration_NotificationWithDeps(t *testing.T) {
 	}
 
 	msgs := handler1.getAll()
-	if len(msgs[0].Deps) != 2 {
-		t.Fatalf("expected 2 deps, got %d", len(msgs[0].Deps))
+	if len(msgs[0].GetDeps()) != 2 {
+		t.Fatalf("expected 2 deps, got %d", len(msgs[0].GetDeps()))
 	}
-	if msgs[0].Deps[0].Offset != 300 || msgs[0].Deps[1].Offset != 200 {
-		t.Fatalf("unexpected dep offsets: %+v", msgs[0].Deps)
+
+	if msgs[0].GetDeps()[0].GetOffset() != 300 || msgs[0].GetDeps()[1].GetOffset() != 200 {
+		t.Fatalf("unexpected dep offsets: %+v", msgs[0].GetDeps())
 	}
 }

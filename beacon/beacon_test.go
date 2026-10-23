@@ -38,6 +38,7 @@ func TestStartCancellationAfterRegistrationRollsBackMembership(t *testing.T) {
 	const nodeID = pb.NodeID(42)
 
 	engine := effects.NewEngine(effects.EngineConfig{NodeID: nodeID})
+
 	t.Cleanup(func() {
 		if err := engine.Close(); err != nil {
 			t.Errorf("close engine: %v", err)
@@ -55,13 +56,15 @@ func TestStartCancellationAfterRegistrationRollsBackMembership(t *testing.T) {
 	}
 
 	selfOps := make(chan pb.EffectOp, 2)
+
 	engine.SetOnLocalEffect(func(_ effects.Tip, eff *pb.Effect) {
 		data := eff.GetData()
-		if string(eff.Key) != MembershipKey || data == nil ||
-			nodeIDFromBytes(data.Id) != uint64(nodeID) {
+		if string(eff.GetKey()) != MembershipKey || data == nil ||
+			nodeIDFromBytes(data.GetId()) != uint64(nodeID) {
 			return
 		}
-		selfOps <- data.Op
+
+		selfOps <- data.GetOp()
 	})
 
 	b := New(Config{
@@ -74,6 +77,7 @@ func TestStartCancellationAfterRegistrationRollsBackMembership(t *testing.T) {
 	b.expectedPeers = 1
 
 	ctx, cancel := context.WithCancel(t.Context())
+
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- b.Start(ctx)
@@ -110,6 +114,7 @@ func TestStartCancellationAfterRegistrationRollsBackMembership(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read membership after failed Start: %v", err)
 	}
+
 	for _, member := range parseMembership(snapshot) {
 		if member.NodeID == uint64(nodeID) {
 			t.Fatalf("failed Start left self registered: %+v", member)
@@ -119,6 +124,7 @@ func TestStartCancellationAfterRegistrationRollsBackMembership(t *testing.T) {
 	// Runtime assigns the beacon before an asynchronous Start completes. A
 	// later Stop must not emit a second REMOVE after Start already rolled back.
 	b.Stop()
+
 	select {
 	case op := <-selfOps:
 		t.Fatalf("Stop emitted duplicate self membership operation %v", op)

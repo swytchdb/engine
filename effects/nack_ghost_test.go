@@ -40,26 +40,29 @@ import (
 // scenarios.
 type selectiveBroadcaster struct {
 	mockBroadcaster
+
 	nackTips  []*pb.EffectRef
 	fetchable map[Tip][]byte // offset → wire bytes; absence = NACK only, not fetchable
 }
 
 func (b *selectiveBroadcaster) ReplicateMarshalled(notify *pb.OffsetNotify, _ []byte, target pb.NodeID) ([]*pb.NackNotify, error) {
-	return b.ReplicateTo(notify, notify.EffectData, target)
+	return b.ReplicateTo(notify, notify.GetEffectData(), target)
 }
 
 func (b *selectiveBroadcaster) ReplicateTo(notify *pb.OffsetNotify, _ []byte, target pb.NodeID) ([]*pb.NackNotify, error) {
-	b.mockBroadcaster.replicateToPeers = append(b.mockBroadcaster.replicateToPeers, target)
+	b.replicateToPeers = append(b.replicateToPeers, target)
+
 	return []*pb.NackNotify{{
-		Key:  notify.Key,
+		Key:  notify.GetKey(),
 		Tips: b.nackTips,
 	}}, nil
 }
 
 func (b *selectiveBroadcaster) FetchFromAny(ref *pb.EffectRef, _ FetchHint) ([]byte, error) {
-	if data, ok := b.fetchable[Tip{ref.NodeId, ref.Offset}]; ok && data != nil {
+	if data, ok := b.fetchable[Tip{ref.GetNodeId(), ref.GetOffset()}]; ok && data != nil {
 		return data, nil
 	}
+
 	return nil, errors.New("effect not found on peer")
 }
 
@@ -67,20 +70,24 @@ func (b *selectiveBroadcaster) FetchFromAny(ref *pb.EffectRef, _ FetchHint) ([]b
 // what storeWireData expects: [4-byte LE keyLen][key][protoData].
 func wireEffect(eff *pb.Effect) []byte {
 	protoData, _ := proto.Marshal(eff)
-	keyLen := uint32(len(eff.Key))
+	keyLen := uint32(len(eff.GetKey()))
 	wire := make([]byte, 4+int(keyLen)+len(protoData))
 	binary.LittleEndian.PutUint32(wire[:4], keyLen)
-	copy(wire[4:4+keyLen], eff.Key)
+	copy(wire[4:4+keyLen], eff.GetKey())
 	copy(wire[4+keyLen:], protoData)
+
 	return wire
 }
 
 // makeReachableEffect builds a leaf effect (no deps) at offset off
-// originating from peerNode for the given key. Returned wire bytes
+// originating from peer 7 for the given key. Returned wire bytes
 // can be installed in selectiveBroadcaster.fetchable so the walk
 // resolves successfully.
-func makeReachableEffect(t *testing.T, key string, peerNode pb.NodeID, off uint64) (Tip, []byte) {
+func makeReachableEffect(t *testing.T, key string, off uint64) (Tip, []byte) {
 	t.Helper()
+
+	const peerNode pb.NodeID = 7
+
 	hlc := sTs(int64(off))
 	eff := &pb.Effect{
 		Key:            []byte(key),
@@ -94,6 +101,7 @@ func makeReachableEffect(t *testing.T, key string, peerNode pb.NodeID, off uint6
 			Value:      &pb.DataEffect_Raw{Raw: []byte("v")},
 		}},
 	}
+
 	return Tip{uint64(peerNode), off}, wireEffect(eff)
 }
 
@@ -132,10 +140,12 @@ func TestBuildEnrichedNack_SkipsTipsWithoutLocalBytes(t *testing.T) {
 	// bytes, or they were evicted).
 	tipB := Tip{99, 200}
 	current := e.index.Contains(key)
+
 	currentTips := []keytrie.EffectRef{tipA}
 	if current != nil {
 		currentTips = current.Tips()
 	}
+
 	e.index.Insert(key, nil, keytrie.NewTipSet(append(currentTips, tipB)...))
 
 	// Trigger NACK construction by simulating a remote subscribe
@@ -157,22 +167,26 @@ func TestBuildEnrichedNack_SkipsTipsWithoutLocalBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if len(nacks) != 1 {
 		t.Fatalf("expected 1 NACK, got %d", len(nacks))
 	}
+
 	nack := nacks[0]
 
 	// NACK should mention tipA (we have its bytes) but NOT tipB
 	// (ghost — we'd be lying about authority).
-	if len(nack.Tips) != 1 {
+	if len(nack.GetTips()) != 1 {
 		t.Fatalf("expected NACK with exactly 1 tip (the cache-resident one), got %d tips: %v",
-			len(nack.Tips), nack.Tips)
+			len(nack.GetTips()), nack.GetTips())
 	}
-	if r(nack.Tips[0]) != tipA {
-		t.Fatalf("expected NACK to advertise %v, got %v", tipA, r(nack.Tips[0]))
+
+	if r(nack.GetTips()[0]) != tipA {
+		t.Fatalf("expected NACK to advertise %v, got %v", tipA, r(nack.GetTips()[0]))
 	}
-	if len(nack.TipDetails) != 1 {
-		t.Fatalf("expected 1 TipDetail, got %d", len(nack.TipDetails))
+
+	if len(nack.GetTipDetails()) != 1 {
+		t.Fatalf("expected 1 TipDetail, got %d", len(nack.GetTipDetails()))
 	}
 }
 
@@ -183,12 +197,14 @@ func TestBuildEnrichedNack_SkipsTipsWithoutLocalBytes(t *testing.T) {
 // not ErrBootstrapIncomplete — partial reachability is the new
 // happy path.
 func TestEnsureSubscribed_InstallsOnlyWalkableTips(t *testing.T) {
-	const key = "membership"
-	const peerNode pb.NodeID = 7
+	const (
+		key                = "membership"
+		peerNode pb.NodeID = 7
+	)
 
 	// Two NACK tips: one fully fetchable, one a ghost (no bytes
 	// anywhere).
-	realTip, realBytes := makeReachableEffect(t, key, peerNode, 100)
+	realTip, realBytes := makeReachableEffect(t, key, 100)
 	ghostTip := Tip{99999, 4}
 
 	bc := &selectiveBroadcaster{
@@ -217,16 +233,20 @@ func TestEnsureSubscribed_InstallsOnlyWalkableTips(t *testing.T) {
 	if idx == nil {
 		t.Fatal("index has no entry for key after bootstrap")
 	}
+
 	tips := idx.Tips()
 	foundReal := false
+
 	for _, tip := range tips {
 		if tip == realTip {
 			foundReal = true
 		}
+
 		if tip == ghostTip {
 			t.Fatalf("ghost tip %v was installed; expected to be filtered out", ghostTip)
 		}
 	}
+
 	if !foundReal {
 		t.Fatalf("reachable tip %v missing from index; tips: %v", realTip, tips)
 	}
@@ -236,9 +256,11 @@ func TestEnsureSubscribed_InstallsOnlyWalkableTips(t *testing.T) {
 	if !ok {
 		t.Fatal("no subscription state for key after successful bootstrap")
 	}
+
 	if state.incomplete.Load() {
 		t.Fatal("subscription marked incomplete despite partial bootstrap success")
 	}
+
 	select {
 	case <-state.ready:
 		// expected
@@ -253,8 +275,10 @@ func TestEnsureSubscribed_InstallsOnlyWalkableTips(t *testing.T) {
 // empty so we never advertise ghost authority to others while we
 // retry.
 func TestEnsureSubscribed_AllTipsUnreachable_RetriesBootstrap(t *testing.T) {
-	const key = "membership"
-	const peerNode pb.NodeID = 7
+	const (
+		key                = "membership"
+		peerNode pb.NodeID = 7
+	)
 
 	// Every NACK tip is a ghost.
 	ghostA := Tip{500, 1}
@@ -270,6 +294,7 @@ func TestEnsureSubscribed_AllTipsUnreachable_RetriesBootstrap(t *testing.T) {
 	}
 
 	e := newTestEngine(bc)
+
 	e.safety.Store(&safetyMap{defaultMode: SafeMode})
 	defer e.closed.Store(true) // stop retryBootstrap on test exit
 
@@ -288,15 +313,18 @@ func TestEnsureSubscribed_AllTipsUnreachable_RetriesBootstrap(t *testing.T) {
 	if tips == nil {
 		t.Fatal("expected our own subscription tip to be installed locally")
 	}
+
 	for _, tp := range tips.Tips() {
 		if tp == ghostA || tp == ghostB {
 			t.Fatalf("ghost tip %v installed despite unreachable bootstrap", tp)
 		}
+
 		eff, ok := e.effectCache.Get(tp)
 		if !ok {
 			t.Fatalf("tip %v not in effectCache", tp)
 		}
-		if eff.GetSubscription() == nil || pb.NodeID(eff.NodeId) != e.nodeID {
+
+		if eff.GetSubscription() == nil || pb.NodeID(eff.GetNodeId()) != e.nodeID {
 			t.Fatalf("unexpected installed tip %v (effect %+v) — only the local "+
 				"SubscriptionEffect should be present after a fully-failed bootstrap",
 				tp, eff)
@@ -308,9 +336,11 @@ func TestEnsureSubscribed_AllTipsUnreachable_RetriesBootstrap(t *testing.T) {
 	if !ok {
 		t.Fatal("no subscription state after failed bootstrap")
 	}
+
 	if !state.incomplete.Load() {
 		t.Fatal("expected state.incomplete = true after full bootstrap failure")
 	}
+
 	select {
 	case <-state.ready:
 		t.Fatal("state.ready was closed despite full failure")
@@ -328,6 +358,7 @@ func TestEnsureSubscribed_AllTipsUnreachable_RetriesBootstrap(t *testing.T) {
 // interpreting the closed channel as success).
 func TestEnsureSubscribed_Partition_FailsCleanly(t *testing.T) {
 	const key = "membership"
+
 	bc := &selectiveBroadcaster{
 		mockBroadcaster: mockBroadcaster{
 			peerIDs:                 []pb.NodeID{7},
@@ -344,6 +375,7 @@ func TestEnsureSubscribed_Partition_FailsCleanly(t *testing.T) {
 	if !errors.Is(err, ErrRegionPartitioned) {
 		t.Fatalf("expected ErrRegionPartitioned, got %v", err)
 	}
+
 	if _, ok := e.subscriptions.Load(key); ok {
 		t.Fatal("subscription state not deleted after partition failure; future calls won't re-bootstrap")
 	}
@@ -355,6 +387,7 @@ func TestEnsureSubscribed_Partition_FailsCleanly(t *testing.T) {
 // subscription state stays ready so later calls don't re-bootstrap.
 func TestEnsureSubscribed_Partition_UnsafeProceeds(t *testing.T) {
 	const key = "membership"
+
 	bc := &selectiveBroadcaster{
 		mockBroadcaster: mockBroadcaster{
 			peerIDs:                 []pb.NodeID{7},
@@ -371,15 +404,18 @@ func TestEnsureSubscribed_Partition_UnsafeProceeds(t *testing.T) {
 	if err := e.ensureSubscribedBlocking(key); err != nil {
 		t.Fatalf("unsafe minority subscribe must not error, got %v", err)
 	}
+
 	state, ok := e.subscriptions.Load(key)
 	if !ok {
 		t.Fatal("subscription state missing after successful unsafe bootstrap")
 	}
+
 	select {
 	case <-state.ready:
 	default:
 		t.Fatal("subscription state not marked ready")
 	}
+
 	if state.incomplete.Load() {
 		t.Fatal("subscription state should not be incomplete")
 	}
@@ -391,6 +427,7 @@ func TestEnsureSubscribed_Partition_UnsafeProceeds(t *testing.T) {
 // replicas must never block reads or writes.
 func TestEnsureSubscribed_Unsafe_UnreachablePeersDoNotBlock(t *testing.T) {
 	const key = "membership"
+
 	bc := &mockBroadcaster{
 		peerIDs:                 []pb.NodeID{7},
 		allRegionPeersReachable: false,
@@ -404,12 +441,15 @@ func TestEnsureSubscribed_Unsafe_UnreachablePeersDoNotBlock(t *testing.T) {
 	start := time.Now()
 	err := e.ensureSubscribedBlocking(key)
 	elapsed := time.Since(start)
+
 	if err != nil {
 		t.Fatalf("unsafe subscribe with unreachable peers must not error, got %v", err)
 	}
+
 	if elapsed > time.Second {
 		t.Fatalf("unsafe subscribe must not spin the bootstrap retry loop, took %v", elapsed)
 	}
+
 	if state, ok := e.subscriptions.Load(key); !ok || state.incomplete.Load() {
 		t.Fatal("subscription state should be present and complete")
 	}
@@ -420,8 +460,10 @@ func TestEnsureSubscribed_Unsafe_UnreachablePeersDoNotBlock(t *testing.T) {
 // markFailed: waiters unblock and re-check incomplete rather than
 // blocking until process exit.
 func TestRetryBootstrap_ShutdownUnblocksWaiters(t *testing.T) {
-	const key = "membership"
-	const peerNode pb.NodeID = 7
+	const (
+		key                = "membership"
+		peerNode pb.NodeID = 7
+	)
 
 	bc := &selectiveBroadcaster{
 		mockBroadcaster: mockBroadcaster{
@@ -448,6 +490,7 @@ func TestRetryBootstrap_ShutdownUnblocksWaiters(t *testing.T) {
 	// and is now parked on <-state.ready. Engine.Close should release
 	// it via markFailed (closes ready + sets incomplete=true).
 	released := make(chan struct{})
+
 	go func() {
 		<-state.ready
 		close(released)

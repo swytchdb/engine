@@ -32,6 +32,7 @@ import (
 // virt sets the virtual partition key on an effect (fluent helper).
 func virt(e *pb.Effect, v string) *pb.Effect {
 	e.Virtual = []byte(v)
+
 	return e
 }
 
@@ -65,34 +66,38 @@ func branchWithPartitions(fch byte, parts map[string]*pb.ReducedEffect) *pb.Redu
 // partitions — the fast path, byte-identical to the pre-nesting engine.
 func TestReduce_FlatHasNoPartitions(t *testing.T) {
 	r := ReduceBranch([]*pb.Effect{
-		makeDataEffect("k", 1, 1, scalarInsertRaw([]byte("hello"))),
+		makeDataEffect(1, scalarInsertRaw([]byte("hello"))),
 	})
-	if r == nil || r.Scalar.GetRaw() == nil {
+	if r == nil || r.GetScalar().GetRaw() == nil {
 		t.Fatalf("flat scalar lost: %v", r)
 	}
-	if len(r.Partitions) != 0 {
-		t.Fatalf("flat key grew partitions: %v", r.Partitions)
+
+	if len(r.GetPartitions()) != 0 {
+		t.Fatalf("flat key grew partitions: %v", r.GetPartitions())
 	}
 }
 
 // Writes to disjoint virtual partitions land in separate partition entries and
 // do not interfere; the root partition reduces normally alongside them.
 func TestReduce_DisjointPartitions(t *testing.T) {
-	root := makeDataEffect("k", 0, 1, keyedInsertRaw("a", []byte("marker")))
-	ea := virt(makeDataEffect("k", 1, 1, scalarInsertRaw([]byte("1"))), "a")
-	eb := virt(makeDataEffect("k", 2, 1, scalarInsertRaw([]byte("2"))), "b")
+	root := makeDataEffect(0, keyedInsertRaw("a", []byte("marker")))
+	ea := virt(makeDataEffect(1, scalarInsertRaw([]byte("1"))), "a")
+	eb := virt(makeDataEffect(2, scalarInsertRaw([]byte("2"))), "b")
 
 	r := ReduceBranch([]*pb.Effect{root, ea, eb})
-	if r == nil || r.Collection != pb.CollectionKind_KEYED {
+	if r == nil || r.GetCollection() != pb.CollectionKind_KEYED {
 		t.Fatalf("root not KEYED: %v", r)
 	}
-	if r.NetAdds["a"] == nil {
+
+	if r.GetNetAdds()["a"] == nil {
 		t.Fatalf("root membership for a missing")
 	}
-	if got := r.Partitions["a"].GetScalar().GetRaw(); string(got) != "1" {
+
+	if got := r.GetPartitions()["a"].GetScalar().GetRaw(); string(got) != "1" {
 		t.Fatalf("partition a = %q, want 1", got)
 	}
-	if got := r.Partitions["b"].GetScalar().GetRaw(); string(got) != "2" {
+
+	if got := r.GetPartitions()["b"].GetScalar().GetRaw(); string(got) != "2" {
 		t.Fatalf("partition b = %q, want 2", got)
 	}
 }
@@ -100,10 +105,11 @@ func TestReduce_DisjointPartitions(t *testing.T) {
 // Sequential writes to the same partition reduce like a flat chain — last
 // (topo-order) write wins under LWW.
 func TestReduce_SamePartitionOverwrite(t *testing.T) {
-	p1 := virt(makeDataEffect("k", 1, 1, scalarInsertRaw([]byte("1"))), "a")
-	p2 := virt(makeDataEffect("k", 2, 1, scalarInsertRaw([]byte("2"))), "a")
+	p1 := virt(makeDataEffect(1, scalarInsertRaw([]byte("1"))), "a")
+	p2 := virt(makeDataEffect(2, scalarInsertRaw([]byte("2"))), "a")
+
 	r := ReduceBranch([]*pb.Effect{p1, p2})
-	if got := r.Partitions["a"].GetScalar().GetRaw(); string(got) != "2" {
+	if got := r.GetPartitions()["a"].GetScalar().GetRaw(); string(got) != "2" {
 		t.Fatalf("partition a = %q, want 2 (overwrite)", got)
 	}
 }
@@ -113,28 +119,30 @@ func TestReduce_SamePartitionOverwrite(t *testing.T) {
 func TestReduce_RootKeyDelWipesPartitions(t *testing.T) {
 	// DEL with nothing after it: the key (and its partitions) is gone.
 	gone := ReduceBranch([]*pb.Effect{
-		virt(makeDataEffect("k", 1, 1, scalarInsertRaw([]byte("1"))), "a"),
-		makeDataEffect("k", 2, 1, scalarRemove()),
+		virt(makeDataEffect(1, scalarInsertRaw([]byte("1"))), "a"),
+		makeDataEffect(2, scalarRemove()),
 	})
-	if gone == nil || gone.Op != pb.EffectOp_REMOVE_OP {
+	if gone == nil || gone.GetOp() != pb.EffectOp_REMOVE_OP {
 		t.Fatalf("expected REMOVE tombstone, got %v", gone)
 	}
-	if len(gone.Partitions) != 0 {
-		t.Fatalf("DEL did not wipe partitions: %v", gone.Partitions)
+
+	if len(gone.GetPartitions()) != 0 {
+		t.Fatalf("DEL did not wipe partitions: %v", gone.GetPartitions())
 	}
 
 	// DEL then recreate root + a new value in partition "a": only the post-DEL
 	// state survives.
 	recreated := ReduceBranch([]*pb.Effect{
-		virt(makeDataEffect("k", 1, 1, scalarInsertRaw([]byte("old"))), "a"),
-		makeDataEffect("k", 2, 1, scalarRemove()),
-		makeDataEffect("k", 3, 1, keyedInsertRaw("a", []byte("marker"))),
-		virt(makeDataEffect("k", 4, 1, scalarInsertRaw([]byte("new"))), "a"),
+		virt(makeDataEffect(1, scalarInsertRaw([]byte("old"))), "a"),
+		makeDataEffect(2, scalarRemove()),
+		makeDataEffect(3, keyedInsertRaw("a", []byte("marker"))),
+		virt(makeDataEffect(4, scalarInsertRaw([]byte("new"))), "a"),
 	})
-	if recreated.Op == pb.EffectOp_REMOVE_OP {
+	if recreated.GetOp() == pb.EffectOp_REMOVE_OP {
 		t.Fatalf("recreated key should not be a tombstone: %v", recreated)
 	}
-	if got := recreated.Partitions["a"].GetScalar().GetRaw(); string(got) != "new" {
+
+	if got := recreated.GetPartitions()["a"].GetScalar().GetRaw(); string(got) != "new" {
 		t.Fatalf("partition a = %q, want new (pre-DEL value wiped)", got)
 	}
 }
@@ -143,20 +151,21 @@ func TestReduce_RootKeyDelWipesPartitions(t *testing.T) {
 // in this chain are carried through; new effects on other partitions add to them.
 func TestReduce_SeedPartitionsCarried(t *testing.T) {
 	seed := ReduceBranch([]*pb.Effect{
-		makeDataEffect("k", 0, 1, keyedInsertRaw("a", []byte("marker"))),
-		virt(makeDataEffect("k", 1, 1, scalarInsertRaw([]byte("av"))), "a"),
+		makeDataEffect(0, keyedInsertRaw("a", []byte("marker"))),
+		virt(makeDataEffect(1, scalarInsertRaw([]byte("av"))), "a"),
 	})
-	if len(seed.Partitions) == 0 {
+	if len(seed.GetPartitions()) == 0 {
 		t.Fatalf("seed has no partitions")
 	}
 
 	r := ReduceChain(seed, []*pb.Effect{
-		virt(makeDataEffect("k", 2, 1, scalarInsertRaw([]byte("bv"))), "b"),
+		virt(makeDataEffect(2, scalarInsertRaw([]byte("bv"))), "b"),
 	})
-	if got := r.Partitions["a"].GetScalar().GetRaw(); string(got) != "av" {
+	if got := r.GetPartitions()["a"].GetScalar().GetRaw(); string(got) != "av" {
 		t.Fatalf("carried partition a = %q, want av", got)
 	}
-	if got := r.Partitions["b"].GetScalar().GetRaw(); string(got) != "bv" {
+
+	if got := r.GetPartitions()["b"].GetScalar().GetRaw(); string(got) != "bv" {
 		t.Fatalf("new partition b = %q, want bv", got)
 	}
 }
@@ -171,10 +180,11 @@ func TestCloneReduced_ClonesPartitions(t *testing.T) {
 	c.Partitions["b"] = pScalarRaw("2", 0x02)
 	c.Partitions["a"] = pScalarRaw("mutated", 0x03)
 
-	if _, leaked := orig.Partitions["b"]; leaked {
+	if _, leaked := orig.GetPartitions()["b"]; leaked {
 		t.Fatalf("clone leaked partition b into original")
 	}
-	if got := orig.Partitions["a"].GetScalar().GetRaw(); string(got) != "1" {
+
+	if got := orig.GetPartitions()["a"].GetScalar().GetRaw(); string(got) != "1" {
 		t.Fatalf("original partition a mutated to %q", got)
 	}
 }

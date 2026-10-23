@@ -106,8 +106,11 @@ func nextPowerOf2(n int) int {
 
 // EstimateMemoryUsage estimates total memory usage for a given configuration
 func (c Config) EstimateMemoryUsage() uint64 {
-	const bytesPerNode = 96
-	const bytesPerSlot = 8
+	const (
+		bytesPerNode = 96
+		bytesPerSlot = 8
+	)
+
 	const shardOverhead = 64 // approximate overhead per shard struct
 
 	totalSlots := uint64(c.NumShards * c.SlotsPerShard)
@@ -139,5 +142,6 @@ func FormatMemory(bytes uint64) string {
 	}
 
 	units := []string{"KB", "MB", "GB", "TB"}
+
 	return fmt.Sprintf("%.1f %s", float64(bytes)/float64(div), units[exp])
 }

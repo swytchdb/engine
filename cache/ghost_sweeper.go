@@ -78,6 +78,7 @@ func (c *CloxCache[K, V]) sweepGhosts() {
 	// Determine if we're under memory pressure
 	memoryLimit := c.memoryLimit.Load()
 	underPressure := false
+
 	if memoryLimit > 0 {
 		processRSS := int64(GetProcessRSS())
 		underPressure = processRSS > memoryLimit
@@ -104,6 +105,7 @@ func (c *CloxCache[K, V]) sweepGhosts() {
 			if excess <= 0 {
 				continue
 			}
+
 			cullTarget = excess
 		}
 
@@ -130,6 +132,7 @@ const sweepBatchSize = 64
 func (c *CloxCache[K, V]) sweepShardGhosts(shardID int, cullTarget int64) int {
 	shard := &c.shards[shardID]
 	slotsPerShard := len(shard.slots)
+
 	var culled int64
 
 	for batchStart := 0; batchStart < slotsPerShard && culled < cullTarget; batchStart += sweepBatchSize {
@@ -139,6 +142,7 @@ func (c *CloxCache[K, V]) sweepShardGhosts(shardID int, cullTarget int64) int {
 		for slotID := batchStart; slotID < batchEnd && culled < cullTarget; slotID++ {
 			slot := &shard.slots[slotID]
 			node := slot.Load()
+
 			var prev *recordNode[K, V]
 
 			for node != nil {
@@ -155,10 +159,13 @@ func (c *CloxCache[K, V]) sweepShardGhosts(shardID int, cullTarget int64) int {
 					} else {
 						prev.next.Store(next)
 					}
+
 					shard.ghostCount.Add(-1)
+
 					culled++
 					// Don't advance prev — it's still the same node
 					node = next
+
 					continue
 				}
 

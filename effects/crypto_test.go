@@ -30,10 +30,12 @@ import (
 
 func testEncryptor(t *testing.T) *Encryptor {
 	t.Helper()
+
 	enc, err := NewEncryptorFromIKM(bytes.Repeat([]byte{0x42}, 32))
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	return enc
 }
 
@@ -69,6 +71,7 @@ func TestNewEncryptorFromIKM_Deterministic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	b, err := NewEncryptorFromIKM(ikm)
 	if err != nil {
 		t.Fatal(err)
@@ -77,14 +80,17 @@ func TestNewEncryptorFromIKM_Deterministic(t *testing.T) {
 	// Two independent derivations from the same IKM must interoperate: one
 	// node seals, another node (deriving on its own) opens.
 	plaintext := []byte("cluster-shared cloud payload")
+
 	sealed, err := a.SealAndCompress(plaintext, []byte("effect"))
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	recovered, err := b.OpenAndDecompress(sealed, []byte("effect"))
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if !bytes.Equal(recovered, plaintext) {
 		t.Fatalf("cross-derivation round-trip failed: got %q, want %q", recovered, plaintext)
 	}
@@ -94,6 +100,7 @@ func TestNewEncryptorFromIKM_Deterministic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if _, err := other.OpenAndDecompress(sealed, []byte("effect")); err == nil {
 		t.Fatal("blob sealed under one IKM opened under another")
 	}
@@ -122,6 +129,7 @@ func TestEncryptor_TamperDetection(t *testing.T) {
 
 	for _, i := range []int{0, len(sealed) / 2, len(sealed) - 1} {
 		tampered := bytes.Clone(sealed)
+
 		tampered[i] ^= 0x01
 		if _, err := enc.OpenAndDecompress(tampered, []byte("effect")); err == nil {
 			t.Fatalf("tampered blob (byte %d) opened successfully", i)
@@ -141,6 +149,7 @@ func TestEncryptor_SealOverhead(t *testing.T) {
 	enc := testEncryptor(t)
 
 	plaintext := []byte("small effect payload")
+
 	sealed, err := enc.SealAndCompress(plaintext, []byte("effect"))
 	if err != nil {
 		t.Fatal(err)

@@ -44,6 +44,7 @@ func TestMarshalParseClockTick(t *testing.T) {
 	if len(packet) != tickHeaderSize+2*observedTickSize {
 		t.Fatalf("packet size %d, expected %d", len(packet), tickHeaderSize+2*observedTickSize)
 	}
+
 	if packet[0] != PacketTypeClockTick {
 		t.Fatalf("packet type %d, expected %d", packet[0], PacketTypeClockTick)
 	}
@@ -52,12 +53,15 @@ func TestMarshalParseClockTick(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+
 	if parsed.NodeID != 42 || parsed.Seq != 7 || parsed.WallClock != 123456789 || parsed.JumpNs != -5000 {
 		t.Fatalf("header mismatch: %+v", parsed)
 	}
+
 	if len(parsed.Observed) != 2 {
 		t.Fatalf("observed count %d, expected 2", len(parsed.Observed))
 	}
+
 	if parsed.Observed[0] != tick.Observed[0] || parsed.Observed[1] != tick.Observed[1] {
 		t.Fatalf("observed mismatch: %+v", parsed.Observed)
 	}
@@ -69,6 +73,7 @@ func TestMarshalParseClockTick(t *testing.T) {
 
 	// Unknown version
 	bad := MarshalClockTick(tick)
+
 	bad[1] = 99
 	if _, err := ParseClockTick(bad); err == nil {
 		t.Fatal("expected error for unknown version")
@@ -97,15 +102,18 @@ func TestTickMarksSymmetric(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+
 	hmB.ProcessInboundTick(tickA.NodeID, tickA)
 
 	phB := healthB.Get(1)
 	if phB == nil {
 		t.Fatal("B should have health entry for A")
 	}
+
 	if !phB.alive.Load() {
 		t.Fatal("B should see A as alive")
 	}
+
 	if !phB.symmetric.Load() {
 		t.Fatal("B should see A as symmetric after receiving a tick")
 	}
@@ -117,15 +125,18 @@ func TestTickMarksSymmetric(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+
 	hmA.ProcessInboundTick(tickB.NodeID, tickB)
 
 	phA := healthA.Get(2)
 	if phA == nil {
 		t.Fatal("A should have health entry for B")
 	}
+
 	if !phA.alive.Load() {
 		t.Fatal("A should see B as alive")
 	}
+
 	if !phA.symmetric.Load() {
 		t.Fatal("A should see B as symmetric after receiving a tick")
 	}
@@ -148,11 +159,14 @@ func TestTickExchangeMeasuresRTT(t *testing.T) {
 		return func(_ NodeId, data []byte) error {
 			// Simulated path delay keeps both directional offsets positive.
 			time.Sleep(time.Millisecond)
+
 			tick, err := ParseClockTick(data)
 			if err != nil {
 				return err
 			}
+
 			to.ProcessInboundTick(tick.NodeID, tick)
+
 			return nil
 		}
 	}
@@ -165,10 +179,12 @@ func TestTickExchangeMeasuresRTT(t *testing.T) {
 	if rtt := healthA.GetRTT(2); rtt <= 0 {
 		t.Fatalf("A should have a positive RTT for B, got %v", rtt)
 	}
+
 	st, ok := healthA.ClockStats(2)
 	if !ok || !st.Primed {
 		t.Fatalf("A's clock stats for B should be primed, got %+v", st)
 	}
+
 	if st.Epsilon < st.RTTMin {
 		t.Fatalf("staleness bound %v should include RTTMin %v", st.Epsilon, st.RTTMin)
 	}
@@ -180,6 +196,7 @@ func TestTickExchangeMeasuresRTT(t *testing.T) {
 
 	// One more round closes B's loop too.
 	hmA.sendTick()
+
 	if rtt := healthB.GetRTT(1); rtt <= 0 {
 		t.Fatalf("B should have a positive RTT for A after the echo, got %v", rtt)
 	}
@@ -229,6 +246,7 @@ func TestAdaptiveLivenessTimeout(t *testing.T) {
 		at := base.Add(-time.Duration(9-i) * 100 * time.Millisecond)
 		ph.clock.observeTick(&ClockTick{NodeID: 1, Seq: uint64(i + 1), WallClock: at.UnixNano()}, at)
 	}
+
 	ph.alive.Store(true)
 
 	health.CheckLiveness()
@@ -241,10 +259,12 @@ func TestAdaptiveLivenessTimeout(t *testing.T) {
 	// adaptive value clamps up to 1s and 400ms of silence is tolerated.
 	healthClamped := NewPeerHealthTable(ClockConfig{})
 	phC := healthClamped.GetOrCreate(1)
+
 	for i := range 10 {
 		at := base.Add(-time.Duration(9-i) * 100 * time.Millisecond)
 		phC.clock.observeTick(&ClockTick{NodeID: 1, Seq: uint64(i + 1), WallClock: at.UnixNano()}, at)
 	}
+
 	phC.alive.Store(true)
 
 	healthClamped.CheckLiveness()
@@ -261,6 +281,7 @@ func TestJumpFlaggedTickResetsOffsets(t *testing.T) {
 
 	now := time.Now()
 	hm.ProcessInboundTick(2, &ClockTick{NodeID: 2, Seq: 1, WallClock: now.UnixNano()})
+
 	ph := health.Get(2)
 	ph.clock.observeEcho(int64(5 * time.Millisecond))
 
@@ -277,9 +298,11 @@ func TestJumpFlaggedTickResetsOffsets(t *testing.T) {
 	if st := ph.clock.snapshot(time.Now()); st.Primed {
 		t.Fatalf("stats should be unprimed after a jump reset, got %+v", st)
 	}
+
 	ph.clock.mu.Lock()
 	inLen, outLen := ph.clock.offsetIn.len(), ph.clock.offsetOut.len()
 	ph.clock.mu.Unlock()
+
 	if inLen != 1 || outLen != 0 {
 		t.Fatalf("expected offset windows (1, 0) after reset+repush, got (%d, %d)", inLen, outLen)
 	}
@@ -316,9 +339,11 @@ func TestTickRing(t *testing.T) {
 	if _, ok := ring.get(1); ok {
 		t.Fatal("seq 1 should have been overwritten")
 	}
+
 	if _, ok := ring.get(2); ok {
 		t.Fatal("seq 2 should have been overwritten")
 	}
+
 	for seq := uint64(3); seq <= 6; seq++ {
 		wall, ok := ring.get(seq)
 		if !ok || wall != int64(seq*100) {
@@ -358,6 +383,7 @@ func TestPeerHealthTable(t *testing.T) {
 	ph3.symmetric.Store(false) // alive but not symmetric
 
 	regions := map[NodeId]string{1: "us-east", 2: "us-east"}
+
 	peers := table.AliveSymmetricPeers("us-east", regions)
 	if len(peers) != 1 || peers[0] != 1 {
 		t.Fatalf("expected [1], got %v", peers)
@@ -370,6 +396,7 @@ func TestPeerHealthTable(t *testing.T) {
 
 	// Remove
 	table.Remove(1)
+
 	if table.Get(1) != nil {
 		t.Fatal("should be removed")
 	}

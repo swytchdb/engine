@@ -67,10 +67,12 @@ var ErrCuckooFull = errors.New("cuckoo filter is full")
 func NewCuckooFilter(capacity int) *CuckooFilter {
 	// Target ~0.95 load: capacity / (bucketSize * 0.95).
 	want := uint64(capacity)/cuckooBucketSize + 1
+
 	nb := uint64(1)
 	for nb < want {
 		nb <<= 1
 	}
+
 	return &CuckooFilter{
 		buckets:    make([]uint16, nb*cuckooBucketSize),
 		numBuckets: nb,
@@ -82,13 +84,16 @@ func NewCuckooFilter(capacity int) *CuckooFilter {
 // marshal round-trips for a given numBuckets.
 func (c *CuckooFilter) fingerprintAndIndices(key string) (fp uint16, i1, i2 uint64) {
 	h := xxhash.Sum64String(key)
+
 	fp = uint16(h & 0xFFFF)
 	if fp == 0 {
 		fp = 1 // 0 is the empty sentinel
 	}
+
 	mask := c.numBuckets - 1
 	i1 = (h >> 32) & mask
 	i2 = c.altIndex(i1, fp)
+
 	return fp, i1, i2
 }
 
@@ -98,11 +103,13 @@ func (c *CuckooFilter) fingerprintAndIndices(key string) (fp uint16, i1, i2 uint
 func (c *CuckooFilter) altIndex(i uint64, fp uint16) uint64 {
 	var b [2]byte
 	binary.LittleEndian.PutUint16(b[:], fp)
+
 	return (i ^ xxhash.Sum64(b[:])) & (c.numBuckets - 1)
 }
 
 func (c *CuckooFilter) bucket(i uint64) []uint16 {
 	start := i * cuckooBucketSize
+
 	return c.buckets[start : start+cuckooBucketSize]
 }
 
@@ -110,9 +117,11 @@ func insertIntoBucket(bkt []uint16, fp uint16) bool {
 	for i, v := range bkt {
 		if v == 0 {
 			bkt[i] = fp
+
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -128,8 +137,10 @@ func (c *CuckooFilter) Add(key string) error {
 	if bucketContains(c.bucket(i1), fp) || bucketContains(c.bucket(i2), fp) {
 		return nil
 	}
+
 	if insertIntoBucket(c.bucket(i1), fp) || insertIntoBucket(c.bucket(i2), fp) {
 		c.count++
+
 		return nil
 	}
 
@@ -138,17 +149,21 @@ func (c *CuckooFilter) Add(key string) error {
 	if c.kickSeed&1 == 1 {
 		i = i2
 	}
+
 	for range cuckooMaxKicks {
 		c.kickSeed++
 		bkt := c.bucket(i)
 		slot := c.kickSeed % cuckooBucketSize
 		fp, bkt[slot] = bkt[slot], fp
+
 		i = c.altIndex(i, fp)
 		if insertIntoBucket(c.bucket(i), fp) {
 			c.count++
+
 			return nil
 		}
 	}
+
 	return ErrCuckooFull
 }
 
@@ -156,6 +171,7 @@ func (c *CuckooFilter) Add(key string) error {
 // possible; false negatives are not (for keys successfully Added).
 func (c *CuckooFilter) MaybeContains(key string) bool {
 	fp, i1, i2 := c.fingerprintAndIndices(key)
+
 	return bucketContains(c.bucket(i1), fp) || bucketContains(c.bucket(i2), fp)
 }
 
@@ -172,9 +188,11 @@ func (c *CuckooFilter) LoadFactor() float64 {
 func (c *CuckooFilter) MarshalBinary() ([]byte, error) {
 	out := make([]byte, 8+len(c.buckets)*2)
 	binary.BigEndian.PutUint64(out[:8], c.numBuckets)
+
 	for i, v := range c.buckets {
 		binary.BigEndian.PutUint16(out[8+i*2:], v)
 	}
+
 	return out, nil
 }
 
@@ -185,27 +203,35 @@ func (c *CuckooFilter) UnmarshalBinary(data []byte) error {
 	if len(data) < 8 {
 		return errors.New("cuckoo: short buffer")
 	}
+
 	nb := binary.BigEndian.Uint64(data[:8])
 	if nb == 0 || nb&(nb-1) != 0 {
 		return errors.New("cuckoo: numBuckets not a power of two")
 	}
+
 	body := data[8:]
 	if uint64(len(body)) != nb*cuckooBucketSize*2 {
 		return errors.New("cuckoo: body length mismatch")
 	}
+
 	buckets := make([]uint16, nb*cuckooBucketSize)
+
 	var count uint64
+
 	for i := range buckets {
 		v := binary.BigEndian.Uint16(body[i*2:])
+
 		buckets[i] = v
 		if v != 0 {
 			count++
 		}
 	}
+
 	c.buckets = buckets
 	c.numBuckets = nb
 	c.count = count
 	c.kickSeed = 0
+
 	return nil
 }
 
@@ -243,6 +269,7 @@ func (cc *CuckooChain) Add(key string) bool {
 		cc.sealed = append(cc.sealed, cc.active)
 		cc.active = NewCuckooFilter(cuckooChainChunk)
 	}
+
 	before := cc.active.Count()
 	if err := cc.active.Add(key); err != nil {
 		// Unreachable in practice: the active segment is held at ~50% load,
@@ -250,11 +277,14 @@ func (cc *CuckooChain) Add(key string) bool {
 		// corrupt) segment and add to a fresh one so the key isn't lost, and
 		// surface it loudly.
 		slog.Error("cuckooChain: active segment full below rotation threshold", "error", err)
+
 		cc.sealed = append(cc.sealed, cc.active)
 		cc.active = NewCuckooFilter(cuckooChainChunk)
 		_ = cc.active.Add(key)
+
 		return true
 	}
+
 	return cc.active.Count() != before
 }
 
@@ -263,11 +293,13 @@ func (cc *CuckooChain) MaybeContains(key string) bool {
 	if cc.active != nil && cc.active.MaybeContains(key) {
 		return true
 	}
+
 	for _, f := range cc.sealed {
 		if f.MaybeContains(key) {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -276,17 +308,21 @@ func (cc *CuckooChain) MarshalBinary() ([]byte, error) {
 	if cc.active != nil {
 		n++
 	}
+
 	out := make([]byte, 4)
 	binary.BigEndian.PutUint32(out, uint32(n))
+
 	appendOne := func(f *CuckooFilter) error {
 		b, err := f.MarshalBinary()
 		if err != nil {
 			return err
 		}
+
 		var lh [4]byte
 		binary.BigEndian.PutUint32(lh[:], uint32(len(b)))
 		out = append(out, lh[:]...)
 		out = append(out, b...)
+
 		return nil
 	}
 	for _, f := range cc.sealed {
@@ -294,11 +330,13 @@ func (cc *CuckooChain) MarshalBinary() ([]byte, error) {
 			return nil, err
 		}
 	}
+
 	if cc.active != nil {
 		if err := appendOne(cc.active); err != nil {
 			return nil, err
 		}
 	}
+
 	return out, nil
 }
 
@@ -308,6 +346,7 @@ func (cc *CuckooChain) UnmarshalBinary(data []byte) error {
 	if len(data) < 4 {
 		return errors.New("cuckoo chain: short buffer")
 	}
+
 	count := binary.BigEndian.Uint32(data[:4])
 	// Each segment costs at least its 4-byte length header, so a count that
 	// couldn't fit in the buffer is corrupt — reject it before it drives a
@@ -315,25 +354,34 @@ func (cc *CuckooChain) UnmarshalBinary(data []byte) error {
 	if uint64(count) > uint64(len(data)-4)/4 {
 		return errors.New("cuckoo chain: segment count exceeds buffer")
 	}
+
 	off := 4
+
 	filters := make([]*CuckooFilter, 0, count)
 	for range count {
 		if off+4 > len(data) {
 			return errors.New("cuckoo chain: truncated length")
 		}
+
 		l := int(binary.BigEndian.Uint32(data[off:]))
+
 		off += 4
 		if off+l > len(data) {
 			return errors.New("cuckoo chain: truncated body")
 		}
+
 		var f CuckooFilter
 		if err := f.UnmarshalBinary(data[off : off+l]); err != nil {
 			return err
 		}
+
 		off += l
+
 		filters = append(filters, &f)
 	}
+
 	cc.sealed = filters
 	cc.active = nil
+
 	return nil
 }

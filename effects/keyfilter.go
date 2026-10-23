@@ -80,15 +80,19 @@ func (e *Engine) ownFilterAdd(key string) {
 func (e *Engine) OwnKeyFilterSnapshot() ([]byte, uint64) {
 	e.keyFilterMu.Lock()
 	defer e.keyFilterMu.Unlock()
+
 	if e.ownFilterBytes == nil || e.ownFilterBytesVer != e.ownFilterVer {
 		b, err := e.ownKeyFilter.MarshalBinary()
 		if err != nil {
 			slog.Error("OwnKeyFilterSnapshot: marshal failed", "error", err)
+
 			return nil, 0
 		}
+
 		e.ownFilterBytes = b
 		e.ownFilterBytesVer = e.ownFilterVer
 	}
+
 	return e.ownFilterBytes, e.ownFilterVer
 }
 
@@ -100,6 +104,7 @@ func (e *Engine) peerFilterAdd(peer pb.NodeID, key string) {
 	if peer == e.nodeID {
 		return
 	}
+
 	e.keyFilterMu.Lock()
 	e.getOrCreatePeerFilter(peer).realtime.Add(key)
 	e.keyFilterMu.Unlock()
@@ -111,11 +116,13 @@ func (e *Engine) getOrCreatePeerFilter(peer pb.NodeID) *peerKeyFilter {
 	if e.peerKeyFilters == nil {
 		e.peerKeyFilters = make(map[pb.NodeID]*peerKeyFilter)
 	}
+
 	pf := e.peerKeyFilters[peer]
 	if pf == nil {
 		pf = &peerKeyFilter{}
 		e.peerKeyFilters[peer] = pf
 	}
+
 	return pf
 }
 
@@ -128,7 +135,9 @@ func (e *Engine) NotePeerConnected(peer pb.NodeID) {
 	if peer == e.nodeID {
 		return
 	}
+
 	e.keyFilterMu.Lock()
+
 	pf := e.getOrCreatePeerFilter(peer)
 	if !pf.counted {
 		pf.counted = true
@@ -152,9 +161,12 @@ func (e *Engine) CachePeerFilter(peer pb.NodeID, data []byte, version uint64) {
 	var decoded CuckooChain
 	if err := decoded.UnmarshalBinary(data); err != nil {
 		slog.Warn("CachePeerFilter: undecodable filter from peer", "peer", peer, "error", err)
+
 		return
 	}
+
 	e.keyFilterMu.Lock()
+
 	pf := e.getOrCreatePeerFilter(peer)
 	if !pf.hasBulk || version > pf.bulkVer {
 		// Replace, don't append: the peer's filter is monotonic, so a newer
@@ -163,6 +175,7 @@ func (e *Engine) CachePeerFilter(peer pb.NodeID, data []byte, version uint64) {
 		if pf.counted && !pf.hasBulk {
 			e.unfilteredPeers--
 		}
+
 		pf.bulk = decoded
 		pf.bulkVer = version
 		pf.hasBulk = true
@@ -181,6 +194,7 @@ func (e *Engine) removePeerKeyFilter(peer pb.NodeID) {
 		if pf.counted && !pf.hasBulk {
 			e.unfilteredPeers--
 		}
+
 		delete(e.peerKeyFilters, peer)
 	}
 	e.keyFilterMu.Unlock()
@@ -194,6 +208,7 @@ func (e *Engine) inMajorityPartition() bool {
 	if e.broadcaster == nil {
 		return true
 	}
+
 	return e.broadcaster.InMajorityPartition()
 }
 
@@ -207,14 +222,17 @@ func (e *Engine) inMajorityPartition() bool {
 func (e *Engine) clusterMaybeHasKey(key string) bool {
 	e.keyFilterMu.RLock()
 	defer e.keyFilterMu.RUnlock()
+
 	if e.unfilteredPeers > 0 {
 		return true
 	}
+
 	for _, pf := range e.peerKeyFilters {
 		if pf.maybeContains(key) {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -228,5 +246,6 @@ func (e *Engine) fetchHint(key string) FetchHint {
 	if key == "" || e.clusterMaybeHasKey(key) {
 		return PreferPeers
 	}
+
 	return PreferCDN
 }

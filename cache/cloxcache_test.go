@@ -35,6 +35,7 @@ func TestCloxCacheBasicOperations(t *testing.T) {
 		NumShards:     16,
 		SlotsPerShard: 256,
 	}
+
 	cache := NewCloxCache[uint64, string](cfg)
 	defer cache.Close()
 
@@ -50,6 +51,7 @@ func TestCloxCacheBasicOperations(t *testing.T) {
 	if !ok {
 		t.Fatal("Get failed: key not found")
 	}
+
 	if got != value {
 		t.Fatalf("Get returned wrong value: got %q, want %q", got, value)
 	}
@@ -66,6 +68,7 @@ func TestCloxCacheUpdate(t *testing.T) {
 		NumShards:     16,
 		SlotsPerShard: 256,
 	}
+
 	cache := NewCloxCache[uint64, int](cfg)
 	defer cache.Close()
 
@@ -83,14 +86,18 @@ func TestCloxCacheUpdate(t *testing.T) {
 	if !ok {
 		t.Fatal("Get failed after update")
 	}
+
 	if got != 3 {
 		t.Fatalf("Get returned wrong value: got %d, want %d", got, 3)
 	}
 }
 
 func TestCloxCacheConcurrentAccess(t *testing.T) {
-	const numGoroutines = 100
-	const numOps = 1000
+	const (
+		numGoroutines = 100
+		numOps        = 1000
+	)
+
 	totalKeys := numGoroutines * numOps // 100,000
 
 	cfg := Config{
@@ -98,6 +105,7 @@ func TestCloxCacheConcurrentAccess(t *testing.T) {
 		SlotsPerShard: 2048,
 		Capacity:      totalKeys * 2, // Extra capacity to prevent eviction during concurrent writes
 	}
+
 	cache := NewCloxCache[uint64, int](cfg)
 	defer cache.Close()
 
@@ -108,6 +116,7 @@ func TestCloxCacheConcurrentAccess(t *testing.T) {
 	for i := range numGoroutines {
 		go func(id int) {
 			defer wg.Done()
+
 			for j := range numOps {
 				key := uint64(id*numOps + j)
 				cache.Put(key, int(key))
@@ -120,11 +129,14 @@ func TestCloxCacheConcurrentAccess(t *testing.T) {
 	// Verify some values
 	for i := range 10 {
 		key := uint64(i * numOps)
+
 		val, ok := cache.Get(key, 0)
 		if !ok {
 			t.Errorf("Key %d not found", key)
+
 			continue
 		}
+
 		if val != int(key) {
 			t.Errorf("Wrong value for key %d: got %d, want %d", key, val, int(key))
 		}
@@ -137,6 +149,7 @@ func TestCloxCacheConcurrentReadWrite(t *testing.T) {
 		SlotsPerShard: 512,
 		CollectStats:  true,
 	}
+
 	cache := NewCloxCache[uint64, int](cfg)
 	defer cache.Close()
 
@@ -148,13 +161,16 @@ func TestCloxCacheConcurrentReadWrite(t *testing.T) {
 	}
 
 	stop := make(chan struct{})
+
 	var wg sync.WaitGroup
 
 	// Start readers
 	wg.Add(50)
+
 	for range 50 {
 		go func() {
 			defer wg.Done()
+
 			for {
 				select {
 				case <-stop:
@@ -170,9 +186,11 @@ func TestCloxCacheConcurrentReadWrite(t *testing.T) {
 
 	// Start writers
 	wg.Add(10)
+
 	for i := range 10 {
 		go func(id int) {
 			defer wg.Done()
+
 			for {
 				select {
 				case <-stop:
@@ -205,6 +223,7 @@ func TestCloxCacheFrequencyIncrement(t *testing.T) {
 		NumShards:     4,
 		SlotsPerShard: 16,
 	}
+
 	cache := NewCloxCache[uint64, int](cfg)
 	defer cache.Close()
 
@@ -221,6 +240,7 @@ func TestCloxCacheFrequencyIncrement(t *testing.T) {
 	if !ok {
 		t.Fatal("Hot key was evicted")
 	}
+
 	if val != 42 {
 		t.Fatalf("Wrong value: got %d, want 42", val)
 	}
@@ -232,6 +252,7 @@ func TestCloxCacheEviction(t *testing.T) {
 		SlotsPerShard: 16, // Small cache
 		CollectStats:  true,
 	}
+
 	cache := NewCloxCache[uint64, int](cfg)
 	defer cache.Close()
 
@@ -263,6 +284,7 @@ func TestCloxCacheStats(t *testing.T) {
 		SlotsPerShard: 64,
 		CollectStats:  true,
 	}
+
 	cache := NewCloxCache[uint64, string](cfg)
 	defer cache.Close()
 
@@ -279,6 +301,7 @@ func TestCloxCacheStats(t *testing.T) {
 	if hits != 2 {
 		t.Errorf("Expected 2 hits, got %d", hits)
 	}
+
 	if misses != 1 {
 		t.Errorf("Expected 1 miss, got %d", misses)
 	}
@@ -294,6 +317,7 @@ func TestCloxCachePointerTypes(t *testing.T) {
 		NumShards:     16,
 		SlotsPerShard: 256,
 	}
+
 	cache := NewCloxCache[uint64, *Record](cfg)
 	defer cache.Close()
 
@@ -322,6 +346,7 @@ func TestCloxCacheHashCollisions(t *testing.T) {
 		NumShards:     2,
 		SlotsPerShard: 4, // Very small to force collisions
 	}
+
 	cache := NewCloxCache[uint64, int](cfg)
 	defer cache.Close()
 
@@ -333,10 +358,12 @@ func TestCloxCacheHashCollisions(t *testing.T) {
 
 	// Verify we can retrieve keys despite collisions
 	retrieved := 0
+
 	for i := range numKeys {
 		val, ok := cache.Get(uint64(i), 0)
 		if ok {
 			retrieved++
+
 			if val != i {
 				t.Errorf("Wrong value for key %d: got %d, want %d", i, val, i)
 			}
@@ -344,6 +371,7 @@ func TestCloxCacheHashCollisions(t *testing.T) {
 	}
 
 	t.Logf("Retrieved %d/%d keys with collisions", retrieved, numKeys)
+
 	if retrieved == 0 {
 		t.Error("Expected to retrieve at least some keys")
 	}
@@ -399,6 +427,7 @@ func TestCloxCacheInvalidConfig(t *testing.T) {
 				if r == nil {
 					t.Fatal("Expected panic but got none")
 				}
+
 				panicMsg := fmt.Sprint(r)
 				if panicMsg != tt.wantPanic {
 					t.Errorf("Wrong panic message: got %q, want %q", panicMsg, tt.wantPanic)
@@ -416,6 +445,7 @@ func TestCloxCacheUint64Keys(t *testing.T) {
 		NumShards:     16,
 		SlotsPerShard: 256,
 	}
+
 	cache := NewCloxCache[uint64, string](cfg)
 	defer cache.Close()
 
@@ -431,6 +461,7 @@ func TestCloxCacheUint64Keys(t *testing.T) {
 	if !ok {
 		t.Fatal("Get failed: key not found")
 	}
+
 	if got != value {
 		t.Fatalf("Get returned wrong value: got %q, want %q", got, value)
 	}
@@ -443,10 +474,12 @@ func TestCloxCacheUint64Keys(t *testing.T) {
 
 	// Test update
 	cache.Put(key, "updated-value")
+
 	got, ok = cache.Get(key, 0)
 	if !ok {
 		t.Fatal("Get failed after update")
 	}
+
 	if got != "updated-value" {
 		t.Fatalf("Get returned wrong value after update: got %q, want %q", got, "updated-value")
 	}
@@ -460,6 +493,7 @@ func TestCloxCacheUint64KeysSlotOffset(t *testing.T) {
 		SlotsPerShard: 1024,
 		Capacity:      10000,
 	}
+
 	cache := NewCloxCache[uint64, uint64](cfg)
 	defer cache.Close()
 
@@ -467,6 +501,7 @@ func TestCloxCacheUint64KeysSlotOffset(t *testing.T) {
 	numEntries := 5000
 	for i := range numEntries {
 		slot := uint64(i)
+
 		offset := uint64(i * 100) // simulate offset
 		if success, _, _, _ := cache.Put(slot, offset); !success {
 			t.Fatalf("Put failed for slot %d", slot)
@@ -477,10 +512,12 @@ func TestCloxCacheUint64KeysSlotOffset(t *testing.T) {
 	for i := range numEntries {
 		slot := uint64(i)
 		expectedOffset := uint64(i * 100)
+
 		got, ok := cache.Get(slot, 0)
 		if !ok {
 			t.Fatalf("Get failed for slot %d", slot)
 		}
+
 		if got != expectedOffset {
 			t.Fatalf("Wrong offset for slot %d: got %d, want %d", slot, got, expectedOffset)
 		}
@@ -493,11 +530,13 @@ func TestCloxCacheUint64KeysConcurrent(t *testing.T) {
 		SlotsPerShard: 1024,
 		Capacity:      50000,
 	}
+
 	cache := NewCloxCache[uint64, uint64](cfg)
 	defer cache.Close()
 
 	// Concurrent writers
 	var wg sync.WaitGroup
+
 	numWriters := 8
 	entriesPerWriter := 5000
 
@@ -505,6 +544,7 @@ func TestCloxCacheUint64KeysConcurrent(t *testing.T) {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
+
 			base := uint64(workerID * entriesPerWriter)
 			for i := range entriesPerWriter {
 				slot := base + uint64(i)
@@ -522,11 +562,14 @@ func TestCloxCacheUint64KeysConcurrent(t *testing.T) {
 		for i := range entriesPerWriter {
 			slot := base + uint64(i)
 			expectedOffset := slot * 100
+
 			got, ok := cache.Get(slot, 0)
 			if !ok {
 				t.Errorf("Get failed for slot %d (worker %d)", slot, w)
+
 				continue
 			}
+
 			if got != expectedOffset {
 				t.Errorf("Wrong offset for slot %d: got %d, want %d", slot, got, expectedOffset)
 			}
@@ -539,6 +582,7 @@ func TestCloxCacheUint64KeysCompareAndSwap(t *testing.T) {
 		NumShards:     16,
 		SlotsPerShard: 256,
 	}
+
 	cache := NewCloxCache[uint64, uint64](cfg)
 	defer cache.Close()
 
@@ -553,6 +597,7 @@ func TestCloxCacheUint64KeysCompareAndSwap(t *testing.T) {
 	if !swapped {
 		t.Fatalf("CAS failed: expected swap to succeed, got current=%d, exists=%v", current, exists)
 	}
+
 	if current != 2000 {
 		t.Fatalf("CAS returned wrong current value: got %d, want 2000", current)
 	}
@@ -562,9 +607,11 @@ func TestCloxCacheUint64KeysCompareAndSwap(t *testing.T) {
 	if swapped {
 		t.Fatal("CAS should have failed with wrong expected value")
 	}
+
 	if !exists {
 		t.Fatal("CAS should report key exists")
 	}
+
 	if current != 2000 {
 		t.Fatalf("CAS returned wrong current value: got %d, want 2000", current)
 	}
@@ -574,6 +621,7 @@ func TestCloxCacheUint64KeysCompareAndSwap(t *testing.T) {
 	if swapped {
 		t.Fatal("CAS should fail on non-existent key")
 	}
+
 	if exists {
 		t.Fatal("CAS should report key does not exist")
 	}
@@ -584,6 +632,7 @@ func TestCloxCacheEvict(t *testing.T) {
 		NumShards:     16,
 		SlotsPerShard: 256,
 	}
+
 	cache := NewCloxCache[uint64, string](cfg)
 	defer cache.Close()
 
@@ -616,6 +665,7 @@ func TestCloxCacheEvictWithSizeFunc(t *testing.T) {
 		NumShards:     16,
 		SlotsPerShard: 256,
 	}
+
 	cache := NewCloxCache[uint64, uint64](cfg)
 	defer cache.Close()
 
@@ -627,12 +677,14 @@ func TestCloxCacheEvictWithSizeFunc(t *testing.T) {
 	value := uint64(100)
 
 	cache.Put(key, value)
+
 	bytesAfterPut := cache.Bytes()
 	if bytesAfterPut == 0 {
 		t.Fatal("Bytes should be > 0 after Put")
 	}
 
 	cache.Evict(key)
+
 	bytesAfterEvict := cache.Bytes()
 	if bytesAfterEvict != 0 {
 		t.Fatalf("Bytes should be 0 after Evict, got %d", bytesAfterEvict)
@@ -645,6 +697,7 @@ func TestCloxCacheArrayKey(t *testing.T) {
 		NumShards:     16,
 		SlotsPerShard: 256,
 	}
+
 	cache := NewCloxCache[[2]uint64, string](cfg)
 	defer cache.Close()
 
@@ -659,6 +712,7 @@ func TestCloxCacheArrayKey(t *testing.T) {
 	if !ok {
 		t.Fatal("Get failed for key1")
 	}
+
 	if got != "first" {
 		t.Fatalf("Wrong value for key1: got %q, want %q", got, "first")
 	}
@@ -667,16 +721,19 @@ func TestCloxCacheArrayKey(t *testing.T) {
 	if !ok {
 		t.Fatal("Get failed for key3 (same as key1)")
 	}
+
 	if got != "first" {
 		t.Fatalf("Wrong value for key3: got %q, want %q", got, "first")
 	}
 
 	// Update via equal key
 	cache.Put(key3, "updated")
+
 	got, ok = cache.Get(key1, 0)
 	if !ok {
 		t.Fatal("Get failed after update")
 	}
+
 	if got != "updated" {
 		t.Fatalf("Wrong value after update: got %q, want %q", got, "updated")
 	}
@@ -692,11 +749,13 @@ func TestCloxCacheEvictDeciderSkipsPinned(t *testing.T) {
 		SlotsPerShard: 8,
 		CollectStats:  true,
 	}
+
 	cache := NewCloxCache[[2]uint64, int](cfg)
 	defer cache.Close()
 
 	// Pin any key whose first word is 1 (treat as "membership").
 	pinned := [2]uint64{1, 99}
+
 	cache.SetEvictDecider(func(key [2]uint64, _ int) bool {
 		return key[0] != 1
 	})
@@ -704,6 +763,7 @@ func TestCloxCacheEvictDeciderSkipsPinned(t *testing.T) {
 	// Seed the pinned entry and bump frequency so the protected-freq
 	// fallback would also try to evict it — the decider must override.
 	cache.Put(pinned, 42)
+
 	for range 5 {
 		_, _ = cache.Get(pinned, 0)
 	}
@@ -733,11 +793,14 @@ func TestCloxCacheEvictNotifyFires(t *testing.T) {
 		SlotsPerShard: 8,
 		CollectStats:  true,
 	}
+
 	cache := NewCloxCache[[2]uint64, int](cfg)
 	defer cache.Close()
 
 	var mu sync.Mutex
+
 	evicted := map[[2]uint64]int{}
+
 	cache.SetEvictNotify(func(key [2]uint64, value int) {
 		mu.Lock()
 		evicted[key] = value
@@ -751,6 +814,7 @@ func TestCloxCacheEvictNotifyFires(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
+
 	if len(evicted) == 0 {
 		t.Fatal("evictNotify was never called; expected at least one eviction")
 	}
@@ -780,6 +844,7 @@ func TestCloxCacheEvictPartialSweepExtends(t *testing.T) {
 		SweepPercent:  2, // maxScan = max(64*2/100, 1) = 1 slot
 		CollectStats:  true,
 	}
+
 	cache := NewCloxCache[[2]uint64, int](cfg)
 	defer cache.Close()
 
@@ -790,6 +855,7 @@ func TestCloxCacheEvictPartialSweepExtends(t *testing.T) {
 			t.Fatalf("seed pinned {1,%d}: Put returned !ok", i)
 		}
 	}
+
 	for i := range uint64(4) {
 		if ok, _, _, _ := cache.Put([2]uint64{2, i}, int(i)); !ok {
 			t.Fatalf("seed unpinned {2,%d}: Put returned !ok", i)
@@ -820,6 +886,7 @@ func TestCloxCacheEvictDeciderAllPinnedRefusesEviction(t *testing.T) {
 		CollectStats:  true,
 		SweepPercent:  100, // scan the whole shard every eviction
 	}
+
 	cache := NewCloxCache[[2]uint64, int](cfg)
 	defer cache.Close()
 

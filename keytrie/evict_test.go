@@ -38,7 +38,9 @@ func tip(seq uint64) EffectRef { return EffectRef{1, seq} }
 // the cold (low-freq) key instead.
 func TestEvictBounded_EvictsColdNotProtected(t *testing.T) {
 	c := NewCritbit[struct{}]()
+
 	var evicted []string
+
 	c.SetEvictHooks(
 		func(string) bool { return true },
 		func(k string, _ []EffectRef, _ *struct{}) { evicted = append(evicted, k) },
@@ -57,12 +59,15 @@ func TestEvictBounded_EvictsColdNotProtected(t *testing.T) {
 	if !c.EvictBounded(64) {
 		t.Fatal("EvictBounded reported no eviction; expected the cold key to go")
 	}
+
 	if len(evicted) != 1 || evicted[0] != "cold-c" {
 		t.Fatalf("evicted = %v; want [cold-c]", evicted)
 	}
+
 	if c.Contains("cold-c") != nil {
 		t.Fatal("cold-c still present after eviction")
 	}
+
 	if c.Contains("hot-a") == nil || c.Contains("hot-b") == nil {
 		t.Fatal("a protected hot key was evicted")
 	}
@@ -76,21 +81,26 @@ func TestEvictBounded_GhostPromoteOnReinsert(t *testing.T) {
 	c.SetEvictHooks(func(string) bool { return true }, func(string, []EffectRef, *struct{}) {}, func() bool { return true })
 
 	c.Insert("x", nil, NewTipSet(tip(1)))
+
 	if !c.EvictBounded(64) {
 		t.Fatal("expected x to be evicted")
 	}
+
 	if c.Contains("x") != nil {
 		t.Fatal("x should be absent after eviction")
 	}
+
 	if g := c.ghostCount.Load(); g != 1 {
 		t.Fatalf("ghostCount = %d; want 1 (the evicted key is a ghost)", g)
 	}
 
 	// Re-insert: the ghost must be promoted, not double-counted.
 	c.Insert("x", nil, NewTipSet(tip(2)))
+
 	if c.Contains("x") == nil {
 		t.Fatal("x should be live again after re-insert")
 	}
+
 	if g := c.ghostCount.Load(); g != 0 {
 		t.Fatalf("ghostCount = %d; want 0 after promotion", g)
 	}
@@ -104,6 +114,7 @@ func TestEvictBatch_EvictsOldestColdInOnePass(t *testing.T) {
 	c.SetEvictHooks(func(string) bool { return true }, func(string, []EffectRef, *struct{}) {}, func() bool { return true })
 
 	const n = 100
+
 	keys := make([]string, n)
 	for i := range n {
 		keys[i] = fmt.Sprintf("k-%04d", i) // inserted in order → ascending lastAccess
@@ -119,6 +130,7 @@ func TestEvictBatch_EvictsOldestColdInOnePass(t *testing.T) {
 		if i < 30 && present {
 			t.Fatalf("key %s is among the 30 oldest and should be evicted", k)
 		}
+
 		if i >= 30 && !present {
 			t.Fatalf("key %s is recent and should be spared", k)
 		}
@@ -134,15 +146,18 @@ func TestEvictBatch_SkipsDynamicallyPinned(t *testing.T) {
 	c.SetEvictHooks(func(string) bool { return true }, func(string, []EffectRef, *struct{}) {}, func() bool { return true })
 
 	const n = 10
+
 	keys := make([]string, n)
 	for i := range n {
 		keys[i] = fmt.Sprintf("k-%04d", i)
 		c.Insert(keys[i], nil, NewTipSet(tip(uint64(i+1))))
 	}
+
 	const held = "k-0000" // the oldest — first in line for eviction
 	if !c.Pin(held) {
 		t.Fatal("Pin on a live key must succeed")
 	}
+
 	if c.Pin("nonexistent") {
 		t.Fatal("Pin on a missing key must report no hold taken")
 	}
@@ -150,6 +165,7 @@ func TestEvictBatch_SkipsDynamicallyPinned(t *testing.T) {
 	if got := c.EvictBatch(n); got != n-1 {
 		t.Fatalf("EvictBatch(%d) = %d; want %d (everything but the pinned key)", n, got, n-1)
 	}
+
 	if c.Contains(held) == nil {
 		t.Fatal("pinned key was evicted")
 	}
@@ -157,9 +173,11 @@ func TestEvictBatch_SkipsDynamicallyPinned(t *testing.T) {
 	if !c.Unpin(held) {
 		t.Fatal("Unpin on a live key must succeed")
 	}
+
 	if got := c.EvictBatch(1); got != 1 {
 		t.Fatalf("EvictBatch(1) after Unpin = %d; want 1", got)
 	}
+
 	if c.Contains(held) != nil {
 		t.Fatal("unpinned key must be evictable again")
 	}
@@ -186,6 +204,7 @@ func TestEvictBounded_ReclaimsGhostBeforeHotKey(t *testing.T) {
 	// Evict the two cold keys — each is the LRU unprotected leaf, so it becomes a ghost.
 	c.EvictBounded(64)
 	c.EvictBounded(64)
+
 	ghostsBefore := c.ghostCount.Load()
 	if ghostsBefore < 1 {
 		t.Fatalf("expected ghosts after evicting cold keys, got %d", ghostsBefore)
@@ -195,9 +214,11 @@ func TestEvictBounded_ReclaimsGhostBeforeHotKey(t *testing.T) {
 	if !c.EvictBounded(64) {
 		t.Fatal("EvictBounded returned false; expected a ghost reclaim")
 	}
+
 	if got := c.ghostCount.Load(); got >= ghostsBefore {
 		t.Fatalf("ghostCount %d -> %d; expected a ghost to be reclaimed", ghostsBefore, got)
 	}
+
 	for _, k := range []string{"hot-1", "hot-2"} {
 		if c.Contains(k) == nil {
 			t.Fatalf("hot key %s was evicted; a ghost should have been reclaimed instead", k)
@@ -212,25 +233,32 @@ func TestEvictBounded_ReclaimsGhostBeforeHotKey(t *testing.T) {
 func TestReap_QueueDrainUnlinks(t *testing.T) {
 	c := NewCritbit[struct{}]()
 	keys := []string{"alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"}
+
 	tips := make([]*TipSet, len(keys))
 	for i, k := range keys {
 		tips[i] = NewTipSet(tip(uint64(i + 1)))
 		c.Insert(k, nil, tips[i])
 	}
+
 	for i := range 4 {
 		c.Delete(keys[i], tips[i])
 	}
 
 	settled := false
+
 	for range 10000 {
 		for c.drainReap() > 0 {
 		}
+
 		if c.deletedCount.Load() == 0 {
 			settled = true
+
 			break
 		}
+
 		runtime.Gosched()
 	}
+
 	if !settled {
 		t.Fatalf("deletedCount = %d after draining; want 0 (all queued leaves unlinked)", c.deletedCount.Load())
 	}
@@ -240,6 +268,7 @@ func TestReap_QueueDrainUnlinks(t *testing.T) {
 		if i < 4 && got != nil {
 			t.Fatalf("deleted key %s still present after queue drain", k)
 		}
+
 		if i >= 4 && got == nil {
 			t.Fatalf("surviving key %s missing after queue drain", k)
 		}
@@ -254,10 +283,13 @@ func TestReap_QueueDrainUnlinks(t *testing.T) {
 // chunkSize distinct keys land in leaf chunk 0.
 func TestChunkReclaim_DropsFullyDeadChunk(t *testing.T) {
 	c := NewCritbit[struct{}]()
+
 	const extra = 500
+
 	n := defaultCritbitArenaChunkSize + extra
 
 	keys := make([]string, n)
+
 	tips := make([]*TipSet, n)
 	for i := range n {
 		keys[i] = fmt.Sprintf("key-%08d", i)
@@ -273,6 +305,7 @@ func TestChunkReclaim_DropsFullyDeadChunk(t *testing.T) {
 	for i := range defaultCritbitArenaChunkSize {
 		c.Delete(keys[i], tips[i])
 	}
+
 	for c.reap() > 0 {
 	}
 
@@ -282,10 +315,12 @@ func TestChunkReclaim_DropsFullyDeadChunk(t *testing.T) {
 	if list.chunks[0] == nil {
 		t.Fatal("leaf chunk 0 was nil-dropped; the free list had room, so it should have been recycled")
 	}
+
 	if got := list.outstanding[0].Load(); got != int64(defaultCritbitArenaChunkSize) {
 		t.Fatalf("chunk 0 outstanding = %d; want %d (all recycled slots unallocated)",
 			got, defaultCritbitArenaChunkSize)
 	}
+
 	if got := c.leafArena.freeCount.Load(); got != int64(defaultCritbitArenaChunkSize) {
 		t.Fatalf("leaf free list holds %d slots; want %d", got, defaultCritbitArenaChunkSize)
 	}
@@ -293,9 +328,11 @@ func TestChunkReclaim_DropsFullyDeadChunk(t *testing.T) {
 	// A new insert must reuse a recycled slot, not grow the monotonic tail.
 	nextBefore := c.leafArena.next.Load()
 	c.Insert("fresh-after-reclaim", nil, NewTipSet(tip(9999)))
+
 	if got := c.leafArena.next.Load(); got != nextBefore {
 		t.Fatalf("insert after reclaim grew the arena tail (%d -> %d); want a recycled slot", nextBefore, got)
 	}
+
 	if c.Contains("fresh-after-reclaim") == nil {
 		t.Fatal("key inserted into a recycled slot is unreadable")
 	}
@@ -307,6 +344,7 @@ func TestChunkReclaim_DropsFullyDeadChunk(t *testing.T) {
 			t.Fatalf("surviving key %s missing after chunk reclaim", keys[i])
 		}
 	}
+
 	c.SetEvictHooks(func(string) bool { return true }, func(string, []EffectRef, *struct{}) {}, func() bool { return true })
 	c.EvictBounded(64) // must not panic on the recycled chunk
 }
@@ -326,6 +364,7 @@ func TestEvictBounded_GhostNotReaped(t *testing.T) {
 	}
 	// Force a reap pass; the ghost must survive it.
 	c.reap()
+
 	if g := c.ghostCount.Load(); g < 1 {
 		t.Fatalf("ghostCount = %d; a ghost should have survived reap", g)
 	}
@@ -339,6 +378,7 @@ func TestEvictBounded_GhostNotReaped(t *testing.T) {
 func TestGraduationGatedByPressure(t *testing.T) {
 	c := NewCritbit[struct{}]()
 	pressure := false
+
 	c.SetEvictHooks(
 		func(string) bool { return true },
 		func(string, []EffectRef, *struct{}) {},
@@ -348,9 +388,11 @@ func TestGraduationGatedByPressure(t *testing.T) {
 	// Walk a fresh leaf's freq past k (=2) with no pressure: the crossing must
 	// not be counted.
 	c.Insert("cold", nil, NewTipSet(tip(1)))
+
 	for range 5 {
 		c.LoadOrStoreData("cold", &struct{}{})
 	}
+
 	if got := c.EvictStats().ReachedProtected; got != 0 {
 		t.Fatalf("ReachedProtected = %d with underPressure=false; want 0 (gated off)", got)
 	}
@@ -358,10 +400,13 @@ func TestGraduationGatedByPressure(t *testing.T) {
 	// Now under pressure, a different fresh leaf's crossing is counted (the gate
 	// fires once per leaf at f==k, so a new key is required).
 	pressure = true
+
 	c.Insert("warm", nil, NewTipSet(tip(2)))
+
 	for range 5 {
 		c.LoadOrStoreData("warm", &struct{}{})
 	}
+
 	if got := c.EvictStats().ReachedProtected; got == 0 {
 		t.Fatal("ReachedProtected = 0 with underPressure=true; want the crossing counted")
 	}
@@ -377,6 +422,7 @@ func findLeaf[T any](c *Critbit[T], key string) *critNode[T] {
 			}
 		}
 	}
+
 	return nil
 }
 
@@ -394,6 +440,7 @@ func TestEvictBatch_GhostTrimOrder(t *testing.T) {
 	// The victim-to-be goes in first, so its lastAccess predates every ghost's.
 	// Pin it so the fodder churn below can't take it early.
 	c.Insert("victim", nil, NewTipSet(tip(1)))
+
 	if !c.Pin("victim") {
 		t.Fatal("Pin on a live key must succeed")
 	}
@@ -403,11 +450,13 @@ func TestEvictBatch_GhostTrimOrder(t *testing.T) {
 	for i := range ghostCap {
 		c.Insert(fmt.Sprintf("fodder-%04d", i), nil, NewTipSet(tip(uint64(i+2))))
 	}
+
 	for range ghostCap {
 		if !c.EvictBounded(64) {
 			t.Fatal("fodder eviction failed")
 		}
 	}
+
 	if got := c.ghostCount.Load(); got != int64(ghostCap) {
 		t.Fatalf("ghostCount = %d; want %d (at capacity)", got, ghostCap)
 	}
@@ -418,6 +467,7 @@ func TestEvictBatch_GhostTrimOrder(t *testing.T) {
 	if !c.Unpin("victim") {
 		t.Fatal("Unpin on a live key must succeed")
 	}
+
 	if !c.EvictBounded(64) {
 		t.Fatal("expected the victim to be evicted")
 	}
@@ -425,12 +475,15 @@ func TestEvictBatch_GhostTrimOrder(t *testing.T) {
 	if got := c.ghostCount.Load(); got != int64(ghostCap) {
 		t.Fatalf("ghostCount = %d after trim+ghost; want %d (net unchanged)", got, ghostCap)
 	}
+
 	if n := findLeaf(c, "victim"); n == nil || n.freq.Load() >= 0 {
 		t.Fatal("fresh victim must survive as a ghost")
 	}
+
 	if n := findLeaf(c, "fodder-0000"); n != nil && n.freq.Load() < 0 {
 		t.Fatal("oldest existing ghost must be the one trimmed")
 	}
+
 	if n := findLeaf(c, "fodder-0001"); n == nil || n.freq.Load() >= 0 {
 		t.Fatal("younger ghosts must survive the trim")
 	}
@@ -448,9 +501,11 @@ func TestDecayStepsLeafFreqDown(t *testing.T) {
 	c.evictK.Store(2)
 
 	c.Insert("hot", nil, NewTipSet(tip(1)))
+
 	for range 30 {
 		c.LoadData("hot") // Contains doesn't record accesses; LoadData does
 	}
+
 	if got := findLeaf(c, "hot").freq.Load(); got != maxLeafFreq {
 		t.Fatalf("hot freq = %d after saturation; want %d", got, maxLeafFreq)
 	}
@@ -459,10 +514,12 @@ func TestDecayStepsLeafFreqDown(t *testing.T) {
 	// protected, never a victim — must step 15 → 14, no further.
 	for i := range 150 {
 		c.Insert(fmt.Sprintf("fodder-%04d", i), nil, NewTipSet(tip(uint64(i+2))))
+
 		if !c.EvictBounded(64) {
 			t.Fatalf("eviction %d failed", i)
 		}
 	}
+
 	if got := findLeaf(c, "hot").freq.Load(); got != maxLeafFreq-1 {
 		t.Fatalf("hot freq = %d after one decay epoch; want %d", got, maxLeafFreq-1)
 	}
@@ -482,28 +539,36 @@ func TestSlidingWindowDriftParity(t *testing.T) {
 		ops        = 60000
 		slideEvery = 40 // window advances one key every N ops
 	)
+
 	rng := rand.New(rand.NewSource(42))
+
 	trace := make([]int, ops)
 	for i := range trace {
 		trace[i] = i/slideEvery + rng.Intn(windowKeys)
 	}
+
 	key := func(id int) string { return fmt.Sprintf("key-%06d", id) }
 
 	// Plain-LRU baseline over the identical trace.
 	lru := list.New()
 	inLRU := make(map[int]*list.Element, capacity)
 	lruHits := 0
+
 	for _, id := range trace {
 		if el, ok := inLRU[id]; ok {
 			lruHits++
+
 			lru.MoveToFront(el)
+
 			continue
 		}
+
 		if lru.Len() >= capacity {
 			back := lru.Back()
 			delete(inLRU, back.Value.(int))
 			lru.Remove(back)
 		}
+
 		inLRU[id] = lru.PushFront(id)
 	}
 
@@ -513,18 +578,23 @@ func TestSlidingWindowDriftParity(t *testing.T) {
 		func(string, []EffectRef, *struct{}) {},
 		func() bool { return c.Size() >= capacity },
 	)
+
 	payload := struct{}{}
 	trieHits := 0
+
 	for _, id := range trace {
 		// LoadData is the probe that records the access for the policy
 		// (Contains doesn't); the payload install below makes a resident key
 		// distinguishable from a miss.
 		if c.LoadData(key(id)) != nil {
 			trieHits++
+
 			continue
 		}
+
 		c.Insert(key(id), nil, NewTipSet(tip(uint64(id))))
 		c.LoadOrStoreData(key(id), &payload)
+
 		for c.Size() > capacity {
 			if c.EvictBatch(int(c.Size())-capacity) == 0 {
 				break
@@ -534,6 +604,7 @@ func TestSlidingWindowDriftParity(t *testing.T) {
 
 	t.Logf("sliding-window drift: LRU hits %d (%.1f%%), trie hits %d (%.1f%%)",
 		lruHits, 100*float64(lruHits)/ops, trieHits, 100*float64(trieHits)/ops)
+
 	if float64(trieHits) < 0.9*float64(lruHits) {
 		t.Fatalf("drift parity broken: trie hits %d < 90%% of LRU's %d — protection is squatting (decay regression?)",
 			trieHits, lruHits)

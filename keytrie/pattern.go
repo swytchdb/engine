@@ -32,14 +32,17 @@ func matchCharClass(b byte, class string) bool {
 			if b >= class[i] && b <= class[i+2] {
 				return true
 			}
+
 			i += 3
 		} else {
 			if b == class[i] {
 				return true
 			}
+
 			i++
 		}
 	}
+
 	return false
 }
 
@@ -60,41 +63,52 @@ func matchGlob(s, pattern string) bool {
 				starIdx = pi
 				matchIdx = si
 				pi++
+
 				continue
 
 			case '?':
 				si++
 				pi++
+
 				continue
 
 			case '[':
 				classStart := pi + 1
+
 				negate := false
 				if classStart < len(pattern) && pattern[classStart] == '^' {
 					negate = true
 					classStart++
 				}
+
 				end := classStart
 				for end < len(pattern) && pattern[end] != ']' {
 					end++
 				}
+
 				if end >= len(pattern) {
 					if starIdx >= 0 {
 						matchIdx++
 						si = matchIdx
 						pi = starIdx + 1
+
 						continue
 					}
+
 					return false
 				}
+
 				class := pattern[classStart:end]
+
 				matched := matchCharClass(s[si], class)
 				if negate {
 					matched = !matched
 				}
+
 				if matched {
 					si++
 					pi = end + 1
+
 					continue
 				}
 
@@ -102,6 +116,7 @@ func matchGlob(s, pattern string) bool {
 				if pi+1 < len(pattern) && s[si] == pattern[pi+1] {
 					si++
 					pi += 2
+
 					continue
 				}
 
@@ -109,6 +124,7 @@ func matchGlob(s, pattern string) bool {
 				if s[si] == pattern[pi] {
 					si++
 					pi++
+
 					continue
 				}
 			}
@@ -127,6 +143,7 @@ func matchGlob(s, pattern string) bool {
 		if pattern[pi] != '*' {
 			return false
 		}
+
 		pi++
 	}
 

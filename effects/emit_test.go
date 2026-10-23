@@ -63,46 +63,55 @@ type mockBroadcaster struct {
 func (m *mockBroadcaster) BroadcastWithData(notify *pb.OffsetNotify, effectData []byte) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	m.broadcasts = append(m.broadcasts, notify)
 }
 func (m *mockBroadcaster) Broadcast(notify *pb.OffsetNotify) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	m.broadcasts = append(m.broadcasts, notify)
 }
 func (m *mockBroadcaster) Replicate(notify *pb.OffsetNotify, wireData []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	m.replicates = append(m.replicates, notify)
+
 	return m.replicateErr
 }
 func (m *mockBroadcaster) ReplicateMarshalled(notify *pb.OffsetNotify, _ []byte, target pb.NodeID) ([]*pb.NackNotify, error) {
-	return m.ReplicateTo(notify, notify.EffectData, target)
+	return m.ReplicateTo(notify, notify.GetEffectData(), target)
 }
 
 func (m *mockBroadcaster) ReplicateTo(notify *pb.OffsetNotify, wireData []byte, targetNodeID pb.NodeID) ([]*pb.NackNotify, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	m.replicateToPeers = append(m.replicateToPeers, targetNodeID)
+
 	m.replicates = append(m.replicates, notify)
 	if m.nackResponses != nil {
 		if nack, ok := m.nackResponses[targetNodeID]; ok {
 			if nack != nil {
 				return []*pb.NackNotify{nack}, m.replicateErr
 			}
+
 			return nil, m.replicateErr
 		}
 	}
 	// Simulate the bootstrap protocol: send an empty NACK back through
 	// the engine's HandleNack so subscription bootstrapping completes.
-	if m.nackTarget != nil && len(notify.Key) != 0 {
-		_ = m.nackTarget.HandleNack(&pb.NackNotify{Key: notify.Key})
+	if m.nackTarget != nil && len(notify.GetKey()) != 0 {
+		_ = m.nackTarget.HandleNack(&pb.NackNotify{Key: notify.GetKey()})
 	}
+
 	return nil, m.replicateErr
 }
 func (m *mockBroadcaster) SendNack(nack *pb.NackNotify, targetNodeID pb.NodeID) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	m.sentNacks = append(m.sentNacks, nack)
 }
 func (m *mockBroadcaster) FetchFromAny(ref *pb.EffectRef, _ FetchHint) ([]byte, error) {
@@ -123,6 +132,7 @@ func (m *mockBroadcaster) ForwardTransaction(_ context.Context, _ pb.NodeID, _ *
 func (m *mockBroadcaster) broadcastCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	return len(m.broadcasts)
 }
 
@@ -130,6 +140,7 @@ func (m *mockBroadcaster) broadcastCount() int {
 func (m *mockBroadcaster) replicateCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	return len(m.replicates)
 }
 
@@ -138,13 +149,16 @@ func (m *mockBroadcaster) replicateCount() int {
 // effect is observable only after the goroutine runs.
 func waitForBroadcast(t *testing.T, bc *mockBroadcaster) {
 	t.Helper()
+
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if bc.broadcastCount() > 0 {
 			return
 		}
+
 		time.Sleep(time.Millisecond)
 	}
+
 	t.Fatal("timed out waiting for async subscription broadcast")
 }
 
@@ -165,6 +179,7 @@ func newTestEngine(bc Broadcaster) *Engine {
 		effectCache:       newVertexPool(),
 	}
 	e.safety.Store(&safetyMap{defaultMode: UnsafeMode})
+
 	return e
 }
 
@@ -253,12 +268,14 @@ func TestEmitTwoSameKey(t *testing.T) {
 
 	// Verify dep chaining: the tip (meta effect) should depend on the first effect
 	tipOff := tips.Tips()[0]
+
 	cached, ok := e.effectCache.Get(tipOff)
 	if !ok {
 		t.Fatal("expected effect in cache")
 	}
-	if len(cached.Deps) != 1 {
-		t.Fatalf("expected 1 dep, got %v", cached.Deps)
+
+	if len(cached.GetDeps()) != 1 {
+		t.Fatalf("expected 1 dep, got %v", cached.GetDeps())
 	}
 }
 
@@ -286,12 +303,14 @@ func TestEmitForkResolution(t *testing.T) {
 
 	// Deps should include both original tips (fork resolution)
 	tipOff := tips.Tips()[0]
+
 	cached, ok := e.effectCache.Get(tipOff)
 	if !ok {
 		t.Fatal("expected effect in cache")
 	}
-	if len(cached.Deps) != 2 {
-		t.Fatalf("expected 2 deps (fork resolution), got %v", cached.Deps)
+
+	if len(cached.GetDeps()) != 2 {
+		t.Fatalf("expected 2 deps (fork resolution), got %v", cached.GetDeps())
 	}
 }
 
@@ -315,6 +334,7 @@ func TestFlushSafeMode(t *testing.T) {
 	if len(bc.replicates) != 1 {
 		t.Fatalf("expected 1 Replicate call, got %d", len(bc.replicates))
 	}
+
 	if len(bc.broadcasts) != 0 {
 		t.Fatal("should not call BroadcastWithData in safe mode")
 	}
@@ -335,6 +355,7 @@ func TestFlushSafeMode_DowngradesWhenKeyHeldNowhere(t *testing.T) {
 	if err := ctx.Emit(dataEffect("k")); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := ctx.Flush(); err != nil {
 		t.Fatal(err)
 	}
@@ -342,6 +363,7 @@ func TestFlushSafeMode_DowngradesWhenKeyHeldNowhere(t *testing.T) {
 	// The downgrade path is fire-and-forget, so observe it through the locked
 	// accessors after the announce goroutine has had a chance to land.
 	waitForBroadcast(t, bc)
+
 	if got := bc.replicateCount(); got != 0 {
 		t.Fatalf("key held nowhere: SafeMode should not block on Replicate, got %d calls", got)
 	}
@@ -408,6 +430,7 @@ func TestFlushTx_SafeMode_RejectsWhenPeersUnreachable(t *testing.T) {
 
 	ctx := e.NewContext()
 	ctx.BeginTx()
+
 	if err := ctx.Emit(dataEffect("k")); err != nil {
 		t.Fatal(err)
 	}
@@ -416,6 +439,7 @@ func TestFlushTx_SafeMode_RejectsWhenPeersUnreachable(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when not all region peers are reachable in SafeMode tx")
 	}
+
 	if !errors.Is(err, ErrRegionPartitioned) {
 		t.Fatalf("expected ErrRegionPartitioned, got: %v", err)
 	}
@@ -438,6 +462,7 @@ func TestFlushUnsafeMode(t *testing.T) {
 	if len(bc.broadcasts) != 1 {
 		t.Fatalf("expected 1 BroadcastWithData call, got %d", len(bc.broadcasts))
 	}
+
 	if len(bc.replicates) != 0 {
 		t.Fatal("should not call Replicate in unsafe mode")
 	}
@@ -461,6 +486,7 @@ func TestBeginTxSetsFlag(t *testing.T) {
 
 	ctx := e.NewContext()
 	ctx.BeginTx()
+
 	if err := ctx.Emit(dataEffect("k")); err != nil {
 		t.Fatal(err)
 	}
@@ -476,16 +502,20 @@ func TestBeginTxSetsFlag(t *testing.T) {
 	}
 	// In a tx, the tip is the BIND; walk tips to find a data effect with TxnId
 	found := false
+
 	for _, off := range tips.Tips() {
 		cached, ok := e.effectCache.Get(off)
 		if !ok {
 			continue
 		}
-		if cached.TxnId != "" {
+
+		if cached.GetTxnId() != "" {
 			found = true
+
 			break
 		}
 	}
+
 	if !found {
 		t.Fatal("expected TxnId to be set on at least one effect")
 	}
@@ -497,6 +527,7 @@ func TestAbort(t *testing.T) {
 
 	ctx := e.NewContext()
 	ctx.BeginTx()
+
 	if err := ctx.Emit(dataEffect("k")); err != nil {
 		t.Fatal(err)
 	}
@@ -563,7 +594,9 @@ func TestAbortAllowsCleanReuse(t *testing.T) {
 	if err := ctx.Watch("k"); err != nil {
 		t.Fatalf("Watch: %v", err)
 	}
+
 	ctx.BeginTx()
+
 	if err := ctx.Emit(dataEffect("k")); err != nil {
 		t.Fatal(err)
 	}
@@ -574,15 +607,19 @@ func TestAbortAllowsCleanReuse(t *testing.T) {
 	if len(ctx.keys) != 0 {
 		t.Fatal("keys should be empty after Abort")
 	}
+
 	if len(ctx.watchedKeys) != 0 {
 		t.Fatal("watchedKeys should be empty after Abort")
 	}
+
 	if ctx.inTx {
 		t.Fatal("inTx should be false after Abort")
 	}
+
 	if ctx.txnID != "" {
 		t.Fatal("txnID should be empty after Abort")
 	}
+
 	if ctx.txSnapshot != nil {
 		t.Fatal("txSnapshot should be nil after Abort")
 	}
@@ -609,9 +646,11 @@ func TestCASRetry(t *testing.T) {
 	if tips == nil {
 		t.Fatal("expected tips after CAS retry")
 	}
+
 	if !tips.Contains(Tip{0, 999}) {
 		t.Fatalf("expected tips to contain 999, got %v", tips.Tips())
 	}
+
 	if len(tips.Tips()) != 2 {
 		t.Fatalf("expected 2 tips (concurrent + ours), got %v", tips.Tips())
 	}
@@ -626,6 +665,7 @@ func TestNotifyEffectData(t *testing.T) {
 	if err := ctx.Emit(dataEffect("k")); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := ctx.Flush(); err != nil {
 		t.Fatal(err)
 	}
@@ -633,26 +673,31 @@ func TestNotifyEffectData(t *testing.T) {
 	if len(bc.broadcasts) != 1 {
 		t.Fatal("expected 1 broadcast")
 	}
+
 	notify := bc.broadcasts[0]
-	if len(notify.EffectData) == 0 {
+	if len(notify.GetEffectData()) == 0 {
 		t.Fatal("EffectData should carry serialized effect bytes")
 	}
 	// EffectData is wire format: [4-byte LE keyLen][key][protoData]
-	wireData := notify.EffectData
+	wireData := notify.GetEffectData()
 	if len(wireData) < 4 {
 		t.Fatal("wire data too short")
 	}
+
 	keyLen := binary.LittleEndian.Uint32(wireData[:4])
 	if keyLen == 0 {
 		t.Fatal("expected non-zero keyLen in wire format")
 	}
+
 	protoData := wireData[4+keyLen:]
+
 	var eff pb.Effect
 	if err := proto.Unmarshal(protoData, &eff); err != nil {
 		t.Fatal(err)
 	}
-	if string(eff.Key) != "k" {
-		t.Fatalf("expected key=k, got %s", eff.Key)
+
+	if string(eff.GetKey()) != "k" {
+		t.Fatalf("expected key=k, got %s", eff.GetKey())
 	}
 }
 
@@ -665,6 +710,7 @@ func TestMultipleKeys(t *testing.T) {
 	if err := ctx.Emit(dataEffect("a")); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := ctx.Emit(dataEffect("b")); err != nil {
 		t.Fatal(err)
 	}
@@ -677,6 +723,7 @@ func TestMultipleKeys(t *testing.T) {
 	if e.index.Contains("a") == nil {
 		t.Fatal("expected index entry for key a")
 	}
+
 	if e.index.Contains("b") == nil {
 		t.Fatal("expected index entry for key b")
 	}
@@ -715,13 +762,14 @@ func TestIndexInvisibleBeforeFlush(t *testing.T) {
 
 type txnMockBroadcaster struct {
 	mockBroadcaster
+
 	replicateToResults map[pb.NodeID]*pb.NackNotify // nodeID → NackNotify (nil = ACK)
 	replicateToErr     error
 	replicateToCalls   []pb.NodeID // node IDs called
 }
 
 func (m *txnMockBroadcaster) ReplicateMarshalled(notify *pb.OffsetNotify, _ []byte, target pb.NodeID) ([]*pb.NackNotify, error) {
-	return m.ReplicateTo(notify, notify.EffectData, target)
+	return m.ReplicateTo(notify, notify.GetEffectData(), target)
 }
 
 func (m *txnMockBroadcaster) ReplicateTo(notify *pb.OffsetNotify, wireData []byte, targetNodeID pb.NodeID) ([]*pb.NackNotify, error) {
@@ -729,12 +777,15 @@ func (m *txnMockBroadcaster) ReplicateTo(notify *pb.OffsetNotify, wireData []byt
 	if m.replicateToErr != nil {
 		return nil, m.replicateToErr
 	}
+
 	if m.replicateToResults != nil {
 		if nack := m.replicateToResults[targetNodeID]; nack != nil {
 			return []*pb.NackNotify{nack}, nil
 		}
+
 		return nil, nil
 	}
+
 	return nil, nil
 }
 
@@ -750,6 +801,7 @@ func newTxnTestEngine(bc Broadcaster) *Engine {
 		m.peerIDs = []pb.NodeID{99}
 		m.allRegionPeersReachable = true
 	}
+
 	e := &Engine{
 		index:             keytrie.NewCritbit[leafState](),
 		broadcaster:       bc,
@@ -764,6 +816,7 @@ func newTxnTestEngine(bc Broadcaster) *Engine {
 		effectCache:       newVertexPool(),
 	}
 	e.safety.Store(&safetyMap{defaultMode: UnsafeMode})
+
 	return e
 }
 
@@ -777,6 +830,7 @@ func TestFlushTx_NoSubscribers_CommitsImmediately(t *testing.T) {
 
 	ctx := e.NewContext()
 	ctx.BeginTx()
+
 	if err := ctx.Emit(dataEffect("k")); err != nil {
 		t.Fatal(err)
 	}
@@ -803,6 +857,7 @@ func TestFlushTx_NoNACKs_Commits(t *testing.T) {
 	// Pre-populate subscriber info: write a subscription effect to the key
 	// so that GetSnapshot sees a subscriber
 	subCtx := e.NewContext()
+
 	subEff := &pb.Effect{
 		Key: []byte("k"),
 		Kind: &pb.Effect_Subscription{Subscription: &pb.SubscriptionEffect{
@@ -812,6 +867,7 @@ func TestFlushTx_NoNACKs_Commits(t *testing.T) {
 	if err := subCtx.Emit(subEff); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := subCtx.Flush(); err != nil {
 		t.Fatal(err)
 	}
@@ -819,6 +875,7 @@ func TestFlushTx_NoNACKs_Commits(t *testing.T) {
 	// Now do the transactional write
 	ctx := e.NewContext()
 	ctx.BeginTx()
+
 	if err := ctx.Emit(dataEffect("k")); err != nil {
 		t.Fatal(err)
 	}
@@ -848,6 +905,7 @@ func TestFlushTx_RealConflict_Aborts(t *testing.T) {
 
 	// Add subscriber
 	subCtx := e.NewContext()
+
 	subEff := &pb.Effect{
 		Key: []byte("k"),
 		Kind: &pb.Effect_Subscription{Subscription: &pb.SubscriptionEffect{
@@ -857,6 +915,7 @@ func TestFlushTx_RealConflict_Aborts(t *testing.T) {
 	if err := subCtx.Emit(subEff); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := subCtx.Flush(); err != nil {
 		t.Fatal(err)
 	}
@@ -864,6 +923,7 @@ func TestFlushTx_RealConflict_Aborts(t *testing.T) {
 	// Transactional write
 	ctx := e.NewContext()
 	ctx.BeginTx()
+
 	if err := ctx.Emit(dataEffect("k")); err != nil {
 		t.Fatal(err)
 	}
@@ -894,6 +954,7 @@ func TestFlushTx_FakeConflict_Commits(t *testing.T) {
 
 	// Add subscriber
 	subCtx := e.NewContext()
+
 	subEff := &pb.Effect{
 		Key: []byte("k"),
 		Kind: &pb.Effect_Subscription{Subscription: &pb.SubscriptionEffect{
@@ -903,6 +964,7 @@ func TestFlushTx_FakeConflict_Commits(t *testing.T) {
 	if err := subCtx.Emit(subEff); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := subCtx.Flush(); err != nil {
 		t.Fatal(err)
 	}
@@ -910,6 +972,7 @@ func TestFlushTx_FakeConflict_Commits(t *testing.T) {
 	// Transactional write
 	ctx := e.NewContext()
 	ctx.BeginTx()
+
 	if err := ctx.Emit(dataEffect("k")); err != nil {
 		t.Fatal(err)
 	}
@@ -1009,6 +1072,7 @@ func TestFlushTx_VerdictSnapshotEmittedOnLoserOnlyKeys(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := subCtx.Flush(); err != nil {
 		t.Fatal(err)
 	}
@@ -1021,9 +1085,11 @@ func TestFlushTx_VerdictSnapshotEmittedOnLoserOnlyKeys(t *testing.T) {
 	// Our winning txn writes only the shared key.
 	ctx := e.NewContext()
 	ctx.BeginTx()
+
 	if err := ctx.Emit(dataEffect(sharedKey)); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := ctx.Flush(); err != nil {
 		t.Fatalf("expected commit, got %v", err)
 	}
@@ -1038,26 +1104,32 @@ func TestFlushTx_VerdictSnapshotEmittedOnLoserOnlyKeys(t *testing.T) {
 	}
 
 	foundLoserOnlyVerdict := false
+
 	for _, tip := range loserOnlyTips.Tips() {
 		eff, ok := e.effectCache.Get(tip)
 		if !ok {
 			continue
 		}
+
 		snap := eff.GetSnapshot()
 		if snap == nil {
 			continue
 		}
-		v, ok := snap.TxnVerdicts[loserTxnID]
+
+		v, ok := snap.GetTxnVerdicts()[loserTxnID]
 		if !ok {
 			t.Fatalf("verdict snapshot on %q is missing the loser txn %q in TxnVerdicts (got %v)",
-				loserOnlyKey, loserTxnID, snap.TxnVerdicts)
+				loserOnlyKey, loserTxnID, snap.GetTxnVerdicts())
 		}
+
 		if v != pb.Verdict_LOST {
 			t.Fatalf("verdict snapshot on %q records loser %q as %v, want LOST",
 				loserOnlyKey, loserTxnID, v)
 		}
+
 		foundLoserOnlyVerdict = true
 	}
+
 	if !foundLoserOnlyVerdict {
 		t.Fatalf("loser-only key %q has tips but none are a SnapshotEffect carrying TxnVerdicts", loserOnlyKey)
 	}
@@ -1069,21 +1141,27 @@ func TestFlushTx_VerdictSnapshotEmittedOnLoserOnlyKeys(t *testing.T) {
 	if sharedTips == nil {
 		t.Fatalf("shared key %q has no tips after commit", sharedKey)
 	}
+
 	foundSharedVerdict := false
+
 	for _, tip := range sharedTips.Tips() {
 		eff, ok := e.effectCache.Get(tip)
 		if !ok {
 			continue
 		}
+
 		snap := eff.GetSnapshot()
 		if snap == nil {
 			continue
 		}
-		if v, ok := snap.TxnVerdicts[loserTxnID]; ok && v == pb.Verdict_LOST {
+
+		if v, ok := snap.GetTxnVerdicts()[loserTxnID]; ok && v == pb.Verdict_LOST {
 			foundSharedVerdict = true
+
 			break
 		}
 	}
+
 	if !foundSharedVerdict {
 		t.Fatalf("no verdict snapshot on shared key %q records the loser as LOST", sharedKey)
 	}
@@ -1114,18 +1192,22 @@ func TestEmit_ExcludesInProgressTxTips(t *testing.T) {
 	if tips == nil {
 		t.Fatal("expected index entry for key k")
 	}
+
 	for _, off := range tips.Tips() {
 		cached, ok := e.effectCache.Get(off)
 		if !ok {
 			continue
 		}
+
 		if cached.GetData() != nil {
-			if len(cached.Deps) != 1 || cached.Deps[0].Offset != 200 {
-				t.Fatalf("expected deps with offset 200 (pre-tx dep), got %v", cached.Deps)
+			if len(cached.GetDeps()) != 1 || cached.GetDeps()[0].GetOffset() != 200 {
+				t.Fatalf("expected deps with offset 200 (pre-tx dep), got %v", cached.GetDeps())
 			}
+
 			return
 		}
 	}
+
 	t.Fatal("did not find data effect in cache")
 }
 
@@ -1139,9 +1221,11 @@ func TestFlushNonTx_Unchanged(t *testing.T) {
 	if err := ctx.Emit(dataEffect("a")); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := ctx.Emit(dataEffect("b")); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := ctx.Flush(); err != nil {
 		t.Fatal(err)
 	}
@@ -1149,9 +1233,11 @@ func TestFlushNonTx_Unchanged(t *testing.T) {
 	if e.index.Contains("a") == nil {
 		t.Fatal("expected index entry for key a")
 	}
+
 	if e.index.Contains("b") == nil {
 		t.Fatal("expected index entry for key b")
 	}
+
 	if len(bc.broadcasts) != 2 {
 		t.Fatalf("expected 2 broadcasts, got %d", len(bc.broadcasts))
 	}
@@ -1166,6 +1252,7 @@ func TestResolveTipDeps_NoPendingTips(t *testing.T) {
 	if len(resolved) != 3 {
 		t.Fatalf("expected 3 tips, got %d", len(resolved))
 	}
+
 	for i, tip := range tips {
 		if resolved[i] != tip {
 			t.Fatalf("expected tip %v, got %v", tip, resolved[i])
@@ -1184,9 +1271,11 @@ func TestResolveTipDeps_WithPendingTips(t *testing.T) {
 
 	// Should be [{42,100}, {42,50}, {42,60}, {42,300}] (200 replaced with 50, 60)
 	expected := map[Tip]bool{{42, 100}: true, {42, 50}: true, {42, 60}: true, {42, 300}: true}
+
 	if len(resolved) != 4 {
 		t.Fatalf("expected 4 resolved tips, got %d: %v", len(resolved), resolved)
 	}
+
 	for _, r := range resolved {
 		if !expected[r] {
 			t.Fatalf("unexpected tip %v in resolved %v", r, resolved)
@@ -1198,6 +1287,7 @@ func TestFlushTx_SerializationEscalation_AfterNAborts(t *testing.T) {
 	if !adaptiveSerializationEnabled {
 		t.Skip("adaptive serialization disabled")
 	}
+
 	bc := &txnMockBroadcaster{
 		replicateToResults: map[pb.NodeID]*pb.NackNotify{
 			99: {
@@ -1217,6 +1307,7 @@ func TestFlushTx_SerializationEscalation_AfterNAborts(t *testing.T) {
 
 	// Add subscriber
 	subCtx := e.NewContext()
+
 	subEff := &pb.Effect{
 		Key: []byte("k"),
 		Kind: &pb.Effect_Subscription{Subscription: &pb.SubscriptionEffect{
@@ -1226,6 +1317,7 @@ func TestFlushTx_SerializationEscalation_AfterNAborts(t *testing.T) {
 	if err := subCtx.Emit(subEff); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := subCtx.Flush(); err != nil {
 		t.Fatal(err)
 	}
@@ -1234,9 +1326,11 @@ func TestFlushTx_SerializationEscalation_AfterNAborts(t *testing.T) {
 	for i := range DefaultSerializationThreshold {
 		ctx := e.NewContext()
 		ctx.BeginTx()
+
 		if err := ctx.Emit(dataEffect("k")); err != nil {
 			t.Fatal(err)
 		}
+
 		err := ctx.Flush()
 		if !errors.Is(err, ErrTxnAborted) {
 			t.Fatalf("iteration %d: expected ErrTxnAborted, got %v", i, err)
@@ -1249,17 +1343,22 @@ func TestFlushTx_SerializationEscalation_AfterNAborts(t *testing.T) {
 	if tips == nil {
 		t.Fatal("expected index entry for key k after serialization escalation")
 	}
+
 	found := false
+
 	for _, off := range tips.Tips() {
 		cached, ok := e.effectCache.Get(off)
 		if !ok {
 			continue
 		}
+
 		if cached.GetSerialization() != nil {
 			found = true
+
 			break
 		}
 	}
+
 	if !found {
 		t.Fatal("expected SerializationEffect after consecutive aborts")
 	}
@@ -1362,6 +1461,7 @@ func TestResolveTipDeps_NilDepsKeepsTip(t *testing.T) {
 	if len(resolved) != 3 {
 		t.Fatalf("expected 3 resolved tips, got %d: %v", len(resolved), resolved)
 	}
+
 	expected := []Tip{{42, 100}, {42, 200}, {42, 300}}
 	for i, r := range resolved {
 		if r != expected[i] {
@@ -1429,6 +1529,7 @@ func TestGetSnapshot_ExcludesPendingTxTips(t *testing.T) {
 	if err := ctxCommit.Emit(scalarSet("k", "committed")); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := ctxCommit.Flush(); err != nil {
 		t.Fatal(err)
 	}
@@ -1437,11 +1538,13 @@ func TestGetSnapshot_ExcludesPendingTxTips(t *testing.T) {
 	if committedTips == nil || committedTips.Len() != 1 {
 		t.Fatal("expected 1 tip after committed write")
 	}
+
 	committedOff := committedTips.Tips()[0]
 
 	// Write an in-progress tx effect
 	ctxTx := e.NewContext()
 	ctxTx.BeginTx()
+
 	if err := ctxTx.Emit(scalarSet("k", "uncommitted")); err != nil {
 		t.Fatal(err)
 	}
@@ -1460,20 +1563,26 @@ func TestGetSnapshot_ExcludesPendingTxTips(t *testing.T) {
 	// during the tx flush — that one is commutative metadata, not the
 	// bind we want to simulate as pending).
 	var txOff Tip
+
 	for _, off := range txTips.Tips() {
 		if off == committedOff {
 			continue
 		}
+
 		eff, ok := e.effectCache.Get(off)
 		if !ok {
 			continue
 		}
+
 		if eff.GetSubscription() != nil {
 			continue
 		}
+
 		txOff = off
+
 		break
 	}
+
 	if txOff == (Tip{}) {
 		t.Fatal("did not find tx bind tip in index after tx flush")
 	}
@@ -1486,11 +1595,13 @@ func TestGetSnapshot_ExcludesPendingTxTips(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if result == nil {
 		t.Fatal("expected non-nil result")
 	}
-	if string(result.Scalar.GetRaw()) != "committed" {
-		t.Fatalf("expected committed value, got %q", string(result.Scalar.GetRaw()))
+
+	if string(result.GetScalar().GetRaw()) != "committed" {
+		t.Fatalf("expected committed value, got %q", string(result.GetScalar().GetRaw()))
 	}
 }
 
@@ -1516,6 +1627,7 @@ func TestSSI_SnapshotIsolation_ReadsConsistentState(t *testing.T) {
 	if err := ctxSetup.Emit(scalarSet("x", "original")); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := ctxSetup.Flush(); err != nil {
 		t.Fatal(err)
 	}
@@ -1530,6 +1642,7 @@ func TestSSI_SnapshotIsolation_ReadsConsistentState(t *testing.T) {
 	if err := ctxB.Emit(scalarSet("x", "modified")); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := ctxB.Flush(); err != nil {
 		t.Fatal(err)
 	}
@@ -1539,11 +1652,13 @@ func TestSSI_SnapshotIsolation_ReadsConsistentState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if result == nil {
 		t.Fatal("expected non-nil result from snapshot read")
 	}
-	if string(result.Scalar.GetRaw()) != "original" {
-		t.Fatalf("expected 'original' from snapshot, got %q", string(result.Scalar.GetRaw()))
+
+	if string(result.GetScalar().GetRaw()) != "original" {
+		t.Fatalf("expected 'original' from snapshot, got %q", string(result.GetScalar().GetRaw()))
 	}
 }
 
@@ -1555,6 +1670,7 @@ func TestSSI_ReadWriteConflict_Aborts(t *testing.T) {
 	if err := ctxSetup.Emit(scalarSet("x", "v1")); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := ctxSetup.Flush(); err != nil {
 		t.Fatal(err)
 	}
@@ -1563,6 +1679,7 @@ func TestSSI_ReadWriteConflict_Aborts(t *testing.T) {
 	ctxA := e.NewContext()
 	ctxA.BeginTx()
 	ctxA.CheckWatches()
+
 	_, _, err := ctxA.GetSnapshot("x")
 	if err != nil {
 		t.Fatal(err)
@@ -1573,6 +1690,7 @@ func TestSSI_ReadWriteConflict_Aborts(t *testing.T) {
 	if err := ctxB.Emit(scalarSet("x", "v2")); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := ctxB.Flush(); err != nil {
 		t.Fatal(err)
 	}
@@ -1603,6 +1721,7 @@ func TestSSI_SubscriberNACK_AbortsLoser(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := subCtx.Flush(); err != nil {
 		t.Fatal(err)
 	}
@@ -1612,12 +1731,15 @@ func TestSSI_SubscriberNACK_AbortsLoser(t *testing.T) {
 	if err := setupCtx.Emit(scalarSet("x", "v1")); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := setupCtx.Flush(); err != nil {
 		t.Fatal(err)
 	}
 	// The setup write's offset is the shared causal base
 	setupTips := e.index.Contains("x")
+
 	var sharedBase []*pb.EffectRef
+
 	if setupTips != nil {
 		for _, t := range setupTips.Tips() {
 			sharedBase = append(sharedBase, toPbRef(t))
@@ -1650,6 +1772,7 @@ func TestSSI_SubscriberNACK_AbortsLoser(t *testing.T) {
 	ctx := e.NewContext()
 	ctx.BeginTx()
 	ctx.CheckWatches()
+
 	_, _, err := ctx.GetSnapshot("x")
 	if err != nil {
 		t.Fatal(err)
@@ -1670,6 +1793,7 @@ func TestSSI_WinnerResultsReturned_LoserAborted(t *testing.T) {
 	if err := setupCtx.Emit(scalarSet("x", "v1")); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := setupCtx.Flush(); err != nil {
 		t.Fatal(err)
 	}
@@ -1678,10 +1802,12 @@ func TestSSI_WinnerResultsReturned_LoserAborted(t *testing.T) {
 	ctxA := e.NewContext()
 	ctxA.BeginTx()
 	ctxA.CheckWatches()
+
 	_, _, err := ctxA.GetSnapshot("x")
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if err := ctxA.Emit(scalarSet("x", "winner")); err != nil {
 		t.Fatal(err)
 	}
@@ -1691,6 +1817,7 @@ func TestSSI_WinnerResultsReturned_LoserAborted(t *testing.T) {
 	if err := ctxB.Emit(scalarSet("x", "concurrent")); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := ctxB.Flush(); err != nil {
 		t.Fatal(err)
 	}
@@ -1708,10 +1835,12 @@ func TestSSI_WinnerResultsReturned_LoserAborted(t *testing.T) {
 	if err2 != nil {
 		t.Fatal(err2)
 	}
+
 	if result == nil {
 		t.Fatal("expected non-nil snapshot after abort")
 	}
-	val := string(result.Scalar.GetRaw())
+
+	val := string(result.GetScalar().GetRaw())
 	if val != "concurrent" && val != "winner" {
 		t.Fatalf("expected 'concurrent' or 'winner' as surviving value, got %q", val)
 	}
@@ -1730,6 +1859,7 @@ func TestSSI_SnapshotDoesNotSeeKeysCreatedAfterTxStart(t *testing.T) {
 	if err := ctxB.Emit(scalarSet("newkey", "hello")); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := ctxB.Flush(); err != nil {
 		t.Fatal(err)
 	}
@@ -1739,6 +1869,7 @@ func TestSSI_SnapshotDoesNotSeeKeysCreatedAfterTxStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if result != nil {
 		t.Fatal("expected nil for key created after snapshot, got non-nil")
 	}
@@ -1752,6 +1883,7 @@ func TestSSI_WriteWithinTxUsesSnapshotDeps(t *testing.T) {
 	if err := setupCtx.Emit(scalarSet("x", "v1")); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := setupCtx.Flush(); err != nil {
 		t.Fatal(err)
 	}
@@ -1766,6 +1898,7 @@ func TestSSI_WriteWithinTxUsesSnapshotDeps(t *testing.T) {
 	if err := ctxB.Emit(scalarSet("x", "v2")); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := ctxB.Flush(); err != nil {
 		t.Fatal(err)
 	}
@@ -1794,6 +1927,7 @@ func TestFlushTx_ConsumesTips_LinearChain(t *testing.T) {
 	if err := setup.Emit(scalarSet("k", "v0")); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := setup.Flush(); err != nil {
 		t.Fatal(err)
 	}
@@ -1839,6 +1973,7 @@ func TestFlushTx_ConsumesTips_LinearChain(t *testing.T) {
 		if postTips == nil {
 			t.Fatalf("iteration %d: expected tips after flush, got nil", i)
 		}
+
 		if len(postTips.Tips()) != 1 {
 			t.Fatalf("iteration %d: expected 1 tip after tx, got %d: %v",
 				i, len(postTips.Tips()), postTips.Tips())
@@ -1846,10 +1981,12 @@ func TestFlushTx_ConsumesTips_LinearChain(t *testing.T) {
 
 		// Verify the tip is a BIND effect via effectCache
 		bindOffset := postTips.Tips()[0]
+
 		cached, ok := e.effectCache.Get(bindOffset)
 		if !ok {
 			t.Fatalf("iteration %d: could not find BIND at offset %d in effectCache", i, bindOffset)
 		}
+
 		if cached.GetTxnBind() == nil {
 			t.Fatalf("iteration %d: tip at offset %d is not a BIND", i, bindOffset)
 		}
@@ -1866,6 +2003,7 @@ func TestSpokenBinds_PopulatedOnHandleRemoteBind(t *testing.T) {
 	defer func() { _ = e.Close() }()
 
 	const remoteNodeID pb.NodeID = 42
+
 	ct1 := Tip{uint64(remoteNodeID), 7}
 	ct2 := Tip{uint64(remoteNodeID), 8}
 
@@ -1891,6 +2029,7 @@ func TestSpokenBinds_PopulatedOnHandleRemoteBind(t *testing.T) {
 	if _, ok := e.spokenBinds.Get(ct1, 0); !ok {
 		t.Fatalf("expected spokenBinds to contain %v after handleRemoteBind, got miss", ct1)
 	}
+
 	if _, ok := e.spokenBinds.Get(ct2, 0); !ok {
 		t.Fatalf("expected spokenBinds to contain %v after handleRemoteBind, got miss", ct2)
 	}
@@ -1917,6 +2056,7 @@ func TestSpokenBinds_PreflightAbortsOnHit(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed emit: %v", err)
 	}
+
 	if err := ctx.Flush(); err != nil {
 		t.Fatalf("seed flush: %v", err)
 	}
@@ -1928,12 +2068,14 @@ func TestSpokenBinds_PreflightAbortsOnHit(t *testing.T) {
 	if tips == nil || len(tips.Tips()) == 0 {
 		t.Fatalf("expected at least one tip on 'k' after seed")
 	}
+
 	spokenTip := tips.Tips()[0]
 	e.spokenBinds.Put(spokenTip, struct{}{})
 
 	// Start a transactional emit on "k" — pre-flight should abort.
 	ctx2 := e.NewContext()
 	ctx2.BeginTx()
+
 	if err := ctx2.Emit(&pb.Effect{
 		Key:  []byte("k"),
 		Kind: &pb.Effect_Data{Data: orderedInsert(pb.Placement_PLACE_TAIL, "newer", []byte("newer"))},
@@ -1965,6 +2107,7 @@ func TestSpokenBinds_PreflightAllowsOnMiss(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed emit: %v", err)
 	}
+
 	if err := ctx.Flush(); err != nil {
 		t.Fatalf("seed flush: %v", err)
 	}
@@ -1972,6 +2115,7 @@ func TestSpokenBinds_PreflightAllowsOnMiss(t *testing.T) {
 	// Do NOT populate spokenBinds. Pre-flight should not abort.
 	ctx2 := e.NewContext()
 	ctx2.BeginTx()
+
 	if err := ctx2.Emit(&pb.Effect{
 		Key:  []byte("k"),
 		Kind: &pb.Effect_Data{Data: orderedInsert(pb.Placement_PLACE_TAIL, "newer", []byte("newer"))},

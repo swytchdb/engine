@@ -71,6 +71,7 @@ func isSystemKey(key []byte) bool {
 // serve", so reclaim never strands an un-served fetch as a permanent leak.
 func (e *Engine) isServed(key []byte) bool {
 	_, sub := e.subscriptions.Load(string(key))
+
 	return sub
 }
 
@@ -81,7 +82,8 @@ func (e *Engine) putIngested(tip Tip, eff *pb.Effect, protoLen int) {
 	if e.effectCache == nil {
 		return
 	}
-	if e.isServed(eff.Key) {
+
+	if e.isServed(eff.GetKey()) {
 		e.effectCache.PutSized(tip, eff, protoLen)
 	} else {
 		e.effectCache.PutSizedCache(tip, eff, protoLen)
@@ -290,14 +292,18 @@ func (e *Engine) ScanKeys(after string, pattern string, fn func(key string) bool
 	if after == "" {
 		ranger = func(_ string, fn func(string) bool) { e.index.Range(fn) }
 	}
+
 	if pattern == "*" {
 		ranger(after, fn)
+
 		return
 	}
+
 	ranger(after, func(key string) bool {
 		if keytrie.MatchGlob(key, pattern) {
 			return fn(key)
 		}
+
 		return true
 	})
 }
@@ -306,15 +312,14 @@ func (e *Engine) ScanKeys(after string, pattern string, fn func(key string) bool
 // Uses a point-in-time snapshot for consistency.
 func (e *Engine) MatchKeys(pattern string) []string {
 	snap := e.index.Snapshot()
+
 	return snap.MatchPattern(pattern)
 }
-
-// swytchEpoch is Jan 7, 2026 00:00:00 UTC.
-var swytchEpoch = time.Date(2026, 1, 7, 0, 0, 0, 0, time.UTC)
 
 // nextOffset returns a globally unique (nodeID, seq) Tip for the next effect.
 func (e *Engine) nextOffset() Tip {
 	seq := e.nextOff.Add(1)
+
 	return Tip{uint64(e.nodeID), seq}
 }
 
@@ -327,6 +332,7 @@ const FlushKey = "__swytch:flush"
 func (e *Engine) FlushIndex() {
 	e.flushGeneration.Add(1)
 	slog.Info("FlushIndex: wiping all keys from index")
+
 	keys := e.index.Keys()
 	for _, key := range keys {
 		tips := e.index.Contains(key)
@@ -336,6 +342,7 @@ func (e *Engine) FlushIndex() {
 			ls, _ := e.index.LoadOrStoreData(key, &leafState{})
 			e.releaseChainRefs(key, tips.Tips(), ls)
 		}
+
 		e.index.Delete(key, tips)
 	}
 }
@@ -347,6 +354,7 @@ func (e *Engine) GetLock(key string) *sync.Mutex {
 		hash ^= uint32(key[i])
 		hash *= 16777619
 	}
+
 	return &e.locks[hash&4095]
 }
 
@@ -361,6 +369,7 @@ func (sm *safetyMap) modeForKey(key string) SafetyMode {
 			return rule.Mode
 		}
 	}
+
 	return sm.defaultMode
 }
 
@@ -401,6 +410,7 @@ func NewEngine(cfg EngineConfig) *Engine {
 	} else if cfg.MemoryLimit > 0 {
 		memTarget = cfg.MemoryLimit
 	}
+
 	e.memTarget = memTarget
 	e.startMemoryGovernor(memTarget)
 
@@ -434,15 +444,11 @@ func (e *Engine) NodeID() pb.NodeID {
 func (e *Engine) PinKey(key string) bool   { return e.index.Pin(key) }
 func (e *Engine) UnpinKey(key string) bool { return e.index.Unpin(key) }
 
-// makeTip constructs a full Tip from a local offset.
-func (e *Engine) makeTip(offset uint64) Tip {
-	return Tip{uint64(e.nodeID), offset}
-}
-
 // generateTxnID returns a globally unique transaction ID.
 // Format: "nodeID:hlc:seq" — unique across reboots (HLC provides time component).
 func (e *Engine) generateTxnID() string {
 	seq := e.txnIDCounter.Add(1)
+
 	return fmt.Sprintf("%d:%d:%d", e.nodeID, e.clock.Now().UnixNano(), seq)
 }
 
@@ -471,6 +477,7 @@ func (e *Engine) ArenaBytes() int64 {
 	if e.index == nil {
 		return 0
 	}
+
 	return e.index.ArenaBytes()
 }
 
@@ -479,6 +486,7 @@ func (e *Engine) VertexCount() int {
 	if e.effectCache == nil {
 		return 0
 	}
+
 	return e.effectCache.EntryCount()
 }
 
@@ -498,14 +506,17 @@ func (e *Engine) addPeerSubscriber(key string, peer pb.NodeID) {
 	if peer == e.nodeID {
 		return
 	}
+
 	ls, _ := e.index.LoadOrStoreData(key, &leafState{})
 	if ls == nil {
 		return
 	}
+
 	ls.subMu.Lock()
 	if ls.subscribers == nil {
 		ls.subscribers = make(map[pb.NodeID]struct{})
 	}
+
 	ls.subscribers[peer] = struct{}{}
 	ls.subMu.Unlock()
 }
@@ -517,6 +528,7 @@ func (e *Engine) removePeerSubscriber(key string, peer pb.NodeID) {
 	if ls == nil {
 		return
 	}
+
 	ls.subMu.Lock()
 	delete(ls.subscribers, peer)
 	ls.subMu.Unlock()
@@ -532,15 +544,19 @@ func (e *Engine) snapshotSubscribers(key string) map[uint64]bool {
 	if ls == nil {
 		return nil
 	}
+
 	ls.subMu.Lock()
 	defer ls.subMu.Unlock()
+
 	if len(ls.subscribers) == 0 {
 		return nil
 	}
+
 	m := make(map[uint64]bool, len(ls.subscribers))
 	for id := range ls.subscribers {
 		m[uint64(id)] = true
 	}
+
 	return m
 }
 
@@ -553,15 +569,19 @@ func (e *Engine) PeerSubscribers(key string) []pb.NodeID {
 	if ls == nil {
 		return nil
 	}
+
 	ls.subMu.Lock()
 	defer ls.subMu.Unlock()
+
 	if len(ls.subscribers) == 0 {
 		return nil
 	}
+
 	result := make([]pb.NodeID, 0, len(ls.subscribers))
 	for id := range ls.subscribers {
 		result = append(result, id)
 	}
+
 	return result
 }
 
@@ -648,13 +668,15 @@ var ErrCDNBlobMissing = errors.New("cdn blob missing")
 // proven non-maximal when another candidate's or local root's readable
 // ancestry names it. Any missing candidate that cannot be so proven remains a
 // real tip and the caller's classification decides what to do with it.
-func NormalizeCloudTipCandidates(key string, candidates, localRoots []Tip, load func(Tip) (*pb.Effect, error)) (real, superseded []Tip, err error) {
+func NormalizeCloudTipCandidates(key string, candidates, localRoots []Tip, load func(Tip) (*pb.Effect, error)) (realTips, superseded []Tip, err error) {
 	candidateSet := make(map[Tip]struct{}, len(candidates))
+
 	unique := make([]Tip, 0, len(candidates))
 	for _, candidate := range candidates {
 		if _, exists := candidateSet[candidate]; exists {
 			continue
 		}
+
 		candidateSet[candidate] = struct{}{}
 		unique = append(unique, candidate)
 	}
@@ -663,13 +685,16 @@ func NormalizeCloudTipCandidates(key string, candidates, localRoots []Tip, load 
 	visited := make(map[Tip]struct{}, (len(unique)+len(localRoots))*8)
 	queue := make([]Tip, 0, len(unique)+len(localRoots))
 	queue = append(queue, unique...)
+
 	queue = append(queue, localRoots...)
 	for len(queue) > 0 {
 		cur := queue[0]
 		queue = queue[1:]
+
 		if _, seen := visited[cur]; seen {
 			continue
 		}
+
 		visited[cur] = struct{}{}
 
 		eff, loadErr := load(cur)
@@ -677,25 +702,30 @@ func NormalizeCloudTipCandidates(key string, candidates, localRoots []Tip, load 
 			if errors.Is(loadErr, ErrCDNBlobMissing) {
 				continue
 			}
+
 			return nil, nil, loadErr
 		}
 
 		var refs []*pb.EffectRef
+
 		if bind := eff.GetTxnBind(); bind != nil {
-			for _, kb := range bind.Keys {
-				if string(kb.Key) == key {
-					refs = []*pb.EffectRef{kb.NewTip}
+			for _, kb := range bind.GetKeys() {
+				if string(kb.GetKey()) == key {
+					refs = []*pb.EffectRef{kb.GetNewTip()}
+
 					break
 				}
 			}
 		} else {
 			refs = eff.GetDeps()
 		}
+
 		for _, ref := range refs {
 			dep := r(ref)
 			if _, candidate := candidateSet[dep]; candidate && dep != cur {
 				supersededSet[dep] = struct{}{}
 			}
+
 			queue = append(queue, dep)
 		}
 	}
@@ -704,10 +734,11 @@ func NormalizeCloudTipCandidates(key string, candidates, localRoots []Tip, load 
 		if _, stale := supersededSet[candidate]; stale {
 			superseded = append(superseded, candidate)
 		} else {
-			real = append(real, candidate)
+			realTips = append(realTips, candidate)
 		}
 	}
-	return real, superseded, nil
+
+	return realTips, superseded, nil
 }
 
 // hydrateFromCloud is the tiered-storage rehydrate on a read-miss: it asks
@@ -729,25 +760,32 @@ func (e *Engine) hydrateFromCloud(key string) (installed, consulted bool, err er
 	if e.cloudReader == nil {
 		return false, false, nil
 	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), cloudTipsBackstop)
 	defer cancel()
+
 	tips, sidecar, missing, err := e.cloudReader.CloudTips(ctx, key)
 	if err != nil {
 		slog.Warn("cloud read-miss backstop: get tips failed; failing read", "key", key, "error", err)
+
 		return false, false, fmt.Errorf("%w: get tips for %q: %w", ErrCloudUnavailable, key, err)
 	}
+
 	if len(tips) == 0 {
 		return false, true, nil // Cloud holds nothing either: an authoritative miss.
 	}
+
 	pending, err := e.InstallCloudTips(key, tips, sidecar, missing)
 	if err != nil {
 		return false, false, err
 	}
+
 	if len(pending) > 0 {
 		e.cloudReader.MarkPending(key)
 		slog.Warn("cloud read-miss backstop: frontier partially holed; serving readable subset, leaving the rest pending for reconcile",
 			"key", key, "pending", pending)
 	}
+
 	return e.index.Contains(key) != nil, len(pending) == 0, nil
 }
 
@@ -767,16 +805,20 @@ func (e *Engine) InstallCloudTips(key string, tips []Tip, sidecar []CloudEffect,
 	if err != nil {
 		return nil, err
 	}
+
 	if len(classification.install) > 0 {
 		slog.Debug("cloud tips: installing readable frontier", "key", key, "tips", classification.install)
 		e.installTips(key, classification.install)
 	}
+
 	if len(classification.dropped) > 0 {
 		slog.Debug("cloud tips: dropped candidate markers superseded by ancestry", "key", key, "tips", classification.dropped)
 	}
+
 	if len(classification.pending) > 0 {
 		slog.Debug("cloud tips: tips left pending on a hole", "key", key, "tips", classification.pending)
 	}
+
 	return classification.pending, nil
 }
 
@@ -811,6 +853,7 @@ func (e *Engine) classifyCloudTips(key string, tips []Tip, sidecar []CloudEffect
 			if _, ok := e.effectCache.Get(ce.Tip); ok {
 				continue
 			}
+
 			e.putIngested(ce.Tip, ce.Eff, ce.ProtoLen)
 		}
 	}
@@ -819,10 +862,12 @@ func (e *Engine) classifyCloudTips(key string, tips []Tip, sidecar []CloudEffect
 	for _, t := range missing {
 		missingSet[t] = struct{}{}
 	}
+
 	load := func(tip Tip) (*pb.Effect, error) {
 		if _, known := missingSet[tip]; known {
 			return nil, ErrCDNBlobMissing
 		}
+
 		return e.getEffect(key, tip)
 	}
 
@@ -832,24 +877,28 @@ func (e *Engine) classifyCloudTips(key string, tips []Tip, sidecar []CloudEffect
 	}
 
 	var classification cloudTipClassification
-	real, superseded, err := NormalizeCloudTipCandidates(key, tips, localRoots, load)
+
+	realTips, superseded, err := NormalizeCloudTipCandidates(key, tips, localRoots, load)
 	if err != nil {
 		return classification, fmt.Errorf("normalize cloud candidates for %q: %w", key, err)
 	}
+
 	classification.dropped = superseded
 
 	// Dependency-less subscriptions are frontier metadata, not state
 	// branches: they install unconditionally, since they carry no ancestry
 	// for a hole to hide in. State tips still need walk validation below.
-	stateTips := make([]Tip, 0, len(real))
-	for _, tip := range real {
+	stateTips := make([]Tip, 0, len(realTips))
+	for _, tip := range realTips {
 		eff, getErr := load(tip)
 		switch {
 		case getErr == nil:
 			if eff.GetSubscription() != nil && len(eff.GetDeps()) == 0 {
 				classification.install = append(classification.install, tip)
+
 				continue
 			}
+
 			stateTips = append(stateTips, tip)
 		case errors.Is(getErr, ErrCDNBlobMissing):
 			classification.pending = append(classification.pending, tip)
@@ -858,6 +907,7 @@ func (e *Engine) classifyCloudTips(key string, tips []Tip, sidecar []CloudEffect
 				ErrCloudUnavailable, tip, key, getErr)
 		}
 	}
+
 	if len(stateTips) == 0 {
 		return classification, nil
 	}
@@ -867,10 +917,12 @@ func (e *Engine) classifyCloudTips(key string, tips []Tip, sidecar []CloudEffect
 	// shared hole below their LCA, so per-tip validation alone is
 	// insufficient to prove the whole frontier installable together.
 	rd := newDag(e, key, "")
+
 	walkErr := rd.walk(stateTips, func(*pb.Effect) error { return nil })
 	switch {
 	case walkErr == nil:
 		classification.install = append(classification.install, stateTips...)
+
 		return classification, nil
 	case errors.Is(walkErr, ErrCDNBlobMissing):
 		// Fall through: split per-tip below.
@@ -881,6 +933,7 @@ func (e *Engine) classifyCloudTips(key string, tips []Tip, sidecar []CloudEffect
 
 	for _, tip := range stateTips {
 		rd := newDag(e, key, "")
+
 		walkErr := rd.walk([]Tip{tip}, func(*pb.Effect) error { return nil })
 		switch {
 		case walkErr == nil:
@@ -892,6 +945,7 @@ func (e *Engine) classifyCloudTips(key string, tips []Tip, sidecar []CloudEffect
 				ErrCloudUnavailable, tip, key, walkErr)
 		}
 	}
+
 	return classification, nil
 }
 
@@ -904,10 +958,12 @@ func (e *Engine) mintLocalEffect(key string, currentSet *keytrie.TipSet, eff *pb
 	if err != nil {
 		return Tip{}, err
 	}
+
 	offset := e.nextOffset()
 	if e.effectCache != nil {
 		e.effectCache.PutSized(offset, eff, len(data))
 	}
+
 	e.updateIndex(key, currentSet, offset)
 	e.fireLocalEffect(offset, eff)
 
@@ -915,6 +971,7 @@ func (e *Engine) mintLocalEffect(key string, currentSet *keytrie.TipSet, eff *pb
 		notify := BuildOffsetNotify(e.nodeID, offset, eff, data, context.Background())
 		e.broadcaster.BroadcastWithData(notify, data)
 	}
+
 	return offset, nil
 }
 
@@ -922,6 +979,7 @@ func (e *Engine) mintLocalEffect(key string, currentSet *keytrie.TipSet, eff *pb
 func (e *Engine) fireLocalEffect(offset Tip, eff *pb.Effect) {
 	e.localEffectMu.RLock()
 	defer e.localEffectMu.RUnlock()
+
 	if e.OnLocalEffect != nil {
 		e.OnLocalEffect(offset, eff)
 	}
@@ -961,7 +1019,7 @@ type Tip = keytrie.EffectRef
 
 // r converts a protobuf EffectRef to an internal Tip.
 func r(ref *pb.EffectRef) Tip {
-	return Tip{ref.NodeId, ref.Offset}
+	return Tip{ref.GetNodeId(), ref.GetOffset()}
 }
 
 // toPbRef converts an internal Tip to a protobuf EffectRef.
@@ -975,6 +1033,7 @@ func toPbRefs(tips []Tip) []*pb.EffectRef {
 	for i, t := range tips {
 		refs[i] = toPbRef(t)
 	}
+
 	return refs
 }
 
@@ -984,6 +1043,7 @@ func fromPbRefs(refs []*pb.EffectRef) []Tip {
 	for i, ref := range refs {
 		tips[i] = r(ref)
 	}
+
 	return tips
 }
 
@@ -999,38 +1059,52 @@ func (e *Engine) resolveTipDeps(tips []Tip) []Tip {
 	// the recursive walk's closure, seen set, and output slice until at least
 	// one tip actually needs substitution.
 	needsResolution := false
+
 	for _, tp := range tips {
 		if _, ok := e.pendingTxTips.Load(tp); ok {
 			needsResolution = true
+
 			break
 		}
 	}
+
 	if !needsResolution {
 		return tips
 	}
 
 	seen := make(map[Tip]struct{}, len(tips))
+
 	var resolved []Tip
+
 	changed := false
+
 	var walk func(Tip)
+
 	walk = func(tp Tip) {
 		if _, dup := seen[tp]; dup {
 			return
 		}
+
 		seen[tp] = struct{}{}
+
 		deps, ok := e.pendingTxTips.Load(tp)
 		if !ok {
 			resolved = append(resolved, tp)
+
 			return
 		}
+
 		changed = true
+
 		if len(deps) == 0 {
 			// First write on this key; no committed predecessor exists.
 			// Keep the tx tip — the new emit has nothing else to anchor
 			// on, and reconstruct's tx-skip filtering handles it.
 			resolved = append(resolved, tp)
+
 			return
 		}
+
 		for _, d := range deps {
 			walk(d)
 		}
@@ -1038,9 +1112,11 @@ func (e *Engine) resolveTipDeps(tips []Tip) []Tip {
 	for _, tp := range tips {
 		walk(tp)
 	}
+
 	if !changed {
 		return tips
 	}
+
 	return resolved
 }
 
@@ -1068,11 +1144,14 @@ func (e *Engine) emitSnapshot(key string, verdicts map[string]pb.Verdict) error 
 			if err != nil {
 				continue
 			}
+
 			if cached.GetSnapshot() != nil {
 				eff.GetSnapshot().PrevSnapshot = toPbRef(t)
+
 				break
 			}
 		}
+
 		eff.Deps = toPbRefs(e.resolveTipDeps(tips))
 	}
 
@@ -1085,7 +1164,8 @@ func (e *Engine) emitSnapshot(key string, verdicts map[string]pb.Verdict) error 
 		"key", key,
 		"offset", offset,
 		"verdicts", len(verdicts),
-		"prev_snapshot", eff.GetSnapshot().PrevSnapshot)
+		"prev_snapshot", eff.GetSnapshot().GetPrevSnapshot())
+
 	return nil
 }
 
@@ -1100,11 +1180,13 @@ func (e *Engine) applySnapshotVerdicts(eff *pb.Effect) {
 	if e.horizon == nil {
 		return
 	}
+
 	snap := eff.GetSnapshot()
-	if snap == nil || len(snap.TxnVerdicts) == 0 {
+	if snap == nil || len(snap.GetTxnVerdicts()) == 0 {
 		return
 	}
-	for txnID := range snap.TxnVerdicts {
+
+	for txnID := range snap.GetTxnVerdicts() {
 		e.horizon.MakeVisible(txnID)
 	}
 }
@@ -1117,44 +1199,58 @@ func (e *Engine) lookupSnapshotVerdict(key, txnID string) (pb.Verdict, bool) {
 	if tipSet == nil {
 		return pb.Verdict_VERDICT_UNSPECIFIED, false
 	}
+
 	visited := make(map[Tip]bool)
+
 	stack := append([]Tip(nil), tipSet.Tips()...)
 	for len(stack) > 0 {
 		t := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
+
 		if visited[t] {
 			continue
 		}
+
 		visited[t] = true
+
 		eff, err := e.getEffect(key, t)
 		if err != nil {
 			continue
 		}
+
 		if snap := eff.GetSnapshot(); snap != nil {
-			if v, ok := snap.TxnVerdicts[txnID]; ok && v != pb.Verdict_VERDICT_UNSPECIFIED {
+			if v, ok := snap.GetTxnVerdicts()[txnID]; ok && v != pb.Verdict_VERDICT_UNSPECIFIED {
 				return v, true
 			}
-			if snap.PrevSnapshot != nil {
-				stack = append(stack, r(snap.PrevSnapshot))
+
+			if snap.GetPrevSnapshot() != nil {
+				stack = append(stack, r(snap.GetPrevSnapshot()))
 			}
-			for _, dep := range eff.Deps {
+
+			for _, dep := range eff.GetDeps() {
 				stack = append(stack, r(dep))
 			}
+
 			continue
 		}
+
 		if bind := eff.GetTxnBind(); bind != nil {
-			for _, kb := range bind.Keys {
-				if string(kb.Key) == key {
-					stack = append(stack, r(kb.NewTip))
+			for _, kb := range bind.GetKeys() {
+				if string(kb.GetKey()) == key {
+					stack = append(stack, r(kb.GetNewTip()))
+
 					break
 				}
 			}
+
 			continue
 		}
-		for _, dep := range eff.Deps {
+
+		for _, dep := range eff.GetDeps() {
 			stack = append(stack, r(dep))
 		}
 	}
+
 	return pb.Verdict_VERDICT_UNSPECIFIED, false
 }
 
@@ -1167,12 +1263,13 @@ func (e *Engine) lookupSnapshotVerdict(key, txnID string) (pb.Verdict, bool) {
 // Returns all NACKs generated (one per diverged key) so the caller can
 // send them synchronously as the ReplicateTo response.
 func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error) {
-	if notify == nil || notify.Origin == nil {
+	if notify == nil || notify.GetOrigin() == nil {
 		return nil, nil
 	}
 
 	if tracing.Enabled() {
 		remoteCtx := tracing.ExtractFromBytes(notify.GetTraceContext())
+
 		_, handleSpan := tracing.Tracer().Start(remoteCtx, "effects.handle_remote",
 			trace.WithAttributes(
 				attribute.String("effect.key", string(notify.GetKey())),
@@ -1183,19 +1280,22 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 	}
 
 	slog.Debug("HandleRemote: received",
-		"offset", notify.Origin.Offset,
-		"node", notify.Origin.NodeId,
-		"key", notify.Key)
+		"offset", notify.GetOrigin().GetOffset(),
+		"node", notify.GetOrigin().GetNodeId(),
+		"key", notify.GetKey())
 
-	effectData := notify.EffectData
+	effectData := notify.GetEffectData()
 	if len(effectData) == 0 {
 		// Need to fetch from the originator
 		if e.broadcaster == nil {
 			return nil, nil
 		}
-		slog.Debug("HandleRemote: fetching missing effect data", "offset", notify.Origin)
+
+		slog.Debug("HandleRemote: fetching missing effect data", "offset", notify.GetOrigin())
+
 		var err error
-		effectData, err = e.broadcaster.FetchFromAny(notify.Origin, e.fetchHint(string(notify.Key)))
+
+		effectData, err = e.broadcaster.FetchFromAny(notify.GetOrigin(), e.fetchHint(string(notify.GetKey())))
 		if err != nil {
 			return nil, err
 		}
@@ -1220,19 +1320,23 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 	// Discovery probes (anti-entropy) are ephemeral wire-only messages —
 	// handle them before fork_choice_hash validation and log storage since
 	// they are never persisted and only need to trigger a NACK response.
-	if sub := eff.GetSubscription(); sub != nil && sub.Discovery {
-		key := string(eff.Key)
+	if sub := eff.GetSubscription(); sub != nil && sub.GetDiscovery() {
+		key := string(eff.GetKey())
 		slog.Debug("HandleRemote: discovery probe, sending NACK only",
-			"key", key, "from_node", eff.NodeId)
+			"key", key, "from_node", eff.GetNodeId())
+
 		if e.broadcaster != nil {
 			initialTips := e.index.Contains(key)
+
 			var tipOffsets []keytrie.EffectRef
 			if initialTips != nil {
 				tipOffsets = initialTips.Tips()
 			}
-			nack := e.buildEnrichedNack(key, notify.Origin, tipOffsets)
-			e.broadcaster.SendNack(nack, pb.NodeID(notify.Origin.NodeId))
+
+			nack := e.buildEnrichedNack(key, notify.GetOrigin(), tipOffsets)
+			e.broadcaster.SendNack(nack, pb.NodeID(notify.GetOrigin().GetNodeId()))
 		}
+
 		return nil, nil
 	}
 
@@ -1246,10 +1350,11 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 	// engine trusts payload origin everywhere — but using Origin keeps
 	// one source of truth and prevents a malformed payload from claiming
 	// a different subscriber than its own origin.
-	if sub := eff.GetSubscription(); sub != nil && sub.Ephemeral {
+	if sub := eff.GetSubscription(); sub != nil && sub.GetEphemeral() {
 		if e.OnEphemeralSubscribe != nil {
-			e.OnEphemeralSubscribe(notify.Origin.NodeId, eff.Key, sub.Unsubscribe)
+			e.OnEphemeralSubscribe(notify.GetOrigin().GetNodeId(), eff.GetKey(), sub.GetUnsubscribe())
 		}
+
 		return nil, nil
 	}
 
@@ -1258,8 +1363,9 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 	// re-broadcast.
 	if msg := eff.GetPubsubMessage(); msg != nil {
 		if e.OnPubSubMessage != nil {
-			e.OnPubSubMessage(msg.Channel, msg.Payload)
+			e.OnPubSubMessage(msg.GetChannel(), msg.GetPayload())
 		}
+
 		return nil, nil
 	}
 
@@ -1269,15 +1375,15 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 	// to know about (a peer's brand-new key). Recording the originator's
 	// effect on K here is a safe over-approximation: worst case a needless
 	// subscribe, never a wrong free-miss. peerFilterAdd skips self.
-	if origin := pb.NodeID(eff.NodeId); origin != e.nodeID {
+	if origin := pb.NodeID(eff.GetNodeId()); origin != e.nodeID {
 		if bind := eff.GetTxnBind(); bind != nil {
-			for _, kb := range bind.Keys {
-				e.peerFilterAdd(origin, string(kb.Key))
+			for _, kb := range bind.GetKeys() {
+				e.peerFilterAdd(origin, string(kb.GetKey()))
 			}
 		} else if eff.GetData() != nil {
-			e.peerFilterAdd(origin, string(eff.Key))
-		} else if sub := eff.GetSubscription(); sub != nil && !sub.Unsubscribe {
-			e.peerFilterAdd(origin, string(eff.Key))
+			e.peerFilterAdd(origin, string(eff.GetKey()))
+		} else if sub := eff.GetSubscription(); sub != nil && !sub.GetUnsubscribe() {
+			e.peerFilterAdd(origin, string(eff.GetKey()))
 		}
 	}
 
@@ -1296,21 +1402,23 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 	// the bind when authority holds for any key in bind.Keys (not just
 	// eff.Key, the canonical first key).
 	{
-		key := string(eff.Key)
+		key := string(eff.GetKey())
 		_, subscribed := e.subscriptions.Load(key)
 		authoritative := subscribed || e.index.Contains(key) != nil
 
 		if !authoritative {
 			if bind := eff.GetTxnBind(); bind != nil {
-				for _, kb := range bind.Keys {
-					kbKey := string(kb.Key)
+				for _, kb := range bind.GetKeys() {
+					kbKey := string(kb.GetKey())
 					if _, sub := e.subscriptions.Load(kbKey); sub || e.index.Contains(kbKey) != nil {
 						authoritative = true
+
 						break
 					}
 				}
 			}
 		}
+
 		if !authoritative && key == FlushKey {
 			authoritative = true
 		}
@@ -1318,12 +1426,15 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 		if !authoritative {
 			if sub := eff.GetSubscription(); sub != nil {
 				slog.Debug("HandleRemote: empty bootstrap response for no-authority subscription",
-					"key", key, "offset", notify.Origin, "unsubscribe", sub.Unsubscribe)
+					"key", key, "offset", notify.GetOrigin(), "unsubscribe", sub.GetUnsubscribe())
+
 				return nil, nil
 			}
+
 			slog.Debug("HandleRemote: dropping notify for key with no local authority",
-				"key", key, "offset", notify.Origin)
-			return []*pb.NackNotify{{Key: eff.Key, NotSubscribed: true}}, nil
+				"key", key, "offset", notify.GetOrigin())
+
+			return []*pb.NackNotify{{Key: eff.GetKey(), NotSubscribed: true}}, nil
 		}
 	}
 
@@ -1331,65 +1442,69 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 	// This hash is the global tiebreaker for ALL effect ordering (merges,
 	// winner selection, DAG sort, FWW). Rejecting missing or incorrect
 	// hashes prevents a malicious peer from gaming deterministic ordering.
-	expected := ComputeForkChoiceHash(pb.NodeID(eff.NodeId), eff.Hlc)
-	if !bytes.Equal(eff.ForkChoiceHash, expected) {
-		return nil, fmt.Errorf("fork_choice_hash missing or mismatch for offset %v", notify.Origin)
+	expected := ComputeForkChoiceHash(pb.NodeID(eff.GetNodeId()), eff.GetHlc())
+	if !bytes.Equal(eff.GetForkChoiceHash(), expected) {
+		return nil, fmt.Errorf("fork_choice_hash missing or mismatch for offset %v", notify.GetOrigin())
 	}
 
 	// Cache deserialized effect — owned if we serve its key, reclaimable cache
 	// (no creation ref) if we only need it to read through (e.g. cross-key).
-	e.putIngested(r(notify.Origin), eff, len(protoData))
+	e.putIngested(r(notify.GetOrigin()), eff, len(protoData))
 
 	// Verdict-snapshot arrival ends horizon wait for every txn it adjudicates.
 	e.applySnapshotVerdicts(eff)
 
 	// Handle flush-all: wipe the entire index
-	if string(eff.Key) == FlushKey {
-		if data := eff.GetData(); data != nil && data.Op == pb.EffectOp_REMOVE_OP {
-			slog.Info("HandleRemote: received flush-all from peer", "node", notify.Origin.NodeId)
+	if string(eff.GetKey()) == FlushKey {
+		if data := eff.GetData(); data != nil && data.GetOp() == pb.EffectOp_REMOVE_OP {
+			slog.Info("HandleRemote: received flush-all from peer", "node", notify.GetOrigin().GetNodeId())
 			e.FlushIndex()
+
 			if e.OnFlushAll != nil {
 				e.OnFlushAll()
 			}
+
 			return nil, nil
 		}
 	}
 
 	// Track in-progress transactional tips
-	if eff.TxnId != "" && eff.GetTxnBind() == nil {
-		slog.Debug("HandleRemote: tracking pending tx tip", "offset", notify.Origin, "deps", eff.Deps)
-		e.pendingTxTips.Store(r(notify.Origin), fromPbRefs(eff.Deps))
+	if eff.GetTxnId() != "" && eff.GetTxnBind() == nil {
+		slog.Debug("HandleRemote: tracking pending tx tip", "offset", notify.GetOrigin(), "deps", eff.GetDeps())
+		e.pendingTxTips.Store(r(notify.GetOrigin()), fromPbRefs(eff.GetDeps()))
 	}
 
 	// Handle bind: remove entries from pendingTxTips (or defer via horizon)
 	if bind := eff.GetTxnBind(); bind != nil {
-		slog.Debug("HandleRemote: processing remote bind", "offset", notify.Origin)
-		e.handleRemoteBind(bind, r(notify.Origin), eff.TxnId)
+		slog.Debug("HandleRemote: processing remote bind", "offset", notify.GetOrigin())
+		e.handleRemoteBind(bind, r(notify.GetOrigin()), eff.GetTxnId())
 	}
 
-	key := string(eff.Key)
+	key := string(eff.GetKey())
 
 	slog.Debug("HandleRemote: updating index",
-		"key", key, "offset", notify.Origin.Offset,
-		"deps", eff.Deps)
+		"key", key, "offset", notify.GetOrigin().GetOffset(),
+		"deps", eff.GetDeps())
 
 	initialTips := e.index.Contains(key)
 
 	_, canonicalIndexable := e.subscriptions.Load(key)
 
 	// Consume deps: any dep that is a current tip becomes an ancestor.
-	deps := eff.Deps
+	deps := eff.GetDeps()
 	if bind := eff.GetTxnBind(); bind != nil {
-		for _, kb := range bind.Keys {
-			if string(kb.Key) == key {
-				deps = []*pb.EffectRef{kb.NewTip}
+		for _, kb := range bind.GetKeys() {
+			if string(kb.GetKey()) == key {
+				deps = []*pb.EffectRef{kb.GetNewTip()}
+
 				break
 			}
 		}
 	}
+
 	if canonicalIndexable {
 		// Consume deps and add the new tip in a single index transition.
-		e.updateIndex(key, keytrie.NewTipSet(fromPbRefs(deps)...), r(notify.Origin))
+		e.updateIndex(key, keytrie.NewTipSet(fromPbRefs(deps)...), r(notify.GetOrigin()))
 		// Remote inserts pay their own eviction debt: a subscribed node that runs
 		// no local commands never reaches Flush's back-pressure, so without this its
 		// pool would grow unbounded on replication traffic and dump the whole debt
@@ -1398,30 +1513,36 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 	}
 
 	if bind := eff.GetTxnBind(); bind != nil {
-		for _, kb := range bind.Keys {
-			kbKey := string(kb.Key)
+		for _, kb := range bind.GetKeys() {
+			kbKey := string(kb.GetKey())
 			if kbKey == key { // canonical handled above
 				continue
 			}
+
 			if _, ok := e.subscriptions.Load(kbKey); !ok {
 				continue
 			}
+
 			preTips := e.index.Contains(kbKey)
+
 			var preOffsets []Tip
 			if preTips != nil {
 				preOffsets = preTips.Tips()
 			}
+
 			slog.Debug("HandleRemote: indexing bind for additional key (before)",
-				"key", kbKey, "bind_offset", notify.Origin,
+				"key", kbKey, "bind_offset", notify.GetOrigin(),
 				"pre_tips", preOffsets)
-			e.updateIndex(kbKey, nil, r(notify.Origin))
+			e.updateIndex(kbKey, nil, r(notify.GetOrigin()))
 			postTips := e.index.Contains(kbKey)
+
 			var postOffsets []Tip
 			if postTips != nil {
 				postOffsets = postTips.Tips()
 			}
+
 			slog.Debug("HandleRemote: indexing bind for additional key (after)",
-				"key", kbKey, "bind_offset", notify.Origin,
+				"key", kbKey, "bind_offset", notify.GetOrigin(),
 				"post_tips", postOffsets)
 		}
 	}
@@ -1433,8 +1554,9 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 	// For bind effects, check EACH key's ConsumedTips against that key's
 	// current tips. A bind has no eff.Deps but carries per-key causal bases.
 	if bind := eff.GetTxnBind(); bind != nil {
-		for _, kb := range bind.Keys {
-			kbKey := string(kb.Key)
+		for _, kb := range bind.GetKeys() {
+			kbKey := string(kb.GetKey())
+
 			kbTips := e.index.Contains(kbKey)
 			if kbTips == nil {
 				continue
@@ -1443,38 +1565,44 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 			// doesn't know about? The bind knows about its ConsumedTips
 			// and its own effects (NewTip + the bind offset itself).
 			// Any other tip means a concurrent write happened — NACK.
-			known := make(map[Tip]bool, len(kb.ConsumedTips)+2)
-			for _, ct := range kb.ConsumedTips {
+			known := make(map[Tip]bool, len(kb.GetConsumedTips())+2)
+			for _, ct := range kb.GetConsumedTips() {
 				known[r(ct)] = true
 			}
-			known[r(kb.NewTip)] = true
-			known[r(notify.Origin)] = true // the bind itself
+
+			known[r(kb.GetNewTip())] = true
+			known[r(notify.GetOrigin())] = true // the bind itself
 			diverged := false
+
 			for _, tip := range kbTips.Tips() {
 				if !known[tip] {
 					diverged = true
+
 					break
 				}
 			}
+
 			if diverged {
 				slog.Debug("HandleRemote: bind has unknown tips, NACK",
-					"key", kbKey, "consumed_tips", kb.ConsumedTips,
-					"new_tip", kb.NewTip,
+					"key", kbKey, "consumed_tips", kb.GetConsumedTips(),
+					"new_tip", kb.GetNewTip(),
 					"current_tips", kbTips.Tips())
-				nacks = append(nacks, e.buildEnrichedNack(kbKey, notify.Origin, kbTips.Tips()))
+				nacks = append(nacks, e.buildEnrichedNack(kbKey, notify.GetOrigin(), kbTips.Tips()))
 			}
 		}
-	} else if initialTips != nil && len(eff.Deps) > 0 {
+	} else if initialTips != nil && len(eff.GetDeps()) > 0 {
 		preTips := initialTips.Tips()
-		if !depsMatchTips(fromPbRefs(eff.Deps), preTips) {
+		if !depsMatchTips(fromPbRefs(eff.GetDeps()), preTips) {
 			slog.Debug("HandleRemote: deps diverged, NACK",
-				"key", key, "deps", eff.Deps, "tips", preTips)
+				"key", key, "deps", eff.GetDeps(), "tips", preTips)
 			postTips := e.index.Contains(key)
+
 			var postTipOffsets []Tip
 			if postTips != nil {
 				postTipOffsets = postTips.Tips()
 			}
-			nacks = append(nacks, e.buildEnrichedNack(key, notify.Origin, postTipOffsets))
+
+			nacks = append(nacks, e.buildEnrichedNack(key, notify.GetOrigin(), postTipOffsets))
 		}
 	}
 
@@ -1485,54 +1613,62 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 	// Also maintain the in-memory peerSubscribers map so flushTx doesn't
 	// have to re-derive the subscriber set from the DAG (where reconstruct
 	// can return Subscribers-less results for legitimate reasons).
-	if sub := eff.GetSubscription(); sub != nil && eff.NodeId != uint64(e.nodeID) {
-		if sub.Unsubscribe {
-			e.removePeerSubscriber(key, pb.NodeID(eff.NodeId))
+	if sub := eff.GetSubscription(); sub != nil && eff.GetNodeId() != uint64(e.nodeID) {
+		if sub.GetUnsubscribe() {
+			e.removePeerSubscriber(key, pb.NodeID(eff.GetNodeId()))
 		} else {
-			e.addPeerSubscriber(key, pb.NodeID(eff.NodeId))
+			e.addPeerSubscriber(key, pb.NodeID(eff.GetNodeId()))
 			// The cluster key filter is populated for all inbound effects in a
 			// single block above, before the authority gate — see there.
 		}
+
 		slog.Debug("HandleRemote: remote subscription, bootstrap NACK",
-			"key", key, "from_node", eff.NodeId, "unsubscribe", sub.Unsubscribe)
+			"key", key, "from_node", eff.GetNodeId(), "unsubscribe", sub.GetUnsubscribe())
+
 		var tipOffsets []Tip
 		if initialTips != nil {
 			tipOffsets = initialTips.Tips()
 		}
-		nacks = append(nacks, e.buildEnrichedNack(key, notify.Origin, tipOffsets))
+
+		nacks = append(nacks, e.buildEnrichedNack(key, notify.GetOrigin(), tipOffsets))
 	}
 
 	// Fire notification callbacks for remote effects
-	if eff.TxnId != "" && eff.GetTxnBind() == nil {
+	if eff.GetTxnId() != "" && eff.GetTxnBind() == nil {
 		// In-progress transactional effect — skip notification until bind
 	} else if bind := eff.GetTxnBind(); bind != nil {
 		if e.horizon != nil {
 			// Callbacks deferred to MakeVisible
 		} else {
 			// Bind effect: wake waiters for each bound key (spurious wakeups OK)
-			for _, kb := range bind.Keys {
-				e.ownFilterAdd(string(kb.Key))
+			for _, kb := range bind.GetKeys() {
+				e.ownFilterAdd(string(kb.GetKey()))
+
 				if e.OnKeyDataAdded != nil {
-					e.OnKeyDataAdded(string(kb.Key))
+					e.OnKeyDataAdded(string(kb.GetKey()))
 				}
 			}
 		}
 	} else if data := eff.GetData(); data != nil {
 		// Non-transactional data effect
-		switch data.Op {
+		switch data.GetOp() {
+		case pb.EffectOp_UNKNOWN_OP:
+			// Unspecified operations do not trigger notifications.
 		case pb.EffectOp_INSERT_OP:
 			e.ownFilterAdd(key)
+
 			if e.OnKeyDataAdded != nil {
 				e.OnKeyDataAdded(key)
 			}
 		case pb.EffectOp_REMOVE_OP:
-			if len(data.Id) == 0 {
+			if len(data.GetId()) == 0 {
 				if e.OnKeyDeleted != nil {
 					e.OnKeyDeleted(key)
 				}
-			} else if data.Collection == pb.CollectionKind_ORDERED || data.Collection == pb.CollectionKind_KEYED {
+			} else if data.GetCollection() == pb.CollectionKind_ORDERED || data.GetCollection() == pb.CollectionKind_KEYED {
 				// Element remove on ordered/keyed collection — chain-wake
 				e.ownFilterAdd(key)
+
 				if e.OnKeyDataAdded != nil {
 					e.OnKeyDataAdded(key)
 				}
@@ -1552,13 +1688,16 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 // HorizonSet.Add for an already-visible txn, which is non-idempotent and
 // makes the bind invisible again until the next timer fires.
 func (e *Engine) handleBackfill(notify *pb.OffsetNotify) error {
-	if notify == nil || notify.Origin == nil {
+	if notify == nil || notify.GetOrigin() == nil {
 		return nil
 	}
 
-	effectData := notify.EffectData
+	effectData := notify.GetEffectData()
+
 	var eff *pb.Effect
+
 	fromCache := false
+
 	if len(effectData) == 0 {
 		// Already resident? Skip the network FetchFromAny — this runs inside
 		// the synchronous NACK-ingest loop that gates commit/abort, and the
@@ -1566,16 +1705,19 @@ func (e *Engine) handleBackfill(notify *pb.OffsetNotify) error {
 		// index/bind/pendingTxTips tail is idempotent, so re-running it on the
 		// cached effect is safe.
 		if e.effectCache != nil {
-			if cached, ok := e.effectCache.Get(r(notify.Origin)); ok {
+			if cached, ok := e.effectCache.Get(r(notify.GetOrigin())); ok {
 				eff, fromCache = cached, true
 			}
 		}
+
 		if !fromCache {
 			if e.broadcaster == nil {
 				return nil
 			}
+
 			var err error
-			effectData, err = e.broadcaster.FetchFromAny(notify.Origin, e.fetchHint(string(notify.Key)))
+
+			effectData, err = e.broadcaster.FetchFromAny(notify.GetOrigin(), e.fetchHint(string(notify.GetKey())))
 			if err != nil {
 				return err
 			}
@@ -1591,6 +1733,7 @@ func (e *Engine) handleBackfill(notify *pb.OffsetNotify) error {
 				protoData = effectData[4+keyLen:]
 			}
 		}
+
 		eff = &pb.Effect{}
 		if err := UnmarshalEffect(protoData, eff); err != nil {
 			return err
@@ -1598,75 +1741,82 @@ func (e *Engine) handleBackfill(notify *pb.OffsetNotify) error {
 	}
 
 	{
-		key := string(eff.Key)
+		key := string(eff.GetKey())
 		_, subscribed := e.subscriptions.Load(key)
+
 		authoritative := subscribed || e.index.Contains(key) != nil
 		if !authoritative {
 			if bind := eff.GetTxnBind(); bind != nil {
-				for _, kb := range bind.Keys {
-					kbKey := string(kb.Key)
+				for _, kb := range bind.GetKeys() {
+					kbKey := string(kb.GetKey())
 					if _, sub := e.subscriptions.Load(kbKey); sub || e.index.Contains(kbKey) != nil {
 						authoritative = true
+
 						break
 					}
 				}
 			}
 		}
+
 		if !authoritative {
 			return nil
 		}
 	}
 
-	expected := ComputeForkChoiceHash(pb.NodeID(eff.NodeId), eff.Hlc)
-	if !bytes.Equal(eff.ForkChoiceHash, expected) {
-		return fmt.Errorf("fork_choice_hash missing or mismatch for offset %v", notify.Origin)
+	expected := ComputeForkChoiceHash(pb.NodeID(eff.GetNodeId()), eff.GetHlc())
+	if !bytes.Equal(eff.GetForkChoiceHash(), expected) {
+		return fmt.Errorf("fork_choice_hash missing or mismatch for offset %v", notify.GetOrigin())
 	}
 
 	if !fromCache {
-		e.putIngested(r(notify.Origin), eff, len(protoData))
+		e.putIngested(r(notify.GetOrigin()), eff, len(protoData))
 	}
 
 	// Verdict-snapshot arrival ends horizon wait for every txn it adjudicates.
 	e.applySnapshotVerdicts(eff)
 
-	if eff.TxnId != "" && eff.GetTxnBind() == nil {
-		e.pendingTxTips.Store(r(notify.Origin), fromPbRefs(eff.Deps))
+	if eff.GetTxnId() != "" && eff.GetTxnBind() == nil {
+		e.pendingTxTips.Store(r(notify.GetOrigin()), fromPbRefs(eff.GetDeps()))
 	}
 
 	if bind := eff.GetTxnBind(); bind != nil {
-		for _, kb := range bind.Keys {
-			e.pendingTxTips.Delete(r(kb.NewTip))
+		for _, kb := range bind.GetKeys() {
+			e.pendingTxTips.Delete(r(kb.GetNewTip()))
 		}
 	}
 
-	key := string(eff.Key)
+	key := string(eff.GetKey())
 	_, canonicalIndexable := e.subscriptions.Load(key)
 
-	deps := eff.Deps
+	deps := eff.GetDeps()
 	if bind := eff.GetTxnBind(); bind != nil {
-		for _, kb := range bind.Keys {
-			if string(kb.Key) == key {
-				deps = []*pb.EffectRef{kb.NewTip}
+		for _, kb := range bind.GetKeys() {
+			if string(kb.GetKey()) == key {
+				deps = []*pb.EffectRef{kb.GetNewTip()}
+
 				break
 			}
 		}
 	}
+
 	if canonicalIndexable {
 		// Single index transition (consume deps + add arrival) so the tip
 		// refcount stays balanced — see HandleRemote.
-		e.updateIndex(key, keytrie.NewTipSet(fromPbRefs(deps)...), r(notify.Origin))
+		e.updateIndex(key, keytrie.NewTipSet(fromPbRefs(deps)...), r(notify.GetOrigin()))
 	}
 
 	if bind := eff.GetTxnBind(); bind != nil {
-		for _, kb := range bind.Keys {
-			kbKey := string(kb.Key)
+		for _, kb := range bind.GetKeys() {
+			kbKey := string(kb.GetKey())
 			if kbKey == key {
 				continue
 			}
+
 			if _, ok := e.subscriptions.Load(kbKey); !ok {
 				continue
 			}
-			e.updateIndex(kbKey, nil, r(notify.Origin))
+
+			e.updateIndex(kbKey, nil, r(notify.GetOrigin()))
 		}
 	}
 
@@ -1686,13 +1836,13 @@ func (e *Engine) handleRemoteBind(bind *pb.TransactionalBindEffect, bindOffset T
 		e.horizon.ScheduleMakeVisible(txnID, e.horizon.computeHorizonWait())
 	} else {
 		// Standalone: remove bound key tips from pendingTxTips immediately
-		for _, kb := range bind.Keys {
-			e.pendingTxTips.Delete(r(kb.NewTip))
+		for _, kb := range bind.GetKeys() {
+			e.pendingTxTips.Delete(r(kb.GetNewTip()))
 		}
 	}
 
 	// Process abort_deps: remove those offsets and abort any local pending txn
-	for _, abortedOffset := range bind.AbortDeps {
+	for _, abortedOffset := range bind.GetAbortDeps() {
 		aborted := r(abortedOffset)
 		e.pendingTxTips.Delete(aborted)
 
@@ -1701,9 +1851,11 @@ func (e *Engine) handleRemoteBind(bind *pb.TransactionalBindEffect, bindOffset T
 			for _, pk := range ptxn.keys {
 				if pk.newTip == aborted {
 					abortPendingTxn(ptxn)
+
 					return false // stop ranging
 				}
 			}
+
 			return true
 		})
 	}
@@ -1712,8 +1864,8 @@ func (e *Engine) handleRemoteBind(bind *pb.TransactionalBindEffect, bindOffset T
 	// pre-flight will abort a future local emit that forks from the
 	// same point.
 	if e.spokenBinds != nil {
-		for _, kb := range bind.Keys {
-			for _, ct := range kb.ConsumedTips {
+		for _, kb := range bind.GetKeys() {
+			for _, ct := range kb.GetConsumedTips() {
 				e.spokenBinds.Put(r(ct), struct{}{})
 			}
 		}
@@ -1745,11 +1897,12 @@ func (e *Engine) handleRemoteBind(bind *pb.TransactionalBindEffect, bindOffset T
 // Predicate refinement: two binds whose row-write evidence proves disjoint
 // element IDs on a KEYED collection coexist without aborting either.
 func (e *Engine) checkCompetingBinds(bind *pb.TransactionalBindEffect, txnID string) string {
-	for _, kb := range bind.Keys {
-		k := string(kb.Key)
-		ourNewTip := r(kb.NewTip)
-		consumedTips := make([]Tip, 0, len(kb.ConsumedTips))
-		for _, ct := range kb.ConsumedTips {
+	for _, kb := range bind.GetKeys() {
+		k := string(kb.GetKey())
+		ourNewTip := r(kb.GetNewTip())
+
+		consumedTips := make([]Tip, 0, len(kb.GetConsumedTips()))
+		for _, ct := range kb.GetConsumedTips() {
 			consumedTips = append(consumedTips, r(ct))
 		}
 
@@ -1761,78 +1914,96 @@ func (e *Engine) checkCompetingBinds(bind *pb.TransactionalBindEffect, txnID str
 		// Ancestor closure of our consumed tips on this key. A bind whose
 		// NewTip on `k` lands in this set is structurally in our past.
 		ourAncestors := make(map[Tip]struct{}, len(consumedTips)*8)
+
 		ancestorStack := make([]Tip, 0, len(consumedTips))
 		for _, t := range consumedTips {
 			if _, dup := ourAncestors[t]; dup {
 				continue
 			}
+
 			ourAncestors[t] = struct{}{}
 			ancestorStack = append(ancestorStack, t)
 		}
+
 		for len(ancestorStack) > 0 {
 			cur := ancestorStack[len(ancestorStack)-1]
 			ancestorStack = ancestorStack[:len(ancestorStack)-1]
+
 			eff, err := e.getEffect(k, cur)
 			if err != nil {
 				continue
 			}
-			for _, dep := range eff.Deps {
+
+			for _, dep := range eff.GetDeps() {
 				dt := r(dep)
 				if _, dup := ourAncestors[dt]; dup {
 					continue
 				}
+
 				ourAncestors[dt] = struct{}{}
 				ancestorStack = append(ancestorStack, dt)
 			}
 		}
 
 		visited := make(map[Tip]bool)
+
 		walkStack := append([]Tip(nil), tipSet.Tips()...)
 		for len(walkStack) > 0 {
 			t := walkStack[len(walkStack)-1]
 			walkStack = walkStack[:len(walkStack)-1]
+
 			if visited[t] {
 				continue
 			}
+
 			visited[t] = true
+
 			eff, err := e.getEffect(k, t)
 			if err != nil {
 				continue
 			}
 
 			if otherBind := eff.GetTxnBind(); otherBind != nil {
-				for _, okb := range otherBind.Keys {
-					if string(okb.Key) != k {
+				for _, okb := range otherBind.GetKeys() {
+					if string(okb.GetKey()) != k {
 						continue
 					}
-					theirNewTip := r(okb.NewTip)
+
+					theirNewTip := r(okb.GetNewTip())
 					if _, inAncestors := ourAncestors[theirNewTip]; inAncestors {
 						walkStack = append(walkStack, theirNewTip)
+
 						break
 					}
-					if txnID != "" && eff.TxnId != "" {
+
+					if txnID != "" && eff.GetTxnId() != "" {
 						conflict, bothHadEvidence := e.hasPredicateConflict(
-							txnID, eff.TxnId, k,
+							txnID, eff.GetTxnId(), k,
 							[]Tip{ourNewTip},
 							[]Tip{theirNewTip, t})
 						if bothHadEvidence && !conflict {
 							walkStack = append(walkStack, theirNewTip)
+
 							break
 						}
 					}
-					return eff.TxnId
+
+					return eff.GetTxnId()
 				}
+
 				continue
 			}
 
-			if snap := eff.GetSnapshot(); snap != nil && snap.PrevSnapshot != nil {
-				walkStack = append(walkStack, r(snap.PrevSnapshot))
+			if snap := eff.GetSnapshot(); snap != nil && snap.GetPrevSnapshot() != nil {
+				walkStack = append(walkStack, r(snap.GetPrevSnapshot()))
 			}
-			for _, dep := range eff.Deps {
+
+			for _, dep := range eff.GetDeps() {
 				walkStack = append(walkStack, r(dep))
 			}
 		}
 	}
+
 	return ""
 }
 
@@ -1846,17 +2017,18 @@ func (e *Engine) evaluateBindForkChoice(bind *pb.TransactionalBindEffect, bindOf
 		offset: bindOffset,
 		hash:   bindHash,
 		txnID:  txnID,
-		keys:   make(map[string][]Tip, len(bind.Keys)),
-		tips:   make(map[string]Tip, len(bind.Keys)),
+		keys:   make(map[string][]Tip, len(bind.GetKeys())),
+		tips:   make(map[string]Tip, len(bind.GetKeys())),
 	}
-	for _, kb := range bind.Keys {
-		k := string(kb.Key)
-		newEntry.keys[k] = fromPbRefs(kb.ConsumedTips)
-		newEntry.tips[k] = r(kb.NewTip)
+	for _, kb := range bind.GetKeys() {
+		k := string(kb.GetKey())
+		newEntry.keys[k] = fromPbRefs(kb.GetConsumedTips())
+		newEntry.tips[k] = r(kb.GetNewTip())
 	}
 
-	for _, kb := range bind.Keys {
-		k := string(kb.Key)
+	for _, kb := range bind.GetKeys() {
+		k := string(kb.GetKey())
+
 		tips := e.index.Contains(k)
 		if tips == nil {
 			continue
@@ -1866,6 +2038,7 @@ func (e *Engine) evaluateBindForkChoice(bind *pb.TransactionalBindEffect, bindOf
 			if tipOff == bindOffset {
 				continue
 			}
+
 			eff, err := e.getEffect(k, tipOff)
 			if err != nil {
 				continue
@@ -1873,24 +2046,25 @@ func (e *Engine) evaluateBindForkChoice(bind *pb.TransactionalBindEffect, bindOf
 
 			// Competing bind: fork-choice determines winner
 			if otherBind := eff.GetTxnBind(); otherBind != nil {
-				if eff.TxnId == txnID {
+				if eff.GetTxnId() == txnID {
 					continue // same transaction
 				}
 				// Already adjudicated as LOST by a snapshot? skip
-				if v, ok := e.lookupSnapshotVerdict(k, eff.TxnId); ok && v == pb.Verdict_LOST {
+				if v, ok := e.lookupSnapshotVerdict(k, eff.GetTxnId()); ok && v == pb.Verdict_LOST {
 					continue
 				}
 
 				otherEntry := &forkChoiceBindEntry{
 					offset: tipOff,
-					hash:   eff.ForkChoiceHash,
-					txnID:  eff.TxnId,
-					keys:   make(map[string][]Tip, len(otherBind.Keys)),
+					hash:   eff.GetForkChoiceHash(),
+					txnID:  eff.GetTxnId(),
+					keys:   make(map[string][]Tip, len(otherBind.GetKeys())),
 				}
-				theirNewTips := make(map[string]Tip, len(otherBind.Keys))
-				for _, okb := range otherBind.Keys {
-					otherEntry.keys[string(okb.Key)] = fromPbRefs(okb.ConsumedTips)
-					theirNewTips[string(okb.Key)] = r(okb.NewTip)
+
+				theirNewTips := make(map[string]Tip, len(otherBind.GetKeys()))
+				for _, okb := range otherBind.GetKeys() {
+					otherEntry.keys[string(okb.GetKey())] = fromPbRefs(okb.GetConsumedTips())
+					theirNewTips[string(okb.GetKey())] = r(okb.GetNewTip())
 				}
 
 				if bindsShareBase(newEntry, otherEntry) {
@@ -1901,12 +2075,13 @@ func (e *Engine) evaluateBindForkChoice(bind *pb.TransactionalBindEffect, bindOf
 					// conflict when either side lacks evidence
 					// (schema-only mutations, non-SQL binds, etc.).
 					conflict, bothHadEvidence := e.hasPredicateConflict(
-						txnID, eff.TxnId, k,
+						txnID, eff.GetTxnId(), k,
 						[]Tip{newEntry.tips[k], bindOffset},
 						[]Tip{theirNewTips[k], tipOff})
 					if bothHadEvidence && !conflict {
 						continue
 					}
+
 					if !ForkChoiceLess(newEntry.hash, otherEntry.hash) {
 						return true
 					}
@@ -1914,10 +2089,11 @@ func (e *Engine) evaluateBindForkChoice(bind *pb.TransactionalBindEffect, bindOf
 			}
 
 			// Non-transactional data effect: SSI invalidation
-			if eff.TxnId == "" && eff.GetData() != nil {
+			if eff.GetTxnId() == "" && eff.GetData() != nil {
 				// Check if this effect is concurrent with our bind on this key:
 				// not in the ancestor set of our consumed tips for this key.
-				consumed := fromPbRefs(kb.ConsumedTips)
+				consumed := fromPbRefs(kb.GetConsumedTips())
+
 				isAncestor := slices.Contains(consumed, tipOff)
 				if !isAncestor {
 					// Not a consumed tip — could be concurrent.
@@ -1928,23 +2104,31 @@ func (e *Engine) evaluateBindForkChoice(bind *pb.TransactionalBindEffect, bindOf
 					visited := make(map[Tip]bool)
 					stack := []Tip{tipOff}
 					zero := Tip{0, 0}
+
 					for len(stack) > 0 {
 						off := stack[len(stack)-1]
 						stack = stack[:len(stack)-1]
-						if off == bindOffset || off == r(kb.NewTip) {
+
+						if off == bindOffset || off == r(kb.GetNewTip()) {
 							isDescendant = true
+
 							break
 						}
+
 						if visited[off] || off == zero {
 							continue
 						}
+
 						visited[off] = true
+
 						depEff, err := e.getEffect(k, off)
 						if err != nil {
 							continue
 						}
-						stack = append(stack, fromPbRefs(depEff.Deps)...)
+
+						stack = append(stack, fromPbRefs(depEff.GetDeps())...)
 					}
+
 					if !isDescendant {
 						return true
 					}
@@ -1952,6 +2136,7 @@ func (e *Engine) evaluateBindForkChoice(bind *pb.TransactionalBindEffect, bindOf
 			}
 		}
 	}
+
 	return false
 }
 
@@ -1961,12 +2146,12 @@ func (e *Engine) HandleNack(nack *pb.NackNotify) error {
 		return nil
 	}
 
-	slog.Debug("HandleNack: received", "key", nack.Key,
-		"conflicting_offset", nack.Conflicting.GetOffset(),
-		"tip_count", len(nack.Tips))
+	slog.Debug("HandleNack: received", "key", nack.GetKey(),
+		"conflicting_offset", nack.GetConflicting().GetOffset(),
+		"tip_count", len(nack.GetTips()))
 
 	// Forward to bootstrap collector if subscription bootstrapping is in progress
-	if bc, ok := e.pendingBootstraps.Load(string(nack.Key)); ok {
+	if bc, ok := e.pendingBootstraps.Load(string(nack.GetKey())); ok {
 		select {
 		case bc.nacks <- nack:
 		default: // channel full, drop
@@ -1979,26 +2164,31 @@ func (e *Engine) HandleNack(nack *pb.NackNotify) error {
 
 	// Check if this NACK is for a transactional key
 	var matchedTxn *pendingTxn
+
 	e.pendingTxns.Range(func(_ Tip, ptxn *pendingTxn) bool {
 		for _, pk := range ptxn.keys {
-			if pk.key == string(nack.Key) {
+			if pk.key == string(nack.GetKey()) {
 				matchedTxn = ptxn
+
 				return false
 			}
 		}
+
 		return true
 	})
 
 	if matchedTxn == nil {
-		slog.Debug("HandleNack: non-transactional, ignoring", "key", nack.Key)
+		slog.Debug("HandleNack: non-transactional, ignoring", "key", nack.GetKey())
+
 		return nil
 	}
 
-	slog.Debug("HandleNack: transactional conflict check", "key", nack.Key, "bind_offset", matchedTxn.bindOffset)
+	slog.Debug("HandleNack: transactional conflict check", "key", nack.GetKey(), "bind_offset", matchedTxn.bindOffset)
 	// Transactional NACK: smart conflict detection across all keys in the tx
-	for _, detail := range nack.TipDetails {
-		if e.isRealConflict(matchedTxn, string(nack.Key), detail) {
+	for _, detail := range nack.GetTipDetails() {
+		if e.isRealConflict(matchedTxn, string(nack.GetKey()), detail) {
 			abortPendingTxn(matchedTxn)
+
 			return nil
 		}
 	}
@@ -2035,28 +2225,31 @@ func (e *Engine) buildEnrichedNack(key string, conflicting *pb.EffectRef, tips [
 
 		detail := &pb.NackTipDetail{
 			Ref:             toPbRef(tp),
-			Hlc:             eff.Hlc,
-			IsTransactional: eff.TxnId != "",
-			Deps:            eff.Deps,
+			Hlc:             eff.GetHlc(),
+			IsTransactional: eff.GetTxnId() != "",
+			Deps:            eff.GetDeps(),
 		}
 		if data := eff.GetData(); data != nil {
 			detail.IsData = true
-			detail.Collection = data.Collection
-			detail.ElementId = data.Id
-			detail.Op = data.Op
+			detail.Collection = data.GetCollection()
+			detail.ElementId = data.GetId()
+			detail.Op = data.GetOp()
 		}
+
 		if bind := eff.GetTxnBind(); bind != nil {
 			detail.IsBind = true
-			detail.BindHlc = bind.TxnHlc
-			detail.BindNodeId = bind.OriginatorNodeId
-			detail.BindForkChoiceHash = ComputeForkChoiceHash(pb.NodeID(bind.OriginatorNodeId), bind.TxnHlc)
-			for _, kb := range bind.Keys {
+			detail.BindHlc = bind.GetTxnHlc()
+			detail.BindNodeId = bind.GetOriginatorNodeId()
+
+			detail.BindForkChoiceHash = ComputeForkChoiceHash(pb.NodeID(bind.GetOriginatorNodeId()), bind.GetTxnHlc())
+			for _, kb := range bind.GetKeys() {
 				detail.BindConsumedTips = append(detail.BindConsumedTips, &pb.KeyConsumedTips{
-					Key:          kb.Key,
-					ConsumedTips: kb.ConsumedTips,
+					Key:          kb.GetKey(),
+					ConsumedTips: kb.GetConsumedTips(),
 				})
 			}
 		}
+
 		nack.TipDetails = append(nack.TipDetails, detail)
 	}
 
@@ -2073,15 +2266,19 @@ func (e *Engine) collectCausalChain(key string, tips []keytrie.EffectRef) []*pb.
 	if e.effectCache == nil || len(tips) == 0 {
 		return nil
 	}
+
 	var zero Tip
+
 	visited := make(map[Tip]bool, len(tips)*4)
 	queue := make([]Tip, 0, len(tips))
+
 	var chain []*pb.EffectRef
 
 	for _, tp := range tips {
 		if tp == zero || visited[tp] {
 			continue
 		}
+
 		visited[tp] = true
 		queue = append(queue, tp)
 		chain = append(chain, toPbRef(tp))
@@ -2096,15 +2293,17 @@ func (e *Engine) collectCausalChain(key string, tips []keytrie.EffectRef) []*pb.
 			continue
 		}
 
-		if snap := eff.GetSnapshot(); snap != nil && snap.State != nil && len(queue) == 0 {
+		if snap := eff.GetSnapshot(); snap != nil && snap.GetState() != nil && len(queue) == 0 {
 			break
 		}
 
 		var refs []*pb.EffectRef
+
 		if bind := eff.GetTxnBind(); bind != nil {
-			for _, kb := range bind.Keys {
-				if string(kb.Key) == key {
-					refs = []*pb.EffectRef{kb.NewTip}
+			for _, kb := range bind.GetKeys() {
+				if string(kb.GetKey()) == key {
+					refs = []*pb.EffectRef{kb.GetNewTip()}
+
 					break
 				}
 			}
@@ -2117,6 +2316,7 @@ func (e *Engine) collectCausalChain(key string, tips []keytrie.EffectRef) []*pb.
 			if dt == zero || visited[dt] {
 				continue
 			}
+
 			visited[dt] = true
 			queue = append(queue, dt)
 			chain = append(chain, ref)
@@ -2138,41 +2338,51 @@ func (e *Engine) ingestNackTips(nack *pb.NackNotify) {
 		return
 	}
 
-	if len(nack.CausalChain) > 0 {
+	if len(nack.GetCausalChain()) > 0 {
 		go e.ingestCausalChain(nack)
 	}
 
 	var zero Tip
+
 	visited := make(map[Tip]bool)
-	queue := make([]Tip, 0, len(nack.TipDetails))
-	for _, d := range nack.TipDetails {
-		if d == nil || d.Ref == nil {
+
+	queue := make([]Tip, 0, len(nack.GetTipDetails()))
+	for _, d := range nack.GetTipDetails() {
+		if d == nil || d.GetRef() == nil {
 			continue
 		}
-		queue = append(queue, r(d.Ref))
+
+		queue = append(queue, r(d.GetRef()))
 	}
+
 	for len(queue) > 0 {
 		off := queue[0]
 		queue = queue[1:]
+
 		if off == zero || visited[off] {
 			continue
 		}
+
 		visited[off] = true
+
 		notify := &pb.OffsetNotify{
 			Origin: toPbRef(off),
-			Key:    nack.Key,
+			Key:    nack.GetKey(),
 		}
 		if err := e.handleBackfill(notify); err != nil {
 			slog.Debug("ingestNackTips: handleBackfill failed",
 				"ref", off, "error", err)
+
 			continue
 		}
+
 		if e.effectCache != nil {
 			if cached, ok := e.effectCache.Get(off); ok {
-				if snap := cached.GetSnapshot(); snap != nil && snap.State != nil && len(queue) == 0 {
+				if snap := cached.GetSnapshot(); snap != nil && snap.GetState() != nil && len(queue) == 0 {
 					break
 				}
-				stack := fromPbRefs(cached.Deps)
+
+				stack := fromPbRefs(cached.GetDeps())
 				queue = append(queue, stack...)
 			}
 		}
@@ -2184,7 +2394,7 @@ func (e *Engine) ingestNackTips(nack *pb.NackNotify) {
 // NOT install tips — the synchronous ingestNackTips / walkAndInstall
 // path handles that.
 func (e *Engine) ingestCausalChain(nack *pb.NackNotify) {
-	e.prefetchEffects(fromPbRefs(nack.CausalChain))
+	e.prefetchEffects(fromPbRefs(nack.GetCausalChain()))
 }
 
 // prefetchEffects fetches every listed ref not already resident in parallel
@@ -2198,45 +2408,58 @@ func (e *Engine) prefetchEffects(refs []Tip) {
 	}
 
 	var pending int
+
 	type fetchResult struct {
 		ref  Tip
 		data []byte
 	}
+
 	results := make(chan fetchResult, len(refs))
 
 	// Bound the fan-out: a causal chain can name thousands of refs, and one
 	// in-flight fetch per ref would dogpile peers/CDN. results is buffered to
 	// len(refs), so a worker never blocks sending and always frees its slot.
 	const prefetchParallelism = 16
+
 	sem := semaphore.NewWeighted(prefetchParallelism)
+
 	for _, off := range refs {
 		if _, ok := e.effectCache.Get(off); ok {
 			continue
 		}
+
 		if err := sem.Acquire(context.Background(), 1); err != nil {
 			// Unreachable with a Background context; stop dispatching rather
 			// than fetch unbounded.
 			slog.Error("prefetchEffects: semaphore acquire failed", "error", err)
+
 			break
 		}
+
 		pending++
+
 		go func(ref *pb.EffectRef) {
 			defer sem.Release(1)
+
 			data, err := e.broadcaster.FetchFromAny(ref, PreferPeers)
 			if err != nil {
 				results <- fetchResult{}
+
 				return
 			}
+
 			results <- fetchResult{ref: r(ref), data: data}
 		}(toPbRef(off))
 	}
 
 	for range pending {
 		res := <-results
+
 		var zero Tip
 		if res.ref == zero || len(res.data) == 0 {
 			continue
 		}
+
 		protoData := res.data
 		if len(res.data) > 4 {
 			keyLen := binary.LittleEndian.Uint32(res.data[:4])
@@ -2244,10 +2467,12 @@ func (e *Engine) prefetchEffects(refs []Tip) {
 				protoData = res.data[4+keyLen:]
 			}
 		}
+
 		eff := &pb.Effect{}
 		if err := UnmarshalEffect(protoData, eff); err != nil {
 			continue
 		}
+
 		e.putIngested(res.ref, eff, len(protoData))
 	}
 }
@@ -2320,28 +2545,37 @@ func (e *Engine) releaseChainRefs(key string, tips []Tip, ls *leafState) {
 			}
 		}
 	}
+
 	visited := make(map[Tip]struct{}, len(tips)*8)
+
 	stack := append([]Tip(nil), tips...)
 	for len(stack) > 0 {
 		t := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
+
 		if _, seen := visited[t]; seen {
 			continue
 		}
+
 		visited[t] = struct{}{}
+
 		eff, ok := e.effectCache.decrefChainNode(t)
 		if !ok {
 			continue // not resident — nothing below to release
 		}
+
 		if bind := eff.GetTxnBind(); bind != nil {
-			for _, kb := range bind.Keys {
-				if string(kb.Key) == key {
-					stack = append(stack, r(kb.NewTip))
+			for _, kb := range bind.GetKeys() {
+				if string(kb.GetKey()) == key {
+					stack = append(stack, r(kb.GetNewTip()))
+
 					break
 				}
 			}
+
 			continue
 		}
+
 		for _, dep := range eff.GetDeps() {
 			stack = append(stack, r(dep))
 		}
@@ -2356,10 +2590,12 @@ func (e *Engine) broadcastUnsubscribe(key string, tips []Tip) {
 	if e.closed.Load() {
 		return
 	}
+
 	if e.broadcaster != nil {
 		hlc := timestamppb.New(e.clock.Now())
 		offset := e.nextOffset()
 		deps := e.resolveTipDeps(tips)
+
 		unsub := &pb.Effect{
 			Key:            []byte(key),
 			Hlc:            hlc,
@@ -2381,16 +2617,20 @@ func (e *Engine) broadcastUnsubscribe(key string, tips []Tip) {
 			if e.effectCache != nil {
 				e.effectCache.PutSized(offset, unsub, len(data))
 			}
+
 			e.fireLocalEffect(offset, unsub)
+
 			if e.effectCache != nil {
 				e.effectCache.Decref(offset)
 			}
+
 			notify := BuildOffsetNotify(e.nodeID, offset, unsub, data, nil)
-			e.broadcaster.BroadcastWithData(notify, notify.EffectData)
+			e.broadcaster.BroadcastWithData(notify, notify.GetEffectData())
 		} else {
 			slog.Error("broadcastUnsubscribe: marshal failed", "key", key, "error", err)
 		}
 	}
+
 	e.subscriptions.Delete(key)
 	slog.Debug("onLeafEvicted: evicted cold key", "key", key)
 }
@@ -2398,17 +2638,21 @@ func (e *Engine) broadcastUnsubscribe(key string, tips []Tip) {
 // Close performs graceful shutdown of the engine and its background components.
 func (e *Engine) Close() error {
 	e.closed.Store(true)
+
 	if e.antiEntropyStop != nil {
 		close(e.antiEntropyStop)
 		e.antiEntropyWg.Wait()
 	}
+
 	if e.memGovStop != nil {
 		close(e.memGovStop)
 		e.memGovWg.Wait()
 	}
+
 	if e.spokenBinds != nil {
 		e.spokenBinds.Close()
 	}
+
 	return nil
 }
 
@@ -2439,6 +2683,7 @@ func (e *Engine) StartAntiEntropy(interval time.Duration) {
 	if e.broadcaster == nil {
 		return
 	}
+
 	e.antiEntropyStop = make(chan struct{})
 	e.reconvergeTrigger = make(chan struct{}, 1)
 	e.antiEntropyWg.Add(1)
@@ -2447,6 +2692,7 @@ func (e *Engine) StartAntiEntropy(interval time.Duration) {
 	// divergence. The periodic sweep over all keys generates excessive
 	// traffic and contributes to ACK timeout flapping.
 	go e.reconvergeLoop()
+
 	e.startSerializationRelease()
 }
 
@@ -2456,6 +2702,7 @@ func (e *Engine) StartAntiEntropy(interval time.Duration) {
 // subscriptions on every peer recovery.
 func (e *Engine) reconvergeLoop() {
 	defer e.antiEntropyWg.Done()
+
 	for {
 		select {
 		case <-e.antiEntropyStop:
@@ -2465,11 +2712,13 @@ func (e *Engine) reconvergeLoop() {
 
 		// Debounce: wait 2s for additional recovery events to coalesce.
 		debounce := time.NewTimer(2 * time.Second)
+
 		draining := true
 		for draining {
 			select {
 			case <-e.antiEntropyStop:
 				debounce.Stop()
+
 				return
 			case <-e.reconvergeTrigger:
 				// Another peer recovered — restart the debounce window.
@@ -2482,26 +2731,9 @@ func (e *Engine) reconvergeLoop() {
 		if e.closed.Load() {
 			return
 		}
+
 		slog.Info("reconverge: running anti-entropy after peer recovery")
 		e.runAntiEntropy()
-	}
-}
-
-func (e *Engine) antiEntropyLoop(interval time.Duration) {
-	defer e.antiEntropyWg.Done()
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-e.antiEntropyStop:
-			return
-		case <-ticker.C:
-			if e.closed.Load() {
-				return
-			}
-			e.runAntiEntropy()
-		}
 	}
 }
 
@@ -2512,6 +2744,7 @@ func (e *Engine) runAntiEntropy() {
 	if len(peers) == 0 {
 		return
 	}
+
 	keys := e.index.Keys()
 	if len(keys) == 0 {
 		return
@@ -2546,16 +2779,18 @@ func (e *Engine) probeAndFetchKey(key string) {
 			Discovery:        true,
 		}},
 	}
+
 	data, err := MarshalEffect(eff)
 	if err != nil {
 		return
 	}
 
-	notify := BuildOffsetNotify(e.nodeID, Tip{0, uint64(hlc.Seconds)}, eff, data, nil)
+	notify := BuildOffsetNotify(e.nodeID, Tip{0, uint64(hlc.GetSeconds())}, eff, data, nil)
 
 	collector := &bootstrapCollector{
 		nacks: make(chan *pb.NackNotify, 64),
 	}
+
 	e.pendingBootstraps.Store(key, collector)
 	defer e.pendingBootstraps.Delete(key)
 
@@ -2565,21 +2800,26 @@ func (e *Engine) probeAndFetchKey(key string) {
 	} else {
 		alivePeers = e.broadcaster.PeerIDs()
 	}
+
 	if len(alivePeers) == 0 {
 		return
 	}
 
-	var ackCount atomic.Int32
-	var wg sync.WaitGroup
+	var (
+		ackCount atomic.Int32
+		wg       sync.WaitGroup
+	)
 	for _, pid := range alivePeers {
 		wg.Add(1)
 		go func(pid pb.NodeID) {
 			defer wg.Done()
-			if _, err := e.broadcaster.ReplicateTo(notify, notify.EffectData, pid); err == nil {
+
+			if _, err := e.broadcaster.ReplicateTo(notify, notify.GetEffectData(), pid); err == nil {
 				ackCount.Add(1)
 			}
 		}(pid)
 	}
+
 	wg.Wait()
 
 	expected := int(ackCount.Load())
@@ -2589,13 +2829,16 @@ func (e *Engine) probeAndFetchKey(key string) {
 
 	// Collect tips from NACKs
 	var allTipOffsets []Tip
+
 	nackDeadline := time.After(5 * time.Second)
+
 	received := 0
 	for received < expected {
 		select {
 		case nack := <-collector.nacks:
 			received++
-			for _, tp := range nack.Tips {
+
+			for _, tp := range nack.GetTips() {
 				allTipOffsets = append(allTipOffsets, r(tp))
 			}
 		case <-nackDeadline:
@@ -2609,6 +2852,7 @@ func (e *Engine) probeAndFetchKey(key string) {
 
 	// Deduplicate
 	seen := make(map[Tip]struct{}, len(allTipOffsets))
+
 	unique := make([]Tip, 0, len(allTipOffsets))
 	for _, off := range allTipOffsets {
 		if _, ok := seen[off]; !ok {
@@ -2619,12 +2863,15 @@ func (e *Engine) probeAndFetchKey(key string) {
 
 	// Filter out tips we already have locally
 	localTips := e.index.Contains(key)
+
 	var missing []Tip
+
 	for _, off := range unique {
 		if localTips == nil || !localTips.Contains(off) {
 			missing = append(missing, off)
 		}
 	}
+
 	if len(missing) == 0 {
 		return
 	}
@@ -2639,18 +2886,23 @@ func (e *Engine) probeAndFetchKey(key string) {
 	fetched := make(map[Tip]bool)
 	fetchStack := make([]Tip, len(missing))
 	copy(fetchStack, missing)
+
 	zero := Tip{0, 0}
+
 	for len(fetchStack) > 0 {
 		off := fetchStack[len(fetchStack)-1]
 		fetchStack = fetchStack[:len(fetchStack)-1]
+
 		if off == zero || fetched[off] {
 			continue
 		}
+
 		fetched[off] = true
 
 		if e.effectCache != nil {
 			if cached, ok := e.effectCache.Get(off); ok {
-				fetchStack = append(fetchStack, fromPbRefs(cached.Deps)...)
+				fetchStack = append(fetchStack, fromPbRefs(cached.GetDeps())...)
+
 				continue
 			}
 		}
@@ -2659,21 +2911,25 @@ func (e *Engine) probeAndFetchKey(key string) {
 		if fetchErr != nil {
 			continue
 		}
+
 		fetchedEff, parseErr := parseWireEffect(fetchedData)
 		if parseErr != nil {
 			continue
 		}
+
 		notify := &pb.OffsetNotify{
 			Origin:     toPbRef(off),
-			Key:        fetchedEff.Key,
+			Key:        fetchedEff.GetKey(),
 			EffectData: fetchedData,
 		}
 		if herr := e.handleBackfill(notify); herr != nil {
 			slog.Debug("anti-entropy: handleBackfill failed",
 				"ref", off, "error", herr)
+
 			continue
 		}
-		fetchStack = append(fetchStack, fromPbRefs(fetchedEff.Deps)...)
+
+		fetchStack = append(fetchStack, fromPbRefs(fetchedEff.GetDeps())...)
 	}
 
 	slog.Debug("anti-entropy: synced", "key", key, "fetched", len(fetched), "new_tips", len(missing))
@@ -2685,16 +2941,21 @@ func (e *Engine) storeWireData(offset Tip, wireData []byte) error {
 	if len(wireData) <= 4 {
 		return fmt.Errorf("wire data too short: %d bytes", len(wireData))
 	}
+
 	keyLen := binary.LittleEndian.Uint32(wireData[:4])
 	if keyLen == 0 || uint32(len(wireData)) < 4+keyLen {
 		return fmt.Errorf("invalid wire data format")
 	}
+
 	protoData := wireData[4+keyLen:]
+
 	eff := &pb.Effect{}
 	if err := UnmarshalEffect(protoData, eff); err != nil {
 		return err
 	}
+
 	e.putIngested(offset, eff, len(protoData))
+
 	return nil
 }
 
@@ -2703,15 +2964,18 @@ func depsMatchTips(deps []Tip, tips []Tip) bool {
 	if len(tips) == 0 {
 		return len(deps) == 0
 	}
+
 	tipSet := make(map[Tip]struct{}, len(tips))
 	for _, t := range tips {
 		tipSet[t] = struct{}{}
 	}
+
 	for _, d := range deps {
 		if _, ok := tipSet[d]; !ok {
 			return false
 		}
 	}
+
 	return true
 }
 
@@ -2720,6 +2984,7 @@ func depsMatchTips(deps []Tip, tips []Tip) bool {
 func (e *Engine) incrementAbortCount(key string) bool {
 	counter, _ := e.txAbortCounts.LoadOrStore(key, &atomic.Int32{})
 	count := counter.Add(1)
+
 	return int(count) >= DefaultSerializationThreshold
 }
 

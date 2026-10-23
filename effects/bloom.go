@@ -77,6 +77,7 @@ func NewBloom(sizeBytes int) *Bloom {
 	for n < sizeBytes {
 		n <<= 1
 	}
+
 	return &Bloom{bits: make([]byte, n), mask: uint64(n)*8 - 1}
 }
 
@@ -100,8 +101,10 @@ func (b *Bloom) position(h, i uint64) uint64 {
 // means the filter already covered the name — nothing to re-push).
 func (b *Bloom) SetHash(h uint64) bool {
 	flipped := false
+
 	for i := range uint64(bloomK) {
 		g := b.position(h, i)
+
 		bit := byte(1) << (g & 7)
 		if b.bits[g>>3]&bit == 0 {
 			b.bits[g>>3] |= bit
@@ -109,6 +112,7 @@ func (b *Bloom) SetHash(h uint64) bool {
 			flipped = true
 		}
 	}
+
 	return flipped
 }
 
@@ -123,6 +127,7 @@ func (b *Bloom) HasHash(h uint64) bool {
 			return false
 		}
 	}
+
 	return true
 }
 
@@ -142,6 +147,7 @@ func (b *Bloom) Frame() []byte {
 	out := make([]byte, 1+len(b.bits))
 	out[0] = bloomFrameVersion
 	copy(out[1:], b.bits)
+
 	return out
 }
 
@@ -152,15 +158,20 @@ func ParseBloomFrame(data []byte) (*Bloom, error) {
 	if len(data) < 1 || data[0] != bloomFrameVersion {
 		return nil, errors.New("bloom frame: bad version")
 	}
+
 	body := data[1:]
+
 	n := len(body)
 	if n < BloomMinBytes || n&(n-1) != 0 {
 		return nil, errors.New("bloom frame: body is not a power-of-two bitmap")
 	}
+
 	b := &Bloom{bits: make([]byte, n), mask: uint64(n)*8 - 1}
 	copy(b.bits, body)
+
 	for _, v := range b.bits {
 		b.setBits += uint64(bits.OnesCount8(v))
 	}
+
 	return b, nil
 }

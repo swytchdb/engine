@@ -51,12 +51,6 @@ const adaptiveSerializationEnabled = false
 // the whole forwarding block dead-code-eliminates while disabled.
 func ForwardingEnabled() bool { return adaptiveSerializationEnabled }
 
-// tipSerializationThreshold is the number of tips on a key before
-// emitting a serialization request. Non-transactional writes (commutative
-// ops) don't trigger abort-count escalation, so this provides a second
-// trigger path for keys with excessive Tip accumulation.
-const tipSerializationThreshold = 50
-
 // keySerializationState tracks the serialization state of a single key.
 type keySerializationState struct {
 	leader       pb.NodeID
@@ -85,15 +79,18 @@ func (e *Engine) startSerializationRelease() {
 	if !adaptiveSerializationEnabled {
 		return
 	}
+
 	if e.serializationState == nil || e.antiEntropyStop == nil {
 		return
 	}
+
 	e.antiEntropyWg.Add(1)
 	go e.serializationReleaseLoop()
 }
 
 func (e *Engine) serializationReleaseLoop() {
 	defer e.antiEntropyWg.Done()
+
 	ticker := time.NewTicker(serializationReleaseCheckInterval)
 	defer ticker.Stop()
 
@@ -105,6 +102,7 @@ func (e *Engine) serializationReleaseLoop() {
 			if e.closed.Load() {
 				return
 			}
+
 			e.checkSerializationRelease()
 		}
 	}
@@ -112,15 +110,18 @@ func (e *Engine) serializationReleaseLoop() {
 
 func (e *Engine) checkSerializationRelease() {
 	deadline := time.Now().Add(-serializationReleaseQuietPeriod).UnixNano()
+
 	var toRelease []string
 
 	e.serializationState.Range(func(key string, state *keySerializationState) bool {
 		if state.leader != e.nodeID {
 			return true // only the leader releases
 		}
+
 		if state.lastActivity.Load() < deadline {
 			toRelease = append(toRelease, key)
 		}
+
 		return true
 	})
 
@@ -136,10 +137,12 @@ func (e *Engine) emitSerializationRelease(key string) {
 	if !adaptiveSerializationEnabled {
 		return
 	}
+
 	slog.Info("adaptive serialization: releasing leader",
 		"key", key, "leader", e.nodeID)
 	ctx := e.NewContext()
 	ctx.BeginTx()
+
 	if err := ctx.Emit(&pb.Effect{
 		Key: []byte(key),
 		Kind: &pb.Effect_Serialization{Serialization: &pb.SerializationEffect{
@@ -148,12 +151,15 @@ func (e *Engine) emitSerializationRelease(key string) {
 		}},
 	}); err != nil {
 		slog.Error("failed to emit serialization release", "key", key, "error", err)
+
 		return
 	}
+
 	if err := ctx.Flush(); err != nil {
 		slog.Debug("serialization release flush failed (expected under contention)",
 			"key", key, "error", err)
 	}
+
 	e.serializationState.Delete(key)
 }
 
@@ -163,11 +169,14 @@ func (e *Engine) CheckSerializationLeader(key string) *pb.NodeID {
 	if e.serializationState == nil {
 		return nil
 	}
+
 	state, ok := e.serializationState.Load(key)
 	if !ok {
 		return nil
 	}
+
 	leader := state.leader
+
 	return &leader
 }
 
@@ -178,6 +187,7 @@ func (e *Engine) RecordSerializationActivity(key string) {
 	if e.serializationState == nil {
 		return
 	}
+
 	if state, ok := e.serializationState.Load(key); ok {
 		state.lastActivity.Store(time.Now().UnixNano())
 	}
@@ -195,15 +205,18 @@ func (e *Engine) updateSerializationState(key string, result *pb.ReducedEffect) 
 	if !adaptiveSerializationEnabled {
 		return
 	}
+
 	if e.serializationState == nil {
 		return
 	}
+
 	if result != nil && result.SerializationLeader != nil {
-		newLeader := *result.SerializationLeader
+		newLeader := result.GetSerializationLeader()
 		_, existed := e.serializationState.Load(key)
 		e.serializationState.Store(key, &keySerializationState{
 			leader: pb.NodeID(newLeader),
 		})
+
 		if !existed {
 			slog.Info("adaptive serialization: leader active",
 				"key", key, "leader", newLeader, "self", e.nodeID)
@@ -229,13 +242,15 @@ func (e *Engine) selectSerializationLeader(key string) pb.NodeID {
 	}
 
 	contenders := make(map[pb.NodeID]struct{})
+
 	contenders[e.nodeID] = struct{}{} // self is always a contender
 	for _, tipOff := range tips.Tips() {
 		eff, err := e.getEffect(key, tipOff)
 		if err != nil {
 			continue
 		}
-		contenders[pb.NodeID(eff.NodeId)] = struct{}{}
+
+		contenders[pb.NodeID(eff.GetNodeId())] = struct{}{}
 	}
 
 	if len(contenders) <= 1 {
@@ -246,32 +261,39 @@ func (e *Engine) selectSerializationLeader(key string) pb.NodeID {
 	// We only have RTT from self to peers, so for pairs not involving
 	// self we approximate as (RTT_self_to_A + RTT_self_to_B) / 2.
 	bestLeader := e.nodeID
+
 	var bestMaxRTT time.Duration
+
 	first := true
 
 	for candidate := range contenders {
 		var maxRTT time.Duration
+
 		for other := range contenders {
 			if other == candidate {
 				continue
 			}
+
 			var rtt time.Duration
 			if candidate == e.nodeID {
-				rtt = e.rttProvider.GetRTT(pb.NodeID(other))
+				rtt = e.rttProvider.GetRTT(other)
 			} else if other == e.nodeID {
-				rtt = e.rttProvider.GetRTT(pb.NodeID(candidate))
+				rtt = e.rttProvider.GetRTT(candidate)
 			} else {
-				rttA := e.rttProvider.GetRTT(pb.NodeID(candidate))
-				rttB := e.rttProvider.GetRTT(pb.NodeID(other))
+				rttA := e.rttProvider.GetRTT(candidate)
+				rttB := e.rttProvider.GetRTT(other)
 				rtt = (rttA + rttB) / 2
 			}
+
 			if rtt == 0 {
 				rtt = time.Hour // unknown RTT = worst case
 			}
+
 			if rtt > maxRTT {
 				maxRTT = rtt
 			}
 		}
+
 		if first || maxRTT < bestMaxRTT {
 			bestMaxRTT = maxRTT
 			bestLeader = candidate
@@ -296,25 +318,31 @@ func (e *Engine) Forward(commandName string, args [][]byte, keys []string, usern
 	if !adaptiveSerializationEnabled {
 		return nil
 	}
+
 	if e.broadcaster == nil || len(keys) == 0 {
 		return nil
 	}
 
 	// Collect non-self leaders
 	var leaderID pb.NodeID
+
 	found := false
+
 	for _, key := range keys {
 		leader := e.CheckSerializationLeader(key)
 		if leader == nil || *leader == e.nodeID {
 			continue
 		}
+
 		if found && *leader != leaderID {
 			// Multiple different leaders
 			return []byte("-TRYAGAIN multiple serialization leaders\r\n")
 		}
+
 		leaderID = *leader
 		found = true
 	}
+
 	if !found {
 		return nil
 	}
@@ -337,14 +365,16 @@ func (e *Engine) Forward(commandName string, args [][]byte, keys []string, usern
 	resp, err := e.broadcaster.ForwardTransaction(ctx, leaderID, tx)
 	if err != nil {
 		slog.Debug("adaptive serialization: forward failed", "error", err, "leader", leaderID)
+
 		if e.broadcaster.InMajorityPartition() {
 			return []byte("-TRYAGAIN forwarding failed, retry\r\n")
 		}
+
 		return []byte("-READONLY forwarding failed and not in majority partition\r\n")
 	}
 
-	if resp.Error {
-		return []byte("-ERR " + resp.ErrorMessage + "\r\n")
+	if resp.GetError() {
+		return []byte("-ERR " + resp.GetErrorMessage() + "\r\n")
 	}
 
 	// Record activity so the leader doesn't release serialization prematurely
@@ -352,7 +382,7 @@ func (e *Engine) Forward(commandName string, args [][]byte, keys []string, usern
 		e.RecordSerializationActivity(key)
 	}
 
-	return resp.RespData
+	return resp.GetRespData()
 }
 
 // ForwardExec checks if any queued command touches a serialized key.
@@ -362,35 +392,43 @@ func (e *Engine) ForwardExec(commands []ForwardCommand, watchedKeys []string, us
 	if !adaptiveSerializationEnabled {
 		return nil
 	}
+
 	if e.broadcaster == nil {
 		return nil
 	}
 
 	// Collect all keys from all commands plus watched keys
 	allKeys := make(map[string]struct{})
+
 	for _, cmd := range commands {
 		for _, k := range cmd.Keys {
 			allKeys[k] = struct{}{}
 		}
 	}
+
 	for _, k := range watchedKeys {
 		allKeys[k] = struct{}{}
 	}
 
 	// Find non-self leaders
 	var leaderID pb.NodeID
+
 	found := false
+
 	for key := range allKeys {
 		leader := e.CheckSerializationLeader(key)
 		if leader == nil || *leader == e.nodeID {
 			continue
 		}
+
 		if found && *leader != leaderID {
 			return []byte("-TRYAGAIN multiple serialization leaders\r\n")
 		}
+
 		leaderID = *leader
 		found = true
 	}
+
 	if !found {
 		return nil
 	}
@@ -408,6 +446,7 @@ func (e *Engine) ForwardExec(commands []ForwardCommand, watchedKeys []string, us
 			Args:        cmd.Args,
 		})
 	}
+
 	for _, wk := range watchedKeys {
 		tx.WatchedKeys = append(tx.WatchedKeys, []byte(wk))
 	}
@@ -418,14 +457,16 @@ func (e *Engine) ForwardExec(commands []ForwardCommand, watchedKeys []string, us
 	resp, err := e.broadcaster.ForwardTransaction(ctx, leaderID, tx)
 	if err != nil {
 		slog.Debug("adaptive serialization: forward EXEC failed", "error", err, "leader", leaderID)
+
 		if e.broadcaster.InMajorityPartition() {
 			return []byte("-TRYAGAIN forwarding failed, retry\r\n")
 		}
+
 		return []byte("-READONLY forwarding failed and not in majority partition\r\n")
 	}
 
-	if resp.Error {
-		return []byte("-ERR " + resp.ErrorMessage + "\r\n")
+	if resp.GetError() {
+		return []byte("-ERR " + resp.GetErrorMessage() + "\r\n")
 	}
 
 	// Record activity for all keys
@@ -433,5 +474,5 @@ func (e *Engine) ForwardExec(commands []ForwardCommand, watchedKeys []string, us
 		e.RecordSerializationActivity(key)
 	}
 
-	return resp.RespData
+	return resp.GetRespData()
 }

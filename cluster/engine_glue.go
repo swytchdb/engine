@@ -55,14 +55,17 @@ func (h *EngineEffectHandler) HandleOffsetNotify(notify *pb.OffsetNotify) ([]*pb
 	if h.engine == nil {
 		return nil, nil
 	}
+
 	nacks, err := h.engine.HandleRemote(notify)
 	if err != nil {
 		slog.Warn("engine HandleRemote failed",
-			"key", notify.Key,
-			"offset", notify.Origin.GetOffset(),
+			"key", notify.GetKey(),
+			"offset", notify.GetOrigin().GetOffset(),
 			"error", err)
+
 		return nil, err
 	}
+
 	return nacks, nil
 }
 
@@ -71,6 +74,7 @@ func (h *EngineEffectHandler) HandleNack(nack *pb.NackNotify) error {
 	if h.engine != nil {
 		return h.engine.HandleNack(nack)
 	}
+
 	return nil
 }
 
@@ -98,11 +102,14 @@ func (r *EngineLogReader) ReadEffect(ref *pb.EffectRef) ([]byte, error) {
 	if r.effectCache == nil {
 		return nil, fmt.Errorf("effect cache not initialized")
 	}
-	key := effects.Tip{ref.NodeId, ref.Offset}
+
+	key := effects.Tip{ref.GetNodeId(), ref.GetOffset()}
+
 	eff, ok := r.effectCache.Get(key)
 	if !ok {
 		return nil, fmt.Errorf("effect not found at %v", ref)
 	}
+
 	return MarshalEffectWire(eff)
 }
 
@@ -115,11 +122,13 @@ func MarshalEffectWire(eff *pb.Effect) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	key := eff.Key
+
+	key := eff.GetKey()
 	keyLen := uint32(len(key))
 	buf := make([]byte, 4+len(key)+len(protoData))
 	binary.LittleEndian.PutUint32(buf[:4], keyLen)
 	copy(buf[4:4+keyLen], key)
 	copy(buf[4+keyLen:], protoData)
+
 	return buf, nil
 }

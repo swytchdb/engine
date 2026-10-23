@@ -42,6 +42,7 @@ type Member struct {
 func nodeIDBytes(nodeID uint64) []byte {
 	b := make([]byte, 8)
 	binary.LittleEndian.PutUint64(b, nodeID)
+
 	return b
 }
 
@@ -50,6 +51,7 @@ func nodeIDFromBytes(b []byte) uint64 {
 	if len(b) != 8 {
 		return 0
 	}
+
 	return binary.LittleEndian.Uint64(b)
 }
 
@@ -95,20 +97,23 @@ func parseMembership(reduced *pb.ReducedEffect) []Member {
 		return nil
 	}
 
-	members := make([]Member, 0, len(reduced.NetAdds))
-	for idStr, elem := range reduced.NetAdds {
+	members := make([]Member, 0, len(reduced.GetNetAdds()))
+	for idStr, elem := range reduced.GetNetAdds() {
 		nodeID := nodeIDFromBytes([]byte(idStr))
 		if nodeID == 0 {
 			continue
 		}
-		addr := string(elem.Data.Decompress())
+
+		addr := string(elem.GetData().Decompress())
 		if addr == "" {
 			continue
 		}
+
 		members = append(members, Member{
 			NodeID: nodeID,
 			Addr:   addr,
 		})
 	}
+
 	return members
 }

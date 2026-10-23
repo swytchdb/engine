@@ -59,7 +59,8 @@ func TestReclaim_KeepsUnreadKeyValue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r == nil || r.Scalar == nil || string(r.Scalar.GetRaw()) != "hello" {
+
+	if r == nil || r.GetScalar() == nil || string(r.GetScalar().GetRaw()) != "hello" {
 		t.Fatalf("value lost to reclamation: got %v — data effect was reclaimed out from under the tip", r)
 	}
 }
@@ -82,6 +83,7 @@ func TestRefcount_ConcurrentReadsVsReclaim(t *testing.T) {
 	)
 
 	const keys = 64
+
 	names := make([]string, keys)
 	for k := range keys {
 		key := fmt.Sprintf("user:c%d", k)
@@ -94,21 +96,26 @@ func TestRefcount_ConcurrentReadsVsReclaim(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
+
 	stop := make(chan struct{})
+
 	for g := range 8 {
 		wg.Add(1)
 		go func(g int) {
 			defer wg.Done()
+
 			for i := 0; ; i++ {
 				select {
 				case <-stop:
 					return
 				default:
 				}
+
 				_, _, _, _ = e.GetSnapshot(names[(i+g)%keys])
 			}
 		}(g)
 	}
+
 	wg.Go(func() {
 		for {
 			select {
@@ -116,6 +123,7 @@ func TestRefcount_ConcurrentReadsVsReclaim(t *testing.T) {
 				return
 			default:
 			}
+
 			e.reclaimUnreferenced()
 		}
 	})
@@ -128,10 +136,12 @@ func TestRefcount_ConcurrentReadsVsReclaim(t *testing.T) {
 		if e.index.EvictBatch(256) == 0 {
 			break
 		}
+
 		if iter > keys*2 {
 			t.Fatalf("eviction stuck: %d keys still indexed", e.index.Size())
 		}
 	}
+
 	e.reclaimUnreferenced()
 
 	if cnt := e.effectCache.EntryCount(); cnt != 0 {
@@ -163,10 +173,12 @@ func TestRefcount_SubscriptionLifecycleEvictAll(t *testing.T) {
 		if err := e.ensureSubscribed(key); err != nil {
 			t.Fatalf("ensureSubscribed(%s): %v", key, err)
 		}
+
 		if _, _, _, err := e.GetSnapshot(key); err != nil {
 			t.Fatalf("GetSnapshot(%s): %v", key, err)
 		}
 	}
+
 	if sz := e.subscriptions.Size(); sz != n {
 		t.Fatalf("expected %d subscriptions, got %d", n, sz)
 	}
@@ -175,10 +187,12 @@ func TestRefcount_SubscriptionLifecycleEvictAll(t *testing.T) {
 		if e.index.EvictBatch(256) == 0 {
 			break
 		}
+
 		if iter > n*2 {
 			t.Fatalf("eviction stuck: %d keys still indexed", e.index.Size())
 		}
 	}
+
 	e.reclaimUnreferenced()
 
 	if cnt := e.effectCache.EntryCount(); cnt != 0 {
@@ -191,6 +205,7 @@ func TestRefcount_SubscriptionLifecycleEvictAll(t *testing.T) {
 	for e.subscriptions.Size() > 0 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
+
 	if sz := e.subscriptions.Size(); sz != 0 {
 		t.Fatalf("subscriptions map leaked %d entries after evicting every key", sz)
 	}
@@ -215,12 +230,18 @@ func TestRefcount_ChurnEvictAllReclaimsPool(t *testing.T) {
 		func() bool { return true },
 	)
 
-	const keys = 100
-	const rewrites = 10
+	const (
+		keys     = 100
+		rewrites = 10
+	)
+
 	for k := range keys {
 		key := fmt.Sprintf("user:k%d", k)
+
 		var curTip Tip
+
 		hasCur := false
+
 		for w := range rewrites {
 			eff := &pb.Effect{
 				Key: []byte(key), Hlc: sTs(int64(k*1000 + w + 1)), NodeId: 1,
@@ -229,14 +250,18 @@ func TestRefcount_ChurnEvictAllReclaimsPool(t *testing.T) {
 			if hasCur {
 				eff.Deps = []*pb.EffectRef{toPbRef(curTip)}
 			}
+
 			off := log.putEffect(eff)
+
 			var consumed *keytrie.TipSet
 			if hasCur {
 				consumed = keytrie.NewTipSet(curTip)
 			}
+
 			e.updateIndex(key, consumed, off)
 			curTip = off
 			hasCur = true
+
 			if _, _, _, err := e.GetSnapshot(key); err != nil {
 				t.Fatalf("GetSnapshot(%s) w=%d: %v", key, w, err)
 			}
@@ -247,10 +272,12 @@ func TestRefcount_ChurnEvictAllReclaimsPool(t *testing.T) {
 		if e.index.EvictBatch(256) == 0 {
 			break
 		}
+
 		if iter > keys*2 {
 			t.Fatalf("eviction stuck: %d keys still indexed", e.index.Size())
 		}
 	}
+
 	e.reclaimUnreferenced()
 
 	if cnt := e.effectCache.EntryCount(); cnt != 0 {
@@ -283,15 +310,18 @@ func TestReleaseQueue_ZeroesDrainedEntries(t *testing.T) {
 			Kind: &pb.Effect_Data{Data: scalarInsertRaw(fmt.Appendf(nil, "v%d", k))},
 		})
 		e.updateIndex(key, nil, off)
+
 		if _, _, _, err := e.GetSnapshot(key); err != nil {
 			t.Fatalf("GetSnapshot(%s): %v", key, err)
 		}
 	}
+
 	for e.index.Size() > 0 {
 		if e.index.EvictBatch(256) == 0 {
 			break
 		}
 	}
+
 	if got := e.ReleaseQueueDepth(); got == 0 {
 		t.Fatal("expected pending releases after evict-all")
 	}
@@ -301,7 +331,9 @@ func TestReleaseQueue_ZeroesDrainedEntries(t *testing.T) {
 	if got := e.ReleaseQueueDepth(); got != 0 {
 		t.Fatalf("ReleaseQueueDepth = %d after drain; want 0", got)
 	}
+
 	var zero evictedKey
+
 	for _, buf := range [][]evictedKey{
 		e.releaseItems[:cap(e.releaseItems)],
 		e.releaseSpare[:cap(e.releaseSpare)],
@@ -357,10 +389,12 @@ func TestRefcount_EvictAllReclaimsPool(t *testing.T) {
 		if e.index.EvictBatch(512) == 0 {
 			break
 		}
+
 		if iter > n {
 			t.Fatalf("eviction made no progress: %d keys still indexed", e.index.Size())
 		}
 	}
+
 	e.reclaimUnreferenced()
 
 	if cnt := e.effectCache.EntryCount(); cnt != 0 {
@@ -401,15 +435,19 @@ func TestDrainReclaim_QueueDrivenReclaim(t *testing.T) {
 	if freed := p.drainReclaim(); freed == 0 {
 		t.Fatal("drainReclaim freed nothing; queued refs==0 candidates were not reclaimed")
 	}
+
 	if _, ok := p.Get(cacheTip); ok {
 		t.Fatal("born-at-zero cache entry survived drainReclaim")
 	}
+
 	if _, ok := p.Get(dropTip); ok {
 		t.Fatal("dropped (refs→0) vertex survived drainReclaim")
 	}
+
 	if _, ok := p.Get(sysTip); !ok {
 		t.Fatal("pinned system-key entry was freed by drainReclaim")
 	}
+
 	if _, ok := p.Get(ownedTip); !ok {
 		t.Fatal("owned (refs>0) vertex was freed by drainReclaim")
 	}
@@ -432,7 +470,8 @@ func TestPublishSubdag_PinFailureAbortsPublish(t *testing.T) {
 
 	resident := Tip{1, 1}
 	p.PutSized(resident, &pb.Effect{Key: []byte("user:k")}, 10) // refs=1 (creation)
-	missing := Tip{1, 2}                                        // never pooled
+
+	missing := Tip{1, 2} // never pooled
 
 	ls := &leafState{}
 	d := &dag{topoOrder: []Tip{resident, missing}, lcaTip: resident}
@@ -446,6 +485,7 @@ func TestPublishSubdag_PinFailureAbortsPublish(t *testing.T) {
 	// resident; a double rollback panics decref's underflow check.
 	p.decref(resident)
 	p.drainReclaim()
+
 	if _, ok := p.Get(resident); ok {
 		t.Fatal("pin rollback left an extra ref on the resident vertex")
 	}
@@ -471,8 +511,10 @@ func TestPublishSubdag_EvictedLeafRefusesPublish(t *testing.T) {
 	if ls.subdag.Load() != evictedSubdag {
 		t.Fatal("publish displaced the evicted-leaf sentinel")
 	}
+
 	p.decref(tip) // creation ref; if the publish leaked its pin, refs never reach 0
 	p.drainReclaim()
+
 	if _, ok := p.Get(tip); ok {
 		t.Fatal("racing publish pinned a vertex on an evicted leaf (ref leaked)")
 	}
@@ -490,8 +532,11 @@ func TestEvictBounded_PinsSystemKey(t *testing.T) {
 		func() bool { return true },
 	)
 
-	const sys = "__swytch:members"
-	const usr = "user:k"
+	const (
+		sys = "__swytch:members"
+		usr = "user:k"
+	)
+
 	e.index.Insert(sys, nil, keytrie.NewTipSet(Tip{1, 1}))
 	e.index.Insert(usr, nil, keytrie.NewTipSet(Tip{1, 2}))
 
@@ -502,6 +547,7 @@ func TestEvictBounded_PinsSystemKey(t *testing.T) {
 	if e.index.Contains(sys) == nil {
 		t.Fatal("system __swytch:members key was evicted; decider pin failed")
 	}
+
 	if e.index.Contains(usr) != nil {
 		t.Fatal("user key was not evicted by the sweep")
 	}
@@ -514,7 +560,9 @@ func TestEvictBounded_PinsSystemKey(t *testing.T) {
 // leak permanently — Delete touches only the index, never the pool.
 func TestFlushIndex_ReleasesTipRefs(t *testing.T) {
 	e := newTestEngine(&mockBroadcaster{})
+
 	const key = "user:k"
+
 	tip := Tip{1, 5}
 	// Resident + indexed: PutSized seeds the creation ref (refs=1) for the one
 	// tipset this effect occupies; Insert only updates the index, not refs.
@@ -523,12 +571,14 @@ func TestFlushIndex_ReleasesTipRefs(t *testing.T) {
 
 	// While it is a live, reachable tip, reclaim must not free it.
 	e.reclaimUnreferenced()
+
 	if _, ok := e.effectCache.Get(tip); !ok {
 		t.Fatal("referenced index tip was reclaimed")
 	}
 
 	e.FlushIndex()
 	e.reclaimUnreferenced()
+
 	if _, ok := e.effectCache.Get(tip); ok {
 		t.Fatal("FlushIndex did not release the creation refcount; vertex leaked")
 	}
@@ -555,6 +605,7 @@ func TestPutSized_PromotesCacheEntryToOwned(t *testing.T) {
 	if _, ok := e.effectCache.Get(owned); !ok {
 		t.Fatal("owned re-put of a cache entry was reclaimed; PutSized did not promote refs 0→creation")
 	}
+
 	if _, ok := e.effectCache.Get(cacheOnly); ok {
 		t.Fatal("plain cache entry survived reclaim; it carries no creation ref and must be freed")
 	}
@@ -568,9 +619,12 @@ func TestPutSized_PromotesCacheEntryToOwned(t *testing.T) {
 // FlushIndex), whose chain walk frees the whole lineage.
 func TestRemoveTips_KeepsReachableAncestor(t *testing.T) {
 	e := newTestEngine(&mockBroadcaster{})
+
 	const key = "user:k"
+
 	ancestor := Tip{1, 5}
 	head := Tip{1, 6}
+
 	e.effectCache.PutSized(ancestor, &pb.Effect{Key: []byte(key)}, 10)
 	e.effectCache.PutSized(head, &pb.Effect{Key: []byte(key), Deps: []*pb.EffectRef{toPbRef(ancestor)}}, 10)
 	e.index.Insert(key, nil, keytrie.NewTipSet(ancestor, head))
@@ -582,6 +636,7 @@ func TestRemoveTips_KeepsReachableAncestor(t *testing.T) {
 	if _, ok := e.effectCache.Get(head); !ok {
 		t.Fatal("head tip was wrongly reclaimed")
 	}
+
 	if _, ok := e.effectCache.Get(ancestor); !ok {
 		t.Fatal("pruned ancestor was reclaimed while still reachable from the head tip")
 	}
@@ -589,9 +644,11 @@ func TestRemoveTips_KeepsReachableAncestor(t *testing.T) {
 	// Removing the key for good releases the whole chain.
 	e.FlushIndex()
 	e.reclaimUnreferenced()
+
 	if _, ok := e.effectCache.Get(head); ok {
 		t.Fatal("FlushIndex did not release the head tip")
 	}
+
 	if _, ok := e.effectCache.Get(ancestor); ok {
 		t.Fatal("FlushIndex did not release the pruned ancestor; chain walk missed it")
 	}
@@ -607,6 +664,7 @@ func TestBroadcastUnsubscribe_EmitsUnsub(t *testing.T) {
 
 	const key = "user:k"
 	e.subscriptions.Store(key, &subscriptionState{ready: make(chan struct{})})
+
 	tip := Tip{1, 42}
 
 	e.broadcastUnsubscribe(key, []Tip{tip})
@@ -614,37 +672,45 @@ func TestBroadcastUnsubscribe_EmitsUnsub(t *testing.T) {
 	if _, ok := e.subscriptions.Load(key); ok {
 		t.Fatal("did not drop subscription state")
 	}
+
 	if len(bc.broadcasts) != 1 {
 		t.Fatalf("expected 1 wire broadcast (the unsubscribe); got %d", len(bc.broadcasts))
 	}
+
 	got := bc.broadcasts[0]
-	if string(got.Key) != key {
-		t.Fatalf("broadcast key = %q, want %q", got.Key, key)
+	if string(got.GetKey()) != key {
+		t.Fatalf("broadcast key = %q, want %q", got.GetKey(), key)
 	}
-	protoStart := 4 + len(got.Key)
-	if len(got.EffectData) <= protoStart {
+
+	protoStart := 4 + len(got.GetKey())
+	if len(got.GetEffectData()) <= protoStart {
 		t.Fatal("broadcast EffectData truncated")
 	}
+
 	parsed := &pb.Effect{}
-	if err := UnmarshalEffect(got.EffectData[protoStart:], parsed); err != nil {
+	if err := UnmarshalEffect(got.GetEffectData()[protoStart:], parsed); err != nil {
 		t.Fatalf("re-parse broadcast effect: %v", err)
 	}
+
 	sub := parsed.GetSubscription()
 	if sub == nil {
 		t.Fatal("broadcast was not a SubscriptionEffect")
 	}
-	if !sub.Unsubscribe {
+
+	if !sub.GetUnsubscribe() {
 		t.Fatal("SubscriptionEffect.Unsubscribe = false; expected true")
 	}
 	// DAG correctness: the unsub references the prior tip as a Dep so peers
 	// reduce us out of the subscribers map.
-	if len(parsed.Deps) != 1 || r(parsed.Deps[0]) != tip {
-		t.Fatalf("unsub Deps = %v; want [%v] to causally consume the prior tip", parsed.Deps, tip)
+	if len(parsed.GetDeps()) != 1 || r(parsed.GetDeps()[0]) != tip {
+		t.Fatalf("unsub Deps = %v; want [%v] to causally consume the prior tip", parsed.GetDeps(), tip)
 	}
-	gotOff := r(got.Origin)
+
+	gotOff := r(got.GetOrigin())
 	if gotOff[0] != uint64(e.nodeID) {
 		t.Fatalf("unsub offset NodeID = %d; want %d", gotOff[0], e.nodeID)
 	}
+
 	if gotOff[1] == 0 {
 		t.Fatal("unsub offset sequence is 0; expected nextOffset to produce a non-zero seq")
 	}
@@ -664,6 +730,7 @@ func TestBroadcastUnsubscribe_HookSeesResidentVertex(t *testing.T) {
 	e.subscriptions.Store(key, &subscriptionState{ready: make(chan struct{})})
 
 	var hookTip Tip
+
 	increfOK := false
 	e.OnLocalEffect = func(offset Tip, eff *pb.Effect) {
 		hookTip = offset
@@ -682,6 +749,7 @@ func TestBroadcastUnsubscribe_HookSeesResidentVertex(t *testing.T) {
 	// a clean refs==0.
 	e.effectCache.Decref(hookTip)
 	e.reclaimUnreferenced()
+
 	if _, ok := e.effectCache.Get(hookTip); ok {
 		t.Fatal("unsub vertex survived reclaim after its last ref was released — a reference leaked")
 	}
@@ -702,6 +770,7 @@ func TestBroadcastUnsubscribe_ShutdownShortCircuit(t *testing.T) {
 	if _, ok := e.subscriptions.Load(key); !ok {
 		t.Fatal("shutdown short-circuit failed; subscription was dropped")
 	}
+
 	if len(bc.broadcasts) != 0 {
 		t.Fatalf("shutdown short-circuit failed; expected 0 broadcasts, got %d", len(bc.broadcasts))
 	}
@@ -713,6 +782,7 @@ func TestBroadcastUnsubscribe_ShutdownShortCircuit(t *testing.T) {
 // bootstrap-incomplete bug (a membership effect must never be swept).
 func TestNewEngine_PinsSystemKeysInCache(t *testing.T) {
 	bc := &mockBroadcaster{}
+
 	e := NewEngine(EngineConfig{
 		NodeID:      1,
 		Broadcaster: bc,
@@ -774,6 +844,7 @@ func TestNewEngine_PinsSystemKeysInCache(t *testing.T) {
 	if evictions == 0 {
 		t.Fatal("no evictions occurred; sweep did not exercise victim selection")
 	}
+
 	if _, ok := e.effectCache.Get(Tip{1, 1000}); ok {
 		t.Fatal("user-key effect survived the sweep; victim selection failed")
 	}
@@ -788,8 +859,10 @@ func TestEvictBounded_CASProtectsConcurrentWrites(t *testing.T) {
 	e := newTestEngine(bc)
 	e.index.SetEvictHooks(func(string) bool { return true }, e.onLeafEvicted, func() bool { return true })
 
-	const key = "user:contended"
-	const iterations = 200
+	const (
+		key        = "user:contended"
+		iterations = 200
+	)
 
 	for i := range iterations {
 		seedTip := Tip{1, uint64(1000 + i)}
@@ -797,26 +870,33 @@ func TestEvictBounded_CASProtectsConcurrentWrites(t *testing.T) {
 		e.effectCache.Put(seedTip, &pb.Effect{Key: []byte(key)})
 
 		newTip := Tip{1, uint64(2000 + i)}
+
 		var wg sync.WaitGroup
+
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
+
 			e.index.EvictBounded(64)
 		}()
 		go func() {
 			defer wg.Done()
+
 			e.updateIndex(key, nil, newTip)
 		}()
+
 		wg.Wait()
 
 		tips := e.index.Contains(key)
 		if tips == nil {
 			continue // evict won — key gone, no torn state
 		}
+
 		if !tips.Contains(newTip) {
 			t.Fatalf("iter %d: key exists but newTip %v missing; got %v — torn state",
 				i, newTip, tips.Tips())
 		}
+
 		e.index.DeleteAndSnapshot(key, tips)
 	}
 }

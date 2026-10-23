@@ -69,5 +69,6 @@ func (c *EngineConfig) ModeForKey(key string) SafetyMode {
 			return rule.Mode
 		}
 	}
+
 	return c.DefaultMode
 }

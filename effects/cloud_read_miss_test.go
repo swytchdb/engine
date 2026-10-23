@@ -54,6 +54,7 @@ func (f *fakeCloudReader) CloudTips(_ context.Context, key string) ([]Tip, []Clo
 	if f.err != nil {
 		return nil, nil, nil, f.err
 	}
+
 	return f.tips[key], f.sidecar[key], f.missing[key], nil
 }
 
@@ -65,10 +66,12 @@ func (f *fakeCloudReader) MarkPending(key string) {
 // CloudEffect a GetTips sidecar would deliver for that tip.
 func cloudEffect(t *testing.T, tip Tip, wire []byte) CloudEffect {
 	t.Helper()
+
 	eff, err := parseWireEffect(wire)
 	if err != nil {
 		t.Fatalf("parse wire effect: %v", err)
 	}
+
 	return CloudEffect{Tip: tip, Eff: eff, ProtoLen: len(wire)}
 }
 
@@ -80,7 +83,7 @@ func cloudEffect(t *testing.T, tip Tip, wire []byte) CloudEffect {
 func TestReadMissRehydratesFromCloud(t *testing.T) {
 	const key = "evicted"
 	// The single leaf effect Cloud still holds for the key (writer long gone).
-	tip, wire := makeReachableEffect(t, key, pb.NodeID(7), 1)
+	tip, wire := makeReachableEffect(t, key, 1)
 
 	// Nothing is fetchable from the broadcaster: the sidecar must carry the
 	// whole closure, so the install walk runs entirely locally — zero
@@ -105,13 +108,16 @@ func TestReadMissRehydratesFromCloud(t *testing.T) {
 	}
 
 	ctx := e.NewReadOnlyContext()
+
 	result, _, err := ctx.GetSnapshot(key)
 	if err != nil {
 		t.Fatalf("read of Cloud-resident key errored: %v", err)
 	}
+
 	if result == nil {
 		t.Fatal("read free-missed a key Cloud still holds; expected a rehydrated value")
 	}
+
 	if fake.calls != 1 {
 		t.Fatalf("expected exactly one Cloud consult on the miss, got %d", fake.calls)
 	}
@@ -125,6 +131,7 @@ func TestReadMissRehydratesFromCloud(t *testing.T) {
 	if _, _, err := ctx.GetSnapshot(key); err != nil {
 		t.Fatalf("second read errored: %v", err)
 	}
+
 	if fake.calls != 1 {
 		t.Fatalf("Cloud was re-consulted after rehydrate (%d calls); the cluster should have taken over", fake.calls)
 	}
@@ -136,17 +143,20 @@ func TestReadMissRehydratesFromCloud(t *testing.T) {
 // pulled through FetchFromAny like any other missing dep.
 func TestReadMissPartialSidecarFetchesStraggler(t *testing.T) {
 	const key = "evicted"
-	depTip, depWire := makeReachableEffect(t, key, pb.NodeID(7), 1)
+
+	depTip, depWire := makeReachableEffect(t, key, 1)
+
 	depEff, err := parseWireEffect(depWire)
 	if err != nil {
 		t.Fatalf("parse dep: %v", err)
 	}
+
 	hlc := sTs(2)
 	tipEff := &pb.Effect{
 		Key:            []byte(key),
 		Hlc:            hlc,
 		NodeId:         7,
-		Deps:           []*pb.EffectRef{{NodeId: uint64(depEff.NodeId), Offset: depTip[1]}},
+		Deps:           []*pb.EffectRef{{NodeId: depEff.GetNodeId(), Offset: depTip[1]}},
 		ForkChoiceHash: ComputeForkChoiceHash(pb.NodeID(7), hlc),
 		Kind: &pb.Effect_Data{Data: &pb.DataEffect{
 			Op:         pb.EffectOp_INSERT_OP,
@@ -175,13 +185,16 @@ func TestReadMissPartialSidecarFetchesStraggler(t *testing.T) {
 	e.SetCloudReader(fake)
 
 	ctx := e.NewReadOnlyContext()
+
 	result, _, err := ctx.GetSnapshot(key)
 	if err != nil {
 		t.Fatalf("read with partial sidecar errored: %v", err)
 	}
+
 	if result == nil {
 		t.Fatal("read free-missed; the walk should have fetched the straggler dep")
 	}
+
 	if e.index.Contains(key) == nil {
 		t.Fatal("rehydrated key was not installed into the local index")
 	}
@@ -205,13 +218,16 @@ func TestReadMissCloudEmptyStillMisses(t *testing.T) {
 	e.SetCloudReader(fake)
 
 	ctx := e.NewReadOnlyContext()
+
 	result, _, err := ctx.GetSnapshot("never-written")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+
 	if result != nil {
 		t.Fatal("expected a miss for a key neither the cluster nor Cloud holds")
 	}
+
 	if fake.calls != 1 {
 		t.Fatalf("expected one Cloud consult on the miss, got %d", fake.calls)
 	}
@@ -221,6 +237,7 @@ func TestReadMissCloudEmptyStillMisses(t *testing.T) {
 			t.Fatalf("repeat read errored: %v", err)
 		}
 	}
+
 	if fake.calls != 1 {
 		t.Fatalf("authoritative nil was re-consulted (%d calls); one complete Cloud answer must stick for the leaf's residency", fake.calls)
 	}
@@ -245,9 +262,11 @@ func TestReadMissCloudErrorFailsRead(t *testing.T) {
 	if _, _, err := ctx.GetSnapshot("unreachable"); !errors.Is(err, ErrCloudUnavailable) {
 		t.Fatalf("read must fail with ErrCloudUnavailable on Cloud error, got: %v", err)
 	}
+
 	if _, _, err := ctx.GetSnapshot("unreachable"); !errors.Is(err, ErrCloudUnavailable) {
 		t.Fatalf("second read must also fail while Cloud is down, got: %v", err)
 	}
+
 	if fake.calls != 2 {
 		t.Fatalf("expected the failed consult to retry on the next read, got %d calls", fake.calls)
 	}
@@ -258,13 +277,15 @@ func TestReadMissCloudErrorFailsRead(t *testing.T) {
 // only partially readable.
 type partialHoleBroadcaster struct {
 	mockBroadcaster
+
 	fetchable map[Tip][]byte
 }
 
 func (b *partialHoleBroadcaster) FetchFromAny(ref *pb.EffectRef, _ FetchHint) ([]byte, error) {
-	if data, ok := b.fetchable[Tip{ref.NodeId, ref.Offset}]; ok {
+	if data, ok := b.fetchable[Tip{ref.GetNodeId(), ref.GetOffset()}]; ok {
 		return data, nil
 	}
+
 	return nil, fmt.Errorf("cdn fetch %v: %w", r(ref), ErrCDNBlobMissing)
 }
 
@@ -276,7 +297,8 @@ func (b *partialHoleBroadcaster) FetchFromAny(ref *pb.EffectRef, _ FetchHint) ([
 // the WAN round-trips for the rest of its residency.
 func TestReadMissServesReadableSubsetAndMarksPending(t *testing.T) {
 	const key = "evicted"
-	reachable, wire := makeReachableEffect(t, key, pb.NodeID(7), 1)
+
+	reachable, wire := makeReachableEffect(t, key, 1)
 	holed := Tip{9, 4} // blob provably absent from cloud storage
 
 	bc := &partialHoleBroadcaster{
@@ -293,16 +315,20 @@ func TestReadMissServesReadableSubsetAndMarksPending(t *testing.T) {
 	e.SetCloudReader(fake)
 
 	ctx := e.NewReadOnlyContext()
+
 	result, _, err := ctx.GetSnapshot(key)
 	if err != nil {
 		t.Fatalf("read of a partially holed frontier errored: %v", err)
 	}
+
 	if result == nil {
 		t.Fatal("expected the readable sibling's state, not a miss")
 	}
+
 	if fake.calls != 1 {
 		t.Fatalf("expected one Cloud consult, got %d", fake.calls)
 	}
+
 	if len(fake.pending) != 1 || fake.pending[0] != key {
 		t.Fatalf("expected the key marked pending once, got %v", fake.pending)
 	}
@@ -310,6 +336,7 @@ func TestReadMissServesReadableSubsetAndMarksPending(t *testing.T) {
 	if _, _, err := ctx.GetSnapshot(key); err != nil {
 		t.Fatalf("second read errored: %v", err)
 	}
+
 	if fake.calls != 1 {
 		t.Fatalf("Cloud was re-consulted on a repeat read of a pending key (%d calls)", fake.calls)
 	}
@@ -322,6 +349,7 @@ func TestReadMissServesReadableSubsetAndMarksPending(t *testing.T) {
 // and leaves healing to the reconcile loop's own schedule.
 func TestReadMissAllTipsPendingFailsRead(t *testing.T) {
 	const key = "evicted"
+
 	holed := Tip{9, 4}
 
 	bc := &holedFetchBroadcaster{
@@ -341,9 +369,11 @@ func TestReadMissAllTipsPendingFailsRead(t *testing.T) {
 			t.Fatalf("read %d: want ErrCloudUnavailable for a wholly holed frontier, got %v", i+1, err)
 		}
 	}
+
 	if fake.calls != 1 {
 		t.Fatalf("expected one Cloud consult (cloudPending caps the rest), got %d", fake.calls)
 	}
+
 	if len(fake.pending) != 1 || fake.pending[0] != key {
 		t.Fatalf("expected the key marked pending once, got %v", fake.pending)
 	}
@@ -358,16 +388,20 @@ func TestReadMissNoCloudFreeMisses(t *testing.T) {
 	e := newTestEngine(bc) // cloudReader stays nil
 
 	ctx := e.NewReadOnlyContext()
+
 	result, _, err := ctx.GetSnapshot("never-written")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+
 	if result != nil {
 		t.Fatal("expected a free-miss with no Cloud configured")
 	}
+
 	if _, ok := e.subscriptions.Load("never-written"); ok {
 		t.Fatal("a free miss must not record a subscription")
 	}
+
 	if e.index.Contains("never-written") != nil {
 		t.Fatal("a free miss must not touch the index")
 	}

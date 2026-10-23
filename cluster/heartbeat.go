@@ -132,6 +132,7 @@ type HeartbeatManager struct {
 // NewHeartbeatManager creates a new HeartbeatManager.
 func NewHeartbeatManager(nodeID NodeId, healthTable *PeerHealthTable, cfg ClockConfig) *HeartbeatManager {
 	cfg = cfg.withDefaults()
+
 	return &HeartbeatManager{
 		nodeID:      nodeID,
 		healthTable: healthTable,
@@ -148,6 +149,7 @@ func NewHeartbeatManager(nodeID NodeId, healthTable *PeerHealthTable, cfg ClockC
 func (hm *HeartbeatManager) AddPeer(nodeID NodeId, region string) {
 	hm.mu.Lock()
 	defer hm.mu.Unlock()
+
 	hm.peerRegions[nodeID] = region
 	hm.healthTable.GetOrCreate(nodeID)
 }
@@ -156,6 +158,7 @@ func (hm *HeartbeatManager) AddPeer(nodeID NodeId, region string) {
 func (hm *HeartbeatManager) RemovePeer(nodeID NodeId) {
 	hm.mu.Lock()
 	defer hm.mu.Unlock()
+
 	delete(hm.peerRegions, nodeID)
 	delete(hm.pendingObs, nodeID)
 	hm.healthTable.Remove(nodeID)
@@ -177,6 +180,7 @@ func (hm *HeartbeatManager) SendTickTo(peerID NodeId) {
 	if hm.sendFunc == nil {
 		return
 	}
+
 	hm.mu.Lock()
 	hm.seq++
 	tick := &ClockTick{NodeID: hm.nodeID, Seq: hm.seq, WallClock: time.Now().UnixNano()}
@@ -206,6 +210,7 @@ func (hm *HeartbeatManager) ProcessInboundTick(peerID NodeId, tick *ClockTick) {
 	if peerID == hm.nodeID {
 		return
 	}
+
 	now := time.Now()
 	ph := hm.healthTable.GetOrCreate(peerID)
 	RecordClockTickReceived(peerID)
@@ -240,9 +245,11 @@ func (hm *HeartbeatManager) ProcessInboundTick(peerID NodeId, tick *ClockTick) {
 		if obs.NodeID != hm.nodeID {
 			continue
 		}
+
 		hm.mu.Lock()
 		wall, ok := hm.ownTicks.get(obs.Seq)
 		hm.mu.Unlock()
+
 		if ok {
 			ph.clock.observeEcho(obs.ObservedAt - wall)
 		}
@@ -262,6 +269,7 @@ func (hm *HeartbeatManager) ProcessInboundTick(peerID NodeId, tick *ClockTick) {
 		RecordPeerClockSkew(peerID, int64(st.SkewEst))
 		RecordPeerStalenessBound(peerID, int64(st.TickInterval+st.RTTMin))
 	}
+
 	if st.TickInterval > 0 {
 		RecordPeerTickInterval(peerID, int64(st.TickInterval))
 	}
@@ -274,10 +282,12 @@ func (hm *HeartbeatManager) ProcessInboundTick(peerID NodeId, tick *ClockTick) {
 // the path round-trip arrive superseded and carry no extra information.
 func (hm *HeartbeatManager) sendLoop() {
 	defer hm.wg.Done()
+
 	hm.mu.Lock()
 	interval := hm.interval
 	hm.mu.Unlock()
 	RecordClockTickInterval(int64(interval))
+
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -287,6 +297,7 @@ func (hm *HeartbeatManager) sendLoop() {
 			return
 		case <-ticker.C:
 			hm.sendTick()
+
 			if !hm.cfg.DisableAdaptiveInterval {
 				if next, changed := hm.adjustInterval(); changed {
 					ticker.Reset(next)
@@ -301,7 +312,9 @@ func (hm *HeartbeatManager) sendLoop() {
 // latency rather than stalling at a fixed sweep rate.
 func (hm *HeartbeatManager) livenessLoop() {
 	defer hm.wg.Done()
+
 	cadence := hm.livenessCadence()
+
 	ticker := time.NewTicker(cadence)
 	defer ticker.Stop()
 
@@ -311,6 +324,7 @@ func (hm *HeartbeatManager) livenessLoop() {
 			return
 		case <-ticker.C:
 			hm.healthTable.CheckLiveness()
+
 			if next := hm.livenessCadence(); next != cadence {
 				cadence = next
 				ticker.Reset(next)
@@ -326,6 +340,7 @@ func (hm *HeartbeatManager) livenessCadence() time.Duration {
 	hm.mu.Lock()
 	interval := hm.interval
 	hm.mu.Unlock()
+
 	return clampDuration(interval, livenessCheckFloor, livenessCheckCeil)
 }
 
@@ -337,6 +352,7 @@ func (hm *HeartbeatManager) sendTick() {
 	wall := now.UnixNano()
 
 	hm.mu.Lock()
+
 	peerIDs := make([]NodeId, 0, len(hm.peerRegions))
 	for peerID := range hm.peerRegions {
 		peerIDs = append(peerIDs, peerID)
@@ -352,10 +368,12 @@ func (hm *HeartbeatManager) sendTick() {
 			jump = 0
 		}
 	}
+
 	hm.lastTickWall = wall
 	hm.lastTickTime = now
 
 	hm.seq++
+
 	tick := &ClockTick{
 		NodeID:    hm.nodeID,
 		Seq:       hm.seq,
@@ -366,6 +384,7 @@ func (hm *HeartbeatManager) sendTick() {
 	for _, obs := range hm.pendingObs {
 		tick.Observed = append(tick.Observed, obs)
 	}
+
 	clear(hm.pendingObs)
 	hm.ownTicks.put(tick.Seq, wall)
 	hm.mu.Unlock()
@@ -378,6 +397,7 @@ func (hm *HeartbeatManager) sendTick() {
 	for _, peerID := range peerIDs {
 		if err := hm.sendFunc(peerID, packet); err != nil {
 			slog.Debug("clock tick send failed", "peer", peerID, "error", err)
+
 			continue
 		}
 	}
@@ -396,34 +416,43 @@ func computeWallJump(prevWall, wall int64, monoElapsed time.Duration) time.Durat
 // clamped to [intervalFloor, intervalCeil] for feedback stability.
 func (hm *HeartbeatManager) adjustInterval() (time.Duration, bool) {
 	hm.mu.Lock()
+
 	hm.ticksToAdjust++
 	if hm.ticksToAdjust < intervalAdjustEvery {
 		hm.mu.Unlock()
+
 		return 0, false
 	}
+
 	hm.ticksToAdjust = 0
+
 	peerIDs := make([]NodeId, 0, len(hm.peerRegions))
 	for peerID := range hm.peerRegions {
 		peerIDs = append(peerIDs, peerID)
 	}
+
 	current := hm.interval
 	hm.mu.Unlock()
 
 	var minRTT time.Duration
+
 	for _, peerID := range peerIDs {
 		st, ok := hm.healthTable.ClockStats(peerID)
 		if !ok || !st.Primed {
 			continue
 		}
+
 		if minRTT == 0 || st.RTTMin < minRTT {
 			minRTT = st.RTTMin
 		}
 	}
+
 	if minRTT == 0 {
 		return 0, false
 	}
 
 	target := clampDuration(minRTT, intervalFloor, intervalCeil)
+
 	next := clampDuration(target, current/2, current*2)
 	if next == current {
 		return 0, false
@@ -434,6 +463,7 @@ func (hm *HeartbeatManager) adjustInterval() (time.Duration, bool) {
 	hm.mu.Unlock()
 	RecordClockTickInterval(int64(next))
 	slog.Info("clock tick interval adjusted", "from", current, "to", next, "target", target)
+
 	return next, true
 }
 
@@ -464,10 +494,12 @@ func (r *tickRing) get(seq uint64) (int64, bool) {
 	if seq == 0 {
 		return 0, false
 	}
+
 	rec := r.entries[seq%uint64(len(r.entries))]
 	if rec.seq != seq {
 		return 0, false
 	}
+
 	return rec.wall, true
 }
 
@@ -484,6 +516,7 @@ func MarshalClockTick(tick *ClockTick) []byte {
 	binary.LittleEndian.PutUint64(buf[18:26], uint64(tick.WallClock))
 	binary.LittleEndian.PutUint64(buf[26:34], uint64(tick.JumpNs))
 	binary.LittleEndian.PutUint16(buf[34:36], uint16(len(tick.Observed)))
+
 	off := tickHeaderSize
 	for _, obs := range tick.Observed {
 		binary.LittleEndian.PutUint64(buf[off:off+8], uint64(obs.NodeID))
@@ -491,6 +524,7 @@ func MarshalClockTick(tick *ClockTick) []byte {
 		binary.LittleEndian.PutUint64(buf[off+16:off+24], uint64(obs.ObservedAt))
 		off += observedTickSize
 	}
+
 	return buf
 }
 
@@ -499,9 +533,11 @@ func ParseClockTick(body []byte) (*ClockTick, error) {
 	if len(body) < tickHeaderSize {
 		return nil, fmt.Errorf("clock tick too short: %d < %d", len(body), tickHeaderSize)
 	}
+
 	if body[1] != clockTickVersion {
 		return nil, fmt.Errorf("unsupported clock tick version: %d", body[1])
 	}
+
 	count := int(binary.LittleEndian.Uint16(body[34:36]))
 	if want := tickHeaderSize + count*observedTickSize; len(body) != want {
 		return nil, fmt.Errorf("clock tick length %d does not match %d observations (want %d)",
@@ -516,6 +552,7 @@ func ParseClockTick(body []byte) (*ClockTick, error) {
 	}
 	if count > 0 {
 		tick.Observed = make([]ObservedTick, count)
+
 		off := tickHeaderSize
 		for i := range tick.Observed {
 			tick.Observed[i] = ObservedTick{
@@ -526,5 +563,6 @@ func ParseClockTick(body []byte) (*ClockTick, error) {
 			off += observedTickSize
 		}
 	}
+
 	return tick, nil
 }

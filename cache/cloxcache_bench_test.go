@@ -61,6 +61,7 @@ func (z *zipfGenerator) zetaN(start, end uint64) float64 {
 	for i := start; i < end; i++ {
 		sum += 1.0 / math.Pow(float64(i+1), z.theta)
 	}
+
 	return sum
 }
 
@@ -85,6 +86,7 @@ func BenchmarkCloxCacheGet(b *testing.B) {
 		NumShards:     128,
 		SlotsPerShard: 4096,
 	}
+
 	cache := NewCloxCache[uint64, int](cfg)
 	defer cache.Close()
 
@@ -134,6 +136,7 @@ func BenchmarkCloxCachePut(b *testing.B) {
 		NumShards:     128,
 		SlotsPerShard: 4096,
 	}
+
 	cache := NewCloxCache[uint64, int](cfg)
 	defer cache.Close()
 
@@ -171,6 +174,7 @@ func BenchmarkCloxCacheMixed(b *testing.B) {
 		NumShards:     128,
 		SlotsPerShard: 4096,
 	}
+
 	cache := NewCloxCache[uint64, int](cfg)
 	defer cache.Close()
 
@@ -185,6 +189,7 @@ func BenchmarkCloxCacheMixed(b *testing.B) {
 
 	b.RunParallel(func(pb *testing.PB) {
 		rng := rand.New(rand.NewSource(42))
+
 		i := 0
 		for pb.Next() {
 			key := uint64(i % numKeys)
@@ -193,6 +198,7 @@ func BenchmarkCloxCacheMixed(b *testing.B) {
 			} else {
 				cache.Put(key, i)
 			}
+
 			i++
 		}
 	})
@@ -218,6 +224,7 @@ func BenchmarkSyncMapMixed(b *testing.B) {
 
 	b.RunParallel(func(pb *testing.PB) {
 		rng := rand.New(rand.NewSource(42))
+
 		i := 0
 		for pb.Next() {
 			key := uint64(i % numKeys)
@@ -226,6 +233,7 @@ func BenchmarkSyncMapMixed(b *testing.B) {
 			} else {
 				m.Store(key, i)
 			}
+
 			i++
 		}
 	})
@@ -237,10 +245,12 @@ func BenchmarkCloxCacheZipf(b *testing.B) {
 		NumShards:     128,
 		SlotsPerShard: 4096,
 	}
+
 	cache := NewCloxCache[uint64, int](cfg)
 	defer cache.Close()
 
 	const numKeys = 100000
+
 	const theta = 0.99 // Zipf parameter (higher = more skewed)
 
 	// Pre-populate cache with subset of keys
@@ -273,8 +283,10 @@ func BenchmarkCloxCacheZipf(b *testing.B) {
 func BenchmarkSyncMapZipf(b *testing.B) {
 	var m sync.Map
 
-	const numKeys = 100000
-	const theta = 0.99
+	const (
+		numKeys = 100000
+		theta   = 0.99
+	)
 
 	// Pre-populate map with subset of keys
 	for i := range numKeys / 10 {
@@ -303,6 +315,7 @@ func BenchmarkCloxCacheContention(b *testing.B) {
 		NumShards:     128,
 		SlotsPerShard: 4096,
 	}
+
 	cache := NewCloxCache[uint64, int](cfg)
 	defer cache.Close()
 
@@ -373,6 +386,7 @@ func BenchmarkCloxCacheSizes(b *testing.B) {
 				NumShards:     size.numShards,
 				SlotsPerShard: size.slotsPerShard,
 			}
+
 			cache := NewCloxCache[uint64, int](cfg)
 			defer cache.Close()
 
@@ -387,6 +401,7 @@ func BenchmarkCloxCacheSizes(b *testing.B) {
 
 			b.RunParallel(func(pb *testing.PB) {
 				rng := rand.New(rand.NewSource(42))
+
 				i := 0
 				for pb.Next() {
 					key := uint64(i % numKeys)
@@ -395,6 +410,7 @@ func BenchmarkCloxCacheSizes(b *testing.B) {
 					} else {
 						cache.Put(key, i)
 					}
+
 					i++
 				}
 			})
@@ -413,6 +429,7 @@ func BenchmarkCloxCachePointers(b *testing.B) {
 		NumShards:     128,
 		SlotsPerShard: 4096,
 	}
+
 	cache := NewCloxCache[uint64, *Record](cfg)
 	defer cache.Close()
 

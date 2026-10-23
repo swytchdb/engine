@@ -38,14 +38,17 @@ import (
 // bind tips are present to avoid racing with concurrent callers.
 func allDeps(eff *pb.Effect) []*pb.EffectRef {
 	bind := eff.GetTxnBind()
-	if bind == nil || len(bind.Keys) == 0 {
-		return eff.Deps
+	if bind == nil || len(bind.GetKeys()) == 0 {
+		return eff.GetDeps()
 	}
-	deps := make([]*pb.EffectRef, len(eff.Deps), len(eff.Deps)+len(bind.Keys))
-	copy(deps, eff.Deps)
-	for _, kb := range bind.Keys {
-		deps = append(deps, kb.NewTip)
+
+	deps := make([]*pb.EffectRef, len(eff.GetDeps()), len(eff.GetDeps())+len(bind.GetKeys()))
+	copy(deps, eff.GetDeps())
+
+	for _, kb := range bind.GetKeys() {
+		deps = append(deps, kb.GetNewTip())
 	}
+
 	return deps
 }
 
@@ -89,6 +92,7 @@ func (d *dag) walk(tips []Tip, processor func(*pb.Effect) error) error {
 	if err := d.prepare(tips); err != nil {
 		return err
 	}
+
 	return d.iterate(func(_ Tip, eff *pb.Effect) error {
 		return processor(eff)
 	})
@@ -129,21 +133,24 @@ func (d *dag) prepare(tips []Tip) error {
 		tip Tip
 		eff *pb.Effect
 	}
+
 	sortedTips := make([]pair, 0, len(tips))
 	for _, t := range tips {
 		if eff, ok := d.nodes[t]; ok {
 			sortedTips = append(sortedTips, pair{t, eff})
 		}
 	}
+
 	if len(sortedTips) > 1 {
 		sort.Slice(sortedTips, func(i, j int) bool {
-			return ForkChoiceLess(sortedTips[i].eff.ForkChoiceHash, sortedTips[j].eff.ForkChoiceHash)
+			return ForkChoiceLess(sortedTips[i].eff.GetForkChoiceHash(), sortedTips[j].eff.GetForkChoiceHash())
 		})
 	}
 
 	for _, p := range sortedTips {
 		d.topoCollect(p.tip, topoVisited)
 	}
+
 	return nil
 }
 
@@ -159,6 +166,7 @@ func (d *dag) iterate(processor func(Tip, *pb.Effect) error) error {
 			}
 		}
 	}
+
 	return nil
 }
 
@@ -169,9 +177,11 @@ func (d *dag) shouldEmit(t Tip, eff *pb.Effect) bool {
 	if eff.GetSnapshot() != nil {
 		return t == d.lcaTip
 	}
-	if eff.TxnId != "" && eff.GetTxnBind() == nil && eff.TxnId != d.activeTxnID {
+
+	if eff.GetTxnId() != "" && eff.GetTxnBind() == nil && eff.GetTxnId() != d.activeTxnID {
 		return false
 	}
+
 	return true
 }
 
@@ -193,6 +203,7 @@ func (d *dag) bfs(tips []Tip, lcaTip *Tip) error {
 		if err != nil {
 			return err
 		}
+
 		d.visited[t] = true
 		d.nodes[t] = eff
 		queue = append(queue, t)
@@ -204,16 +215,19 @@ func (d *dag) bfs(tips []Tip, lcaTip *Tip) error {
 
 		eff := d.nodes[cur]
 
-		if snap := eff.GetSnapshot(); snap != nil && snap.State != nil && len(queue) == 0 {
+		if snap := eff.GetSnapshot(); snap != nil && snap.GetState() != nil && len(queue) == 0 {
 			*lcaTip = cur
+
 			return nil
 		}
 
 		var refs []*pb.EffectRef
+
 		if bind := eff.GetTxnBind(); bind != nil {
-			for _, kb := range bind.Keys {
-				if string(kb.Key) == d.key {
-					refs = []*pb.EffectRef{kb.NewTip}
+			for _, kb := range bind.GetKeys() {
+				if string(kb.GetKey()) == d.key {
+					refs = []*pb.EffectRef{kb.GetNewTip()}
+
 					break
 				}
 			}
@@ -226,15 +240,18 @@ func (d *dag) bfs(tips []Tip, lcaTip *Tip) error {
 			if d.visited[dt] {
 				continue
 			}
+
 			depEff, err := d.engine.getEffect(d.key, dt)
 			if err != nil {
 				return err
 			}
+
 			d.visited[dt] = true
 			d.nodes[dt] = depEff
 			queue = append(queue, dt)
 		}
 	}
+
 	return nil
 }
 
@@ -252,41 +269,53 @@ func (d *dag) trimAncestorsOfLCA() {
 	if d.lcaTip == zero {
 		return
 	}
+
 	lcaEff, ok := d.nodes[d.lcaTip]
 	if !ok || lcaEff.GetSnapshot() == nil {
 		return
 	}
+
 	folded := make(map[Tip]struct{})
-	stack := make([]Tip, 0, len(lcaEff.Deps))
-	for _, dep := range lcaEff.Deps {
+
+	stack := make([]Tip, 0, len(lcaEff.GetDeps()))
+	for _, dep := range lcaEff.GetDeps() {
 		stack = append(stack, r(dep))
 	}
+
 	for len(stack) > 0 {
 		cur := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
+
 		if _, seen := folded[cur]; seen {
 			continue
 		}
+
 		folded[cur] = struct{}{}
+
 		eff, ok := d.nodes[cur]
 		if !ok {
 			continue
 		}
+
 		var refs []*pb.EffectRef
+
 		if bind := eff.GetTxnBind(); bind != nil {
-			for _, kb := range bind.Keys {
-				if string(kb.Key) == d.key {
-					refs = []*pb.EffectRef{kb.NewTip}
+			for _, kb := range bind.GetKeys() {
+				if string(kb.GetKey()) == d.key {
+					refs = []*pb.EffectRef{kb.GetNewTip()}
+
 					break
 				}
 			}
 		} else {
-			refs = eff.Deps
+			refs = eff.GetDeps()
 		}
+
 		for _, dep := range refs {
 			stack = append(stack, r(dep))
 		}
 	}
+
 	for t := range folded {
 		delete(d.nodes, t)
 		delete(d.visited, t)
@@ -302,6 +331,7 @@ func (d *dag) topoCollect(t Tip, visited map[Tip]bool) {
 	if visited[t] {
 		return
 	}
+
 	visited[t] = true
 
 	eff, ok := d.nodes[t]
@@ -312,15 +342,18 @@ func (d *dag) topoCollect(t Tip, visited map[Tip]bool) {
 	// LCA snapshot: record and don't descend past it
 	if eff.GetSnapshot() != nil && t == d.lcaTip {
 		d.topoOrder = append(d.topoOrder, t)
+
 		return
 	}
 
 	// Follow deps within collected set
 	var refs []*pb.EffectRef
+
 	if bind := eff.GetTxnBind(); bind != nil {
-		for _, kb := range bind.Keys {
-			if string(kb.Key) == d.key {
-				refs = []*pb.EffectRef{kb.NewTip}
+		for _, kb := range bind.GetKeys() {
+			if string(kb.GetKey()) == d.key {
+				refs = []*pb.EffectRef{kb.GetNewTip()}
+
 				break
 			}
 		}
@@ -333,6 +366,7 @@ func (d *dag) topoCollect(t Tip, visited map[Tip]bool) {
 			tip Tip
 			eff *pb.Effect
 		}
+
 		deps := make([]pair, 0, len(refs))
 		for _, ref := range refs {
 			dt := r(ref)
@@ -340,11 +374,13 @@ func (d *dag) topoCollect(t Tip, visited map[Tip]bool) {
 				deps = append(deps, pair{dt, de})
 			}
 		}
+
 		if len(deps) > 1 {
 			sort.Slice(deps, func(i, j int) bool {
-				return ForkChoiceLess(deps[i].eff.ForkChoiceHash, deps[j].eff.ForkChoiceHash)
+				return ForkChoiceLess(deps[i].eff.GetForkChoiceHash(), deps[j].eff.GetForkChoiceHash())
 			})
 		}
+
 		for _, dep := range deps {
 			d.topoCollect(dep.tip, visited)
 		}
@@ -363,10 +399,12 @@ func (d *dag) encode(tips []Tip) string {
 	for off := range d.nodes {
 		offsets = append(offsets, off)
 	}
+
 	sort.Slice(offsets, func(i, j int) bool {
 		if offsets[i][0] != offsets[j][0] {
 			return offsets[i][0] < offsets[j][0]
 		}
+
 		return offsets[i][1] < offsets[j][1]
 	})
 
@@ -378,16 +416,21 @@ func (d *dag) encode(tips []Tip) string {
 	}
 
 	b.WriteString("T")
+
 	first := true
+
 	for _, t := range tips {
 		if _, ok := d.nodes[t]; ok {
 			if !first {
 				b.WriteByte(',')
 			}
+
 			fmt.Fprintf(&b, "%d:%d", t[0], t[1])
+
 			first = false
 		}
 	}
+
 	b.WriteByte(';')
 
 	for _, off := range offsets {
@@ -395,14 +438,16 @@ func (d *dag) encode(tips []Tip) string {
 
 		kind := byte('?')
 		val := int64(0)
+
 		switch {
 		case eff.GetData() != nil:
 			kind = 'D'
 			val = eff.GetData().GetIntVal()
 		case eff.GetSnapshot() != nil:
 			kind = 'S'
-			if s := eff.GetSnapshot().State; s != nil && s.Scalar != nil {
-				val = s.Scalar.GetIntVal()
+
+			if s := eff.GetSnapshot().GetState(); s != nil && s.GetScalar() != nil {
+				val = s.GetScalar().GetIntVal()
 			}
 		case eff.GetNoop() != nil:
 			kind = 'N'
@@ -417,17 +462,22 @@ func (d *dag) encode(tips []Tip) string {
 		}
 
 		fmt.Fprintf(&b, "%d:%d:%c:%d:", off[0], off[1], kind, val)
+
 		depFirst := true
-		for _, dep := range eff.Deps {
+
+		for _, dep := range eff.GetDeps() {
 			dt := r(dep)
 			if _, ok := d.nodes[dt]; ok {
 				if !depFirst {
 					b.WriteByte(',')
 				}
+
 				fmt.Fprintf(&b, "%d:%d", dt[0], dt[1])
+
 				depFirst = false
 			}
 		}
+
 		b.WriteByte(';')
 	}
 

@@ -117,10 +117,12 @@ func TestBindConsumedTipsMatchEmittedDeps(t *testing.T) {
 			Value:      &pb.DataEffect_Raw{Raw: []byte("31947")},
 		}},
 	}
+
 	foreignData, err := MarshalEffect(foreignEff)
 	if err != nil {
 		t.Fatalf("MarshalEffect(foreign): %v", err)
 	}
+
 	foreignNotify := BuildOffsetNotify(
 		pb.NodeID(foreign[0]), foreign, foreignEff, foreignData, nil,
 	)
@@ -133,9 +135,11 @@ func TestBindConsumedTipsMatchEmittedDeps(t *testing.T) {
 	if idxTips == nil {
 		t.Fatal("el-1 has no index tips after ingesting foreign in-flight effect")
 	}
+
 	if !idxTips.Contains(foreign) {
 		t.Fatalf("foreign in-flight tip %v is not a live index tip; tips=%v", foreign, idxTips.Tips())
 	}
+
 	if _, ok := e.pendingTxTips.Load(foreign); !ok {
 		t.Fatalf("foreign in-flight tip %v not registered in pendingTxTips", foreign)
 	}
@@ -146,9 +150,11 @@ func TestBindConsumedTipsMatchEmittedDeps(t *testing.T) {
 	// RAW into initialTips and runs resolveTipDeps for eff.Deps.
 	ctx := e.NewContext()
 	ctx.BeginTx()
+
 	if err := ctx.Emit(dataEffect(key)); err != nil {
 		t.Fatalf("Emit data effect: %v", err)
 	}
+
 	txnID := ctx.txnID // Flush's reset() clears ctx.txnID — capture it now
 	if err := ctx.Flush(); err != nil {
 		t.Fatalf("expected commit, got: %v", err)
@@ -159,45 +165,53 @@ func TestBindConsumedTipsMatchEmittedDeps(t *testing.T) {
 	if committedTips == nil {
 		t.Fatal("el-1 has no tips after commit")
 	}
+
 	var (
 		bindEff *pb.Effect
 		dataEff *pb.Effect
 	)
+
 	for _, off := range committedTips.Tips() {
 		eff, ok := e.effectCache.Get(off)
 		if !ok {
 			continue
 		}
-		if b := eff.GetTxnBind(); b != nil && eff.TxnId == txnID {
+
+		if b := eff.GetTxnBind(); b != nil && eff.GetTxnId() == txnID {
 			bindEff = eff
 			// The bind's NewTip on el-1 points to our committed data effect.
-			for _, kb := range b.Keys {
-				if string(kb.Key) != key {
+			for _, kb := range b.GetKeys() {
+				if string(kb.GetKey()) != key {
 					continue
 				}
-				if d, ok := e.effectCache.Get(r(kb.NewTip)); ok {
+
+				if d, ok := e.effectCache.Get(r(kb.GetNewTip())); ok {
 					dataEff = d
 				}
 			}
 		}
 	}
+
 	if bindEff == nil {
 		t.Fatal("did not find our committed bind on el-1")
 	}
+
 	if dataEff == nil {
 		t.Fatal("did not find the data effect anchored by our bind's el-1 NewTip")
 	}
 
 	// Extract the data effect's resolved Deps on el-1.
-	depSet := offsetSet(fromPbRefs(dataEff.Deps))
+	depSet := offsetSet(fromPbRefs(dataEff.GetDeps()))
 
 	// Extract the bind's ConsumedTips on el-1.
 	var consumed []Tip
-	for _, kb := range bindEff.GetTxnBind().Keys {
-		if string(kb.Key) == key {
-			consumed = fromPbRefs(kb.ConsumedTips)
+
+	for _, kb := range bindEff.GetTxnBind().GetKeys() {
+		if string(kb.GetKey()) == key {
+			consumed = fromPbRefs(kb.GetConsumedTips())
 		}
 	}
+
 	consumedSet := offsetSet(consumed)
 
 	t.Logf("data effect Deps[%s]      = %v", key, sortedTips(depSet))
@@ -232,6 +246,7 @@ func offsetSet(tips []Tip) map[Tip]bool {
 	for _, t := range tips {
 		m[t] = true
 	}
+
 	return m
 }
 
@@ -239,11 +254,13 @@ func sameTipSet(a, b map[Tip]bool) bool {
 	if len(a) != len(b) {
 		return false
 	}
+
 	for t := range a {
 		if !b[t] {
 			return false
 		}
 	}
+
 	return true
 }
 
@@ -252,11 +269,14 @@ func sortedTips(m map[Tip]bool) []Tip {
 	for t := range m {
 		out = append(out, t)
 	}
+
 	sort.Slice(out, func(i, j int) bool {
 		if out[i][0] != out[j][0] {
 			return out[i][0] < out[j][0]
 		}
+
 		return out[i][1] < out[j][1]
 	})
+
 	return out
 }

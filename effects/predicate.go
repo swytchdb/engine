@@ -52,33 +52,41 @@ func (e *Engine) collectTxnEffectsOnKey(txnID, key string, startTips ...Tip) (
 	obs []*pb.ObservationEffect, rw []*pb.RowWriteEffect,
 ) {
 	var zero Tip
+
 	visited := make(map[Tip]bool, 16)
+
 	stack := make([]Tip, 0, len(startTips))
 	for _, t := range startTips {
 		if t != zero {
 			stack = append(stack, t)
 		}
 	}
+
 	for len(stack) > 0 {
 		off := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
+
 		if visited[off] {
 			continue
 		}
+
 		visited[off] = true
+
 		eff, err := e.getEffect(key, off)
 		if err != nil {
 			continue
 		}
 		// A different TxnId terminates this branch — we've crossed
 		// into somebody else's history.
-		if eff.TxnId != txnID {
+		if eff.GetTxnId() != txnID {
 			continue
 		}
-		if string(eff.Key) == key {
+
+		if string(eff.GetKey()) == key {
 			if o := eff.GetObservation(); o != nil {
 				obs = append(obs, o)
 			}
+
 			if w := eff.GetRowWrite(); w != nil {
 				rw = append(rw, w)
 			}
@@ -92,6 +100,7 @@ func (e *Engine) collectTxnEffectsOnKey(txnID, key string, startTips ...Tip) (
 			}
 		}
 	}
+
 	return
 }
 
@@ -129,25 +138,29 @@ func (e *Engine) hasPredicateConflict(
 	}
 
 	for _, o := range ourObs {
-		if o.Predicate == nil {
+		if o.GetPredicate() == nil {
 			continue
 		}
+
 		for _, w := range theirRW {
-			if predicateMatches(o.Predicate, w) {
+			if predicateMatches(o.GetPredicate(), w) {
 				return true, true
 			}
 		}
 	}
+
 	for _, o := range theirObs {
-		if o.Predicate == nil {
+		if o.GetPredicate() == nil {
 			continue
 		}
+
 		for _, w := range ourRW {
-			if predicateMatches(o.Predicate, w) {
+			if predicateMatches(o.GetPredicate(), w) {
 				return true, true
 			}
 		}
 	}
+
 	return false, true
 }
 
@@ -172,121 +185,147 @@ func predicateMatches(p *pb.Predicate, rw *pb.RowWriteEffect) bool {
 	if p == nil || rw == nil {
 		return false
 	}
+
 	return predEval(p, rw) == predTrue
 }
 
 func predEval(p *pb.Predicate, rw *pb.RowWriteEffect) predTri {
-	switch p.Kind {
+	switch p.GetKind() {
 	case pb.Predicate_BOOL:
-		if p.BoolVal {
+		if p.GetBoolVal() {
 			return predTrue
 		}
+
 		return predFalse
 
 	case pb.Predicate_AND:
 		acc := predTrue
-		for _, child := range p.Children {
+
+		for _, child := range p.GetChildren() {
 			r := predEval(child, rw)
 			if r == predFalse {
 				return predFalse
 			}
+
 			if r == predUnknown {
 				acc = predUnknown
 			}
 		}
+
 		return acc
 
 	case pb.Predicate_OR:
 		acc := predFalse
-		for _, child := range p.Children {
+
+		for _, child := range p.GetChildren() {
 			r := predEval(child, rw)
 			if r == predTrue {
 				return predTrue
 			}
+
 			if r == predUnknown {
 				acc = predUnknown
 			}
 		}
+
 		return acc
 
 	case pb.Predicate_NOT:
-		r := predEval(p.Child, rw)
+		r := predEval(p.GetChild(), rw)
 		switch r {
 		case predTrue:
 			return predFalse
 		case predFalse:
 			return predTrue
+		case predUnknown:
+			return predUnknown
 		}
+
 		return predUnknown
 
 	case pb.Predicate_CMP:
-		return predCmp(int(p.Col), p.Op, p.Literal, rw)
+		return predCmp(int(p.GetCol()), p.GetOp(), p.GetLiteral(), rw)
 
 	case pb.Predicate_COL_CMP:
-		return predColCmp(int(p.Col), p.Op, int(p.Col2), rw)
+		return predColCmp(int(p.GetCol()), p.GetOp(), int(p.GetCol2()), rw)
 
 	case pb.Predicate_IS_NULL:
-		col := int(p.Col)
-		if col < 0 || col >= len(rw.Columns) {
+		col := int(p.GetCol())
+		if col < 0 || col >= len(rw.GetColumns()) {
 			return predUnknown
 		}
-		if rw.Columns[col].Kind == pb.TypedValue_NULL_VALUE {
+
+		if rw.GetColumns()[col].GetKind() == pb.TypedValue_NULL_VALUE {
 			return predTrue
 		}
+
 		return predFalse
 	}
+
 	return predUnknown
 }
 
 func predCmp(col int, op pb.PredicateCmpOp, lit *pb.TypedValue, rw *pb.RowWriteEffect) predTri {
-	if col < 0 || col >= len(rw.Columns) {
+	if col < 0 || col >= len(rw.GetColumns()) {
 		return predUnknown
 	}
+
 	if lit == nil {
 		return predUnknown
 	}
-	left := rw.Columns[col]
-	if left.Kind == pb.TypedValue_NULL_VALUE || lit.Kind == pb.TypedValue_NULL_VALUE {
+
+	left := rw.GetColumns()[col]
+	if left.GetKind() == pb.TypedValue_NULL_VALUE || lit.GetKind() == pb.TypedValue_NULL_VALUE {
 		return predUnknown
 	}
+
 	return compareTypedValues(left, op, lit)
 }
 
 func predColCmp(leftCol int, op pb.PredicateCmpOp, rightCol int, rw *pb.RowWriteEffect) predTri {
-	if leftCol < 0 || leftCol >= len(rw.Columns) {
+	if leftCol < 0 || leftCol >= len(rw.GetColumns()) {
 		return predUnknown
 	}
-	if rightCol < 0 || rightCol >= len(rw.Columns) {
+
+	if rightCol < 0 || rightCol >= len(rw.GetColumns()) {
 		return predUnknown
 	}
-	l := rw.Columns[leftCol]
-	r := rw.Columns[rightCol]
-	if l.Kind == pb.TypedValue_NULL_VALUE || r.Kind == pb.TypedValue_NULL_VALUE {
+
+	l := rw.GetColumns()[leftCol]
+
+	r := rw.GetColumns()[rightCol]
+	if l.GetKind() == pb.TypedValue_NULL_VALUE || r.GetKind() == pb.TypedValue_NULL_VALUE {
 		return predUnknown
 	}
+
 	return compareTypedValues(l, op, r)
 }
 
 func compareTypedValues(a *pb.TypedValue, op pb.PredicateCmpOp, b *pb.TypedValue) predTri {
-	if a.Kind == b.Kind {
-		switch a.Kind {
+	if a.GetKind() == b.GetKind() {
+		switch a.GetKind() {
+		case pb.TypedValue_NULL_VALUE:
+			return predUnknown
 		case pb.TypedValue_INT:
-			return predCmpFromInt(cmp3Int(a.IntVal, b.IntVal), op)
+			return predCmpFromInt(cmp3Int(a.GetIntVal(), b.GetIntVal()), op)
 		case pb.TypedValue_FLOAT:
-			return predCmpFromInt(cmp3Float(a.FloatVal, b.FloatVal), op)
+			return predCmpFromInt(cmp3Float(a.GetFloatVal(), b.GetFloatVal()), op)
 		case pb.TypedValue_TEXT:
-			return predCmpFromInt(cmp3Str(a.TextVal, b.TextVal), op)
+			return predCmpFromInt(cmp3Str(a.GetTextVal(), b.GetTextVal()), op)
 		case pb.TypedValue_BLOB:
-			return predCmpFromInt(bytes.Compare(a.BlobVal, b.BlobVal), op)
+			return predCmpFromInt(bytes.Compare(a.GetBlobVal(), b.GetBlobVal()), op)
 		}
+
 		return predUnknown
 	}
 	// Cross-type numeric promotion.
-	if isNumericKind(a.Kind) && isNumericKind(b.Kind) {
+	if isNumericKind(a.GetKind()) && isNumericKind(b.GetKind()) {
 		af := numericKindAsFloat(a)
 		bf := numericKindAsFloat(b)
+
 		return predCmpFromInt(cmp3Float(af, bf), op)
 	}
+
 	return predUnknown
 }
 
@@ -295,10 +334,11 @@ func isNumericKind(k pb.TypedValue_Kind) bool {
 }
 
 func numericKindAsFloat(v *pb.TypedValue) float64 {
-	if v.Kind == pb.TypedValue_FLOAT {
-		return v.FloatVal
+	if v.GetKind() == pb.TypedValue_FLOAT {
+		return v.GetFloatVal()
 	}
-	return float64(v.IntVal)
+
+	return float64(v.GetIntVal())
 }
 
 func cmp3Int(a, b int64) int {
@@ -308,6 +348,7 @@ func cmp3Int(a, b int64) int {
 	case a > b:
 		return 1
 	}
+
 	return 0
 }
 
@@ -318,6 +359,7 @@ func cmp3Float(a, b float64) int {
 	case a > b:
 		return 1
 	}
+
 	return 0
 }
 
@@ -328,11 +370,13 @@ func cmp3Str(a, b string) int {
 	case a > b:
 		return 1
 	}
+
 	return 0
 }
 
 func predCmpFromInt(c int, op pb.PredicateCmpOp) predTri {
 	var yes bool
+
 	switch op {
 	case pb.PredicateCmpOp_CMP_EQ:
 		yes = c == 0
@@ -347,8 +391,10 @@ func predCmpFromInt(c int, op pb.PredicateCmpOp) predTri {
 	default:
 		return predUnknown
 	}
+
 	if yes {
 		return predTrue
 	}
+
 	return predFalse
 }

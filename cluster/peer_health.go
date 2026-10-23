@@ -72,6 +72,7 @@ func (t *PeerHealthTable) Get(nodeID NodeId) *PeerHealth {
 	if !ok {
 		return nil
 	}
+
 	return v
 }
 
@@ -80,7 +81,9 @@ func (t *PeerHealthTable) GetOrCreate(nodeID NodeId) *PeerHealth {
 	if v, ok := t.peers.Load(nodeID); ok {
 		return v
 	}
+
 	v, _ := t.peers.LoadOrStore(nodeID, &PeerHealth{clock: newPeerClockStats(t.cfg.WindowSize)})
+
 	return v
 }
 
@@ -94,12 +97,15 @@ func (t *PeerHealthTable) Remove(nodeID NodeId) {
 // localRegion and are both alive and symmetric (valid replication targets).
 func (t *PeerHealthTable) AliveSymmetricPeers(localRegion string, peerRegions map[NodeId]string) []NodeId {
 	var result []NodeId
+
 	t.peers.Range(func(nodeID NodeId, ph *PeerHealth) bool {
 		if peerRegions[nodeID] == localRegion && ph.IsReplicationTarget() {
 			result = append(result, nodeID)
 		}
+
 		return true
 	})
+
 	return result
 }
 
@@ -108,24 +114,30 @@ func (t *PeerHealthTable) AliveSymmetricPeers(localRegion string, peerRegions ma
 // so they receive effects when the partition heals.
 func (t *PeerHealthTable) AllSameRegionPeers(localRegion string, peerRegions map[NodeId]string) []NodeId {
 	var result []NodeId
+
 	t.peers.Range(func(nodeID NodeId, _ *PeerHealth) bool {
 		if peerRegions[nodeID] == localRegion {
 			result = append(result, nodeID)
 		}
+
 		return true
 	})
+
 	return result
 }
 
 // AliveSymmetricCount returns the count of alive+symmetric peers in the local region.
 func (t *PeerHealthTable) AliveSymmetricCount(localRegion string, peerRegions map[NodeId]string) int {
 	count := 0
+
 	t.peers.Range(func(nodeID NodeId, ph *PeerHealth) bool {
 		if peerRegions[nodeID] == localRegion && ph.IsReplicationTarget() {
 			count++
 		}
+
 		return true
 	})
+
 	return count
 }
 
@@ -134,13 +146,17 @@ func (t *PeerHealthTable) AliveSymmetricCount(localRegion string, peerRegions ma
 // same-region peers (standalone or cross-region-only deployment).
 func (t *PeerHealthTable) AllRegionPeersReachable(localRegion string, peerRegions map[NodeId]string) bool {
 	reachable := true
+
 	t.peers.Range(func(nodeID NodeId, ph *PeerHealth) bool {
 		if peerRegions[nodeID] == localRegion && !ph.IsReplicationTarget() {
 			reachable = false
+
 			return false // short-circuit
 		}
+
 		return true
 	})
+
 	return reachable
 }
 
@@ -151,15 +167,19 @@ func (t *PeerHealthTable) AllRegionPeersReachable(localRegion string, peerRegion
 func (t *PeerHealthTable) InMajorityPartition(localRegion string, peerRegions map[NodeId]string) bool {
 	total := 1     // count self
 	reachable := 1 // self is always reachable
+
 	t.peers.Range(func(nodeID NodeId, ph *PeerHealth) bool {
 		if peerRegions[nodeID] == localRegion {
 			total++
+
 			if ph.IsReplicationTarget() {
 				reachable++
 			}
 		}
+
 		return true
 	})
+
 	return reachable > total/2
 }
 
@@ -171,6 +191,7 @@ func (t *PeerHealthTable) GetRTT(nodeID NodeId) time.Duration {
 	if ph == nil {
 		return 0
 	}
+
 	return ph.clock.snapshot(time.Now()).RTTMin
 }
 
@@ -181,6 +202,7 @@ func (t *PeerHealthTable) ClockStats(nodeID NodeId) (ClockStats, bool) {
 	if ph == nil {
 		return ClockStats{}, false
 	}
+
 	return ph.clock.snapshot(time.Now()), true
 }
 
@@ -188,12 +210,15 @@ func (t *PeerHealthTable) ClockStats(nodeID NodeId) (ClockStats, bool) {
 // Implements effects.PeerRTTProvider.
 func (t *PeerHealthTable) AlivePeerIDs() []NodeId {
 	var result []NodeId
+
 	t.peers.Range(func(nodeID NodeId, ph *PeerHealth) bool {
 		if ph.alive.Load() {
 			result = append(result, nodeID)
 		}
+
 		return true
 	})
+
 	return result
 }
 
@@ -206,6 +231,7 @@ func (t *PeerHealthTable) PruneUnknownPeers(known map[NodeId]struct{}) {
 			t.peers.Delete(nodeID)
 			removePeerMetrics(nodeID)
 		}
+
 		return true
 	})
 }
@@ -226,19 +252,24 @@ func (t *PeerHealthTable) CheckLiveness() {
 		if !ph.alive.Load() {
 			return true
 		}
+
 		elapsed, heard := ph.clock.sinceLastArrival(now)
 		if !heard {
 			return true
 		}
+
 		timeout, adaptive := ph.clock.livenessTimeout(t.cfg)
 		if !adaptive {
 			timeout = fallback
 		}
+
 		RecordPeerLivenessTimeout(nodeID, int64(timeout))
+
 		if elapsed > timeout {
 			ph.alive.Store(false)
 			RecordPeerAlive(nodeID, false)
 		}
+
 		return true
 	})
 }

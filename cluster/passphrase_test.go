@@ -38,6 +38,7 @@ func TestDeriveCADeterministic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first derivation failed: %v", err)
 	}
+
 	key2, cert2, err := DeriveCAFromPassphrase("deterministic-test")
 	if err != nil {
 		t.Fatalf("second derivation failed: %v", err)
@@ -47,6 +48,7 @@ func TestDeriveCADeterministic(t *testing.T) {
 	if !bytes.Equal(key1.Seed(), key2.Seed()) {
 		t.Fatal("same passphrase produced different CA keys")
 	}
+
 	if !bytes.Equal(cert1.Raw, cert2.Raw) {
 		t.Fatal("same passphrase produced different CA certificate bytes")
 	}
@@ -57,6 +59,7 @@ func TestDeriveCADifferentPassphrases(t *testing.T) {
 	if err != nil {
 		t.Fatalf("derivation a failed: %v", err)
 	}
+
 	key2, _, err := DeriveCAFromPassphrase("passphrase-b")
 	if err != nil {
 		t.Fatalf("derivation b failed: %v", err)
@@ -76,9 +79,11 @@ func TestDeriveCAProperties(t *testing.T) {
 	if !cert.IsCA {
 		t.Fatal("CA cert should have IsCA=true")
 	}
+
 	if cert.Subject.CommonName != "swytch-cluster-ca" {
 		t.Fatalf("expected CN 'swytch-cluster-ca', got %q", cert.Subject.CommonName)
 	}
+
 	if cert.KeyUsage&x509.KeyUsageCertSign == 0 {
 		t.Fatal("CA cert should have CertSign key usage")
 	}
@@ -107,6 +112,7 @@ func TestGenerateLeafCert(t *testing.T) {
 
 	pool := x509.NewCertPool()
 	pool.AddCert(caCert)
+
 	if _, err := leafCert.Verify(x509.VerifyOptions{
 		Roots:     pool,
 		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
@@ -151,6 +157,7 @@ func TestGenerateLeafCertEphemeral(t *testing.T) {
 	if err != nil {
 		t.Fatalf("leaf1 failed: %v", err)
 	}
+
 	leaf2, err := GenerateLeafCert(caKey, caCert, "127.0.0.1:7000")
 	if err != nil {
 		t.Fatalf("leaf2 failed: %v", err)
@@ -158,6 +165,7 @@ func TestGenerateLeafCertEphemeral(t *testing.T) {
 
 	// Leaf keys should be different (ephemeral).
 	key1 := leaf1.PrivateKey.(ed25519.PrivateKey)
+
 	key2 := leaf2.PrivateKey.(ed25519.PrivateKey)
 	if bytes.Equal(key1.Seed(), key2.Seed()) {
 		t.Fatal("two leaf certs should have different ephemeral keys")
@@ -169,6 +177,7 @@ func TestGeneratePassphraseEntropy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gen 1 failed: %v", err)
 	}
+
 	p2, err := GeneratePassphrase()
 	if err != nil {
 		t.Fatalf("gen 2 failed: %v", err)
@@ -177,6 +186,7 @@ func TestGeneratePassphraseEntropy(t *testing.T) {
 	if len(p1) != 43 {
 		t.Fatalf("expected 43 chars (base64 RawURL of 32 bytes), got %d", len(p1))
 	}
+
 	if p1 == p2 {
 		t.Fatal("two generated passphrases should not be identical")
 	}
@@ -197,10 +207,12 @@ func TestLeafSourceReMintsNearExpiry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first current: %v", err)
 	}
+
 	again, err := src.current()
 	if err != nil {
 		t.Fatalf("second current: %v", err)
 	}
+
 	if again != first {
 		t.Fatal("expected the cached leaf to be reused while fresh")
 	}
@@ -212,9 +224,11 @@ func TestLeafSourceReMintsNearExpiry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rotated current: %v", err)
 	}
+
 	if rotated == first {
 		t.Fatal("expected a re-minted leaf past half-life")
 	}
+
 	if time.Until(rotated.Leaf.NotAfter) < leafValidity-time.Minute {
 		t.Fatal("re-minted leaf should carry a fresh validity window")
 	}
@@ -229,6 +243,7 @@ func TestPassphraseTLSHandshake(t *testing.T) {
 		Nodes:         []NodeConfig{{ID: 0, Address: "127.0.0.1:0"}},
 		TLSPassphrase: passphrase,
 	}
+
 	serverTLS, err := serverCfg.BuildTLSConfig()
 	if err != nil {
 		t.Fatalf("server TLS: %v", err)
@@ -239,6 +254,7 @@ func TestPassphraseTLSHandshake(t *testing.T) {
 		Nodes:         []NodeConfig{{ID: 1, Address: "127.0.0.1:0"}},
 		TLSPassphrase: passphrase,
 	}
+
 	clientTLS, err := clientCfg.BuildClientTLSConfig()
 	if err != nil {
 		t.Fatalf("client TLS: %v", err)
@@ -249,16 +265,23 @@ func TestPassphraseTLSHandshake(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer ln.Close()
+	defer func() {
+		if err := ln.Close(); err != nil {
+			t.Errorf("close listener: %v", err)
+		}
+	}()
 
 	errCh := make(chan error, 1)
+
 	go func() {
 		conn, err := ln.Accept()
 		if err != nil {
 			errCh <- err
+
 			return
 		}
-		defer conn.Close()
+		// The handshake result is checked below; connection teardown is best effort.
+		defer func() { _ = conn.Close() }()
 		// Force the handshake.
 		errCh <- conn.(*tls.Conn).Handshake()
 	}()
@@ -266,11 +289,14 @@ func TestPassphraseTLSHandshake(t *testing.T) {
 	// Dial with client TLS.
 	clientTLS.ServerName = "" // skip hostname verification for this test
 	clientTLS.InsecureSkipVerify = false
+
 	conn, err := tls.Dial("tcp", ln.Addr().String(), clientTLS)
 	if err != nil {
 		t.Fatalf("client dial: %v", err)
 	}
-	conn.Close()
+
+	// The handshake is complete; a peer closing first is harmless during teardown.
+	_ = conn.Close()
 
 	if err := <-errCh; err != nil {
 		t.Fatalf("server handshake: %v", err)
@@ -284,6 +310,7 @@ func TestPassphraseTLSHandshakeMismatch(t *testing.T) {
 		Nodes:         []NodeConfig{{ID: 0, Address: "127.0.0.1:0"}},
 		TLSPassphrase: "server-passphrase",
 	}
+
 	serverTLS, err := serverCfg.BuildTLSConfig()
 	if err != nil {
 		t.Fatalf("server TLS: %v", err)
@@ -294,6 +321,7 @@ func TestPassphraseTLSHandshakeMismatch(t *testing.T) {
 		Nodes:         []NodeConfig{{ID: 1, Address: "127.0.0.1:0"}},
 		TLSPassphrase: "client-passphrase",
 	}
+
 	clientTLS, err := clientCfg.BuildClientTLSConfig()
 	if err != nil {
 		t.Fatalf("client TLS: %v", err)
@@ -303,20 +331,37 @@ func TestPassphraseTLSHandshakeMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer ln.Close()
+	defer func() {
+		if err := ln.Close(); err != nil {
+			t.Errorf("close listener: %v", err)
+		}
+	}()
+
+	errCh := make(chan error, 1)
 
 	go func() {
 		conn, err := ln.Accept()
 		if err != nil {
+			errCh <- err
+
 			return
 		}
-		conn.(*tls.Conn).Handshake() //nolint:errcheck
-		conn.Close()
+
+		// Failed TLS connections have no application data to flush.
+		defer func() { _ = conn.Close() }()
+
+		errCh <- conn.(*tls.Conn).Handshake()
 	}()
 
 	conn, err := tls.Dial("tcp", ln.Addr().String(), clientTLS)
 	if err == nil {
-		conn.Close()
+		// Release the unexpected connection before reporting the handshake failure.
+		_ = conn.Close()
+
 		t.Fatal("expected handshake to fail with mismatched passphrases")
+	}
+
+	if err := <-errCh; err == nil {
+		t.Fatal("expected server handshake to fail with mismatched passphrases")
 	}
 }

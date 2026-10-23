@@ -174,6 +174,7 @@ func TestReconstructIncludesDescendantBindWithInvisibleAncestor(t *testing.T) {
 	// the moment we read.
 	e.horizon.Add("txn-A", bindA,
 		bindA_pbBind(key, []Tip{root}, txAWrite))
+
 	if !e.horizon.IsInvisible("txn-A") {
 		t.Fatal("setup: txn-A should be invisible after Add")
 	}
@@ -184,9 +185,11 @@ func TestReconstructIncludesDescendantBindWithInvisibleAncestor(t *testing.T) {
 	e.horizon.Add("txn-B", bindB,
 		bindA_pbBind(key, []Tip{preB}, txBWrite))
 	e.horizon.MakeVisible("txn-B")
+
 	if e.horizon.IsInvisible("txn-B") {
 		t.Fatal("setup: txn-B should be visible after MakeVisible")
 	}
+
 	if !e.horizon.IsInvisible("txn-A") {
 		t.Fatal("setup: txn-A should still be invisible after txn-B was made visible")
 	}
@@ -198,12 +201,14 @@ func TestReconstructIncludesDescendantBindWithInvisibleAncestor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reconstruct error: %v", err)
 	}
+
 	got := orderedValues(result)
 	sort.Strings(got)
 
 	hasBase := false
 	has66 := false
 	has69 := false
+
 	for _, v := range got {
 		switch v {
 		case "base":
@@ -240,6 +245,7 @@ func bindA_pbBind(key string, consumed []Tip, newTip Tip) *pb.TransactionalBindE
 	for i, t := range consumed {
 		refs[i] = toPbRef(t)
 	}
+
 	return &pb.TransactionalBindEffect{
 		TxnHlc:           sTs(100),
 		OriginatorNodeId: 1,
@@ -261,6 +267,7 @@ func newSnapshotEngineWithHorizon(log *snapshotLog) *Engine {
 	} else {
 		ec = newVertexPool()
 	}
+
 	e := &Engine{
 		index:             keytrie.NewCritbit[leafState](),
 		effectCache:       ec,
@@ -280,7 +287,9 @@ func newSnapshotEngineWithHorizon(log *snapshotLog) *Engine {
 	e.horizon.afterFunc = func(d time.Duration, f func()) *time.Timer {
 		_ = f
 		_ = d
+
 		return time.NewTimer(time.Hour)
 	}
+
 	return e
 }

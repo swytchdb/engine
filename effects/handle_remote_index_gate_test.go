@@ -65,10 +65,12 @@ func TestHandleRemote_Rule1_UnsubscribedCanonical_NoIndexUpdate(t *testing.T) {
 		TxnId:          "2:50:1",
 		Kind:           &pb.Effect_TxnBind{TxnBind: bind},
 	}
+
 	data, err := proto.Marshal(eff)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
+
 	notify := BuildOffsetNotify(2, bindOff, eff, data, nil)
 
 	if _, err := e.HandleRemote(notify); err != nil {
@@ -126,10 +128,12 @@ func TestHandleRemote_Rule1_UnsubscribedAdditional_NoIndexUpdate(t *testing.T) {
 		TxnId:          "2:60:1",
 		Kind:           &pb.Effect_TxnBind{TxnBind: bind},
 	}
+
 	data, err := proto.Marshal(eff)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
+
 	notify := BuildOffsetNotify(2, bindOff, eff, data, nil)
 
 	if _, err := e.HandleRemote(notify); err != nil {

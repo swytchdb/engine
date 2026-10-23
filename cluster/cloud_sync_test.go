@@ -42,6 +42,7 @@ import (
 
 type staticTipsClient struct {
 	dp.DataPlaneClient
+
 	response *dp.GetTipsResponse
 }
 
@@ -65,6 +66,7 @@ func TestStopWaitsForInflightEnqueue(t *testing.T) {
 			t.Fatalf("close engine: %v", err)
 		}
 	}()
+
 	cs := &CloudSync{
 		engine:      engine,
 		keyNameKey:  DeriveKeyNameKey("shutdown-test-secret"),
@@ -76,14 +78,17 @@ func TestStopWaitsForInflightEnqueue(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	enqueued := make(chan effects.Tip, 1)
+
 	engine.SetOnLocalEffect(func(tip effects.Tip, eff *pb.Effect) {
 		close(entered)
 		<-release
 		cs.handleLocalEffect(tip, eff)
+
 		enqueued <- tip
 	})
 
 	emitDone := make(chan error, 1)
+
 	go func() {
 		ctx := engine.NewContext()
 		if err := ctx.Emit(&pb.Effect{
@@ -94,17 +99,22 @@ func TestStopWaitsForInflightEnqueue(t *testing.T) {
 			}},
 		}); err != nil {
 			emitDone <- err
+
 			return
 		}
+
 		emitDone <- ctx.Flush()
 	}()
+
 	<-entered
 
 	stopped := make(chan struct{})
+
 	go func() {
 		cs.Stop()
 		close(stopped)
 	}()
+
 	select {
 	case <-stopped:
 		t.Fatal("Stop returned while a local-effect callback was still in flight")
@@ -112,11 +122,14 @@ func TestStopWaitsForInflightEnqueue(t *testing.T) {
 	}
 
 	close(release)
+
 	tip := <-enqueued
 	cs.retire(tip) // stand in for the cloud ack so the drain can complete
+
 	if err := <-emitDone; err != nil {
 		t.Fatalf("emit: %v", err)
 	}
+
 	select {
 	case <-stopped:
 	case <-time.After(time.Second):
@@ -128,10 +141,12 @@ func TestStopWaitsForInflightEnqueue(t *testing.T) {
 // given PRF names.
 func filterFrame(t *testing.T, names ...[]byte) []byte {
 	t.Helper()
+
 	b := effects.NewBloom(effects.BloomMinBytes)
 	for _, n := range names {
 		b.Set(n)
 	}
+
 	return b.Frame()
 }
 
@@ -152,9 +167,11 @@ func TestCloudMayHoldGate(t *testing.T) {
 	}
 
 	cs.handleFilter(&dp.KeyFilter{Filter: filterFrame(t, held)})
+
 	if !cs.cloudMayHold(held) {
 		t.Fatal("cloud-held name must pass the gate")
 	}
+
 	if cs.cloudMayHold(absent) {
 		t.Fatal("name absent from the filter must free-miss")
 	}
@@ -163,15 +180,18 @@ func TestCloudMayHoldGate(t *testing.T) {
 	cs.filterMu.Lock()
 	cs.filterOwn.add(ours)
 	cs.filterMu.Unlock()
+
 	if !cs.cloudMayHold(ours) {
 		t.Fatal("own-uploaded name must pass the gate")
 	}
 
 	// A replacement frame wins wholesale, but own uploads remain visible.
 	cs.handleFilter(&dp.KeyFilter{Filter: filterFrame(t, absent)})
+
 	if !cs.cloudMayHold(absent) || cs.cloudMayHold(held) {
 		t.Fatal("a new frame must replace the previous filter wholesale")
 	}
+
 	if !cs.cloudMayHold(ours) {
 		t.Fatal("own uploads must survive a bulk replacement")
 	}
@@ -190,6 +210,7 @@ func TestHandleFilterUndecodableKeepsPrevious(t *testing.T) {
 	if !cs.cloudMayHold(held) {
 		t.Fatal("undecodable frame must not replace the previous filter")
 	}
+
 	if cs.cloudMayHold(CloudKeyName(keyNameKey, []byte("absent"))) {
 		t.Fatal("undecodable frame must not open the gate")
 	}
@@ -209,8 +230,10 @@ func TestHandleMemberRemoveRoutesToHandler(t *testing.T) {
 	cs.handleMemberRemove(&dp.MemberRemove{NodeId: 8})
 
 	var got uint64
+
 	cs.SetMemberRemoveHandler(func(nodeID uint64) { got = nodeID })
 	cs.handleMemberRemove(&dp.MemberRemove{NodeId: 42})
+
 	if got != 42 {
 		t.Fatalf("member remove not routed to handler: got node_id %d, want 42", got)
 	}
@@ -221,15 +244,19 @@ func TestHandleMemberRemoveRoutesToHandler(t *testing.T) {
 // whose upload the cloud frame doesn't cover yet.
 func TestOwnFilterGrowth(t *testing.T) {
 	var f ownFilter
+
 	const n = 10_000 // enough to force several doublings from the 4KB floor
+
 	names := make([][]byte, n)
 	for i := range n {
 		names[i] = []byte{byte(i), byte(i >> 8), 'o', 'w', 'n'}
 		f.add(names[i])
 	}
+
 	if len(f.blooms) < 2 {
 		t.Fatalf("expected the filter to grow, still %d bloom(s)", len(f.blooms))
 	}
+
 	for i, name := range names {
 		if !f.has(effects.BloomHash(name)) {
 			t.Fatalf("false negative for name %d after growth", i)
@@ -247,6 +274,7 @@ func TestPendingTipsIndex(t *testing.T) {
 			t.Fatalf("close engine: %v", err)
 		}
 	}()
+
 	cs := &CloudSync{
 		engine:      engine,
 		keyNameKey:  DeriveKeyNameKey("outbox-test-secret"),
@@ -259,23 +287,29 @@ func TestPendingTipsIndex(t *testing.T) {
 	effB := &pb.Effect{Key: []byte("k")}
 	tipA := effects.Tip{1, 10}
 	tipB := effects.Tip{1, 11}
+
 	engine.EffectCache().PutSized(tipA, effA, 64)
 	engine.EffectCache().PutSized(tipB, effB, 64)
 
 	cs.handleLocalEffect(tipA, effA)
 	cs.handleLocalEffect(tipB, effB)
+
 	if got := cs.pendingTipsFor("k"); len(got) != 2 {
 		t.Fatalf("expected both un-acked tips on k, got %v", got)
 	}
 
 	cs.retire(tipA)
+
 	if got := cs.pendingTipsFor("k"); len(got) != 1 || got[0] != tipB {
 		t.Fatalf("expected only %v after retiring %v, got %v", tipB, tipA, got)
 	}
+
 	cs.retire(tipB)
+
 	if got := cs.pendingTipsFor("k"); got != nil {
 		t.Fatalf("expected no pending tips after full retire, got %v", got)
 	}
+
 	if len(cs.pendingKeys) != 0 {
 		t.Fatal("pendingKeys entry should be removed with its last tip")
 	}
@@ -292,6 +326,7 @@ func TestOutboxPinsKeyUntilDrained(t *testing.T) {
 			t.Fatalf("close engine: %v", err)
 		}
 	}()
+
 	cs := &CloudSync{
 		engine:      engine,
 		keyNameKey:  DeriveKeyNameKey("pin-test-secret"),
@@ -303,6 +338,7 @@ func TestOutboxPinsKeyUntilDrained(t *testing.T) {
 	// A real emit creates the key's index leaf, as it has always done by the
 	// time handleLocalEffect fires in production.
 	const key = "pinned-key"
+
 	ectx := engine.NewContext()
 	if err := ectx.Emit(&pb.Effect{
 		Key: []byte(key),
@@ -313,6 +349,7 @@ func TestOutboxPinsKeyUntilDrained(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("emit: %v", err)
 	}
+
 	if err := ectx.Flush(); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
@@ -321,16 +358,20 @@ func TestOutboxPinsKeyUntilDrained(t *testing.T) {
 	effB := &pb.Effect{Key: []byte(key)}
 	tipA := effects.Tip{1, 1000}
 	tipB := effects.Tip{1, 1001}
+
 	engine.EffectCache().PutSized(tipA, effA, 64)
 	engine.EffectCache().PutSized(tipB, effB, 64)
 
 	cs.handleLocalEffect(tipA, effA)
+
 	if !cs.pendingKeys[key].pinned {
 		t.Fatal("first enqueue on a live key must take the eviction pin")
 	}
+
 	cs.handleLocalEffect(tipB, effB)
 
 	cs.retire(tipA)
+
 	if _, held := cs.pendingKeys[key]; !held {
 		t.Fatal("key entry must survive while a tip is still un-acked")
 	}
@@ -343,6 +384,7 @@ func TestOutboxPinsKeyUntilDrained(t *testing.T) {
 	if !engine.PinKey(key) {
 		t.Fatal("key leaf disappeared after drain")
 	}
+
 	engine.UnpinKey(key)
 
 	// A key with no live leaf (the eviction path's own unsubscribe mint):
@@ -351,9 +393,11 @@ func TestOutboxPinsKeyUntilDrained(t *testing.T) {
 	ghostTip := effects.Tip{1, 1002}
 	engine.EffectCache().PutSized(ghostTip, ghost, 64)
 	cs.handleLocalEffect(ghostTip, ghost)
+
 	if cs.pendingKeys["never-indexed"].pinned {
 		t.Fatal("enqueue on a leafless key must not claim a pin")
 	}
+
 	cs.retire(ghostTip)
 }
 
@@ -370,6 +414,7 @@ func TestSubscriptionMintDoesNotOpenGate(t *testing.T) {
 			t.Fatalf("close engine: %v", err)
 		}
 	}()
+
 	keyNameKey := DeriveKeyNameKey("sub-gate-test-secret")
 	cs := &CloudSync{
 		engine:      engine,
@@ -392,6 +437,7 @@ func TestSubscriptionMintDoesNotOpenGate(t *testing.T) {
 	if cs.cloudMayHold(CloudKeyName(keyNameKey, []byte("k"))) {
 		t.Fatal("a subscription mint must not open the read-miss gate for its key")
 	}
+
 	if got := cs.pendingTipsFor("k"); len(got) != 1 || got[0] != tip {
 		t.Fatalf("the subscription must still upload, got outbox tips %v", got)
 	}
@@ -427,9 +473,11 @@ func TestDiscoverySkipsOnlyDependencyLessSubscriptions(t *testing.T) {
 	if !discoverySkipsTip(plainSub) {
 		t.Fatal("dependency-less subscription must not keep the LCA queue open")
 	}
+
 	if discoverySkipsTip(unsub) {
 		t.Fatal("unsubscribe dependencies must remain reachable from the cloud frontier")
 	}
+
 	if discoverySkipsTip(data) {
 		t.Fatal("data tip was mistaken for subscription metadata")
 	}
@@ -444,8 +492,9 @@ func TestDiscoverMembersNormalizesCandidateMarkersBeforeMissingVerdict(t *testin
 	if err != nil {
 		t.Fatalf("encryptor: %v", err)
 	}
+
 	stale := effects.Tip{77, 1}
-	real := effects.Tip{88, 2}
+	realTip := effects.Tip{88, 2}
 	wantState := &pb.ReducedEffect{
 		Collection: pb.CollectionKind_SCALAR,
 		Scalar: &pb.DataEffect{
@@ -463,20 +512,23 @@ func TestDiscoverMembersNormalizesCandidateMarkersBeforeMissingVerdict(t *testin
 		keyNameKey: DeriveKeyNameKey("candidate-frontier-test-secret"),
 		folder:     "test-folder",
 	}
-	realEnv, err := cs.buildEnvelope(real, realEff)
+
+	realEnv, err := cs.buildEnvelope(realTip, realEff)
 	if err != nil {
 		t.Fatalf("build envelope: %v", err)
 	}
+
 	cs.client = &staticTipsClient{response: &dp.GetTipsResponse{Keys: []*dp.KeyTips{{
 		Tips: []*dp.EffectRef{
 			{NodeId: stale[0], Offset: stale[1]},
-			{NodeId: real[0], Offset: real[1]},
+			{NodeId: realTip[0], Offset: realTip[1]},
 		},
 		Closure: []*dp.Effect{realEnv},
 	}}}}
 	missingFetches := 0
 	cs.httpClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 		missingFetches++
+
 		return &http.Response{
 			StatusCode: http.StatusNotFound,
 			Body:       io.NopCloser(strings.NewReader("")),
@@ -488,9 +540,11 @@ func TestDiscoverMembersNormalizesCandidateMarkersBeforeMissingVerdict(t *testin
 	if err != nil {
 		t.Fatalf("discover members: %v", err)
 	}
+
 	if got == nil || got.GetScalar() == nil || string(got.GetScalar().GetRaw()) != "membership-state" {
 		t.Fatalf("discovered state = %v, want snapshot scalar %q", got, "membership-state")
 	}
+
 	if missingFetches != 1 {
 		t.Fatalf("missing stale marker fetched %d times, want one normalization probe", missingFetches)
 	}
@@ -507,6 +561,7 @@ func TestDiscoverMembersUnreadableBranchErrorsInsteadOfForkChoice(t *testing.T) 
 	if err != nil {
 		t.Fatalf("encryptor: %v", err)
 	}
+
 	hole := effects.Tip{99, 1}
 	first := effects.Tip{100, 2}
 	second := effects.Tip{101, 2}
@@ -531,14 +586,17 @@ func TestDiscoverMembersUnreadableBranchErrorsInsteadOfForkChoice(t *testing.T) 
 		keyNameKey: DeriveKeyNameKey("candidate-fork-test-secret"),
 		folder:     "test-folder",
 	}
+
 	firstEnv, err := cs.buildEnvelope(first, firstEff)
 	if err != nil {
 		t.Fatalf("build first envelope: %v", err)
 	}
+
 	secondEnv, err := cs.buildEnvelope(second, secondEff)
 	if err != nil {
 		t.Fatalf("build second envelope: %v", err)
 	}
+
 	cs.client = &staticTipsClient{response: &dp.GetTipsResponse{Keys: []*dp.KeyTips{{
 		Tips: []*dp.EffectRef{
 			{NodeId: first[0], Offset: first[1]},
@@ -572,6 +630,7 @@ func TestCloudTipsGatedSkipsRPC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gated CloudTips errored: %v", err)
 	}
+
 	if tips != nil || sidecar != nil || missing != nil {
 		t.Fatalf("gated CloudTips returned tips: %v (sidecar %v, missing %v)", tips, sidecar, missing)
 	}
@@ -600,11 +659,13 @@ func TestCloudTipsSurfacesMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CloudTips: %v", err)
 	}
-	wantTips := []effects.Tip{{readable.NodeId, readable.Offset}, {holed.NodeId, holed.Offset}}
+
+	wantTips := []effects.Tip{{readable.GetNodeId(), readable.GetOffset()}, {holed.GetNodeId(), holed.GetOffset()}}
 	if !slices.Equal(tips, wantTips) {
 		t.Fatalf("tips = %v, want %v", tips, wantTips)
 	}
-	wantMissing := []effects.Tip{{holed.NodeId, holed.Offset}}
+
+	wantMissing := []effects.Tip{{holed.GetNodeId(), holed.GetOffset()}}
 	if !slices.Equal(missing, wantMissing) {
 		t.Fatalf("missing = %v, want %v", missing, wantMissing)
 	}
@@ -614,6 +675,7 @@ func TestCloudTipsSurfacesMissing(t *testing.T) {
 // per call, holding on the last entry once exhausted.
 type sequencedTipsClient struct {
 	dp.DataPlaneClient
+
 	responses []*dp.GetTipsResponse
 	call      int
 }
@@ -623,6 +685,7 @@ func (c *sequencedTipsClient) GetTips(context.Context, *dp.GetTipsRequest, ...gr
 	if c.call < len(c.responses)-1 {
 		c.call++
 	}
+
 	return resp, nil
 }
 
@@ -638,6 +701,7 @@ func TestReconcileKeepsKeyPendingUntilHoleHeals(t *testing.T) {
 			t.Fatalf("close engine: %v", err)
 		}
 	}()
+
 	keyNameKey := DeriveKeyNameKey("reconcile-test-secret")
 	name := CloudKeyName(keyNameKey, []byte("k"))
 	holedRef := &dp.EffectRef{NodeId: 9, Offset: 4}
@@ -655,11 +719,13 @@ func TestReconcileKeepsKeyPendingUntilHoleHeals(t *testing.T) {
 	}
 
 	cs.reconcileBatch([]string{"k"})
+
 	if got := cs.reconcileKeys(); !slices.Equal(got, []string{"k"}) {
 		t.Fatalf("reconcile set after a still-holed tick = %v, want [k]", got)
 	}
 
 	cs.reconcileBatch([]string{"k"})
+
 	if got := cs.reconcileKeys(); got != nil {
 		t.Fatalf("reconcile set after the hole healed = %v, want empty", got)
 	}
@@ -683,6 +749,7 @@ func TestFetchEffectServesOutbox(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fetchEffect: %v", err)
 	}
+
 	if got != want {
 		t.Fatalf("fetchEffect returned %v, want the outbox effect", got)
 	}
@@ -697,6 +764,7 @@ func TestBuildEnvelopeDeclaresRawSize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encryptor: %v", err)
 	}
+
 	cs := &CloudSync{keyNameKey: DeriveKeyNameKey("raw-size-secret"), enc: enc}
 
 	eff := &pb.Effect{
@@ -706,6 +774,7 @@ func TestBuildEnvelopeDeclaresRawSize(t *testing.T) {
 			Value: &pb.DataEffect_Raw{Raw: make([]byte, 4096)},
 		}},
 	}
+
 	raw, err := effects.MarshalEffect(eff)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -715,9 +784,11 @@ func TestBuildEnvelopeDeclaresRawSize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildEnvelope: %v", err)
 	}
+
 	if env.GetRawSize() != uint64(len(raw)) {
 		t.Fatalf("raw_size = %d, want pre-seal length %d", env.GetRawSize(), len(raw))
 	}
+
 	if uint64(len(env.GetRawEffect())) == env.GetRawSize() {
 		t.Fatal("sealed length equals raw_size; the test payload no longer exercises the divergence")
 	}
@@ -727,10 +798,12 @@ func TestBuildEnvelopeDeclaresRawSize(t *testing.T) {
 // ours, where only the newest mint reaches OnLocalEffect.
 func ancestrySync(t *testing.T, engine *effects.Engine) (*CloudSync, effects.Tip, effects.Tip, effects.Tip, *pb.Effect) {
 	t.Helper()
+
 	enc, err := effects.NewEncryptorFromIKM([]byte("ancestry-test-ikm"))
 	if err != nil {
 		t.Fatalf("encryptor: %v", err)
 	}
+
 	cs := &CloudSync{
 		engine:      engine,
 		enc:         enc,
@@ -745,9 +818,11 @@ func ancestrySync(t *testing.T, engine *effects.Engine) (*CloudSync, effects.Tip
 	rootEff := &pb.Effect{Key: []byte("k")}
 	midEff := &pb.Effect{Key: []byte("k"), Deps: []*pb.EffectRef{{NodeId: root[0], Offset: root[1]}}}
 	oursEff := &pb.Effect{Key: []byte("k"), Deps: []*pb.EffectRef{{NodeId: mid[0], Offset: mid[1]}}}
+
 	engine.EffectCache().PutSized(root, rootEff, 64)
 	engine.EffectCache().PutSized(mid, midEff, 64)
 	engine.EffectCache().PutSized(ours, oursEff, 64)
+
 	return cs, root, mid, ours, oursEff
 }
 
@@ -760,6 +835,7 @@ func TestUnsentAncestryUploads(t *testing.T) {
 			t.Fatalf("close engine: %v", err)
 		}
 	}()
+
 	cs, root, mid, ours, oursEff := ancestrySync(t, engine)
 
 	cs.handleLocalEffect(ours, oursEff)
@@ -769,6 +845,7 @@ func TestUnsentAncestryUploads(t *testing.T) {
 	if _, queued := cs.pending[mid]; !queued {
 		t.Fatal("the mint's own dep must be enqueued on the emit path")
 	}
+
 	if _, queued := cs.pending[root]; queued {
 		t.Fatal("the deeper ancestor must wait for the send-path walk")
 	}
@@ -778,6 +855,7 @@ func TestUnsentAncestryUploads(t *testing.T) {
 			break
 		}
 	}
+
 	if _, queued := cs.pending[root]; !queued {
 		t.Fatal("draining the outbox must complete the ancestry closure")
 	}
@@ -798,6 +876,7 @@ func TestForeignDependenciesRequireExplicitCloudFetch(t *testing.T) {
 			t.Fatalf("close engine: %v", err)
 		}
 	}()
+
 	cs, _, _, ours, oursEff := ancestrySync(t, engine)
 	foreignNode := uint64(engine.NodeID()) ^ 1
 	foreignRoot := effects.Tip{foreignNode, 1}
@@ -809,12 +888,15 @@ func TestForeignDependenciesRequireExplicitCloudFetch(t *testing.T) {
 	oursEff.Deps = []*pb.EffectRef{{NodeId: foreignDep[0], Offset: foreignDep[1]}}
 
 	cs.handleLocalEffect(ours, oursEff)
+
 	if _, queued := cs.pending[foreignDep]; queued {
 		t.Fatal("foreign dependency entered the outbox without a Cloud fetch")
 	}
+
 	if _, queued := cs.pending[foreignRoot]; queued {
 		t.Fatal("foreign ancestry entered the outbox without a Cloud fetch")
 	}
+
 	if env, ok := cs.nextEnvelope(); !ok {
 		t.Fatal("local mint was not queued")
 	} else if got := (effects.Tip{env.GetId().GetNodeId(), env.GetId().GetOffset()}); got != ours {
@@ -822,16 +904,20 @@ func TestForeignDependenciesRequireExplicitCloudFetch(t *testing.T) {
 	}
 
 	cs.handleFetch(&dp.FetchRequest{Ref: &dp.EffectRef{NodeId: foreignDep[0], Offset: foreignDep[1]}})
+
 	if _, queued := cs.pending[foreignDep]; !queued {
 		t.Fatal("explicitly requested foreign dependency did not enter the outbox")
 	}
+
 	env, ok := cs.nextEnvelope()
 	if !ok {
 		t.Fatal("explicitly requested foreign dependency was not sent")
 	}
+
 	if got := (effects.Tip{env.GetId().GetNodeId(), env.GetId().GetOffset()}); got != foreignDep {
 		t.Fatalf("fetch reply = %v, want exactly %v", got, foreignDep)
 	}
+
 	if _, queued := cs.pending[foreignRoot]; queued {
 		t.Fatal("fetch reply recursively queued a dependency Cloud did not request")
 	}
@@ -848,18 +934,23 @@ func TestUnsentAncestryUploadsOldestFirst(t *testing.T) {
 			t.Fatalf("close engine: %v", err)
 		}
 	}()
+
 	cs, root, mid, ours, oursEff := ancestrySync(t, engine)
 
 	cs.handleLocalEffect(ours, oursEff)
-	var got []effects.Tip
+
+	got := make([]effects.Tip, 0, 3)
+
 	for range 3 {
 		env, ok := cs.nextEnvelope()
 		if !ok {
 			t.Fatalf("outbox ended after %d envelopes", len(got))
 		}
+
 		got = append(got, effects.Tip{env.GetId().GetNodeId(), env.GetId().GetOffset()})
 		cs.handleAck(&dp.WriteAck{Id: env.GetId(), Ok: true})
 	}
+
 	want := []effects.Tip{root, mid, ours}
 	if !slices.Equal(got, want) {
 		t.Fatalf("upload order = %v, want oldest-first %v", got, want)
@@ -878,19 +969,24 @@ func TestUnsentAncestryWaitsForParentAck(t *testing.T) {
 			t.Fatalf("close engine: %v", err)
 		}
 	}()
+
 	cs, root, mid, ours, oursEff := ancestrySync(t, engine)
 
 	cs.handleLocalEffect(ours, oursEff)
+
 	assertNext := func(want effects.Tip) *dp.Effect {
 		t.Helper()
+
 		env, ok := cs.nextEnvelope()
 		if !ok {
 			t.Fatalf("outbox ended before %v", want)
 		}
+
 		got := effects.Tip{env.GetId().GetNodeId(), env.GetId().GetOffset()}
 		if got != want {
 			t.Fatalf("next upload = %v, want %v", got, want)
 		}
+
 		return env
 	}
 
@@ -898,12 +994,14 @@ func TestUnsentAncestryWaitsForParentAck(t *testing.T) {
 	if env, ok := cs.nextEnvelope(); ok {
 		t.Fatalf("uploaded %v before parent %v was ACKed", env.GetId(), root)
 	}
+
 	cs.handleAck(&dp.WriteAck{Id: rootEnv.GetId(), Ok: true})
 
 	midEnv := assertNext(mid)
 	if env, ok := cs.nextEnvelope(); ok {
 		t.Fatalf("uploaded %v before parent %v was ACKed", env.GetId(), mid)
 	}
+
 	cs.handleAck(&dp.WriteAck{Id: midEnv.GetId(), Ok: true})
 	assertNext(ours)
 }
@@ -919,6 +1017,7 @@ func TestUnsentAncestryReconnectOrderDoesNotStrand(t *testing.T) {
 			t.Fatalf("close engine: %v", err)
 		}
 	}()
+
 	cs, root, mid, ours, oursEff := ancestrySync(t, engine)
 
 	cs.handleLocalEffect(ours, oursEff)
@@ -930,6 +1029,7 @@ func TestUnsentAncestryReconnectOrderDoesNotStrand(t *testing.T) {
 	if !ok {
 		t.Fatal("adverse reconnect order stranded newly discovered ancestry")
 	}
+
 	if got := (effects.Tip{env.GetId().GetNodeId(), env.GetId().GetOffset()}); got != root {
 		t.Fatalf("first upload after reconnect = %v, want root %v", got, root)
 	}
@@ -945,33 +1045,42 @@ func TestFetchReplyUsesAckGatedOutbox(t *testing.T) {
 			t.Fatalf("close engine: %v", err)
 		}
 	}()
+
 	cs, root, mid, ours, _ := ancestrySync(t, engine)
 
 	cs.handleFetch(&dp.FetchRequest{Ref: &dp.EffectRef{NodeId: ours[0], Offset: ours[1]}})
+
 	assertNext := func(want effects.Tip) *dp.Effect {
 		t.Helper()
+
 		env, ok := cs.nextEnvelope()
 		if !ok {
 			t.Fatalf("fetch outbox ended before %v", want)
 		}
+
 		got := effects.Tip{env.GetId().GetNodeId(), env.GetId().GetOffset()}
 		if got != want {
 			t.Fatalf("next fetch upload = %v, want %v", got, want)
 		}
+
 		return env
 	}
 
 	oursEnv := assertNext(ours)
+
 	if _, queued := cs.pending[mid]; queued {
 		t.Fatal("fetch reply recursively queued its direct dependency")
 	}
+
 	if _, queued := cs.pending[root]; queued {
 		t.Fatal("fetch reply recursively queued deeper ancestry")
 	}
+
 	cs.handleAck(&dp.WriteAck{Id: oursEnv.GetId(), Ok: true})
 	cs.mu.Lock()
 	pending := len(cs.pending)
 	cs.mu.Unlock()
+
 	if pending != 0 {
 		t.Fatalf("fetch outbox retained %d effects after ACKs", pending)
 	}
@@ -987,10 +1096,12 @@ func TestCloudHeldAncestryStops(t *testing.T) {
 			t.Fatalf("close engine: %v", err)
 		}
 	}()
+
 	cs, root, mid, ours, oursEff := ancestrySync(t, engine)
 
 	cs.markCloudHolds(mid)
 	cs.handleLocalEffect(ours, oursEff)
+
 	for range 8 {
 		if _, ok := cs.nextEnvelope(); !ok {
 			break
@@ -1000,6 +1111,7 @@ func TestCloudHeldAncestryStops(t *testing.T) {
 	if _, queued := cs.pending[mid]; queued {
 		t.Fatal("an effect the cloud already holds must not be re-uploaded")
 	}
+
 	if _, queued := cs.pending[root]; queued {
 		t.Fatal("the walk must stop at the first cloud-held ancestor, not walk past it")
 	}
@@ -1013,12 +1125,15 @@ func TestTipGenSetRotation(t *testing.T) {
 	for i := range cloudHasGenSize*2 + 1 {
 		s.add(effects.Tip{1, uint64(i)})
 	}
+
 	if newest := (effects.Tip{1, cloudHasGenSize * 2}); !s.has(newest) {
 		t.Fatalf("most recent add %v missing after rotation", newest)
 	}
+
 	if s.has(effects.Tip{1, 0}) {
 		t.Fatal("the oldest generation should have been dropped")
 	}
+
 	if total := len(s.cur) + len(s.prev); total > 2*cloudHasGenSize {
 		t.Fatalf("set holds %d tips, above the %d bound", total, 2*cloudHasGenSize)
 	}

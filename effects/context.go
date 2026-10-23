@@ -128,12 +128,15 @@ func (c *Context) TakeSavepoint() *ContextSavepoint {
 			cloned.notifies = make([]*pb.OffsetNotify, len(ck.notifies))
 			copy(cloned.notifies, ck.notifies)
 		}
+
 		if len(ck.elementIDs) > 0 {
 			cloned.elementIDs = make([][]byte, len(ck.elementIDs))
 			copy(cloned.elementIDs, ck.elementIDs)
 		}
+
 		snap.keys[k] = &cloned
 	}
+
 	return snap
 }
 
@@ -156,12 +159,15 @@ func (c *Context) RestoreSavepoint(sp *ContextSavepoint) {
 			cloned.notifies = make([]*pb.OffsetNotify, len(ck.notifies))
 			copy(cloned.notifies, ck.notifies)
 		}
+
 		if len(ck.elementIDs) > 0 {
 			cloned.elementIDs = make([][]byte, len(ck.elementIDs))
 			copy(cloned.elementIDs, ck.elementIDs)
 		}
+
 		restored[k] = &cloned
 	}
+
 	c.keys = restored
 }
 
@@ -194,10 +200,12 @@ func (c *Context) PendingKeys() []string {
 	if c == nil || len(c.keys) == 0 {
 		return nil
 	}
+
 	out := make([]string, 0, len(c.keys))
 	for k := range c.keys {
 		out = append(out, k)
 	}
+
 	return out
 }
 
@@ -211,6 +219,7 @@ func (c *Context) TraceCtx() context.Context {
 	if c.traceCtx != nil {
 		return c.traceCtx
 	}
+
 	return context.Background()
 }
 
@@ -228,11 +237,13 @@ func (c *Context) GetSnapshot(key string) (*pb.ReducedEffect, []Tip, error) {
 	if c == nil {
 		return nil, nil, nil
 	}
+
 	if tracing.Enabled() {
 		_, snapSpan := tracing.Tracer().Start(c.TraceCtx(), "effects.get_snapshot",
 			trace.WithAttributes(attribute.String("effect.key", key)))
 		defer snapSpan.End()
 	}
+
 	ck, hasPending := c.keys[key]
 	if !hasPending {
 		// SSI: if we have a snapshot, read from it instead of the live index
@@ -256,6 +267,7 @@ func (c *Context) GetSnapshot(key string) (*pb.ReducedEffect, []Tip, error) {
 		if c.engine.broadcaster == nil {
 			compactThreshold = 5
 		}
+
 		if !c.readOnly && result != nil && chainLen >= compactThreshold {
 			slog.Debug("compaction: emitting snapshot",
 				"key", key,
@@ -272,19 +284,23 @@ func (c *Context) GetSnapshot(key string) (*pb.ReducedEffect, []Tip, error) {
 			result = cloneReduced(result)
 			result.Subscribers = c.engine.snapshotSubscribers(key)
 			snapEff := &pb.SnapshotEffect{
-				Collection: result.Collection,
+				Collection: result.GetCollection(),
 				State:      result,
 			}
+
 			for _, t := range tips {
 				cached, err := c.engine.getEffect(key, t)
 				if err != nil {
 					continue
 				}
+
 				if cached.GetSnapshot() != nil {
 					snapEff.PrevSnapshot = toPbRef(t)
+
 					break
 				}
 			}
+
 			if err := c.Emit(&pb.Effect{
 				Key:  []byte(key),
 				Kind: &pb.Effect_Snapshot{Snapshot: snapEff},
@@ -295,6 +311,7 @@ func (c *Context) GetSnapshot(key string) (*pb.ReducedEffect, []Tip, error) {
 					"error", err)
 			}
 		}
+
 		return filterSnapshot(result), tips, nil
 	}
 
@@ -305,7 +322,9 @@ func (c *Context) GetSnapshot(key string) (*pb.ReducedEffect, []Tip, error) {
 	// while a blocking XREADGROUP holds a compaction snapshot) are visible.
 	myTip := ck.lastOffset
 	reconTips := []Tip{myTip}
+
 	var baseTips []Tip
+
 	if c.txSnapshot != nil {
 		if ts := c.txSnapshot.Contains(key); ts != nil {
 			// Match getSnapshotFromTx: resolve pending-tx tips to their
@@ -316,11 +335,13 @@ func (c *Context) GetSnapshot(key string) (*pb.ReducedEffect, []Tip, error) {
 	} else if ts := c.engine.index.Contains(key); ts != nil {
 		baseTips = ts.Tips()
 	}
+
 	for _, t := range baseTips {
 		if t != myTip {
 			reconTips = append(reconTips, t)
 		}
 	}
+
 	slog.Debug("Context.GetSnapshot: hasPending reconstruct", "key", key,
 		"txn_id", c.txnID, "recon_tips", reconTips)
 	// waitForHorizon=true: client-facing in-txn read. If the walk reaches
@@ -340,6 +361,7 @@ func (c *Context) GetSnapshot(key string) (*pb.ReducedEffect, []Tip, error) {
 	if ck.initialTips != nil {
 		tips = ck.initialTips.Tips()
 	}
+
 	return result, tips, nil
 }
 
@@ -347,11 +369,14 @@ func (c *Context) GetSnapshot(key string) (*pb.ReducedEffect, []Tip, error) {
 // to record the read in the causal log for the Bind's read set.
 func (c *Context) getSnapshotFromTx(key string) (*pb.ReducedEffect, []Tip, error) {
 	slog.Debug("getSnapshotFromTx: entry", "key", key, "txn_id", c.txnID)
+
 	tips := c.txSnapshot.Contains(key)
 	if tips == nil {
 		return nil, nil, nil // key didn't exist at snapshot time
 	}
+
 	snapshotTips := tips.Tips()
+
 	tipOffsets := c.engine.resolveTipDeps(snapshotTips)
 	if len(tipOffsets) == 0 {
 		return nil, nil, nil
@@ -361,6 +386,7 @@ func (c *Context) getSnapshotFromTx(key string) (*pb.ReducedEffect, []Tip, error
 	if err != nil {
 		return nil, nil, err
 	}
+
 	result = filterSnapshot(result)
 
 	// Emit a NOOP to record this read in the causal structure.
@@ -370,6 +396,7 @@ func (c *Context) getSnapshotFromTx(key string) (*pb.ReducedEffect, []Tip, error
 		Kind: &pb.Effect_Noop{Noop: &pb.NoopEffect{}},
 	}, snapshotTips); err != nil {
 		slog.Error("getSnapshotFromTx: NOOP emit failed", "key", key, "error", err)
+
 		return nil, nil, err
 	}
 
@@ -409,6 +436,7 @@ func (c *Context) Watch(key string) error {
 	if err != nil {
 		return err
 	}
+
 	hadData := snap != nil
 
 	// Emit NOOP to record the observation in the causal log. We set
@@ -421,6 +449,7 @@ func (c *Context) Watch(key string) error {
 		Kind:  &pb.Effect_Noop{Noop: &pb.NoopEffect{}},
 	}); err != nil {
 		slog.Error("Watch: NOOP emit failed", "key", key, "error", err)
+
 		return err
 	}
 
@@ -441,6 +470,7 @@ func (c *Context) Watch(key string) error {
 		hadData:    hadData,
 		flushGen:   c.engine.flushGeneration.Load(),
 	}
+
 	return nil
 }
 
@@ -452,6 +482,7 @@ func (c *Context) Watch(key string) error {
 // and must be preserved.
 func (c *Context) ClearWatches() {
 	clear(c.watchedKeys)
+
 	if !c.inTx {
 		c.txnID = ""
 	}
@@ -465,6 +496,7 @@ func (c *Context) BeginTx() {
 	if c.inTx {
 		return // nested transaction inherits outer
 	}
+
 	c.inTx = true
 	// A prior WATCH may have already materialized our txn id; reuse it
 	// so the WATCH noop and the MULTI/EXEC effects share one tx.
@@ -513,6 +545,7 @@ func (c *Context) CheckWatches() bool {
 		c.inTx = false
 		c.txnID = ""
 		c.txSnapshot = nil
+
 		return false
 	}
 
@@ -529,6 +562,7 @@ func (c *Context) CheckWatches() bool {
 			c.inTx = false
 			c.txnID = ""
 			c.txSnapshot = nil
+
 			return false
 		}
 		// Mark as watched for SSI fork detection in flushTx
@@ -536,7 +570,9 @@ func (c *Context) CheckWatches() bool {
 			ck.watched = true
 		}
 	}
+
 	clear(c.watchedKeys)
+
 	return true
 }
 
@@ -565,7 +601,7 @@ func (c *Context) Abort() {
 // tips the handler actually read, not whatever the index contains now.
 // Pure writes (SET, LPUSH) omit snapshotTips and Emit reads the index.
 func (c *Context) Emit(eff *pb.Effect, snapshotTips ...[]Tip) error {
-	key := string(eff.Key)
+	key := string(eff.GetKey())
 
 	// The effect must dep-reference our own SubscriptionEffect, or the
 	// subscription's offset is orphaned in this node's DAG and the subscriber
@@ -586,7 +622,8 @@ func (c *Context) Emit(eff *pb.Effect, snapshotTips ...[]Tip) error {
 	// Fill causality
 	eff.Hlc = timestamppb.New(c.engine.clock.Now())
 	eff.NodeId = uint64(c.engine.nodeID)
-	eff.ForkChoiceHash = ComputeForkChoiceHash(c.engine.nodeID, eff.Hlc)
+
+	eff.ForkChoiceHash = ComputeForkChoiceHash(c.engine.nodeID, eff.GetHlc())
 	if c.inTx {
 		eff.TxnId = c.txnID
 	}
@@ -602,8 +639,10 @@ func (c *Context) Emit(eff *pb.Effect, snapshotTips ...[]Tip) error {
 		} else {
 			tips = c.engine.index.Contains(key)
 		}
+
 		ck = &contextKey{initialTips: tips, readOnly: c.inTx}
 		c.keys[key] = ck
+
 		if tips != nil {
 			tipOffsets := tips.Tips()
 			// Exclude in-progress tx tips: substitute pre-tx deps
@@ -615,16 +654,18 @@ func (c *Context) Emit(eff *pb.Effect, snapshotTips ...[]Tip) error {
 
 	// Track notification intent from DataEffect ops
 	if data := eff.GetData(); data != nil {
-		switch data.Op {
+		switch data.GetOp() {
+		case pb.EffectOp_UNKNOWN_OP:
+			// Unspecified operations leave notification intent unchanged.
 		case pb.EffectOp_INSERT_OP:
 			ck.shouldNotifyData = true
 			ck.shouldNotifyDelete = false
 		case pb.EffectOp_REMOVE_OP:
-			if len(data.Id) == 0 {
+			if len(data.GetId()) == 0 {
 				// Full key delete
 				ck.shouldNotifyData = false
 				ck.shouldNotifyDelete = true
-			} else if data.Collection == pb.CollectionKind_ORDERED || data.Collection == pb.CollectionKind_KEYED {
+			} else if data.GetCollection() == pb.CollectionKind_ORDERED || data.GetCollection() == pb.CollectionKind_KEYED {
 				// Element remove on ordered/keyed collection — chain-wake
 				// so the next blocked client gets a chance to pop
 				ck.shouldNotifyData = true
@@ -637,9 +678,10 @@ func (c *Context) Emit(eff *pb.Effect, snapshotTips ...[]Tip) error {
 		if data := eff.GetData(); data != nil {
 			ck.readOnly = false
 			ck.hasData = true
-			ck.collection = data.Collection
-			if len(data.Id) > 0 {
-				ck.elementIDs = append(ck.elementIDs, data.Id)
+
+			ck.collection = data.GetCollection()
+			if len(data.GetId()) > 0 {
+				ck.elementIDs = append(ck.elementIDs, data.GetId())
 			}
 		}
 		// A RowWriteEffect is semantic evidence of a row-level write
@@ -676,6 +718,7 @@ func (c *Context) Emit(eff *pb.Effect, snapshotTips ...[]Tip) error {
 		if len(ck.notifies) == 0 {
 			delete(c.keys, key)
 		}
+
 		return err
 	}
 
@@ -686,10 +729,10 @@ func (c *Context) Emit(eff *pb.Effect, snapshotTips ...[]Tip) error {
 	// Defer peer-subscriber tracking to Flush: the subscriber set lives on the
 	// key's leaf, which updateIndex only creates at Flush time. Self-subscribes
 	// are filtered inside addPeerSubscriber when applied.
-	if sub := eff.GetSubscription(); sub != nil && !sub.Ephemeral {
+	if sub := eff.GetSubscription(); sub != nil && !sub.GetEphemeral() {
 		ck.subOps = append(ck.subOps, subOp{
-			peer:        pb.NodeID(sub.SubscriberNodeId),
-			unsubscribe: sub.Unsubscribe,
+			peer:        pb.NodeID(sub.GetSubscriberNodeId()),
+			unsubscribe: sub.GetUnsubscribe(),
 		})
 	}
 
@@ -702,31 +745,33 @@ func (c *Context) Emit(eff *pb.Effect, snapshotTips ...[]Tip) error {
 // Snapshot's ReducedEffect may share slices with cached effects, but
 // cache memory is immutable and never recycled, so aliasing it is safe.
 func ownEffectBytes(eff *pb.Effect) {
-	eff.Key = bytes.Clone(eff.Key)
-	switch k := eff.Kind.(type) {
+	eff.Key = bytes.Clone(eff.GetKey())
+	switch k := eff.GetKind().(type) {
 	case *pb.Effect_Data:
 		d := k.Data
-		d.Reference = bytes.Clone(d.Reference)
-		d.Id = bytes.Clone(d.Id)
-		if v, ok := d.Value.(*pb.DataEffect_Raw); ok {
+		d.Reference = bytes.Clone(d.GetReference())
+
+		d.Id = bytes.Clone(d.GetId())
+		if v, ok := d.GetValue().(*pb.DataEffect_Raw); ok {
 			v.Raw = bytes.Clone(v.Raw)
 		}
 		// A compressed arm needs no clone: it only exists as fresh codec
 		// output from CompressEffectValues, never as pooled parser memory.
 	case *pb.Effect_Meta:
-		k.Meta.ElementId = bytes.Clone(k.Meta.ElementId)
+		k.Meta.ElementId = bytes.Clone(k.Meta.GetElementId())
 	case *pb.Effect_PubsubMessage:
 		m := k.PubsubMessage
-		m.Channel = bytes.Clone(m.Channel)
-		m.Payload = bytes.Clone(m.Payload)
+		m.Channel = bytes.Clone(m.GetChannel())
+		m.Payload = bytes.Clone(m.GetPayload())
 	case *pb.Effect_RowWrite:
 		rw := k.RowWrite
-		rw.Pk = bytes.Clone(rw.Pk)
-		for _, col := range rw.Columns {
-			col.BlobVal = bytes.Clone(col.BlobVal)
+
+		rw.Pk = bytes.Clone(rw.GetPk())
+		for _, col := range rw.GetColumns() {
+			col.BlobVal = bytes.Clone(col.GetBlobVal())
 		}
 	case *pb.Effect_Observation:
-		ownPredicateBytes(k.Observation.Predicate)
+		ownPredicateBytes(k.Observation.GetPredicate())
 	}
 }
 
@@ -734,11 +779,14 @@ func ownPredicateBytes(p *pb.Predicate) {
 	if p == nil {
 		return
 	}
-	if p.Literal != nil {
-		p.Literal.BlobVal = bytes.Clone(p.Literal.BlobVal)
+
+	if p.GetLiteral() != nil {
+		p.Literal.BlobVal = bytes.Clone(p.GetLiteral().GetBlobVal())
 	}
-	ownPredicateBytes(p.Child)
-	for _, c := range p.Children {
+
+	ownPredicateBytes(p.GetChild())
+
+	for _, c := range p.GetChildren() {
 		ownPredicateBytes(c)
 	}
 }
@@ -764,7 +812,7 @@ func (c *Context) rawEmit(eff *pb.Effect) (Tip, *pb.OffsetNotify, error) {
 
 	if slog.Default().Enabled(c.TraceCtx(), slog.LevelDebug) {
 		slog.Debug("Emit: wrote effect",
-			"key", string(eff.Key), "offset", offset, "deps", eff.Deps, "tx", eff.TxnId != "")
+			"key", string(eff.GetKey()), "offset", offset, "deps", eff.GetDeps(), "tx", eff.GetTxnId() != "")
 	}
 
 	// Marshal once and reuse the length for the pool's byte accounting (avoids
@@ -774,7 +822,9 @@ func (c *Context) rawEmit(eff *pb.Effect) (Tip, *pb.OffsetNotify, error) {
 		if c.engine.effectCache != nil {
 			c.engine.effectCache.Put(offset, eff)
 		}
+
 		c.engine.fireLocalEffect(offset, eff)
+
 		return offset, nil, nil
 	}
 
@@ -782,12 +832,15 @@ func (c *Context) rawEmit(eff *pb.Effect) (Tip, *pb.OffsetNotify, error) {
 	if err != nil {
 		return Tip{}, nil, err
 	}
+
 	if c.engine.effectCache != nil {
 		c.engine.effectCache.PutSized(offset, eff, len(data))
 	}
+
 	c.engine.fireLocalEffect(offset, eff)
 
 	notify := BuildOffsetNotify(c.engine.nodeID, offset, eff, data, c.TraceCtx())
+
 	return offset, notify, nil
 }
 
@@ -811,7 +864,9 @@ func (c *Context) Flush() error {
 	} else {
 		err = c.flushTx()
 	}
+
 	c.engine.backpressure()
+
 	return err
 }
 
@@ -829,14 +884,16 @@ func (c *Context) flushNonTx() error {
 			// Broadcast to peers but skip index update (already wiped)
 			if c.engine.broadcaster != nil {
 				for _, n := range ck.notifies {
-					c.engine.broadcaster.BroadcastWithData(n, n.EffectData)
+					c.engine.broadcaster.BroadcastWithData(n, n.GetEffectData())
 				}
 			}
 			// Fire OnFlushAll callback
 			if c.engine.OnFlushAll != nil {
 				c.engine.OnFlushAll()
 			}
+
 			delete(c.keys, key)
+
 			continue
 		}
 
@@ -847,12 +904,14 @@ func (c *Context) flushNonTx() error {
 				trace.WithAttributes(attribute.String("effect.key", key)))
 			defer idxSpan.End()
 		}
+
 		slog.Debug("Flush: updating index", "key", key, "offset", ck.lastOffset)
 		c.engine.updateIndex(key, ck.initialTips, ck.lastOffset)
 		c.applySubOps(key, ck)
 
 		if c.engine.broadcaster != nil {
 			var bcastTrace []byte
+
 			if tracing.Enabled() {
 				bcastCtx, bcastSpan := tracing.Tracer().Start(c.TraceCtx(), "flush.broadcast",
 					trace.WithAttributes(
@@ -861,8 +920,10 @@ func (c *Context) flushNonTx() error {
 						attribute.Int("flush.notifies", len(ck.notifies)),
 					))
 				defer bcastSpan.End()
+
 				bcastTrace = tracing.InjectIntoBytes(bcastCtx)
 			}
+
 			for _, n := range ck.notifies {
 				n.TraceContext = bcastTrace
 			}
@@ -880,6 +941,7 @@ func (c *Context) flushNonTx() error {
 				!c.engine.clusterMaybeHasKey(key) {
 				mode = UnsafeMode
 			}
+
 			if mode == SafeMode {
 				// Pre-check already verified all peers are reachable.
 				// Index is updated, so the write is committed — replicate
@@ -888,10 +950,11 @@ func (c *Context) flushNonTx() error {
 				// concurrently so they don't serialize QUIC stream opens
 				// before the blocking Replicate on the final effect.
 				for _, n := range ck.notifies[:len(ck.notifies)-1] {
-					go c.engine.broadcaster.BroadcastWithData(n, n.EffectData)
+					go c.engine.broadcaster.BroadcastWithData(n, n.GetEffectData())
 				}
+
 				last := ck.notifies[len(ck.notifies)-1]
-				if err := c.engine.broadcaster.Replicate(last, last.EffectData); err != nil {
+				if err := c.engine.broadcaster.Replicate(last, last.GetEffectData()); err != nil {
 					if len(c.engine.broadcaster.PeerIDs()) == 0 {
 						slog.Debug("SafeMode replication skipped: no peers", "key", key, "error", err)
 					} else {
@@ -900,7 +963,7 @@ func (c *Context) flushNonTx() error {
 				}
 			} else {
 				for _, n := range ck.notifies {
-					c.engine.broadcaster.BroadcastWithData(n, n.EffectData)
+					c.engine.broadcaster.BroadcastWithData(n, n.GetEffectData())
 				}
 			}
 		}
@@ -908,10 +971,12 @@ func (c *Context) flushNonTx() error {
 		// Fire notification callbacks after effect is durable
 		if ck.shouldNotifyData {
 			c.engine.ownFilterAdd(key)
+
 			if c.engine.OnKeyDataAdded != nil {
 				c.engine.OnKeyDataAdded(key)
 			}
 		}
+
 		if ck.shouldNotifyDelete && c.engine.OnKeyDeleted != nil {
 			c.engine.OnKeyDeleted(key)
 		}
@@ -927,6 +992,7 @@ func (c *Context) flushTx() error {
 	slog.Debug("Flush: transactional commit", "keys", len(c.keys))
 	c.inTx = false
 	hadSnapshot := c.txSnapshot != nil
+
 	c.txSnapshot = nil
 	if len(c.keys) == 0 {
 		return nil
@@ -939,8 +1005,10 @@ func (c *Context) flushTx() error {
 			if c.engine.modeForKey(key) == SafeMode {
 				if !c.engine.broadcaster.InMajorityPartition() {
 					c.reset()
+
 					return ErrRegionPartitioned
 				}
+
 				break // one check is enough — reachability is per-region, not per-key
 			}
 		}
@@ -956,6 +1024,7 @@ func (c *Context) flushTx() error {
 	for key := range c.keys {
 		if err := c.engine.ensureSubscribedBlocking(key); err != nil {
 			c.reset()
+
 			return ErrRegionPartitioned
 		}
 	}
@@ -974,29 +1043,37 @@ func (c *Context) flushTx() error {
 		if ck.initialTips == nil {
 			continue // first write to a brand-new key
 		}
+
 		initial := ck.initialTips.Tips()
 		if len(initial) == 0 {
 			continue
 		}
+
 		initialSet := make(map[Tip]bool, len(initial))
 		for _, t := range initial {
 			initialSet[t] = true
 		}
+
 		current := c.engine.index.Contains(key)
 		currentSet := make(map[Tip]bool)
+
 		if current != nil {
 			for _, t := range current.Tips() {
 				currentSet[t] = true
 			}
 		}
+
 		for _, t := range initial {
 			if !currentSet[t] {
 				slog.Debug("flushTx: stale consumed tip, aborting before emission",
 					"key", key, "stale_tip", t, "current_tips", current)
+
 				for _, ck3 := range c.keys {
 					c.engine.pendingTxTips.Delete(ck3.lastOffset)
 				}
+
 				c.reset()
+
 				return ErrTxnAborted
 			}
 			// Abort if we already ACKed/NACKed a remote bind that consumed
@@ -1005,14 +1082,18 @@ func (c *Context) flushTx() error {
 				if _, spoken := c.engine.spokenBinds.Get(t, 0); spoken {
 					slog.Debug("flushTx: pre-flight aborting, spoke on consumed tip",
 						"key", key, "tip", t)
+
 					for _, ck3 := range c.keys {
 						c.engine.pendingTxTips.Delete(ck3.lastOffset)
 					}
+
 					c.reset()
+
 					return ErrTxnAborted
 				}
 			}
 		}
+
 		for t := range currentSet {
 			if initialSet[t] {
 				continue
@@ -1027,12 +1108,16 @@ func (c *Context) flushTx() error {
 			if eff, ok := c.engine.effectCache.Get(t); ok && eff.GetSubscription() != nil {
 				continue
 			}
+
 			slog.Debug("flushTx: concurrent remote bind landed, aborting before emission",
 				"key", key, "new_tip", t, "initial_tips", initial)
+
 			for _, ck3 := range c.keys {
 				c.engine.pendingTxTips.Delete(ck3.lastOffset)
 			}
+
 			c.reset()
+
 			return ErrTxnAborted
 		}
 	}
@@ -1047,11 +1132,12 @@ func (c *Context) flushTx() error {
 		if ck.initialTips != nil {
 			preTxDeps = ck.initialTips.Tips()
 		}
+
 		c.engine.pendingTxTips.Store(ck.lastOffset, preTxDeps)
 
 		if c.engine.broadcaster != nil {
 			for _, n := range ck.notifies {
-				c.engine.broadcaster.BroadcastWithData(n, n.EffectData)
+				c.engine.broadcaster.BroadcastWithData(n, n.GetEffectData())
 			}
 		}
 	}
@@ -1064,22 +1150,28 @@ func (c *Context) flushTx() error {
 		if !hadSnapshot && !ck.readOnly {
 			continue
 		}
+
 		tips := c.engine.index.Contains(key)
 		if tips == nil {
 			continue
 		}
+
 		myTip := ck.lastOffset
 		for _, t := range tips.Tips() {
 			if t == myTip {
 				continue // our own tip
 			}
+
 			isOurs := false
+
 			for _, ck2 := range c.keys {
 				if ck2.lastOffset == t {
 					isOurs = true
+
 					break
 				}
 			}
+
 			if isOurs {
 				continue
 			}
@@ -1096,31 +1188,39 @@ func (c *Context) flushTx() error {
 			// Concurrent effect on watched key → SSI conflict
 			slog.Debug("SSI conflict: concurrent write on watched key",
 				"tip", t, "our_tip", myTip)
+
 			for _, ck3 := range c.keys {
 				c.engine.pendingTxTips.Delete(ck3.lastOffset)
 			}
+
 			c.reset()
+
 			return ErrTxnAborted
 		}
 	}
 
 	// Step 2: Collect competing in-progress tx offsets for abort_deps
 	var abortDeps []*pb.EffectRef
+
 	for key := range c.keys {
 		tips := c.engine.index.Contains(key)
 		if tips == nil {
 			continue
 		}
+
 		for _, t := range tips.Tips() {
 			if _, isPending := c.engine.pendingTxTips.Load(t); isPending {
 				// Check it's not our own tip
 				isOurs := false
+
 				for _, ck := range c.keys {
 					if ck.lastOffset == t {
 						isOurs = true
+
 						break
 					}
 				}
+
 				if !isOurs {
 					abortDeps = append(abortDeps, toPbRef(t))
 				}
@@ -1149,6 +1249,7 @@ func (c *Context) flushTx() error {
 			// part of its committed base.
 			consumedTips = toPbRefs(c.engine.resolveTipDeps(ck.initialTips.Tips()))
 		}
+
 		kb := &pb.TransactionalBindEffect_KeyBind{
 			Key:          []byte(key),
 			ConsumedTips: consumedTips,
@@ -1161,15 +1262,15 @@ func (c *Context) flushTx() error {
 	// is a Go map, raw iteration is random. Any predicate or behavior
 	// that branches on eff.Key (or on bind.Keys ordering) needs this
 	// to be stable across runs.
-	sort.Slice(bind.Keys, func(i, j int) bool {
-		return bytes.Compare(bind.Keys[i].Key, bind.Keys[j].Key) < 0
+	sort.Slice(bind.GetKeys(), func(i, j int) bool {
+		return bytes.Compare(bind.GetKeys()[i].GetKey(), bind.GetKeys()[j].GetKey()) < 0
 	})
 
 	// Bind deps: the last effect on each key in the transaction.
 	// Walk bind.Keys (already sorted) so eff.Deps is deterministic too.
-	bindDeps := make([]*pb.EffectRef, 0, len(bind.Keys))
-	for _, kb := range bind.Keys {
-		bindDeps = append(bindDeps, kb.NewTip)
+	bindDeps := make([]*pb.EffectRef, 0, len(bind.GetKeys()))
+	for _, kb := range bind.GetKeys() {
+		bindDeps = append(bindDeps, kb.GetNewTip())
 	}
 
 	// Pre-emission check: a bind that completed its horizon wait is a
@@ -1178,6 +1279,7 @@ func (c *Context) flushTx() error {
 	if conflict := c.engine.checkCompetingBinds(bind, c.txnID); conflict != "" {
 		slog.Debug("flushTx: competing bind found, aborting before emission",
 			"competing_txn", conflict)
+
 		for key, ck3 := range c.keys {
 			if c.engine.horizon == nil {
 				c.engine.pendingTxTips.Delete(ck3.lastOffset)
@@ -1189,7 +1291,9 @@ func (c *Context) flushTx() error {
 				c.emitSerializationEffect(key)
 			}
 		}
+
 		c.reset()
+
 		return ErrTxnAborted
 	}
 
@@ -1197,7 +1301,7 @@ func (c *Context) flushTx() error {
 	// txn record — all keyed on (nodeID, hlcTs), so recomputing would be waste.
 	bindHash := ComputeForkChoiceHash(c.engine.nodeID, hlcTs)
 	bindEff := &pb.Effect{
-		Key:            bind.Keys[0].Key, // use first key as canonical
+		Key:            bind.GetKeys()[0].GetKey(), // use first key as canonical
 		Hlc:            hlcTs,
 		NodeId:         uint64(c.engine.nodeID),
 		ForkChoiceHash: bindHash,
@@ -1219,19 +1323,22 @@ func (c *Context) flushTx() error {
 	// Step 1 indexed (ck.lastOffset). This replaces the tentative DATA
 	// tip with the BIND, preventing tip accumulation across transactions.
 	// Concurrent tips from other writers are preserved (not consumed).
-	for _, kb := range bind.Keys {
-		key := string(kb.Key)
+	for _, kb := range bind.GetKeys() {
+		key := string(kb.GetKey())
 		ck := c.keys[key]
 		c.engine.updateIndex(key, keytrie.NewTipSet(ck.lastOffset), bindOffset)
 	}
 
-	if c.engine.evaluateBindForkChoice(bind, bindOffset, bindEff.ForkChoiceHash, c.txnID) {
+	if c.engine.evaluateBindForkChoice(bind, bindOffset, bindEff.GetForkChoiceHash(), c.txnID) {
 		slog.Debug("flushTx: voided by concurrent bind, aborting",
 			"bind_offset", bindOffset, "txn", c.txnID)
+
 		for _, ck := range c.keys {
 			c.engine.pendingTxTips.Delete(ck.lastOffset)
 		}
+
 		c.reset()
+
 		return ErrTxnAborted
 	}
 
@@ -1251,6 +1358,7 @@ func (c *Context) flushTx() error {
 			// local NACK-conflict view matches what peers see.
 			consumedTips = c.engine.resolveTipDeps(ck.initialTips.Tips())
 		}
+
 		ptxn.keys = append(ptxn.keys, pendingTxnKey{
 			key:          key,
 			consumedTips: consumedTips,
@@ -1260,6 +1368,7 @@ func (c *Context) flushTx() error {
 			elementIDs:   ck.elementIDs,
 		})
 	}
+
 	c.engine.pendingTxns.Store(bindOffset, ptxn)
 
 	// Step 5: Gather subscribers and replicate bind
@@ -1269,6 +1378,7 @@ func (c *Context) flushTx() error {
 		slog.Debug("flushTx: replicating bind",
 			"bind_offset", bindOffset,
 			"subscribers", len(subscribers))
+
 		if len(subscribers) == 0 {
 			// Single-node fast path: commit immediately. No
 			// horizon.Add needed — the bind has no peers to wait
@@ -1313,11 +1423,14 @@ func (c *Context) flushTx() error {
 			}
 
 			results := make([]replicaResult, len(subscribers))
+
 			var wg sync.WaitGroup
 			wg.Add(len(subscribers))
+
 			for i, subID := range subscribers {
 				go func(idx int, target pb.NodeID) {
 					defer wg.Done()
+
 					slog.Debug("flushTx: ReplicateTo",
 						"bind_offset", bindOffset,
 						"target", target)
@@ -1325,6 +1438,7 @@ func (c *Context) flushTx() error {
 					results[idx] = replicaResult{subID: target, nacks: nacks, err: err}
 				}(i, subID)
 			}
+
 			wg.Wait()
 
 			// Competitor txnIDs we beat during the NACK loop, keyed by
@@ -1340,45 +1454,54 @@ func (c *Context) flushTx() error {
 			defeatedSet := make(map[string]Tip)
 
 			responseCount := 0
+
 			for _, res := range results {
 				if res.err != nil {
 					slog.Warn("flushTx: ReplicateTo failed",
 						"bind_offset", bindOffset,
 						"target", res.subID,
 						"error", res.err)
+
 					continue
 				}
+
 				responseCount++
+
 				for _, nack := range res.nacks {
 					slog.Debug("flushTx: received NACK",
 						"bind_offset", bindOffset,
 						"target", res.subID,
-						"nack_key", string(nack.Key),
-						"tip_count", len(nack.TipDetails))
+						"nack_key", string(nack.GetKey()),
+						"tip_count", len(nack.GetTipDetails()))
 					// Pull every tip the peer mentions into our DAG
 					// before deciding conflict — the NACK is informational
 					// and ignoring it would let the cluster diverge.
 					c.engine.ingestNackTips(nack)
-					for _, detail := range nack.TipDetails {
-						if c.engine.isRealConflict(ptxn, string(nack.Key), detail) {
+
+					for _, detail := range nack.GetTipDetails() {
+						if c.engine.isRealConflict(ptxn, string(nack.GetKey()), detail) {
 							slog.Debug("flushTx: real conflict detected, aborting",
 								"bind_offset", bindOffset,
-								"nack_key", string(nack.Key),
-								"detail_offset", detail.Ref,
-								"detail_is_bind", detail.IsBind,
-								"detail_is_data", detail.IsData,
-								"detail_is_tx", detail.IsTransactional)
+								"nack_key", string(nack.GetKey()),
+								"detail_offset", detail.GetRef(),
+								"detail_is_bind", detail.GetIsBind(),
+								"detail_is_data", detail.GetIsData(),
+								"detail_is_tx", detail.GetIsTransactional())
 							abortPendingTxn(ptxn)
+
 							break
 						}
-						if beaten := c.engine.defeatedCompetitor(ptxn, string(nack.Key), detail); beaten != "" {
-							defeatedSet[beaten] = r(detail.Ref)
+
+						if beaten := c.engine.defeatedCompetitor(ptxn, string(nack.GetKey()), detail); beaten != "" {
+							defeatedSet[beaten] = r(detail.GetRef())
 						}
 					}
+
 					if ptxn.state.Load() == txnStateAborted {
 						break
 					}
 				}
+
 				if ptxn.state.Load() == txnStateAborted {
 					break
 				}
@@ -1424,12 +1547,14 @@ func (c *Context) flushTx() error {
 				// dependent on closure widening, which can be truncated
 				// by a tx-context reconstruct's pre-tx cutoff and
 				// surface as G1a.
-				emitKeys := make(map[string]struct{}, len(bind.Keys))
-				for _, kb := range bind.Keys {
-					emitKeys[string(kb.Key)] = struct{}{}
+				emitKeys := make(map[string]struct{}, len(bind.GetKeys()))
+				for _, kb := range bind.GetKeys() {
+					emitKeys[string(kb.GetKey())] = struct{}{}
 				}
+
 				for beatenTxn, beatenOffset := range defeatedSet {
 					verdicts[beatenTxn] = pb.Verdict_LOST
+
 					loserEff, err := c.engine.getEffect("", beatenOffset)
 					if err != nil {
 						slog.Warn("flushTx: cannot fetch beaten bind for verdict emit",
@@ -1437,18 +1562,22 @@ func (c *Context) flushTx() error {
 							"loser_offset", beatenOffset,
 							"bind_offset", bindOffset,
 							"error", err)
+
 						continue
 					}
+
 					loserBind := loserEff.GetTxnBind()
 					if loserBind == nil {
 						slog.Warn("flushTx: beaten effect is not a TxnBind",
 							"loser_txn", beatenTxn,
 							"loser_offset", beatenOffset,
 							"bind_offset", bindOffset)
+
 						continue
 					}
-					for _, kb := range loserBind.Keys {
-						emitKeys[string(kb.Key)] = struct{}{}
+
+					for _, kb := range loserBind.GetKeys() {
+						emitKeys[string(kb.GetKey())] = struct{}{}
 					}
 				}
 
@@ -1469,6 +1598,7 @@ func (c *Context) flushTx() error {
 
 	// Step 6: Process result
 	state := ptxn.state.Load()
+
 	c.engine.pendingTxns.Delete(bindOffset)
 
 	if state == txnStateAborted {
@@ -1491,6 +1621,7 @@ func (c *Context) flushTx() error {
 		}
 
 		c.reset()
+
 		return ErrTxnAborted
 	}
 
@@ -1502,6 +1633,7 @@ func (c *Context) flushTx() error {
 		if c.engine.horizon == nil {
 			c.engine.pendingTxTips.Delete(pk.newTip)
 		}
+
 		c.engine.resetAbortCount(pk.key)
 	}
 
@@ -1509,16 +1641,19 @@ func (c *Context) flushTx() error {
 	for key, ck := range c.keys {
 		if ck.shouldNotifyData {
 			c.engine.ownFilterAdd(key)
+
 			if c.engine.OnKeyDataAdded != nil {
 				c.engine.OnKeyDataAdded(key)
 			}
 		}
+
 		if ck.shouldNotifyDelete && c.engine.OnKeyDeleted != nil {
 			c.engine.OnKeyDeleted(key)
 		}
 	}
 
 	c.reset()
+
 	return nil
 }
 
@@ -1541,19 +1676,24 @@ func (c *Context) flushTx() error {
 // key can still make progress.
 func (c *Context) collectSubscribers() []pb.NodeID {
 	var members map[pb.NodeID]struct{}
+
 	if c.engine.broadcaster != nil {
 		ids := c.engine.broadcaster.PeerIDs()
+
 		members = make(map[pb.NodeID]struct{}, len(ids))
 		for _, id := range ids {
 			members[id] = struct{}{}
 		}
 	}
+
 	seen := make(map[pb.NodeID]struct{})
+
 	for key := range c.keys {
 		ls, _ := c.engine.index.LoadOrStoreData(key, &leafState{})
 		if ls == nil {
 			continue
 		}
+
 		ls.subMu.Lock()
 		for id := range ls.subscribers {
 			if members != nil {
@@ -1561,14 +1701,17 @@ func (c *Context) collectSubscribers() []pb.NodeID {
 					continue
 				}
 			}
+
 			seen[id] = struct{}{}
 		}
 		ls.subMu.Unlock()
 	}
+
 	result := make([]pb.NodeID, 0, len(seen))
 	for id := range seen {
 		result = append(result, id)
 	}
+
 	return result
 }
 
@@ -1581,6 +1724,7 @@ func (c *Context) emitSerializationEffect(key string) {
 	if !adaptiveSerializationEnabled {
 		return
 	}
+
 	leader := c.engine.selectSerializationLeader(key)
 
 	slog.Info("adaptive serialization: requesting leader",
@@ -1594,8 +1738,10 @@ func (c *Context) emitSerializationEffect(key string) {
 		}},
 	}); err != nil {
 		slog.Error("failed to emit serialization effect", "key", key, "error", err)
+
 		return
 	}
+
 	if err := ctx.Flush(); err != nil {
 		slog.Debug("serialization effect flush failed",
 			"key", key, "error", err)
@@ -1618,8 +1764,11 @@ func (e *Engine) updateIndex(key string, initialTips *keytrie.TipSet, lastOffset
 		if attempt > 0 {
 			slog.Debug("updateIndex: CAS retry", "key", key, "attempt", attempt)
 		}
+
 		current := e.index.Contains(key)
+
 		var offsets []Tip
+
 		if current != nil {
 			for _, tp := range current.Tips() {
 				if initialTips == nil || !initialTips.Contains(tp) {
@@ -1627,7 +1776,9 @@ func (e *Engine) updateIndex(key string, initialTips *keytrie.TipSet, lastOffset
 				}
 			}
 		}
+
 		offsets = append(offsets, lastOffset)
+
 		newTips := keytrie.NewTipSet(offsets...)
 		if _, ok := e.index.Insert(key, current, newTips); ok {
 			// Insert fires the trie's refDelta hook (applyRefDelta), which
@@ -1635,6 +1786,7 @@ func (e *Engine) updateIndex(key string, initialTips *keytrie.TipSet, lastOffset
 			// refcount call here.
 			return
 		}
+
 		if e.index.Closed() {
 			// Not a CAS race: Insert fails unconditionally on a closed trie,
 			// so retrying would spin forever during shutdown.
@@ -1653,15 +1805,18 @@ func (e *Engine) installTips(key string, tips []Tip) {
 		if attempt > 0 {
 			slog.Debug("installTips: CAS retry", "key", key, "attempt", attempt)
 		}
+
 		current := e.index.Contains(key)
 		cur := current.Tips()
 		offsets := make([]Tip, 0, len(cur)+len(tips))
 		offsets = append(offsets, cur...)
 		offsets = append(offsets, tips...)
+
 		newTips := keytrie.NewTipSet(offsets...)
 		if _, ok := e.index.Insert(key, current, newTips); ok {
 			return
 		}
+
 		if e.index.Closed() {
 			// Not a CAS race: Insert fails unconditionally on a closed trie,
 			// so retrying would spin forever during shutdown.
@@ -1675,7 +1830,7 @@ func (e *Engine) installTips(key string, tips []Tip) {
 // traceCtx is optional; when non-nil, OTel trace context is injected into the notification.
 func BuildOffsetNotify(nodeID pb.NodeID, offset Tip, eff *pb.Effect, data []byte, traceCtx context.Context) *pb.OffsetNotify {
 	// Wire format: [4-byte LE keyLen][key][protoData]
-	keyBytes := eff.Key
+	keyBytes := eff.GetKey()
 	wireData := make([]byte, 4+len(keyBytes)+len(data))
 	binary.LittleEndian.PutUint32(wireData[:4], uint32(len(keyBytes)))
 	copy(wireData[4:4+len(keyBytes)], keyBytes)
@@ -1683,9 +1838,9 @@ func BuildOffsetNotify(nodeID pb.NodeID, offset Tip, eff *pb.Effect, data []byte
 
 	notify := &pb.OffsetNotify{
 		Origin:     toPbRef(offset),
-		Hlc:        eff.Hlc,
-		Key:        eff.Key,
-		Deps:       eff.Deps,
+		Hlc:        eff.GetHlc(),
+		Key:        eff.GetKey(),
+		Deps:       eff.GetDeps(),
 		EffectData: wireData,
 	}
 

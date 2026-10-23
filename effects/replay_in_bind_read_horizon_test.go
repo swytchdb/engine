@@ -250,14 +250,17 @@ func TestReplayRun26373595271InBindReadDiverges(t *testing.T) {
 	if tipsAfterSnap == nil {
 		t.Fatalf("setup: el-0 must have tips after snapshot arrival")
 	}
+
 	for _, tp := range tipsAfterSnap.Tips() {
 		if tp == bindROff {
 			t.Fatalf("setup: R (n_3:27) must NOT be a current tip after n_117:50 consumed it as a dep (got tips=%v)", tipsAfterSnap.Tips())
 		}
 	}
+
 	if !e.horizon.IsInvisible(replay26373595271Txn211) {
 		t.Fatalf("setup: R must still be invisible after snapshot (no verdict for R)")
 	}
+
 	t.Logf("post-snapshot el-0 tips = %v; R is reachable only as DAG ancestor via n_117:50 deps; R IsInvisible=%v",
 		tipsAfterSnap.Tips(), e.horizon.IsInvisible(replay26373595271Txn211))
 
@@ -285,16 +288,19 @@ func TestReplayRun26373595271InBindReadDiverges(t *testing.T) {
 
 	ctx := e.NewContext()
 	ctx.BeginTx()
+
 	if err := ctx.Emit(&pb.Effect{
 		Key:  []byte("el-0"),
 		Kind: &pb.Effect_Data{Data: keyedInsertRaw("553", []byte("v553"))},
 	}); err != nil {
 		t.Fatalf("Emit local 553: %v", err)
 	}
+
 	inBindReduced, _, err := ctx.GetSnapshot("el-0")
 	if err != nil {
 		t.Fatalf("in-bind GetSnapshot: %v", err)
 	}
+
 	inBindIDs := inBindReadIDSet(inBindReduced)
 	t.Logf("in-bind read of el-0 (txn %s in flight, 553 pending) returned IDs=%v",
 		ctx.txnID, sortedKeys(inBindIDs))
@@ -310,6 +316,7 @@ func TestReplayRun26373595271InBindReadDiverges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("post-promotion reconstruct: %v", err)
 	}
+
 	postIDs := inBindReadIDSet(postReduced)
 	t.Logf("post-promotion reconstruct of el-0 (same tips=%v as in-bind read) returned IDs=%v",
 		preTxTips, sortedKeys(postIDs))
@@ -347,6 +354,7 @@ func TestReplayRun26373595271InBindReadDiverges(t *testing.T) {
 // test.
 func newInBindReadReplayEngine(t *testing.T) *Engine {
 	t.Helper()
+
 	e := &Engine{
 		effectCache:       newVertexPool(),
 		index:             keytrie.NewCritbit[leafState](),
@@ -363,6 +371,7 @@ func newInBindReadReplayEngine(t *testing.T) *Engine {
 	e.safety.Store(&safetyMap{defaultMode: UnsafeMode})
 	e.horizon = newHorizonSet(e)
 	installFakeTimers(e.horizon)
+
 	return e
 }
 
@@ -379,10 +388,12 @@ func markInBindReadSubscribed(e *Engine, key string) {
 // same path a real network arrival would take.
 func pushInBindEffect(t *testing.T, e *Engine, originNode pb.NodeID, off uint64, eff *pb.Effect) {
 	t.Helper()
+
 	data, err := proto.Marshal(eff)
 	if err != nil {
 		t.Fatalf("marshal effect: %v", err)
 	}
+
 	notify := BuildOffsetNotify(originNode, Tip{uint64(originNode), off}, eff, data, nil)
 	if _, err := e.HandleRemote(notify); err != nil {
 		t.Fatalf("HandleRemote: %v", err)
@@ -396,9 +407,11 @@ func inBindReadIDSet(r *pb.ReducedEffect) map[string]struct{} {
 	if r == nil || r.NetAdds == nil {
 		return out
 	}
-	for id := range r.NetAdds {
+
+	for id := range r.GetNetAdds() {
 		out[id] = struct{}{}
 	}
+
 	return out
 }
 
@@ -410,17 +423,20 @@ func subtractSet(a, b map[string]struct{}) map[string]struct{} {
 			out[k] = struct{}{}
 		}
 	}
+
 	return out
 }
 
 // elementsInOnlyOneSet returns elements in want that are missing from got.
 func elementsInOnlyOneSet(want, got map[string]struct{}) map[string]struct{} {
 	out := make(map[string]struct{})
+
 	for k := range want {
 		if _, ok := got[k]; !ok {
 			out[k] = struct{}{}
 		}
 	}
+
 	return out
 }
 
@@ -436,5 +452,6 @@ func sortedKeys(m map[string]struct{}) []string {
 			out[j], out[j-1] = out[j-1], out[j]
 		}
 	}
+
 	return out
 }

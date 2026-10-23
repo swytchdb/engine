@@ -31,17 +31,21 @@ import (
 
 func TestCloudSecretsDeterministic(t *testing.T) {
 	const conn = "test-connection-secret"
+
 	cloud := DeriveCloudSecret(conn)
 
 	if got := DeriveCloudSecret(conn); got != cloud {
 		t.Fatalf("cloud secret not deterministic: %q != %q", got, cloud)
 	}
+
 	if got, want := DeriveAuthKey(cloud), DeriveAuthKey(cloud); got != want {
 		t.Fatalf("auth key not deterministic: %q != %q", got, want)
 	}
+
 	if got, want := DeriveEncryptionKey(conn), DeriveEncryptionKey(conn); !bytes.Equal(got, want) {
 		t.Fatalf("encryption key not deterministic")
 	}
+
 	if got, want := DeriveClusterPassphrase(conn), DeriveClusterPassphrase(conn); got != want {
 		t.Fatalf("cluster passphrase not deterministic: %q != %q", got, want)
 	}
@@ -49,6 +53,7 @@ func TestCloudSecretsDeterministic(t *testing.T) {
 
 func TestCloudSecretsDistinct(t *testing.T) {
 	const conn = "test-connection-secret"
+
 	cloud := DeriveCloudSecret(conn)
 
 	values := map[string]string{
@@ -57,11 +62,13 @@ func TestCloudSecretsDistinct(t *testing.T) {
 		"encryption": base64.RawURLEncoding.EncodeToString(DeriveEncryptionKey(conn)),
 		"cluster":    DeriveClusterPassphrase(conn),
 	}
+
 	seen := make(map[string]string, len(values))
 	for name, v := range values {
 		if other, ok := seen[v]; ok {
 			t.Fatalf("derivations %q and %q collide on %q", name, other, v)
 		}
+
 		seen[v] = name
 	}
 }
@@ -73,13 +80,16 @@ func TestDeriveClusterPassphraseFeedsCA(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DeriveCAFromPassphrase: %v", err)
 	}
+
 	key2, cert2, err := DeriveCAFromPassphrase(pass)
 	if err != nil {
 		t.Fatalf("DeriveCAFromPassphrase (second call): %v", err)
 	}
+
 	if !key1.Equal(key2) {
 		t.Fatal("CA key not deterministic from derived passphrase")
 	}
+
 	if !bytes.Equal(cert1.Raw, cert2.Raw) {
 		t.Fatal("CA cert not deterministic from derived passphrase")
 	}
@@ -90,20 +100,24 @@ func TestCloudSecretsEncoding(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateConnectionSecret: %v", err)
 	}
+
 	cloud := DeriveCloudSecret(conn)
 
 	for _, s := range []string{conn, cloud, DeriveAuthKey(cloud), DeriveClusterPassphrase(conn)} {
 		if len(s) != 43 {
 			t.Fatalf("expected 43-char base64url, got %d: %q", len(s), s)
 		}
+
 		b, err := base64.RawURLEncoding.DecodeString(s)
 		if err != nil {
 			t.Fatalf("not valid base64url: %v", err)
 		}
+
 		if len(b) != 32 {
 			t.Fatalf("expected 32 decoded bytes, got %d", len(b))
 		}
 	}
+
 	if got := len(DeriveEncryptionKey(conn)); got != 32 {
 		t.Fatalf("expected 32-byte encryption key, got %d", got)
 	}
@@ -114,12 +128,14 @@ func TestDeriveAuthKeyBytesMatchesEncoded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateConnectionSecret: %v", err)
 	}
+
 	cloud := DeriveCloudSecret(conn)
 
 	raw := DeriveAuthKeyBytes(cloud)
 	if len(raw) != 32 {
 		t.Fatalf("expected 32-byte auth key, got %d", len(raw))
 	}
+
 	if got, want := base64.RawURLEncoding.EncodeToString(raw), DeriveAuthKey(cloud); got != want {
 		t.Fatalf("raw auth key does not encode to DeriveAuthKey: %q != %q", got, want)
 	}
@@ -130,12 +146,14 @@ func TestCloudKeyName(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateConnectionSecret: %v", err)
 	}
+
 	knk := DeriveKeyNameKey(conn)
 	key := []byte("__swytch:members")
 
 	// Deterministic: every node's mapping of one logical key must agree, or the
 	// cloud's per-key tip grouping falls apart.
 	a := CloudKeyName(knk, key)
+
 	b := CloudKeyName(DeriveKeyNameKey(conn), key)
 	if !bytes.Equal(a, b) {
 		t.Fatal("CloudKeyName is not deterministic across derivations")
@@ -145,6 +163,7 @@ func TestCloudKeyName(t *testing.T) {
 	if bytes.Equal(a, CloudKeyName(knk, []byte("__swytch:member"))) {
 		t.Fatal("distinct keys mapped to the same cloud name")
 	}
+
 	if bytes.Contains(a, key) {
 		t.Fatal("cloud key name contains the plaintext key")
 	}
@@ -154,6 +173,7 @@ func TestCloudKeyName(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateConnectionSecret: %v", err)
 	}
+
 	if bytes.Equal(a, CloudKeyName(DeriveKeyNameKey(other), key)) {
 		t.Fatal("different secrets produced the same cloud key name")
 	}
@@ -164,13 +184,16 @@ func TestDifferentConnectionsDifferentCloudSecrets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateConnectionSecret: %v", err)
 	}
+
 	b, err := GenerateConnectionSecret()
 	if err != nil {
 		t.Fatalf("GenerateConnectionSecret: %v", err)
 	}
+
 	if a == b {
 		t.Fatal("two random connection secrets collided")
 	}
+
 	if DeriveCloudSecret(a) == DeriveCloudSecret(b) {
 		t.Fatal("different connection secrets produced the same cloud secret")
 	}

@@ -57,12 +57,14 @@ func NewBunnyStorage(uploadEndpoint, cdnEndpoint, accessKey string) *BunnyStorag
 
 func (b *BunnyStorage) Upload(ctx context.Context, path string, data []byte) error {
 	url := b.uploadEndpoint + "/" + path
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, io.NopCloser(
 		io.NewSectionReader(newBytesReaderAt(data), 0, int64(len(data))),
 	))
 	if err != nil {
 		return fmt.Errorf("bunny upload: %w", err)
 	}
+
 	req.Header.Set("AccessKey", b.accessKey)
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.ContentLength = int64(len(data))
@@ -71,17 +73,21 @@ func (b *BunnyStorage) Upload(ctx context.Context, path string, data []byte) err
 	if err != nil {
 		return fmt.Errorf("bunny upload: %w", err)
 	}
-	defer resp.Body.Close()
+	// Closing the response body is cleanup; the status determines upload success.
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
+
 		return fmt.Errorf("bunny upload: status %d: %s", resp.StatusCode, string(body))
 	}
+
 	return nil
 }
 
 func (b *BunnyStorage) Download(ctx context.Context, path string) ([]byte, error) {
 	url := b.cdnEndpoint + "/" + path
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("bunny download: %w", err)
@@ -91,7 +97,8 @@ func (b *BunnyStorage) Download(ctx context.Context, path string) ([]byte, error
 	if err != nil {
 		return nil, fmt.Errorf("bunny download: %w", err)
 	}
-	defer resp.Body.Close()
+	// Response-body cleanup cannot change the status or the checked read result.
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("bunny download: status %d", resp.StatusCode)
@@ -113,10 +120,12 @@ func (r *bytesReaderAt) ReadAt(p []byte, off int64) (int, error) {
 	if off >= int64(len(r.data)) {
 		return 0, io.EOF
 	}
+
 	n := copy(p, r.data[off:])
 	if n < len(p) {
 		return n, io.EOF
 	}
+
 	return n, nil
 }
 
@@ -134,21 +143,26 @@ func NewMemoryStorage() *MemoryStorage {
 func (m *MemoryStorage) Upload(_ context.Context, path string, data []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	cp := make([]byte, len(data))
 	copy(cp, data)
 	m.blobs[path] = cp
+
 	return nil
 }
 
 func (m *MemoryStorage) Download(_ context.Context, path string) ([]byte, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+
 	data, ok := m.blobs[path]
 	if !ok {
 		return nil, fmt.Errorf("not found: %s", path)
 	}
+
 	cp := make([]byte, len(data))
 	copy(cp, data)
+
 	return cp, nil
 }
 
@@ -156,9 +170,11 @@ func (m *MemoryStorage) Download(_ context.Context, path string) ([]byte, error)
 func (m *MemoryStorage) Keys() []string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+
 	keys := make([]string, 0, len(m.blobs))
 	for k := range m.blobs {
 		keys = append(keys, k)
 	}
+
 	return keys
 }
