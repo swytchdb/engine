@@ -73,7 +73,8 @@ func (b *BunnyStorage) Upload(ctx context.Context, path string, data []byte) err
 	if err != nil {
 		return fmt.Errorf("bunny upload: %w", err)
 	}
-	defer resp.Body.Close()
+	// Closing the response body is cleanup; the status determines upload success.
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
@@ -96,7 +97,8 @@ func (b *BunnyStorage) Download(ctx context.Context, path string) ([]byte, error
 	if err != nil {
 		return nil, fmt.Errorf("bunny download: %w", err)
 	}
-	defer resp.Body.Close()
+	// Response-body cleanup cannot change the status or the checked read result.
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("bunny download: status %d", resp.StatusCode)

@@ -353,7 +353,9 @@ func (b *Beacon) primeSubscription() {
 		slog.Debug("beacon: prime subscription incomplete (will retry)", "error", err)
 	}
 
-	ctx.Flush()
+	if err := ctx.Flush(); err != nil {
+		slog.Warn("beacon: prime subscription flush failed", "error", err)
+	}
 }
 
 // registerSelf publishes this node's membership entry. Dead predecessors at
@@ -472,7 +474,10 @@ func (b *Beacon) refreshTopology() {
 
 	snapshot, _, err := ctx.GetSnapshot(MembershipKey)
 	if err != nil {
-		ctx.Flush()
+		if flushErr := ctx.Flush(); flushErr != nil {
+			slog.Error("beacon: failed membership read flush", "error", flushErr)
+		}
+
 		slog.Debug("beacon: membership snapshot read failed", "error", err)
 
 		return
@@ -555,7 +560,8 @@ func DetectAdvertiseAddr(joinAddr string, clusterPort int) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer conn.Close()
+	// This socket only probes the local address; no data is sent or buffered.
+	defer func() { _ = conn.Close() }()
 
 	host, _, _ := net.SplitHostPort(conn.LocalAddr().String())
 	if host == "0.0.0.0" || host == "::" {

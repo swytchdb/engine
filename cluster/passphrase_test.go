@@ -265,7 +265,11 @@ func TestPassphraseTLSHandshake(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer ln.Close()
+	defer func() {
+		if err := ln.Close(); err != nil {
+			t.Errorf("close listener: %v", err)
+		}
+	}()
 
 	errCh := make(chan error, 1)
 
@@ -276,7 +280,8 @@ func TestPassphraseTLSHandshake(t *testing.T) {
 
 			return
 		}
-		defer conn.Close()
+		// The handshake result is checked below; connection teardown is best effort.
+		defer func() { _ = conn.Close() }()
 		// Force the handshake.
 		errCh <- conn.(*tls.Conn).Handshake()
 	}()
@@ -290,7 +295,8 @@ func TestPassphraseTLSHandshake(t *testing.T) {
 		t.Fatalf("client dial: %v", err)
 	}
 
-	conn.Close()
+	// The handshake is complete; a peer closing first is harmless during teardown.
+	_ = conn.Close()
 
 	if err := <-errCh; err != nil {
 		t.Fatalf("server handshake: %v", err)
@@ -325,21 +331,37 @@ func TestPassphraseTLSHandshakeMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer ln.Close()
+	defer func() {
+		if err := ln.Close(); err != nil {
+			t.Errorf("close listener: %v", err)
+		}
+	}()
+
+	errCh := make(chan error, 1)
 
 	go func() {
 		conn, err := ln.Accept()
 		if err != nil {
+			errCh <- err
+
 			return
 		}
 
-		conn.(*tls.Conn).Handshake() //nolint:errcheck
-		conn.Close()
+		// Failed TLS connections have no application data to flush.
+		defer func() { _ = conn.Close() }()
+
+		errCh <- conn.(*tls.Conn).Handshake()
 	}()
 
 	conn, err := tls.Dial("tcp", ln.Addr().String(), clientTLS)
 	if err == nil {
-		conn.Close()
+		// Release the unexpected connection before reporting the handshake failure.
+		_ = conn.Close()
+
 		t.Fatal("expected handshake to fail with mismatched passphrases")
+	}
+
+	if err := <-errCh; err == nil {
+		t.Fatal("expected server handshake to fail with mismatched passphrases")
 	}
 }

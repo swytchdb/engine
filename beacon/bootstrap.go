@@ -26,6 +26,7 @@ package beacon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"time"
@@ -303,8 +304,11 @@ func (b *Beacon) readMembershipWithRetry(ctx context.Context, expectedPeers int)
 
 	for {
 		ectx := b.engine.NewContext()
+
 		snapshot, _, err := ectx.GetSnapshot(MembershipKey)
-		ectx.Flush()
+		if flushErr := ectx.Flush(); flushErr != nil {
+			return nil, errors.Join(err, fmt.Errorf("flush membership read: %w", flushErr))
+		}
 
 		if err == nil {
 			members := parseMembership(snapshot)

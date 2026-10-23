@@ -769,9 +769,7 @@ func (cs *CloudSync) runStream() error {
 				slog.Debug("cloud sync: close send", "error", err)
 			}
 
-			<-readerErr
-
-			return cs.ctx.Err()
+			return errors.Join(cs.ctx.Err(), <-readerErr)
 		case err := <-readerErr:
 			return err
 		case <-cs.wake:
@@ -1700,7 +1698,8 @@ func (cs *CloudSync) fetchEffect(ctx context.Context, tip effects.Tip) (*pb.Effe
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	// Response-body cleanup cannot change the status or the checked read result.
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, fmt.Errorf("cdn fetch %s: %w", url, effects.ErrCDNBlobMissing)

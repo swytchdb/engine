@@ -142,7 +142,10 @@ func (t *QUICNotifyTransport) Send(peerID NodeId, plaintext []byte) (wireSize in
 		return 0, err
 	}
 
-	stream.Close() // sends FIN
+	if err := stream.Close(); err != nil { // sends FIN
+		return 0, err
+	}
+
 	RecordQUICStreamOpened()
 
 	return len(body) + len(header), nil
