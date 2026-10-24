@@ -48,6 +48,9 @@ import (
 // post-resolution state.
 var errHorizonRetryNeeded = errors.New("reconstruct: horizon ancestor resolved, retry")
 
+// Disabled until invalidation accounts for adjudication on associated keys.
+const reducedReadCacheEnabled = false
+
 // leafState is the per-key payload attached to each critbit leaf (the trie's
 // T). It carries the cached subdag for the key so reads reuse the prepared
 // structure instead of rebuilding it. It is created once per key and mutated
@@ -714,7 +717,7 @@ func (e *Engine) reconstructLocal(key string) (*pb.ReducedEffect, []Tip, int) {
 	// filtering and compaction use copy-on-write before changing it. The memo is
 	// bypassed while any txn is mid-horizon: a conservative guard that keeps the
 	// cache out of the in-flight-visibility window entirely.
-	horizonClear := e.horizon == nil || e.horizon.Empty()
+	horizonClear := reducedReadCacheEnabled && (e.horizon == nil || e.horizon.Empty())
 
 	ls := e.index.LoadData(key)
 	if ls == nil {

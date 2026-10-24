@@ -162,6 +162,7 @@ func TestReconstruct_WonSnapshotsPreserveConflictChecks(t *testing.T) {
 		{name: "winner_snapshot", bobSnapshot: true},
 		{name: "both_snapshots", aliceSnapshot: true, bobSnapshot: true},
 		{name: "sequential_snapshots", aliceSnapshot: true, bobSnapshot: true, sequential: true},
+		{name: "cached_payout_new_competitor", aliceSnapshot: true, bobSnapshot: true, warmPayout: true},
 	} {
 		for _, payoutFirst := range []bool{false, true} {
 			order := "winner_first"

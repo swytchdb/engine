@@ -155,6 +155,10 @@ func TestGetSnapshot_SingleEffect(t *testing.T) {
 }
 
 func TestGetSnapshot_ReusesImmutableReducedMemo(t *testing.T) {
+	if !reducedReadCacheEnabled {
+		t.Skip("materialized read cache disabled pending cross-key invalidation")
+	}
+
 	log := newSnapshotLog()
 	e := newSnapshotEngine(log)
 
