@@ -2,6 +2,7 @@ package beacon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -58,14 +59,16 @@ func (w *safetyWatcher) refresh() error {
 		return err
 	}
 
-	mode, err := effects.ClusterSafetyMode(cluster)
-	if err != nil {
-		return err
-	}
+	mode, clusterErr := effects.ClusterSafetyMode(cluster)
 
-	overrides, err := effects.KeySafetyModes(keys)
-	if err != nil {
-		return err
+	overrides, keysErr := effects.KeySafetyModes(keys)
+	if err := errors.Join(clusterErr, keysErr); err != nil {
+		// Stored policy is untrusted input. Apply the same defaults on live
+		// updates and startup, and keep watching for a corrected value.
+		slog.Warn("beacon: invalid safety configuration; using defaults", "error", err)
+
+		mode = effects.SafeMode
+		overrides = nil
 	}
 
 	w.engine.UpdateSafetyRules(mode, effects.SafetyRules(overrides))
@@ -83,9 +86,7 @@ func (w *safetyWatcher) start(parent context.Context) error {
 		return fmt.Errorf("load safety configuration: %w", err)
 	}
 
-	w.wg.Add(1)
-	go func() {
-		defer w.wg.Done()
+	w.wg.Go(func() {
 
 		var retry <-chan time.Time
 
@@ -105,7 +106,7 @@ func (w *safetyWatcher) start(parent context.Context) error {
 				retry = time.After(time.Second)
 			}
 		}
-	}()
+	})
 
 	return nil
 }

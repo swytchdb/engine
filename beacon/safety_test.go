@@ -90,40 +90,65 @@ func TestSafetyWatcherLoadsAndTracksOrdinaryEffects(t *testing.T) {
 	waitSafetyTest(t, e, map[string]effects.SafetyMode{"other": effects.SafeMode, "sessions::a": effects.SafeMode})
 }
 
-func TestSafetyWatcherRejectsBadProjectionAndRecovers(t *testing.T) {
-	e := effects.NewEngine(effects.EngineConfig{})
+func TestSafetyWatcherInvalidConfigurationUsesDefaults(t *testing.T) {
+	for _, tc := range []struct {
+		name, key, field, value string
+	}{
+		{"cluster mode", effects.ClusterSafetyKey, "", "typo"},
+		{"cluster type", effects.ClusterSafetyKey, "mode", "unsafe"},
+		{"override mode", effects.KeySafetyKey, "bad:*", "typo"},
+		{"override type", effects.KeySafetyKey, "", "unsafe"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := effects.NewEngine(effects.EngineConfig{})
 
-	t.Cleanup(func() {
-		if err := e.Close(); err != nil {
-			t.Error(err)
-		}
-	})
+			t.Cleanup(func() {
+				if err := e.Close(); err != nil {
+					t.Error(err)
+				}
+			})
 
-	w := newSafetyWatcher(e)
-	emitSafetyTest(t, e, effects.ClusterSafetyKey, "", "unsafe", false)
+			w := newSafetyWatcher(e)
+			emitSafetyTest(t, e, effects.ClusterSafetyKey, "", "unsafe", false)
+			emitSafetyTest(t, e, effects.KeySafetyKey, "sessions::*", "unsafe", false)
 
-	if err := w.refresh(); err != nil {
-		t.Fatal(err)
-	}
+			if err := w.refresh(); err != nil {
+				t.Fatal(err)
+			}
 
-	emitSafetyTest(t, e, effects.ClusterSafetyKey, "", "typo", false)
+			emitSafetyTest(t, e, tc.key, "", "", true)
+			emitSafetyTest(t, e, tc.key, tc.field, tc.value, false)
 
-	if err := w.refresh(); err == nil {
-		t.Fatal("accepted invalid state")
-	}
+			if err := w.refresh(); err != nil {
+				t.Fatalf("invalid stored policy should fall back, not fail: %v", err)
+			}
 
-	if e.SafetyModeForKey("other") != effects.UnsafeMode {
-		t.Fatal("invalid update changed active policy")
-	}
+			// Neither a previous policy nor the valid sibling key may leave
+			// application keys unsafe. Internal keys retain their exception.
+			want := map[string]effects.SafetyMode{
+				"other": effects.SafeMode, "sessions::a": effects.SafeMode,
+				"bad:a": effects.SafeMode, effects.ClusterSafetyKey: effects.UnsafeMode,
+				effects.KeySafetyKey: effects.UnsafeMode,
+			}
+			for key, mode := range want {
+				if got := e.SafetyModeForKey(key); got != mode {
+					t.Fatalf("fallback policy for %s = %s, want %s", key, got, mode)
+				}
+			}
 
-	emitSafetyTest(t, e, effects.ClusterSafetyKey, "", "safe", false)
+			if err := w.start(t.Context()); err != nil {
+				t.Fatalf("invalid stored policy prevented watcher startup: %v", err)
+			}
+			defer w.stop()
 
-	if err := w.refresh(); err != nil {
-		t.Fatal(err)
-	}
-
-	if e.SafetyModeForKey("other") != effects.SafeMode {
-		t.Fatal("valid correction not applied")
+			// Repair both keys after startup. The subscription worker must
+			// still be alive and apply the repaired policy.
+			emitSafetyTest(t, e, effects.ClusterSafetyKey, "", "", true)
+			emitSafetyTest(t, e, effects.KeySafetyKey, "", "", true)
+			emitSafetyTest(t, e, effects.ClusterSafetyKey, "", "unsafe", false)
+			emitSafetyTest(t, e, effects.KeySafetyKey, "sessions::*", "safe", false)
+			waitSafetyTest(t, e, map[string]effects.SafetyMode{"other": effects.UnsafeMode, "sessions::a": effects.SafeMode})
+		})
 	}
 }
 
@@ -140,6 +165,14 @@ func TestStandaloneRuntimeWatchesSafetyKeys(t *testing.T) {
 	})
 	emitSafetyTest(t, rt.Engine, effects.ClusterSafetyKey, "", "unsafe", false)
 	waitSafetyTest(t, rt.Engine, map[string]effects.SafetyMode{"other": effects.UnsafeMode})
+	emitSafetyTest(t, rt.Engine, effects.ClusterSafetyKey, "", "typo", false)
+	waitSafetyTest(t, rt.Engine, map[string]effects.SafetyMode{"other": effects.SafeMode})
+	emitSafetyTest(t, rt.Engine, effects.ClusterSafetyKey, "", "unsafe", false)
+	waitSafetyTest(t, rt.Engine, map[string]effects.SafetyMode{"other": effects.UnsafeMode})
+	emitSafetyTest(t, rt.Engine, effects.KeySafetyKey, "sessions::*", "typo", false)
+	waitSafetyTest(t, rt.Engine, map[string]effects.SafetyMode{"other": effects.SafeMode, "sessions::a": effects.SafeMode})
+	emitSafetyTest(t, rt.Engine, effects.KeySafetyKey, "sessions::*", "safe", false)
+	waitSafetyTest(t, rt.Engine, map[string]effects.SafetyMode{"other": effects.UnsafeMode, "sessions::a": effects.SafeMode})
 
 	if err := rt.Engine.FlushIndex(); err != nil {
 		t.Fatalf("FlushIndex: %v", err)
