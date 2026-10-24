@@ -1666,7 +1666,7 @@ func bindsShareBase(a, b *forkChoiceBindEntry) bool {
 // surface as a winner. Failing the read on bootstrap error is correct:
 // we can't reconstruct K without authoritative state on K'.
 //
-// bindsByKey[K'] is the set of bind NewTip[K'] offsets discovered during
+// bindsByKey[K'] is the set of bind envelope offsets discovered during
 // the closure walk. Callers pass these as extra starting tips to
 // losersOnKey(K') so the per-key walk reaches those binds even when an
 // intervening snapshot on K' would otherwise truncate the walk before
@@ -1674,6 +1674,9 @@ func bindsShareBase(a, b *forkChoiceBindEntry) bool {
 func (e *Engine) bindKeyClosure(startKey string) (map[string]struct{}, map[string][]Tip, verdictMap, error) {
 	keys := map[string]struct{}{startKey: {}}
 	bindsByKey := make(map[string][]Tip)
+	queue := []string{startKey}
+	queued := map[string]bool{startKey: true}
+	visitedByKey := make(map[string]map[Tip]bool)
 	seenBindTip := make(map[string]map[Tip]struct{})
 	addBindTip := func(k string, t Tip) {
 		s, ok := seenBindTip[k]
@@ -1688,13 +1691,17 @@ func (e *Engine) bindKeyClosure(startKey string) (map[string]struct{}, map[strin
 
 		s[t] = struct{}{}
 		bindsByKey[k] = append(bindsByKey[k], t)
+		if !queued[k] {
+			queue = append(queue, k)
+			queued[k] = true
+		}
 	}
 	verdicts := make(verdictMap)
 
-	queue := []string{startKey}
 	for len(queue) > 0 {
 		k := queue[len(queue)-1]
 		queue = queue[:len(queue)-1]
+		queued[k] = false
 
 		if err := e.ensureSubscribed(k); err != nil {
 			return nil, nil, nil, err
@@ -1715,7 +1722,11 @@ func (e *Engine) bindKeyClosure(startKey string) (map[string]struct{}, map[strin
 		// dep, which would truncate closure expansion. For closure
 		// discovery we only need to find binds reachable from tips,
 		// not a complete DAG — skip missing refs and keep going.
-		visited := make(map[Tip]bool)
+		visited := visitedByKey[k]
+		if visited == nil {
+			visited = make(map[Tip]bool)
+			visitedByKey[k] = visited
+		}
 
 		stack := append([]Tip(nil), startTips...)
 		for len(stack) > 0 {
@@ -1738,21 +1749,13 @@ func (e *Engine) bindKeyClosure(startKey string) (map[string]struct{}, map[strin
 				for _, kb := range bind.GetKeys() {
 					other := string(kb.GetKey())
 					if other != k {
-						// Cross-key NewTip: seed losersOnKey's walk on
-						// `other` so it reaches this bind even when the
-						// only path goes through the current key.
-						// Same-key NewTip is already reachable from
-						// `other`'s own tipset; recording it here just
-						// piles redundant starting tips into long
-						// single-key chains and explodes the pairwise
-						// reach check.
-						addBindTip(other, r(kb.GetNewTip()))
+						// Start at the envelope: NewTip is its ancestor
+						// and cannot lead a backwards walk to this bind.
+						// A new anchor also requeues an already visited key.
+						addBindTip(other, t)
 					}
 
-					if _, ok := keys[other]; !ok {
-						keys[other] = struct{}{}
-						queue = append(queue, other)
-					}
+					keys[other] = struct{}{}
 				}
 				// Bind dep: same-key NewTip.
 				for _, kb := range bind.GetKeys() {
@@ -1796,7 +1799,7 @@ func (e *Engine) bindKeyClosure(startKey string) (map[string]struct{}, map[strin
 // reachable snapshot (or in snapshotVerdicts from the caller) bypass the
 // pairwise hash comparison. WON only records a decision against the competitors
 // known to that snapshot, so those binds still run pairwise hash + predicate
-// refinement against concurrent binds. extraTips augments the starting set with NewTip[key] offsets
+// refinement against concurrent binds. extraTips augments the starting set with bind envelopes
 // the caller harvested on other closure keys.
 func (e *Engine) losersOnKey(key string, extraTips []Tip, snapshotVerdicts verdictMap) (map[string]struct{}, int) {
 	losers := make(map[string]struct{})
