@@ -198,7 +198,7 @@ func TestDirectoryLockResetAndCancellation(t *testing.T) {
 		t.Fatal("concurrent directory owner accepted")
 	}
 
-	if err := os.WriteFile(filepath.Join(dir, "unrelated"), []byte("keep"), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "unrelated"), []byte("keep"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -295,7 +295,7 @@ func TestFailedSyncRemainsDirty(t *testing.T) {
 		t.Error("failed sync marked clean")
 	}
 
-	f, err := os.OpenFile(b.path, os.O_RDWR, 0600)
+	f, err := os.OpenFile(b.path, os.O_RDWR, 0o600)
 	if err != nil {
 		t.Fatal(err)
 	}

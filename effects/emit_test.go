@@ -66,12 +66,14 @@ func (m *mockBroadcaster) BroadcastWithData(notify *pb.OffsetNotify, effectData 
 
 	m.broadcasts = append(m.broadcasts, notify)
 }
+
 func (m *mockBroadcaster) Broadcast(notify *pb.OffsetNotify) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	m.broadcasts = append(m.broadcasts, notify)
 }
+
 func (m *mockBroadcaster) Replicate(notify *pb.OffsetNotify, wireData []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -80,6 +82,7 @@ func (m *mockBroadcaster) Replicate(notify *pb.OffsetNotify, wireData []byte) er
 
 	return m.replicateErr
 }
+
 func (m *mockBroadcaster) ReplicateMarshalled(notify *pb.OffsetNotify, _ []byte, target pb.NodeID) ([]*pb.NackNotify, error) {
 	return m.ReplicateTo(notify, notify.GetEffectData(), target)
 }
@@ -108,15 +111,18 @@ func (m *mockBroadcaster) ReplicateTo(notify *pb.OffsetNotify, wireData []byte, 
 
 	return nil, m.replicateErr
 }
+
 func (m *mockBroadcaster) SendNack(nack *pb.NackNotify, targetNodeID pb.NodeID) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	m.sentNacks = append(m.sentNacks, nack)
 }
+
 func (m *mockBroadcaster) FetchFromAny(ref *pb.EffectRef, _ FetchHint) ([]byte, error) {
 	return nil, nil
 }
+
 func (m *mockBroadcaster) Fetch(ref *pb.EffectRef) ([]byte, error) {
 	return nil, nil
 }

@@ -79,7 +79,7 @@ func Open(dir string) (*Store, error) {
 
 // OpenContext also permits cancellation while loading a large TOC inventory.
 func OpenContext(ctx context.Context, dir string) (*Store, error) {
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
 
@@ -237,18 +237,18 @@ func recordChecksum(offset, pos, size, allocated uint64, data []byte) uint32 {
 
 func (b *bucket) open(ctx context.Context, create bool) error {
 	if create {
-		if err := os.MkdirAll(filepath.Dir(b.path), 0700); err != nil {
+		if err := os.MkdirAll(filepath.Dir(b.path), 0o700); err != nil {
 			return err
 		}
 	}
 
-	f, err := os.OpenFile(b.path, os.O_RDWR, 0600)
+	f, err := os.OpenFile(b.path, os.O_RDWR, 0o600)
 
 	fresh := create && os.IsNotExist(err)
 	if fresh {
 		// Publish the filename only after the complete header is synced. A crash
 		// while initializing a new bucket must not break recovery of older files.
-		f, err = os.OpenFile(b.path+".new", os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
+		f, err = os.OpenFile(b.path+".new", os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
 	}
 
 	if err != nil {
@@ -311,7 +311,7 @@ func (b *bucket) open(ctx context.Context, create bool) error {
 			return err
 		}
 
-		f, err = os.OpenFile(b.path, os.O_RDWR, 0600)
+		f, err = os.OpenFile(b.path, os.O_RDWR, 0o600)
 		if err != nil {
 			return err
 		}

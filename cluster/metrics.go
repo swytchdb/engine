@@ -282,12 +282,10 @@ func removePeerMetrics(peerID NodeId) {
 
 // --- 9.7 Retransmission ---
 
-var (
-	retransmissionGiveUpsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "cluster_retransmission_giveups_total",
-		Help: "Total retransmission give-ups (max retries exhausted) per peer",
-	}, []string{peerLabelName})
-)
+var retransmissionGiveUpsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "cluster_retransmission_giveups_total",
+	Help: "Total retransmission give-ups (max retries exhausted) per peer",
+}, []string{peerLabelName})
 
 // RecordRetransmissionGiveUp increments the give-up counter for a peer.
 func RecordRetransmissionGiveUp(peerID NodeId) {

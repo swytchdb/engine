@@ -5,9 +5,10 @@ package durability
 import (
 	"errors"
 	"fmt"
-	"golang.org/x/sys/unix"
 	"os"
 	"path/filepath"
+
+	"golang.org/x/sys/unix"
 )
 
 func mapFile(f *os.File, size uint64) ([]byte, error) {
@@ -20,7 +21,7 @@ func mapFile(f *os.File, size uint64) ([]byte, error) {
 func unmapFile(data []byte) error           { return unix.Munmap(data) }
 func syncMapped(f *os.File, _ []byte) error { return f.Sync() }
 func lockDirectory(dir string) (*os.File, error) {
-	f, err := os.OpenFile(filepath.Join(dir, ".swytch.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	f, err := os.OpenFile(filepath.Join(dir, ".swytch.lock"), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -33,6 +34,7 @@ func lockDirectory(dir string) (*os.File, error) {
 
 	return f, nil
 }
+
 func allocationBlock(f *os.File) (uint64, error) {
 	var st unix.Statfs_t
 	if err := unix.Fstatfs(int(f.Fd()), &st); err != nil {
@@ -41,6 +43,7 @@ func allocationBlock(f *os.File) (uint64, error) {
 
 	return uint64(st.Bsize), nil
 }
+
 func syncDirectory(path string) error {
 	f, err := os.Open(path)
 	if err != nil {

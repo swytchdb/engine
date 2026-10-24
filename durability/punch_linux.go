@@ -4,8 +4,9 @@ package durability
 
 import (
 	"errors"
-	"golang.org/x/sys/unix"
 	"os"
+
+	"golang.org/x/sys/unix"
 )
 
 func punchFile(f *os.File, pos, size uint64) error {

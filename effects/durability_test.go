@@ -240,7 +240,7 @@ func TestDurabilityLowMemoryFallback(t *testing.T) {
 
 func TestDurabilityOpenFailureAndWriteFailure(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "file")
-	if err := os.WriteFile(path, []byte("file"), 0600); err != nil {
+	if err := os.WriteFile(path, []byte("file"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 

@@ -87,7 +87,6 @@ func (w *safetyWatcher) start(parent context.Context) error {
 	}
 
 	w.wg.Go(func() {
-
 		var retry <-chan time.Time
 
 		for {
