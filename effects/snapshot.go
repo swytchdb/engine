@@ -290,8 +290,8 @@ type verdictEntry struct {
 	snapshotTip Tip
 }
 
-// verdictMap accumulates snapshot-supplied verdicts during a walk so binds
-// already adjudicated can skip pairwise fork choice.
+// verdictMap accumulates snapshot-supplied verdicts during a walk. Recorded
+// losses suppress binds; recorded wins still need checks against concurrent binds.
 type verdictMap map[string]verdictEntry
 
 // harvest folds a snapshot's TxnVerdicts into the map. First-seen wins;
@@ -1705,9 +1705,9 @@ func (e *Engine) bindKeyClosure(startKey string) (map[string]struct{}, map[strin
 // losersOnKey returns the txnIDs of binds on `key` that lost fork choice,
 // plus the count of effects walked. Binds with a LOST verdict in any
 // reachable snapshot (or in snapshotVerdicts from the caller) bypass the
-// pairwise hash comparison; binds with a WON verdict skip the pass
-// entirely. The unadjudicated tail still runs pairwise hash + predicate
-// refinement. extraTips augments the starting set with NewTip[key] offsets
+// pairwise hash comparison. WON only records a decision against the competitors
+// known to that snapshot, so those binds still run pairwise hash + predicate
+// refinement against concurrent binds. extraTips augments the starting set with NewTip[key] offsets
 // the caller harvested on other closure keys.
 func (e *Engine) losersOnKey(key string, extraTips []Tip, snapshotVerdicts verdictMap) (map[string]struct{}, int) {
 	losers := make(map[string]struct{})
@@ -1851,7 +1851,7 @@ func (e *Engine) losersOnKey(key string, extraTips []Tip, snapshotVerdicts verdi
 		verdictSrc Tip
 	}
 
-	var unadjudicated []seenBind
+	var candidates []seenBind
 
 	verdictAdjudicated := make(map[string]bindWithSource)
 
@@ -1862,34 +1862,37 @@ func (e *Engine) losersOnKey(key string, extraTips []Tip, snapshotVerdicts verdi
 			}
 
 			verdictAdjudicated[b.txnID] = bindWithSource{seenBind: b, verdictSrc: entry.snapshotTip}
+			if entry.verdict == pb.Verdict_WON {
+				candidates = append(candidates, b)
+			}
 
 			continue
 		}
 
-		unadjudicated = append(unadjudicated, b)
+		candidates = append(candidates, b)
 	}
 
-	// Chain detection: if every unadjudicated bind's ConsumedTips on this
-	// key contains another unadjudicated bind's anchor offset, the binds
+	// Chain detection: if every candidate bind's ConsumedTips on this
+	// key contains another candidate bind's anchor offset, the binds
 	// form a total order via consumed-bind edges (each bind explicitly
 	// built on its predecessor's committed bind). No two can be
 	// DAG-concurrent on this key, so no losers — skip the O(N²) pairwise
 	// and ancestor work entirely. Common in sequential single-writer
 	// workloads (XADD, LPUSH, INCR), where this is the difference
 	// between O(N²) and O(N).
-	if len(unadjudicated) > 1 {
-		bindOffsetToIdx := make(map[Tip]int, len(unadjudicated))
-		for i := range unadjudicated {
-			bindOffsetToIdx[unadjudicated[i].bindOffset] = i
+	if len(candidates) > 1 {
+		bindOffsetToIdx := make(map[Tip]int, len(candidates))
+		for i := range candidates {
+			bindOffsetToIdx[candidates[i].bindOffset] = i
 		}
 
 		rootBinds := 0
 		chained := true
 
-		for i := range unadjudicated {
+		for i := range candidates {
 			consumesSibling := false
 
-			for _, ct := range unadjudicated[i].consumed {
+			for _, ct := range candidates[i].consumed {
 				if _, ok := bindOffsetToIdx[ct]; ok {
 					consumesSibling = true
 
@@ -1961,15 +1964,15 @@ func (e *Engine) losersOnKey(key string, extraTips []Tip, snapshotVerdicts verdi
 		return found
 	}
 
-	// Pairwise fork choice over the unadjudicated tail.
-	for i := range unadjudicated {
-		b := &unadjudicated[i]
-		for j := range unadjudicated {
+	// Pairwise fork choice over all candidates, including snapshot winners.
+	for i := range candidates {
+		b := &candidates[i]
+		for j := range candidates {
 			if i == j {
 				continue
 			}
 
-			other := &unadjudicated[j]
+			other := &candidates[j]
 			if reaches(b.newTip, other.newTip) || reaches(other.newTip, b.newTip) {
 				continue
 			}
@@ -2021,7 +2024,7 @@ func (e *Engine) losersOnKey(key string, extraTips []Tip, snapshotVerdicts verdi
 			"binds_seen", seen,
 			"losers", loserList,
 			"snapshot_adjudicated", len(verdictAdjudicated),
-			"pairwise_candidates", len(unadjudicated))
+			"pairwise_candidates", len(candidates))
 	}
 
 	return losers, walked
