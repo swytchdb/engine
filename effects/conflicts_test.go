@@ -136,7 +136,7 @@ func TestConflictEffects_EmittedAndDocumentGate(t *testing.T) {
 
 func TestConflictEffects_NewCompetitorPreservesDocuments(t *testing.T) {
 	e, log, binds := conflictLottery(t, "alice", "bob")
-	if err := e.emitConflict("winner", binds["alice"], binds["bob"]); err != nil {
+	if err := e.emitConflict("winner", binds["alice"], binds["bob"], nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -151,7 +151,7 @@ func TestConflictEffects_NewCompetitorPreservesDocuments(t *testing.T) {
 	})
 
 	charlie := addConflictLottery(e, log, "charlie", 3, nil)
-	if err := e.emitConflict("winner", binds["alice"], charlie); err != nil {
+	if err := e.emitConflict("winner", binds["alice"], charlie, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -166,7 +166,7 @@ func TestConflictEffects_NewCompetitorPreservesDocuments(t *testing.T) {
 	}
 	// Bob and Charlie were never reported together. Existence alone gates
 	// reporting; documents need no knowledge of their competitors.
-	if err := e.emitConflict("winner", binds["bob"], charlie); err != nil {
+	if err := e.emitConflict("winner", binds["bob"], charlie, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -190,7 +190,7 @@ func TestConflictEffects_ConcurrentReportsPreserveDuplicates(t *testing.T) {
 	})
 
 	for range 2 {
-		go func() { done <- e.emitConflict("winner", binds["alice"], binds["bob"]) }()
+		go func() { done <- e.emitConflict("winner", binds["alice"], binds["bob"], nil) }()
 	}
 
 	for range 2 {
@@ -233,7 +233,7 @@ func TestConflictEffects_HistoricalEvidence(t *testing.T) {
 	bob := addConflictLottery(e, log, "bob", 2, parents)
 
 	tips := append([]Tip(nil), e.index.Contains("winner").Tips()...)
-	if err := e.emitConflict("winner", alice, bob); err != nil {
+	if err := e.emitConflict("winner", alice, bob, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -357,7 +357,7 @@ func TestConflictEffects_MissingHistoryRetries(t *testing.T) {
 	alice := addConflictLottery(e, log, "alice", 1, map[string]Tip{"winner": missing})
 	bob := addConflictLottery(e, log, "bob", 2, nil)
 
-	if err := e.emitConflict("winner", alice, bob); err == nil {
+	if err := e.emitConflict("winner", alice, bob, nil); err == nil {
 		t.Fatal("missing history must not produce a complete document")
 	}
 
@@ -372,7 +372,7 @@ func TestConflictEffects_MissingHistoryRetries(t *testing.T) {
 		t.Fatalf("Put: %v", err)
 	}
 
-	if err := e.emitConflict("winner", alice, bob); err != nil {
+	if err := e.emitConflict("winner", alice, bob, nil); err != nil {
 		t.Fatal(err)
 	}
 

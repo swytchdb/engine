@@ -1,6 +1,6 @@
 module github.com/swytchdb/engine
 
-go 1.27.3
+go 1.27
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0

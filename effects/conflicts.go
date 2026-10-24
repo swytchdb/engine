@@ -114,7 +114,18 @@ func (e *Engine) hasConflictDocument(txn string) (bool, error) {
 	return snapshot.GetScalar() != nil, nil
 }
 
-func (e *Engine) emitConflict(key string, a, b Tip) error {
+type conflictDocumentCheck struct {
+	exists bool
+	err    error
+}
+
+// checks belongs to one reporting pass. Independent observations still read
+// the ordinary documents and may emit the intentionally preserved duplicates.
+func (e *Engine) emitConflict(key string, a, b Tip, checks map[string]conflictDocumentCheck) error {
+	if checks == nil {
+		checks = make(map[string]conflictDocumentCheck)
+	}
+
 	binds := []Tip{a, b}
 	envelopes := make([]*pb.Effect, 2)
 	covered := make([]bool, 2)
@@ -129,12 +140,19 @@ func (e *Engine) emitConflict(key string, a, b Tip) error {
 	}
 
 	for i := range binds {
-		var err error
+		txn := envelopes[i].GetTxnId()
 
-		covered[i], err = e.hasConflictDocument(envelopes[i].GetTxnId())
-		if err != nil {
-			return err
+		check, ok := checks[txn]
+		if !ok {
+			check.exists, check.err = e.hasConflictDocument(txn)
+			checks[txn] = check
 		}
+
+		if check.err != nil {
+			return check.err
+		}
+
+		covered[i] = check.exists
 	}
 
 	if covered[0] && covered[1] {
@@ -183,6 +201,12 @@ func (e *Engine) emitConflict(key string, a, b Tip) error {
 
 	if err := ctx.Flush(); err != nil {
 		return err
+	}
+
+	// Match the ordinary document gate even if a later notification flush
+	// fails: these documents have already been published.
+	for _, envelope := range envelopes {
+		checks[envelope.GetTxnId()] = conflictDocumentCheck{exists: true}
 	}
 
 	keys := make(map[string]struct{})

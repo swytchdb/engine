@@ -2104,6 +2104,27 @@ func (e *Engine) losersOnKeyAt(key string, tips, extraTips []Tip, snapshotVerdic
 		return found
 	}
 
+	// Check reporting eligibility once per envelope for this scan, and defer
+	// document reads and effects until adjudication is complete.
+	var reportable map[Tip]bool
+	if reportConflicts && !strings.HasPrefix(key, conflictKeyPrefix) && len(candidates) > 1 {
+		reportable = make(map[Tip]bool, len(candidates))
+		for _, b := range candidates {
+			if verdicts[b.txnID].verdict == pb.Verdict_WON {
+				reportable[b.bindOffset] = e.unresolvedConflictTip(key, b.bindOffset, startTips, reaches)
+			}
+		}
+	}
+
+	type conflictPair struct {
+		binds [2]Tip
+		txns  [2]string
+	}
+
+	var conflicts []conflictPair
+
+	seenConflicts := make(map[[2]string]struct{})
+
 	// Pairwise fork choice over all candidates, including snapshot winners.
 	for i := range candidates {
 		b := &candidates[i]
@@ -2132,13 +2153,20 @@ func (e *Engine) losersOnKeyAt(key string, tips, extraTips []Tip, snapshotVerdic
 
 			losers[b.txnID] = struct{}{}
 
-			canReport := reportConflicts && !strings.HasPrefix(key, conflictKeyPrefix) &&
-				verdicts[b.txnID].verdict == pb.Verdict_WON &&
-				e.unresolvedConflictTip(key, b.bindOffset, startTips, reaches)
-			if canReport && verdicts[other.txnID].verdict == pb.Verdict_WON &&
-				e.unresolvedConflictTip(key, other.bindOffset, startTips, reaches) {
-				if err := e.emitConflict(key, b.bindOffset, other.bindOffset); err != nil {
-					slog.Warn("conflict report emission failed", "key", key, "txn", b.txnID, "competing_txn", other.txnID, "error", err)
+			canReport := reportable[b.bindOffset]
+			if canReport && reportable[other.bindOffset] {
+				pair := [2]string{b.txnID, other.txnID}
+				if pair[1] < pair[0] {
+					pair[0], pair[1] = pair[1], pair[0]
+				}
+
+				if _, seen := seenConflicts[pair]; !seen {
+					seenConflicts[pair] = struct{}{}
+
+					conflicts = append(conflicts, conflictPair{
+						binds: [2]Tip{b.bindOffset, other.bindOffset},
+						txns:  [2]string{b.txnID, other.txnID},
+					})
 				}
 			}
 
@@ -2147,6 +2175,13 @@ func (e *Engine) losersOnKeyAt(key string, tips, extraTips []Tip, snapshotVerdic
 			if !canReport {
 				break
 			}
+		}
+	}
+
+	checks := make(map[string]conflictDocumentCheck)
+	for _, pair := range conflicts {
+		if err := e.emitConflict(key, pair.binds[0], pair.binds[1], checks); err != nil {
+			slog.Warn("conflict report emission failed", "key", key, "txn", pair.txns[0], "competing_txn", pair.txns[1], "error", err)
 		}
 	}
 
