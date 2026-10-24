@@ -1367,7 +1367,13 @@ func (e *Engine) reconstructWithView(key string, tips []Tip, txID string, waitFo
 		}
 
 		d = newDag(e, key, txID)
-		if err := e.prepareDag(d, key, tips); err != nil {
+		if view != nil && view.historical {
+			err = d.prepare(tips)
+		} else {
+			err = e.prepareDag(d, key, tips)
+		}
+
+		if err != nil {
 			return nil, 0, err
 		}
 
@@ -1848,10 +1854,10 @@ func (e *Engine) losersOnKey(key string, extraTips []Tip, snapshotVerdicts verdi
 		isInvisible = e.horizon.IsInvisible
 	}
 
-	return e.losersOnKeyAt(key, e.index.Contains(key).Tips(), extraTips, snapshotVerdicts, isInvisible)
+	return e.losersOnKeyAt(key, e.index.Contains(key).Tips(), extraTips, snapshotVerdicts, isInvisible, true)
 }
 
-func (e *Engine) losersOnKeyAt(key string, tips, extraTips []Tip, snapshotVerdicts verdictMap, isInvisible func(string) bool) (map[string]struct{}, int) {
+func (e *Engine) losersOnKeyAt(key string, tips, extraTips []Tip, snapshotVerdicts verdictMap, isInvisible func(string) bool, reportConflicts bool) (map[string]struct{}, int) {
 	losers := make(map[string]struct{})
 
 	startTips := append([]Tip(nil), tips...)
@@ -2121,7 +2127,21 @@ func (e *Engine) losersOnKeyAt(key string, tips, extraTips []Tip, snapshotVerdic
 
 			losers[b.txnID] = struct{}{}
 
-			break
+			canReport := reportConflicts && !strings.HasPrefix(key, conflictKeyPrefix) &&
+				verdicts[b.txnID].verdict == pb.Verdict_WON &&
+				e.unresolvedConflictTip(key, b.bindOffset, startTips, reaches)
+			if canReport && verdicts[other.txnID].verdict == pb.Verdict_WON &&
+				e.unresolvedConflictTip(key, other.bindOffset, startTips, reaches) {
+				if err := e.emitConflict(key, b.bindOffset, other.bindOffset); err != nil {
+					slog.Warn("conflict report emission failed", "key", key, "txn", b.txnID, "competing_txn", other.txnID, "error", err)
+				}
+			}
+
+			// Reporting needs every competing WON pair, even after this
+			// candidate has already lost to another transaction.
+			if !canReport {
+				break
+			}
 		}
 	}
 

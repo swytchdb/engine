@@ -12,16 +12,17 @@ import (
 // pointers are immutable; validating them after reconstruction detects changes
 // during discovery or materialization without copying the entire key index.
 type snapshotReadView struct {
-	engine    *Engine
-	ctx       context.Context
-	frontier  map[string]*keytrie.TipSet
-	resolved  map[string][]Tip
-	invisible map[string]bool
-	keys      map[string]struct{}
-	anchors   map[string][]Tip
-	verdicts  verdictMap
-	lost      map[string]struct{}
-	walked    int
+	engine     *Engine
+	ctx        context.Context
+	frontier   map[string]*keytrie.TipSet
+	resolved   map[string][]Tip
+	invisible  map[string]bool
+	keys       map[string]struct{}
+	anchors    map[string][]Tip
+	verdicts   verdictMap
+	lost       map[string]struct{}
+	walked     int
+	historical bool // report reconstruction uses recorded ancestry only
 }
 
 func newSnapshotReadView(e *Engine, ctx context.Context) *snapshotReadView {
@@ -57,6 +58,10 @@ func (v *snapshotReadView) capture(key string) ([]Tip, error) {
 // Freeze visibility decisions too: horizon completion need not change a key's
 // tips. A changed decision invalidates the entire batch at validation time.
 func (v *snapshotReadView) isInvisible(txn string) bool {
+	if v.historical {
+		return false
+	}
+
 	invisible, ok := v.invisible[txn]
 	if !ok {
 		invisible = v.engine.horizon != nil && v.engine.horizon.IsInvisible(txn)
@@ -98,7 +103,7 @@ func (v *snapshotReadView) discover(keys []string) error {
 	}
 
 	for key := range v.keys {
-		losers, walked := v.engine.losersOnKeyAt(key, v.resolved[key], v.anchors[key], v.verdicts, v.isInvisible)
+		losers, walked := v.engine.losersOnKeyAt(key, v.resolved[key], v.anchors[key], v.verdicts, v.isInvisible, true)
 
 		v.walked += walked
 		for txn := range losers {
