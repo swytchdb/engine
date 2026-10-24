@@ -75,19 +75,15 @@ func (e *Engine) isServed(key []byte) bool {
 	return sub
 }
 
-// putIngested pools a fetched/ingested effect, choosing owned vs cache residency
-// by whether we serve its key. The single routing point for every ingest path
+// putIngested pools a fetched/ingested effect, taking ownership for each served
+// key in a bind, or its single key otherwise. The routing point for every ingest path
 // (HandleRemote, backfill, NACK causal-chain prefetch, getEffect's storeWireData).
 func (e *Engine) putIngested(tip Tip, eff *pb.Effect, protoLen int) {
 	if e.effectCache == nil {
 		return
 	}
 
-	if e.isServed(eff.GetKey()) {
-		e.effectCache.PutSized(tip, eff, protoLen)
-	} else {
-		e.effectCache.PutSizedCache(tip, eff, protoLen)
-	}
+	e.effectCache.putSized(tip, eff, protoLen, e.isServed)
 }
 
 // bootstrapCollector collects NACKs during subscription bootstrapping.
@@ -2559,7 +2555,7 @@ func (e *Engine) releaseChainRefs(key string, tips []Tip, ls *leafState) {
 
 		visited[t] = struct{}{}
 
-		eff, ok := e.effectCache.decrefChainNode(t)
+		eff, ok := e.effectCache.decrefChainNode(key, t)
 		if !ok {
 			continue // not resident — nothing below to release
 		}
@@ -2621,7 +2617,7 @@ func (e *Engine) broadcastUnsubscribe(key string, tips []Tip) {
 			e.fireLocalEffect(offset, unsub)
 
 			if e.effectCache != nil {
-				e.effectCache.Decref(offset)
+				e.effectCache.decrefChainNode(key, offset)
 			}
 
 			notify := BuildOffsetNotify(e.nodeID, offset, unsub, data, nil)

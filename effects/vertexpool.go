@@ -29,6 +29,7 @@ import (
 	"math"
 	"runtime/debug"
 	"runtime/metrics"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -63,6 +64,10 @@ type vertex struct {
 	eff  *pb.Effect
 	size int64
 	refs atomic.Int32
+	// Creation references belong to individual keys. A positive refs count
+	// alone cannot distinguish ownership from another subdag's adoption pin.
+	creationMu   sync.Mutex
+	creationKeys map[string]struct{}
 }
 
 // VertexPool is the engine's deserialized effect store: a map from Tip to
@@ -146,9 +151,12 @@ func (p *VertexPool) Get(tip Tip) (*pb.Effect, bool) {
 // so the payload and byte cost are identical. Replacing the vertex would reset
 // refs to 0, letting reclaimUnreferenced free an effect the index still holds
 // as a frontier tip — a premature free surfacing as a missing read. The
-// resident fast-path also skips the proto.Size walk on the common re-delivery.
+// resident fast-path reuses the known size on a re-delivery while still taking
+// any missing creation ownership.
 func (p *VertexPool) Put(tip Tip, eff *pb.Effect) {
-	if _, ok := p.m.Load(tip); ok {
+	if v, ok := p.m.Load(tip); ok {
+		p.PutSized(tip, eff, int(v.size-vertexOverhead))
+
 		return
 	}
 
@@ -171,35 +179,70 @@ func (p *VertexPool) Put(tip Tip, eff *pb.Effect) {
 // fresh vertex at 0 (a birth-race free). Read adoption layers further refs on top
 // in publishSubdag.
 //
-// If the tip is already resident as a cache entry (PutSizedCache left it at
-// refs==0 because we did not yet serve its key), this owned Put promotes it by
-// adding the creation ref it lacked, so reclaim won't drop a vertex we now own.
-// The CAS makes that race-safe: it loses to reclaim's 0→tombstone claim (the
-// vertex is being freed; we refetch on the next miss) and to a concurrent read's
-// publishSubdag incref (refs>0; left un-promoted, resolved by a later refetch),
-// and it never double-counts an already-owned re-put (refs>0 → CAS fails → keep
-// the accumulated count).
+// Re-putting adds only missing key ownership, even if an adoption pin already
+// holds the vertex. Creation ownership is tracked separately from total refs.
 func (p *VertexPool) PutSized(tip Tip, eff *pb.Effect, protoLen int) {
-	tc := tipCount(eff)
-	nv := &vertex{eff: eff, size: int64(protoLen) + vertexOverhead}
-	nv.refs.Store(tc)
-
-	if v, loaded := p.m.LoadOrStore(tip, nv); loaded {
-		v.refs.CompareAndSwap(0, tc) // promote a cache-only entry to owned, once
-	}
+	p.putSized(tip, eff, protoLen, nil)
 }
 
-// tipCount is the number of index tipsets a freshly-emitted effect occupies: one
-// per key it is the tip of. A bind commits every key in its keyset, so it is the
-// tip of each; any other effect is the tip of its single key.
-func tipCount(eff *pb.Effect) int32 {
-	if bind := eff.GetTxnBind(); bind != nil {
-		if n := len(bind.GetKeys()); n > 0 {
-			return int32(n)
+// putSized takes creation references only for keys accepted by owns. Local
+// emission owns the whole keyset (nil); remote ingestion owns served keys.
+func (p *VertexPool) putSized(tip Tip, eff *pb.Effect, protoLen int, owns func([]byte) bool) {
+	keys := make(map[string]struct{})
+	add := func(key []byte) {
+		if owns == nil || owns(key) {
+			keys[string(key)] = struct{}{}
 		}
 	}
 
-	return 1
+	if bind := eff.GetTxnBind(); bind != nil && len(bind.GetKeys()) > 0 {
+		for _, kb := range bind.GetKeys() {
+			add(kb.GetKey())
+		}
+	} else {
+		add(eff.GetKey())
+	}
+
+	if len(keys) == 0 {
+		p.PutSizedCache(tip, eff, protoLen)
+
+		return
+	}
+
+	nv := &vertex{eff: eff, size: int64(protoLen) + vertexOverhead, creationKeys: keys}
+	nv.refs.Store(int32(len(keys)))
+
+	if v, loaded := p.m.LoadOrStore(tip, nv); loaded {
+		v.creationMu.Lock()
+		defer v.creationMu.Unlock()
+
+		for key := range v.creationKeys {
+			delete(keys, key)
+		}
+
+		if len(keys) == 0 {
+			return
+		}
+
+		for {
+			n := v.refs.Load()
+			if n < 0 {
+				return // reclaim already claimed this vertex; do not resurrect it
+			}
+
+			if v.refs.CompareAndSwap(n, n+int32(len(keys))) {
+				break
+			}
+		}
+
+		if v.creationKeys == nil {
+			v.creationKeys = keys
+		} else {
+			for key := range keys {
+				v.creationKeys[key] = struct{}{}
+			}
+		}
+	}
 }
 
 // PutSizedCache stores a fetched effect on a key we do NOT serve as a reclaimable
@@ -243,31 +286,20 @@ func (p *VertexPool) delete(tip Tip) int64 {
 // decrefChainNode releases one creation reference on tip and returns its effect
 // so the eviction reachable-walk (releaseChainRefs) can follow its deps. ok is
 // false when tip is not resident — already reclaimed or never fetched — so there
-// is nothing below it to release. It decrefs only when refs>0: a served key's
-// chain can include cache nodes (refs==0, no creation ref) fetched for cross-key
-// adjudication, and those carry no creation ref to release — the subdag-adoption
-// decref already handled any DAG ref they held. A single map load serves both the
-// decref and the dep follow.
-func (p *VertexPool) decrefChainNode(tip Tip) (*pb.Effect, bool) {
+// is nothing below it to release. A cache node or an already released key has
+// no creation reference to drop, even when other keys or subdags still pin it.
+func (p *VertexPool) decrefChainNode(key string, tip Tip) (*pb.Effect, bool) {
 	v, ok := p.m.Load(tip)
 	if !ok {
 		return nil, false
 	}
 
-	for {
-		n := v.refs.Load()
-		if n <= 0 {
-			break // cache node (no creation ref) or already released — nothing to do
-		}
-
-		if v.refs.CompareAndSwap(n, n-1) {
-			if n-1 == 0 {
-				p.enqueueReclaim(tip) // last ref released — reclaim candidate
-			}
-
-			break
-		}
+	v.creationMu.Lock()
+	if _, owned := v.creationKeys[key]; owned {
+		delete(v.creationKeys, key)
+		p.decref(tip)
 	}
+	v.creationMu.Unlock()
 
 	return v.eff, true
 }
