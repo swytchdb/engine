@@ -365,6 +365,40 @@ func (c *Context) GetSnapshot(key string) (*pb.ReducedEffect, []Tip, error) {
 	return result, tips, nil
 }
 
+// GetSnapshots reads an ordinary batch from a shared reconstruction view.
+// Transactional and pending-effect contexts retain their SSI/read-your-writes
+// path, including read-set NOOPs; they must not switch to a live read view.
+func (c *Context) GetSnapshots(keys []string) ([]*pb.ReducedEffect, error) {
+	results := make([]*pb.ReducedEffect, len(keys))
+	if c == nil {
+		return results, nil
+	}
+
+	if c.inTx || c.txSnapshot != nil || len(c.keys) != 0 {
+		for i, key := range keys {
+			var err error
+
+			results[i], _, err = c.GetSnapshot(key)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		return results, nil
+	}
+
+	results, err := c.engine.GetSnapshots(c.TraceCtx(), keys)
+	if err != nil {
+		return nil, err
+	}
+
+	for i := range results {
+		results[i] = filterSnapshot(results[i])
+	}
+
+	return results, nil
+}
+
 // getSnapshotFromTx reads a key from the SSI snapshot and emits a NOOP
 // to record the read in the causal log for the Bind's read set.
 func (c *Context) getSnapshotFromTx(key string) (*pb.ReducedEffect, []Tip, error) {

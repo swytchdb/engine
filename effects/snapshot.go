@@ -1261,6 +1261,10 @@ func (e *Engine) retryBootstrap(key string, state *subscriptionState, nackTips [
 //
 // Returns the reduced result and the number of effects walked.
 func (e *Engine) reconstruct(key string, tips []Tip, txID string, waitForHorizon bool) (*pb.ReducedEffect, int, error) {
+	return e.reconstructWithView(key, tips, txID, waitForHorizon, nil)
+}
+
+func (e *Engine) reconstructWithView(key string, tips []Tip, txID string, waitForHorizon bool, view *snapshotReadView) (*pb.ReducedEffect, int, error) {
 	slog.Debug("reconstruct: start", "key", key, "tips", tips, "txn_id", txID, "wait_for_horizon", waitForHorizon)
 
 	var (
@@ -1308,27 +1312,32 @@ func (e *Engine) reconstruct(key string, tips []Tip, txID string, waitForHorizon
 		crossKeyWalked = 0
 		resultFromSnapshot = false
 
-		expandKeys, bindsByKey, snapshotVerdicts, err = e.bindKeyClosure(key)
-		if err != nil {
-			return nil, 0, err
-		}
-
-		atomicallyLost = make(map[string]struct{})
-
-		for txnID, entry := range snapshotVerdicts {
-			if entry.verdict == pb.Verdict_LOST {
-				atomicallyLost[txnID] = struct{}{}
-			}
-		}
-
-		for k := range expandKeys {
-			losers, walked := e.losersOnKey(k, bindsByKey[k], snapshotVerdicts)
-			if k != key {
-				crossKeyWalked += walked
+		if view != nil {
+			expandKeys, snapshotVerdicts = view.keys, view.verdicts
+			atomicallyLost, crossKeyWalked = view.lost, view.walked
+		} else {
+			expandKeys, bindsByKey, snapshotVerdicts, err = e.bindKeyClosure(key)
+			if err != nil {
+				return nil, 0, err
 			}
 
-			for txnID := range losers {
-				atomicallyLost[txnID] = struct{}{}
+			atomicallyLost = make(map[string]struct{})
+
+			for txnID, entry := range snapshotVerdicts {
+				if entry.verdict == pb.Verdict_LOST {
+					atomicallyLost[txnID] = struct{}{}
+				}
+			}
+
+			for k := range expandKeys {
+				losers, walked := e.losersOnKey(k, bindsByKey[k], snapshotVerdicts)
+				if k != key {
+					crossKeyWalked += walked
+				}
+
+				for txnID := range losers {
+					atomicallyLost[txnID] = struct{}{}
+				}
 			}
 		}
 
@@ -1368,6 +1377,10 @@ func (e *Engine) reconstruct(key string, tips []Tip, txID string, waitForHorizon
 		var isInvisible func(string) bool
 		if e.horizon != nil && !e.horizon.Empty() {
 			isInvisible = e.horizon.IsInvisible
+		}
+
+		if view != nil {
+			isInvisible = view.isInvisible
 		}
 
 		// Propagate HorizonSet invisibility along DAG dep edges. A visible
@@ -1517,6 +1530,10 @@ func (e *Engine) reconstruct(key string, tips []Tip, txID string, waitForHorizon
 			return nil
 		})
 		if errors.Is(err, errHorizonRetryNeeded) {
+			if view != nil {
+				return nil, 0, err // the entire batch must retry with fresh decisions
+			}
+
 			continue
 		}
 
@@ -1543,7 +1560,7 @@ func (e *Engine) reconstruct(key string, tips []Tip, txID string, waitForHorizon
 	// be temporarily unavailable. Only prune when at least one real
 	// DAG tip is committed (present in the current index) to avoid
 	// removing tips superseded only by an in-flight transaction.
-	if len(tips) > 1 {
+	if view == nil && len(tips) > 1 {
 		inputSet := make(map[Tip]bool, len(tips))
 		for _, t := range tips {
 			inputSet[t] = true
@@ -1672,10 +1689,33 @@ func bindsShareBase(a, b *forkChoiceBindEntry) bool {
 // intervening snapshot on K' would otherwise truncate the walk before
 // them.
 func (e *Engine) bindKeyClosure(startKey string) (map[string]struct{}, map[string][]Tip, verdictMap, error) {
-	keys := map[string]struct{}{startKey: {}}
+	return e.bindKeyClosureFrom([]string{startKey}, func(key string) ([]Tip, error) {
+		if err := e.ensureSubscribed(key); err != nil {
+			return nil, err
+		}
+
+		return e.index.Contains(key).Tips(), nil
+	}, false)
+}
+
+// bindKeyClosureFrom shares the same traversal between live single-key reads
+// and batch reads with a captured frontier. Batch reads require every branch
+// to be available before deciding which transactions survive.
+func (e *Engine) bindKeyClosureFrom(startKeys []string, tipsFor func(string) ([]Tip, error), strict bool) (map[string]struct{}, map[string][]Tip, verdictMap, error) {
+	keys := make(map[string]struct{})
 	bindsByKey := make(map[string][]Tip)
-	queue := []string{startKey}
-	queued := map[string]bool{startKey: true}
+
+	var queue []string
+
+	queued := make(map[string]bool)
+	for _, key := range startKeys {
+		if !queued[key] {
+			keys[key] = struct{}{}
+			queue = append(queue, key)
+			queued[key] = true
+		}
+	}
+
 	visitedByKey := make(map[string]map[Tip]bool)
 	seenBindTip := make(map[string]map[Tip]struct{})
 	addBindTip := func(k string, t Tip) {
@@ -1690,6 +1730,7 @@ func (e *Engine) bindKeyClosure(startKey string) (map[string]struct{}, map[strin
 		}
 
 		s[t] = struct{}{}
+
 		bindsByKey[k] = append(bindsByKey[k], t)
 		if !queued[k] {
 			queue = append(queue, k)
@@ -1703,16 +1744,12 @@ func (e *Engine) bindKeyClosure(startKey string) (map[string]struct{}, map[strin
 		queue = queue[:len(queue)-1]
 		queued[k] = false
 
-		if err := e.ensureSubscribed(k); err != nil {
+		frontier, err := tipsFor(k)
+		if err != nil {
 			return nil, nil, nil, err
 		}
 
-		tipSet := e.index.Contains(k)
-
-		var startTips []Tip
-		if tipSet != nil {
-			startTips = append(startTips, tipSet.Tips()...)
-		}
+		startTips := append([]Tip(nil), frontier...)
 
 		startTips = append(startTips, bindsByKey[k]...)
 		if len(startTips) == 0 {
@@ -1741,6 +1778,10 @@ func (e *Engine) bindKeyClosure(startKey string) (map[string]struct{}, map[strin
 
 			eff, err := e.getEffect(k, t)
 			if err != nil {
+				if strict {
+					return nil, nil, nil, err
+				}
+
 				continue
 			}
 
@@ -1802,17 +1843,18 @@ func (e *Engine) bindKeyClosure(startKey string) (map[string]struct{}, map[strin
 // refinement against concurrent binds. extraTips augments the starting set with bind envelopes
 // the caller harvested on other closure keys.
 func (e *Engine) losersOnKey(key string, extraTips []Tip, snapshotVerdicts verdictMap) (map[string]struct{}, int) {
+	var isInvisible func(string) bool
+	if e.horizon != nil && !e.horizon.Empty() {
+		isInvisible = e.horizon.IsInvisible
+	}
+
+	return e.losersOnKeyAt(key, e.index.Contains(key).Tips(), extraTips, snapshotVerdicts, isInvisible)
+}
+
+func (e *Engine) losersOnKeyAt(key string, tips, extraTips []Tip, snapshotVerdicts verdictMap, isInvisible func(string) bool) (map[string]struct{}, int) {
 	losers := make(map[string]struct{})
 
-	tipSet := e.index.Contains(key)
-	if tipSet == nil && len(extraTips) == 0 {
-		return losers, 0
-	}
-
-	var startTips []Tip
-	if tipSet != nil {
-		startTips = append(startTips, tipSet.Tips()...)
-	}
+	startTips := append([]Tip(nil), tips...)
 
 	if len(extraTips) > 0 {
 		seen := make(map[Tip]struct{}, len(startTips))
@@ -1832,11 +1874,6 @@ func (e *Engine) losersOnKey(key string, extraTips []Tip, snapshotVerdicts verdi
 
 	if len(startTips) == 0 {
 		return losers, 0
-	}
-
-	var isInvisible func(string) bool
-	if e.horizon != nil && !e.horizon.Empty() {
-		isInvisible = e.horizon.IsInvisible
 	}
 
 	// Local verdict map, seeded from any verdicts the caller harvested via
