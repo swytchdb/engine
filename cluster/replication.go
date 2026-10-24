@@ -608,9 +608,12 @@ func allNotSubscribed(nacks []*pb.NackNotify) bool {
 // ReplicateTo sends a notification to a specific peer and waits for ACK or NACK.
 // Used by transactional bind to get deliberate per-subscriber responses.
 func (r *Replicator) ReplicateTo(notify *pb.OffsetNotify, wireData []byte, targetPeerID NodeId) ([]*pb.NackNotify, error) {
-	notify.EffectData = wireData
+	// Subscription fan-out shares notify across peer goroutines. Keep the
+	// caller's message immutable while attaching this call's wire payload.
+	message := proto.Clone(notify).(*pb.OffsetNotify)
+	message.EffectData = wireData
 
-	body, err := proto.Marshal(notify)
+	body, err := proto.Marshal(message)
 	if err != nil {
 		return nil, fmt.Errorf("marshal notify packet: %w", err)
 	}
