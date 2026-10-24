@@ -191,6 +191,10 @@ func (e *Engine) prepareDag(d *dag, key string, tips []Tip) error {
 			d.topoOrder = cs.topoOrder
 			d.lcaTip = cs.lcaTip
 
+			if d.activeTxnID == "" {
+				e.installBoundSubdags(d)
+			}
+
 			return nil
 		}
 	}
@@ -199,9 +203,91 @@ func (e *Engine) prepareDag(d *dag, key string, tips []Tip) error {
 		return err
 	}
 
+	// A transaction reads its captured frontier. Installing historical tips
+	// into other keys here would change the live frontier underneath its
+	// preflight checks, even when those tips are already ancestors.
+	if d.activeTxnID == "" {
+		e.installBoundSubdags(d)
+	}
+
 	e.publishSubdag(ls, d, tips)
 
 	return nil
+}
+
+// installBoundSubdags makes an ancestral bind discovered on one key reachable
+// from its other subscribed keys too. Fetching effects only fills the vertex
+// pool; it does not run HandleRemote's multi-key indexing. Validate each branch
+// before installing its bind as an additional tip. A subsequent read prunes the
+// tip if it is already an ancestor of a newer value.
+func (e *Engine) installBoundSubdags(root *dag) {
+	type branch struct {
+		key  string
+		bind Tip
+	}
+
+	seen := make(map[branch]bool)
+
+	queue := []*dag{root}
+	for len(queue) > 0 {
+		d := queue[len(queue)-1]
+		queue = queue[:len(queue)-1]
+
+		for offset, eff := range d.nodes {
+			bind := eff.GetTxnBind()
+			if bind == nil {
+				continue
+			}
+
+			seen[branch{d.key, offset}] = true
+			for _, kb := range bind.GetKeys() {
+				key := string(kb.GetKey())
+
+				b := branch{key, offset}
+				if seen[b] {
+					continue
+				}
+
+				seen[b] = true
+
+				if _, subscribed := e.subscriptions.Load(key); !subscribed {
+					continue
+				}
+
+				tips := e.index.Contains(key)
+				if tips != nil && tips.Contains(offset) {
+					continue
+				}
+
+				if ls := e.index.LoadData(key); ls != nil && tips != nil {
+					if cs := ls.subdag.Load(); cs != nil && cs != evictedSubdag &&
+						tipsEqual(cs.tips, tips.Tips()) && slices.Contains(cs.topoOrder, offset) {
+						continue
+					}
+				}
+				// Do not add a redundant ancestor to a live frontier: a
+				// transaction can capture it before the next read prunes it,
+				// then mistake that pruning for a concurrent write at Flush.
+				candidates, _, err := NormalizeCloudTipCandidates(key, []Tip{offset}, tips.Tips(), func(t Tip) (*pb.Effect, error) {
+					return e.getEffect(key, t)
+				})
+				if err != nil || len(candidates) == 0 {
+					continue
+				}
+
+				associated := newDag(e, key, "")
+				if err := associated.prepare([]Tip{offset}); err != nil {
+					slog.Debug("installBoundSubdags: skipping unreachable branch", "key", key, "bind", offset, "error", err)
+
+					continue
+				}
+
+				e.updateIndex(key, nil, offset)
+
+				queue = append(queue, associated)
+			}
+		}
+	}
 }
 
 // materializeSubdag rebuilds the node map for a cached subdag from the vertex
