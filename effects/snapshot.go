@@ -880,7 +880,12 @@ func (e *Engine) ensureSubscribedMode(key string, allowAsync bool) error {
 	offset := e.nextOffset()
 
 	if e.effectCache != nil {
-		e.effectCache.PutSized(offset, eff, len(data))
+		if err := e.effectCache.PutSized(offset, eff, len(data)); err != nil {
+			e.subscriptions.Delete(ownedKey)
+			state.markFailed()
+
+			return err
+		}
 	}
 
 	e.updateIndex(ownedKey, nil, offset)

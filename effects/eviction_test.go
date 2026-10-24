@@ -414,23 +414,33 @@ func TestDrainReclaim_QueueDrivenReclaim(t *testing.T) {
 
 	// Born-at-zero cache fetch: enqueued at birth, freed by the queue drain.
 	cacheTip := Tip{1, 1}
-	p.PutSizedCache(cacheTip, &pb.Effect{Key: []byte("user:c")}, 10)
+	if err := p.PutSizedCache(cacheTip, &pb.Effect{Key: []byte("user:c")}, 10); err != nil {
+		t.Fatalf("PutSizedCache: %v", err)
+	}
 
 	// System-key cache entry: also enqueued, but pinned — drainReclaim must skip it.
 	sysTip := Tip{1, 2}
-	p.PutSizedCache(sysTip, &pb.Effect{Key: []byte("__swytch:members")}, 10)
+	if err := p.PutSizedCache(sysTip, &pb.Effect{Key: []byte("__swytch:members")}, 10); err != nil {
+		t.Fatalf("PutSizedCache: %v", err)
+	}
 
 	// Owned vertex (creation ref): never enqueued, must survive the drain.
 	ownedTip := Tip{1, 3}
-	p.PutSized(ownedTip, &pb.Effect{Key: []byte("user:o")}, 10)
+	if err := p.PutSized(ownedTip, &pb.Effect{Key: []byte("user:o")}, 10); err != nil {
+		t.Fatalf("PutSized: %v", err)
+	}
 
 	// Adopted then dropped: incref over the creation ref, then two decrefs drive
 	// it back to 0 — only the last transition enqueues it.
 	dropTip := Tip{1, 4}
-	p.PutSized(dropTip, &pb.Effect{Key: []byte("user:d")}, 10) // refs=1 (creation)
-	p.incref(dropTip)                                          // refs=2 (adoption)
-	p.decref(dropTip)                                          // refs=1, no enqueue
-	p.decref(dropTip)                                          // refs=0, enqueue
+	// refs=1 (creation)
+	if err := p.PutSized(dropTip, &pb.Effect{Key: []byte("user:d")}, 10); err != nil {
+		t.Fatalf("PutSized: %v", err)
+	}
+
+	p.incref(dropTip) // refs=2 (adoption)
+	p.decref(dropTip) // refs=1, no enqueue
+	p.decref(dropTip) // refs=0, enqueue
 
 	if freed := p.drainReclaim(); freed == 0 {
 		t.Fatal("drainReclaim freed nothing; queued refs==0 candidates were not reclaimed")
@@ -469,7 +479,10 @@ func TestPublishSubdag_PinFailureAbortsPublish(t *testing.T) {
 	p := e.effectCache
 
 	resident := Tip{1, 1}
-	p.PutSized(resident, &pb.Effect{Key: []byte("user:k")}, 10) // refs=1 (creation)
+	// refs=1 (creation)
+	if err := p.PutSized(resident, &pb.Effect{Key: []byte("user:k")}, 10); err != nil {
+		t.Fatalf("PutSized: %v", err)
+	}
 
 	missing := Tip{1, 2} // never pooled
 
@@ -500,7 +513,10 @@ func TestPublishSubdag_EvictedLeafRefusesPublish(t *testing.T) {
 	p := e.effectCache
 
 	tip := Tip{1, 1}
-	p.PutSized(tip, &pb.Effect{Key: []byte("user:k")}, 10) // refs=1 (creation)
+	// refs=1 (creation)
+	if err := p.PutSized(tip, &pb.Effect{Key: []byte("user:k")}, 10); err != nil {
+		t.Fatalf("PutSized: %v", err)
+	}
 
 	ls := &leafState{}
 	e.releaseChainRefs("user:k", nil, ls) // eviction already swept this leaf
@@ -566,7 +582,10 @@ func TestFlushIndex_ReleasesTipRefs(t *testing.T) {
 	tip := Tip{1, 5}
 	// Resident + indexed: PutSized seeds the creation ref (refs=1) for the one
 	// tipset this effect occupies; Insert only updates the index, not refs.
-	e.effectCache.PutSized(tip, &pb.Effect{Key: []byte(key)}, 10)
+	if err := e.effectCache.PutSized(tip, &pb.Effect{Key: []byte(key)}, 10); err != nil {
+		t.Fatalf("PutSized: %v", err)
+	}
+
 	e.index.Insert(key, nil, keytrie.NewTipSet(tip))
 
 	// While it is a live, reachable tip, reclaim must not free it.
@@ -576,7 +595,10 @@ func TestFlushIndex_ReleasesTipRefs(t *testing.T) {
 		t.Fatal("referenced index tip was reclaimed")
 	}
 
-	e.FlushIndex()
+	if err := e.FlushIndex(); err != nil {
+		t.Fatalf("FlushIndex: %v", err)
+	}
+
 	e.reclaimUnreferenced()
 
 	if _, ok := e.effectCache.Get(tip); ok {
@@ -594,11 +616,20 @@ func TestPutSized_PromotesCacheEntryToOwned(t *testing.T) {
 	eff := &pb.Effect{Key: []byte("user:k")}
 
 	owned := Tip{1, 7}
-	e.effectCache.PutSizedCache(owned, eff, 10) // first seen as cross-key cache
-	e.effectCache.PutSized(owned, eff, 10)      // now served → promote to owned
+	// first seen as cross-key cache
+	if err := e.effectCache.PutSizedCache(owned, eff, 10); err != nil {
+		t.Fatalf("PutSizedCache: %v", err)
+	}
+	// now served → promote to owned
+	if err := e.effectCache.PutSized(owned, eff, 10); err != nil {
+		t.Fatalf("PutSized: %v", err)
+	}
 
 	cacheOnly := Tip{1, 8}
-	e.effectCache.PutSizedCache(cacheOnly, eff, 10) // stays a cache entry
+	// stays a cache entry
+	if err := e.effectCache.PutSizedCache(cacheOnly, eff, 10); err != nil {
+		t.Fatalf("PutSizedCache: %v", err)
+	}
 
 	e.reclaimUnreferenced()
 
@@ -625,8 +656,14 @@ func TestRemoveTips_KeepsReachableAncestor(t *testing.T) {
 	ancestor := Tip{1, 5}
 	head := Tip{1, 6}
 
-	e.effectCache.PutSized(ancestor, &pb.Effect{Key: []byte(key)}, 10)
-	e.effectCache.PutSized(head, &pb.Effect{Key: []byte(key), Deps: []*pb.EffectRef{toPbRef(ancestor)}}, 10)
+	if err := e.effectCache.PutSized(ancestor, &pb.Effect{Key: []byte(key)}, 10); err != nil {
+		t.Fatalf("PutSized: %v", err)
+	}
+
+	if err := e.effectCache.PutSized(head, &pb.Effect{Key: []byte(key), Deps: []*pb.EffectRef{toPbRef(ancestor)}}, 10); err != nil {
+		t.Fatalf("PutSized: %v", err)
+	}
+
 	e.index.Insert(key, nil, keytrie.NewTipSet(ancestor, head))
 
 	// Prune the redundant ancestor from the frontier — it stays reachable via head.
@@ -642,7 +679,10 @@ func TestRemoveTips_KeepsReachableAncestor(t *testing.T) {
 	}
 
 	// Removing the key for good releases the whole chain.
-	e.FlushIndex()
+	if err := e.FlushIndex(); err != nil {
+		t.Fatalf("FlushIndex: %v", err)
+	}
+
 	e.reclaimUnreferenced()
 
 	if _, ok := e.effectCache.Get(head); ok {
@@ -810,7 +850,9 @@ func TestNewEngine_PinsSystemKeysInCache(t *testing.T) {
 	// Cache residency (no creation ref): these are unindexed, never reached from a
 	// served tip — exactly how a cross-key fetch or an un-served orphan is pooled.
 	// The system key must survive on the isSystemKey pin alone, not a refcount.
-	e.effectCache.PutSizedCache(systemTip, systemEff, 64)
+	if err := e.effectCache.PutSizedCache(systemTip, systemEff, 64); err != nil {
+		t.Fatalf("PutSizedCache: %v", err)
+	}
 
 	// User-key effects with no index entry — below-LCA / orphan from the
 	// sweep's perspective, so all should be evicted.
@@ -827,7 +869,9 @@ func TestNewEngine_PinsSystemKeysInCache(t *testing.T) {
 				Value:      &pb.DataEffect_Raw{Raw: make([]byte, 256)},
 			}},
 		}
-		e.effectCache.PutSizedCache(Tip{1, 1000 + i}, userEff, 256)
+		if err := e.effectCache.PutSizedCache(Tip{1, 1000 + i}, userEff, 256); err != nil {
+			t.Fatalf("PutSizedCache: %v", err)
+		}
 	}
 
 	// Run reclamation directly (the governor fires it on its tick under
@@ -867,7 +911,10 @@ func TestEvictBounded_CASProtectsConcurrentWrites(t *testing.T) {
 	for i := range iterations {
 		seedTip := Tip{1, uint64(1000 + i)}
 		e.index.Insert(key, nil, keytrie.NewTipSet(seedTip))
-		e.effectCache.Put(seedTip, &pb.Effect{Key: []byte(key)})
+
+		if err := e.effectCache.Put(seedTip, &pb.Effect{Key: []byte(key)}); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
 
 		newTip := Tip{1, uint64(2000 + i)}
 

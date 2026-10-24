@@ -1045,7 +1045,7 @@ func TestFlushTx_VerdictSnapshotEmittedOnLoserOnlyKeys(t *testing.T) {
 	// snapshot's emit set. Independent NodeId so reachesFromTx returns
 	// false (loser is not in our DAG ancestry).
 	loserBindHlc := timestamppb.New(time.Unix(0, 50))
-	e.effectCache.Put(loserBindOffset, &pb.Effect{
+	if err := e.effectCache.Put(loserBindOffset, &pb.Effect{
 		TxnId:          loserTxnID,
 		NodeId:         uint64(loserNodeID),
 		Hlc:            loserBindHlc,
@@ -1059,7 +1059,9 @@ func TestFlushTx_VerdictSnapshotEmittedOnLoserOnlyKeys(t *testing.T) {
 				{Key: []byte(loserOnlyKey), NewTip: toPbRef(loserDataLoserOnly)},
 			},
 		}},
-	})
+	}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
 
 	// Subscribe peer 99 to the shared key so flushTx replicates our
 	// bind to peer 99 and processes its NACK response.

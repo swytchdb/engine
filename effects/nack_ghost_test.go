@@ -131,8 +131,12 @@ func TestBuildEnrichedNack_SkipsTipsWithoutLocalBytes(t *testing.T) {
 			Value:      &pb.DataEffect_Raw{Raw: []byte("alive")},
 		}},
 	}
+
 	tipA := Tip{42, 100}
-	e.effectCache.Put(tipA, effA)
+	if err := e.effectCache.Put(tipA, effA); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
 	e.index.Insert(key, nil, keytrie.NewTipSet(tipA))
 
 	// Ghost tip B: in the index (we adopted it from a NACK at some

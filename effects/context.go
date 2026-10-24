@@ -854,7 +854,9 @@ func (c *Context) rawEmit(eff *pb.Effect) (Tip, *pb.OffsetNotify, error) {
 	// (no-broadcaster) path has nothing to marshal, so it falls back to Put.
 	if c.engine.broadcaster == nil {
 		if c.engine.effectCache != nil {
-			c.engine.effectCache.Put(offset, eff)
+			if err := c.engine.effectCache.Put(offset, eff); err != nil {
+				return Tip{}, nil, err
+			}
 		}
 
 		c.engine.fireLocalEffect(offset, eff)
@@ -868,7 +870,9 @@ func (c *Context) rawEmit(eff *pb.Effect) (Tip, *pb.OffsetNotify, error) {
 	}
 
 	if c.engine.effectCache != nil {
-		c.engine.effectCache.PutSized(offset, eff, len(data))
+		if err := c.engine.effectCache.PutSized(offset, eff, len(data)); err != nil {
+			return Tip{}, nil, err
+		}
 	}
 
 	c.engine.fireLocalEffect(offset, eff)
@@ -914,7 +918,10 @@ func (c *Context) flushNonTx() error {
 		// Handle flush-all: wipe index before broadcasting
 		if key == FlushKey {
 			slog.Info("Flush: flush-all effect, wiping index")
-			c.engine.FlushIndex()
+
+			if err := c.engine.FlushIndex(); err != nil {
+				return err
+			}
 			// Broadcast to peers but skip index update (already wiped)
 			if c.engine.broadcaster != nil {
 				for _, n := range ck.notifies {

@@ -43,6 +43,8 @@ import (
 // callbacks in redis, ORM dialect hooks in sql) stays in the
 // transport package.
 type RuntimeConfig struct {
+	// DataDir enables the engine's local resident-effect mirror.
+	DataDir string
 	// MemoryLimit caps effects-engine memory at a fixed byte count.
 	// Mutually exclusive with MemoryLimitPercent — set one or the
 	// other. Forwarded to effects.EngineConfig.
@@ -158,13 +160,18 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 		log = slog.Default()
 	}
 
-	engine := effects.NewEngine(effects.EngineConfig{
+	engine, err := effects.OpenEngine(ctx, effects.EngineConfig{
+		DataDir:            cfg.DataDir,
 		NodeID:             pb.NewNodeID(),
 		DefaultMode:        effects.SafeMode,
 		MemoryLimit:        cfg.MemoryLimit,
 		MemoryLimitPercent: cfg.MemoryLimitPercent,
 		CompressValues:     cfg.CompressValues,
 	})
+	if err != nil {
+		return nil, err
+	}
+
 	log.Info("effects engine initialized", "node_id", engine.NodeID())
 
 	// The connection secret is derive-and-drop: everything needed later comes

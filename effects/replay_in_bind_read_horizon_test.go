@@ -127,6 +127,7 @@ func TestReplayRun26373595271InBindReadDiverges(t *testing.T) {
 	// verbatim from ANALYSIS.md row 3 of the "Append 107" subsection.
 	bind107Off := Tip{uint64(replay26373595271NodeN117), 49}
 	dataN117_43Off := Tip{uint64(replay26373595271NodeN117), 43}
+
 	dataN117_43 := &pb.Effect{
 		Key:            []byte("el-0"),
 		Hlc:            sTs(1_000_100),
@@ -135,7 +136,10 @@ func TestReplayRun26373595271InBindReadDiverges(t *testing.T) {
 		TxnId:          replay26373595271Txn107,
 		Kind:           &pb.Effect_Data{Data: keyedInsertRaw("107", []byte("v107"))},
 	}
-	e.effectCache.Put(dataN117_43Off, dataN117_43)
+	if err := e.effectCache.Put(dataN117_43Off, dataN117_43); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
 	bind107 := &pb.TransactionalBindEffect{
 		TxnHlc:           sTs(1_000_200),
 		OriginatorNodeId: uint64(replay26373595271NodeN117),
@@ -177,7 +181,10 @@ func TestReplayRun26373595271InBindReadDiverges(t *testing.T) {
 		TxnId:          replay26373595271Txn211,
 		Kind:           &pb.Effect_Data{Data: keyedInsertRaw("211", []byte("v211"))},
 	}
-	e.effectCache.Put(Tip{uint64(replay26373595271NodeN3), 26}, dataR_el0)
+	if err := e.effectCache.Put(Tip{uint64(replay26373595271NodeN3), 26}, dataR_el0); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
 	dataR_el2 := &pb.Effect{
 		Key:            []byte("el-2"),
 		Hlc:            sTs(2_000_024),
@@ -186,7 +193,9 @@ func TestReplayRun26373595271InBindReadDiverges(t *testing.T) {
 		TxnId:          replay26373595271Txn211,
 		Kind:           &pb.Effect_Data{Data: keyedInsertRaw("210", []byte("v210"))},
 	}
-	e.effectCache.Put(Tip{uint64(replay26373595271NodeN3), 24}, dataR_el2)
+	if err := e.effectCache.Put(Tip{uint64(replay26373595271NodeN3), 24}, dataR_el2); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
 
 	bindR := &pb.TransactionalBindEffect{
 		TxnHlc:           sTs(2_000_100),

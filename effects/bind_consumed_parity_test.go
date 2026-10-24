@@ -94,7 +94,10 @@ func TestBindConsumedTipsMatchEmittedDeps(t *testing.T) {
 			Value:      &pb.DataEffect_Raw{Raw: []byte("base")},
 		}},
 	}
-	e.effectCache.Put(base, baseEff)
+	if err := e.effectCache.Put(base, baseEff); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
 	e.index.Insert(key, nil, keytrie.NewTipSet(base))
 
 	// (2) Foreign IN-FLIGHT tx-marked effect on el-1: TxnId set, NO bind,

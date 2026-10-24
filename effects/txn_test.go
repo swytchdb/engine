@@ -397,7 +397,7 @@ func TestDefeatedCompetitor_TheirBindReachableViaDeps_NotDefeated(t *testing.T) 
 	}
 
 	theirBindHLC := tTs(50)
-	e.effectCache.Put(theirBindOffset, &pb.Effect{
+	if err := e.effectCache.Put(theirBindOffset, &pb.Effect{
 		TxnId:          theirTxnID,
 		NodeId:         5,
 		Hlc:            theirBindHLC,
@@ -406,13 +406,17 @@ func TestDefeatedCompetitor_TheirBindReachableViaDeps_NotDefeated(t *testing.T) 
 			TxnHlc:           theirBindHLC,
 			OriginatorNodeId: 5,
 		}},
-	})
+	}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
 
 	// Our bind: causally-after theirs. Deps include theirBindOffset.
 	ourBindOffset := Tip{42, 200}
-	e.effectCache.Put(ourBindOffset, &pb.Effect{
+	if err := e.effectCache.Put(ourBindOffset, &pb.Effect{
 		Deps: []*pb.EffectRef{{NodeId: 5, Offset: 100}},
-	})
+	}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
 
 	ptxn := &pendingTxn{
 		txnID:          "our-tx",
@@ -457,7 +461,7 @@ func TestDefeatedCompetitor_DetailDepsReferenceOurNewTip_NotDefeated(t *testing.
 	}
 
 	theirBindHLC := tTs(200)
-	e.effectCache.Put(theirBindOffset, &pb.Effect{
+	if err := e.effectCache.Put(theirBindOffset, &pb.Effect{
 		TxnId:          theirTxnID,
 		NodeId:         5,
 		Hlc:            theirBindHLC,
@@ -466,7 +470,9 @@ func TestDefeatedCompetitor_DetailDepsReferenceOurNewTip_NotDefeated(t *testing.
 			TxnHlc:           theirBindHLC,
 			OriginatorNodeId: 5,
 		}},
-	})
+	}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
 
 	ptxn := &pendingTxn{
 		txnID:          "our-tx",
@@ -510,7 +516,7 @@ func TestDefeatedCompetitor_ConcurrentHigherHash_Defeated(t *testing.T) {
 	}
 
 	theirBindHLC := tTs(50)
-	e.effectCache.Put(theirBindOffset, &pb.Effect{
+	if err := e.effectCache.Put(theirBindOffset, &pb.Effect{
 		TxnId:          theirTxnID,
 		NodeId:         5,
 		Hlc:            theirBindHLC,
@@ -519,13 +525,17 @@ func TestDefeatedCompetitor_ConcurrentHigherHash_Defeated(t *testing.T) {
 			TxnHlc:           theirBindHLC,
 			OriginatorNodeId: 5,
 		}},
-	})
+	}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
 
 	// Our bind: NOT reachable to theirs. Independent deps.
 	ourBindOffset := Tip{42, 200}
-	e.effectCache.Put(ourBindOffset, &pb.Effect{
+	if err := e.effectCache.Put(ourBindOffset, &pb.Effect{
 		Deps: []*pb.EffectRef{{NodeId: 7, Offset: 50}},
-	})
+	}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
 
 	ptxn := &pendingTxn{
 		txnID:          "our-tx",

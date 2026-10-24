@@ -365,10 +365,12 @@ func TestConflictEffects_MissingHistoryRetries(t *testing.T) {
 		t.Fatal("incomplete evidence would suppress a later retry")
 	}
 
-	log.effectCache.Put(missing, &pb.Effect{
+	if err := log.effectCache.Put(missing, &pb.Effect{
 		Key: []byte("winner"), NodeId: 1, Hlc: sTs(1),
 		Kind: &pb.Effect_Data{Data: scalarInsertRaw([]byte("undecided"))},
-	})
+	}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
 
 	if err := e.emitConflict("winner", alice, bob); err != nil {
 		t.Fatal(err)

@@ -140,7 +140,11 @@ func TestStandaloneRuntimeWatchesSafetyKeys(t *testing.T) {
 	})
 	emitSafetyTest(t, rt.Engine, effects.ClusterSafetyKey, "", "unsafe", false)
 	waitSafetyTest(t, rt.Engine, map[string]effects.SafetyMode{"other": effects.UnsafeMode})
-	rt.Engine.FlushIndex()
+
+	if err := rt.Engine.FlushIndex(); err != nil {
+		t.Fatalf("FlushIndex: %v", err)
+	}
+
 	waitSafetyTest(t, rt.Engine, map[string]effects.SafetyMode{"other": effects.SafeMode})
 }
 
