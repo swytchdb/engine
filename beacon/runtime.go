@@ -139,6 +139,7 @@ type Runtime struct {
 	// when AsyncJoin is false, making Stop's drain a no-op.
 	joinCancel context.CancelFunc
 	joinWG     sync.WaitGroup
+	safety     *safetyWatcher // standalone runtime has no membership beacon
 }
 
 // NewRuntime builds and starts the engine. If cfg.ClusterPassphrase
@@ -222,6 +223,11 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 
 	// Single-node mode: done.
 	if passphrase == "" {
+		rt.safety = newSafetyWatcher(engine)
+		if err := rt.safety.start(ctx); err != nil {
+			return nil, errors.Join(err, closeRuntimeOnError(rt))
+		}
+
 		log.Debug("no cluster passphrase, running single-node")
 
 		return rt, nil
@@ -358,6 +364,12 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 		rt.joinWG.Go(func() {
 			if err := b.Start(joinCtx); err != nil {
 				log.Warn("cluster join did not complete; serving solo, will converge in background", "error", err)
+
+				return
+			}
+
+			if err := b.startSafety(joinCtx); err != nil {
+				log.Warn("post-bootstrap safety configuration failed", "error", err)
 			}
 		})
 	} else {
@@ -369,6 +381,9 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 		}
 
 		rt.Beacon = b
+		if err := b.startSafety(ctx); err != nil {
+			return nil, errors.Join(err, closeRuntimeOnError(rt))
+		}
 	}
 
 	log.Info("cluster runtime ready",
@@ -395,6 +410,10 @@ func (r *Runtime) Stop() error {
 	}
 
 	r.joinWG.Wait()
+
+	if r.safety != nil {
+		r.safety.stop()
+	}
 
 	var errs []error
 

@@ -1818,6 +1818,10 @@ func (e *Engine) updateIndex(key string, initialTips *keytrie.TipSet, lastOffset
 			// Insert fires the trie's refDelta hook (applyRefDelta), which
 			// increfs the added tips and decrefs the consumed ones — no manual
 			// refcount call here.
+			if current.Len() != newTips.Len() || !current.ContainsAll(newTips.Tips()) {
+				e.notifyKeyChanged(key)
+			}
+
 			return
 		}
 
@@ -1848,6 +1852,10 @@ func (e *Engine) installTips(key string, tips []Tip) {
 
 		newTips := keytrie.NewTipSet(offsets...)
 		if _, ok := e.index.Insert(key, current, newTips); ok {
+			if current.Len() != newTips.Len() || !current.ContainsAll(newTips.Tips()) {
+				e.notifyKeyChanged(key)
+			}
+
 			return
 		}
 

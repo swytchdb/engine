@@ -204,6 +204,7 @@ type Engine struct {
 	OnKeyDataAdded func(key string) // wake oldest waiter (data inserted)
 	OnKeyDeleted   func(key string) // wake all waiters (key removed)
 	OnFlushAll     func()           // wake all waiters across all keys
+	keyChanged     atomic.Pointer[func(string)]
 
 	// OnLocalEffect fires once for every effect this node mints and persists —
 	// data/meta/bind via Context, verdict snapshots, subscriptions,
@@ -341,6 +342,8 @@ func (e *Engine) FlushIndex() {
 
 		e.index.Delete(key, tips)
 	}
+
+	e.notifyKeyChanged(FlushKey)
 }
 
 // GetLock returns a striped lock for the given key using FNV-1a hashing.
