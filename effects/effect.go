@@ -83,7 +83,14 @@ func (e *Engine) putIngested(tip Tip, eff *pb.Effect, protoLen int) error {
 		return nil
 	}
 
-	return e.effectCache.putSized(tip, eff, protoLen, e.isServed)
+	if err := e.effectCache.putSized(tip, eff, protoLen, e.isServed); err != nil {
+		return err
+	}
+	// Preserve the actual receipt observation even when the application has
+	// not read this key yet. A later prepared DAG fills any missing parents.
+	e.observeTemporal(tip, eff, true)
+
+	return nil
 }
 
 // bootstrapCollector collects NACKs during subscription bootstrapping.
@@ -105,8 +112,9 @@ type Engine struct {
 	broadcaster Broadcaster // nil for standalone
 	cloudReader CloudReader // nil when no cloud is configured (standalone/dev)
 
-	nodeID pb.NodeID
-	clock  *crdt.HLC
+	nodeID   pb.NodeID
+	clock    *crdt.HLC
+	temporal temporalEvidence
 
 	// In-memory offset generator (no durable log)
 	nextOff atomic.Uint64
@@ -988,6 +996,8 @@ func (e *Engine) mintLocalEffect(key string, currentSet *keytrie.TipSet, eff *pb
 
 // fireLocalEffect invokes OnLocalEffect for a freshly-minted persisted effect.
 func (e *Engine) fireLocalEffect(offset Tip, eff *pb.Effect) {
+	e.observeTemporal(offset, eff, false)
+
 	e.localEffectMu.RLock()
 	defer e.localEffectMu.RUnlock()
 

@@ -65,6 +65,9 @@ type vertex struct {
 	eff  *pb.Effect
 	size int64
 	refs atomic.Int32
+	// Temporal completion belongs to this resident copy, so eviction also
+	// discards the bookkeeping. Bits are set only after evidence publication.
+	temporal atomic.Uint32
 	// Creation references belong to individual keys. A positive refs count
 	// alone cannot distinguish ownership from another subdag's adoption pin.
 	creationMu   sync.Mutex

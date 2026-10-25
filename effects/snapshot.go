@@ -427,11 +427,17 @@ func isJSONType(t pb.ValueType) bool {
 // element-level expiry for KEYED collections, and auto-delete of empty
 // collections (Redis semantics: empty lists/sets/hashes/zsets don't exist).
 func filterSnapshot(result *pb.ReducedEffect) *pb.ReducedEffect {
+	return filterSnapshotAt(result, time.Now())
+}
+
+// Historical Context reads use their established boundary for expiration.
+// Live reads retain wall-clock expiration through filterSnapshot.
+func filterSnapshotAt(result *pb.ReducedEffect, now time.Time) *pb.ReducedEffect {
 	if result == nil {
 		return nil
 	}
 	// Key-level expiry
-	if result.GetExpiresAt() != nil && time.Now().After(result.GetExpiresAt().AsTime()) {
+	if result.GetExpiresAt() != nil && now.After(result.GetExpiresAt().AsTime()) {
 		return nil
 	}
 	// JSON nodes manage their own emptiness: an empty object/array (or a
@@ -442,7 +448,6 @@ func filterSnapshot(result *pb.ReducedEffect) *pb.ReducedEffect {
 	}
 	// Filter expired elements from KEYED collections
 	if len(result.GetNetAdds()) > 0 {
-		now := time.Now()
 		cloned := false
 
 		for k, elem := range result.GetNetAdds() {
