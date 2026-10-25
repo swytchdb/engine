@@ -43,9 +43,11 @@ func waitSafetyTest(t *testing.T, e *effects.Engine, want map[string]effects.Saf
 
 	for {
 		match := true
+		got := make(map[string]effects.SafetyMode, len(want))
 
 		for key, mode := range want {
-			if e.SafetyModeForKey(key) != mode {
+			got[key] = e.SafetyModeForKey(key)
+			if got[key] != mode {
 				match = false
 			}
 		}
@@ -55,7 +57,7 @@ func waitSafetyTest(t *testing.T, e *effects.Engine, want map[string]effects.Saf
 		}
 
 		if time.Now().After(deadline) {
-			t.Fatalf("policy did not update: want %v", want)
+			t.Fatalf("node %d policy did not update: got %v, want %v", e.NodeID(), got, want)
 		}
 
 		time.Sleep(time.Millisecond)

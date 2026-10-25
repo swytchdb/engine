@@ -2827,7 +2827,9 @@ func (e *Engine) probeAndFetchKey(key string) {
 		return
 	}
 
-	notify := BuildOffsetNotify(e.nodeID, Tip{0, uint64(hlc.GetSeconds())}, eff, data, nil)
+	// The offset is synthetic because discovery is never persisted, but the
+	// origin node must identify us: the peer routes its NACK reply there.
+	notify := BuildOffsetNotify(e.nodeID, Tip{uint64(e.nodeID), uint64(hlc.GetSeconds())}, eff, data, nil)
 
 	collector := &bootstrapCollector{
 		nacks: make(chan *pb.NackNotify, 64),
