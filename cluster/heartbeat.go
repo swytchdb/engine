@@ -104,7 +104,7 @@ type ClockTick struct {
 
 // HeartbeatManager emits and ingests clock ticks for all registered peers,
 // driving liveness, path symmetry, and the per-peer clock measurements
-// (RTT_min, skew, staleness bounds) in PeerHealthTable.
+// (RTT_min, skew, inter-arrival statistics) in PeerHealthTable.
 type HeartbeatManager struct {
 	nodeID      NodeId
 	healthTable *PeerHealthTable
@@ -263,11 +263,10 @@ func (hm *HeartbeatManager) ProcessInboundTick(peerID NodeId, tick *ClockTick) {
 	hm.pendingObs[peerID] = ObservedTick{NodeID: peerID, Seq: tick.Seq, ObservedAt: now.UnixNano()}
 	hm.mu.Unlock()
 
-	st := ph.clock.snapshot(now)
+	st := ph.clock.snapshot()
 	if st.Primed {
 		RecordPeerRTT(peerID, int64(st.RTTMin))
 		RecordPeerClockSkew(peerID, int64(st.SkewEst))
-		RecordPeerStalenessBound(peerID, int64(st.TickInterval+st.RTTMin))
 	}
 
 	if st.TickInterval > 0 {
@@ -437,13 +436,13 @@ func (hm *HeartbeatManager) adjustInterval() (time.Duration, bool) {
 	var minRTT time.Duration
 
 	for _, peerID := range peerIDs {
-		st, ok := hm.healthTable.ClockStats(peerID)
-		if !ok || !st.Primed {
+		rtt := hm.healthTable.GetRTT(peerID)
+		if rtt == 0 {
 			continue
 		}
 
-		if minRTT == 0 || st.RTTMin < minRTT {
-			minRTT = st.RTTMin
+		if minRTT == 0 || rtt < minRTT {
+			minRTT = rtt
 		}
 	}
 

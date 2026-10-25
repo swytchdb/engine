@@ -34,12 +34,13 @@ import (
 const minAdaptiveSamples = 8
 
 // clockWindow is a fixed-size ring of int64 samples. Pushes are O(1);
-// min/quantile queries scan (and for quantiles, sort) the live samples.
-// Windows are small (default 64) and queried at heartbeat cadence, so the
-// O(n log n) query cost is irrelevant. Network delay is heavy-tailed:
+// min queries scan the live samples; quantiles share a lazily allocated
+// sorting buffer, sorted once after each change. Callers synchronize access.
+// Network delay is heavy-tailed:
 // minimums and quantiles are the right estimators, never means or stddevs.
 type clockWindow struct {
 	samples []int64
+	sorted  []int64
 	next    int
 	count   int
 }
@@ -49,6 +50,7 @@ func newClockWindow(size int) clockWindow {
 }
 
 func (w *clockWindow) push(v int64) {
+	w.sorted = w.sorted[:0]
 	w.samples[w.next] = v
 
 	w.next = (w.next + 1) % len(w.samples)
@@ -60,6 +62,7 @@ func (w *clockWindow) push(v int64) {
 func (w *clockWindow) len() int { return w.count }
 
 func (w *clockWindow) reset() {
+	w.sorted = w.sorted[:0]
 	w.next = 0
 	w.count = 0
 }
@@ -79,22 +82,29 @@ func (w *clockWindow) min() int64 {
 // quantile returns the q-quantile (0 ≤ q ≤ 1) of the live samples.
 // Caller must ensure len() > 0.
 func (w *clockWindow) quantile(q float64) int64 {
-	sorted := make([]int64, w.count)
-	copy(sorted, w.samples[:w.count])
-	slices.Sort(sorted)
+	if len(w.sorted) != w.count {
+		if cap(w.sorted) < w.count {
+			w.sorted = make([]int64, w.count, len(w.samples))
+		} else {
+			w.sorted = w.sorted[:w.count]
+		}
+
+		copy(w.sorted, w.samples[:w.count])
+		slices.Sort(w.sorted)
+	}
 
 	idx := int(q * float64(w.count-1))
 
-	return sorted[idx]
+	return w.sorted[idx]
 }
 
 // ClockStats is a point-in-time snapshot of the clock measurements for one
 // peer, derived from the raw observation windows. All bounds follow
-// docs/design/clock.md: RTTMin and Epsilon are skew-free; SkewEst carries an
+// docs/design/clock.md: RTTMin is skew-free; SkewEst carries an
 // error of at most half the path asymmetry (≤ RTTMin/2).
 type ClockStats struct {
 	// Primed is true once both offset directions have samples and the
-	// derived RTT is positive. RTTMin, SkewEst, and Epsilon are only
+	// derived RTT is positive. RTTMin and SkewEst are only
 	// meaningful when Primed.
 	Primed bool
 
@@ -114,10 +124,6 @@ type ClockStats struct {
 	// JitterQ99 is the q99 inter-arrival gap's excess over the median —
 	// the margin term for failure detection.
 	JitterQ99 time.Duration
-
-	// Epsilon bounds how stale our view of the peer can be right now:
-	// elapsed time since the peer's last tick arrived plus RTTMin.
-	Epsilon time.Duration
 }
 
 // peerClockStats holds the raw per-peer observation windows. All methods are
@@ -189,8 +195,20 @@ func (s *peerClockStats) observeEcho(rawOffsetOut int64) {
 	s.offsetOut.push(rawOffsetOut)
 }
 
+// rtt returns only RTT, without computing skew or inter-arrival quantiles.
+func (s *peerClockStats) rtt() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.offsetIn.len() == 0 || s.offsetOut.len() == 0 {
+		return 0
+	}
+
+	return time.Duration(max(s.offsetIn.min()+s.offsetOut.min(), 0))
+}
+
 // snapshot derives the current ClockStats.
-func (s *peerClockStats) snapshot(now time.Time) ClockStats {
+func (s *peerClockStats) snapshot() ClockStats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -214,10 +232,6 @@ func (s *peerClockStats) snapshot(now time.Time) ClockStats {
 		if margin := s.interArrival.quantile(0.99) - median; margin > 0 {
 			st.JitterQ99 = time.Duration(margin)
 		}
-	}
-
-	if st.Primed && !s.lastArrival.IsZero() {
-		st.Epsilon = now.Sub(s.lastArrival) + st.RTTMin
 	}
 
 	return st

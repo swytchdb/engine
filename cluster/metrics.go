@@ -167,11 +167,6 @@ var (
 		Help: "Estimated peer wall-clock skew in milliseconds (positive: peer ahead); error bounded by half the path asymmetry",
 	}, []string{peerLabelName})
 
-	peerStalenessBoundMsGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "cluster_peer_staleness_bound_ms",
-		Help: "Standing staleness bound ε for the peer in milliseconds (tick interval + RTT_min)",
-	}, []string{peerLabelName})
-
 	peerTickIntervalMsGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "cluster_peer_tick_interval_ms",
 		Help: "Median inter-arrival gap of the peer's clock ticks in milliseconds (δ_B)",
@@ -234,11 +229,6 @@ func RecordPeerClockSkew(peerID NodeId, skewNanos int64) {
 	peerClockSkewMsGauge.WithLabelValues(peerLabel(peerID)).Set(float64(skewNanos) / 1e6)
 }
 
-// RecordPeerStalenessBound updates the standing staleness bound gauge for a peer.
-func RecordPeerStalenessBound(peerID NodeId, boundNanos int64) {
-	peerStalenessBoundMsGauge.WithLabelValues(peerLabel(peerID)).Set(float64(boundNanos) / 1e6)
-}
-
 // RecordPeerTickInterval updates the peer tick inter-arrival gauge.
 func RecordPeerTickInterval(peerID NodeId, intervalNanos int64) {
 	peerTickIntervalMsGauge.WithLabelValues(peerLabel(peerID)).Set(float64(intervalNanos) / 1e6)
@@ -273,7 +263,6 @@ func removePeerMetrics(peerID NodeId) {
 	peerAliveGauge.DeleteLabelValues(label)
 	peerRttMsGauge.DeleteLabelValues(label)
 	peerClockSkewMsGauge.DeleteLabelValues(label)
-	peerStalenessBoundMsGauge.DeleteLabelValues(label)
 	peerTickIntervalMsGauge.DeleteLabelValues(label)
 	peerLivenessTimeoutMsGauge.DeleteLabelValues(label)
 	peerClockJumpsTotal.DeleteLabelValues(label)

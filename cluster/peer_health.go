@@ -40,7 +40,7 @@ type PeerHealth struct {
 	symmetric atomic.Bool
 
 	// clock holds the per-peer measurement windows (offsets, inter-arrival)
-	// and derives RTT_min / skew / staleness bounds from them.
+	// and derives RTT_min / skew / inter-arrival statistics from them.
 	clock *peerClockStats
 }
 
@@ -192,7 +192,7 @@ func (t *PeerHealthTable) GetRTT(nodeID NodeId) time.Duration {
 		return 0
 	}
 
-	return ph.clock.snapshot(time.Now()).RTTMin
+	return ph.clock.rtt()
 }
 
 // ClockStats returns the derived clock measurements for the given peer, and
@@ -203,7 +203,7 @@ func (t *PeerHealthTable) ClockStats(nodeID NodeId) (ClockStats, bool) {
 		return ClockStats{}, false
 	}
 
-	return ph.clock.snapshot(time.Now()), true
+	return ph.clock.snapshot(), true
 }
 
 // AlivePeerIDs returns the IDs of all peers that are currently alive.

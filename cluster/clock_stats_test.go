@@ -24,9 +24,89 @@
 package cluster
 
 import (
+	"slices"
 	"testing"
 	"time"
 )
+
+// Compare quantiles to a fresh sort through partial fills, ring wraparound,
+// and resets. Reading a quantile must not reorder the ring itself.
+func TestClockWindowQuantiles(t *testing.T) {
+	for _, size := range []int{1, 4, 64} {
+		w := newClockWindow(size)
+
+		var live []int64
+
+		for i := range size * 4 {
+			if i == size*2 {
+				w.reset()
+
+				live = live[:0]
+			}
+
+			v := int64((i*37)%101 - 50)
+			w.push(v)
+
+			live = append(live, v)
+			if len(live) > size {
+				live = live[1:]
+			}
+
+			sorted := slices.Clone(live)
+			slices.Sort(sorted)
+
+			for range 2 {
+				for _, q := range []float64{0, 0.5, 0.99, 1} {
+					want := sorted[int(q*float64(len(sorted)-1))]
+					if got := w.quantile(q); got != want {
+						t.Fatalf("size=%d iteration=%d q=%v: got %d, want %d", size, i, q, got, want)
+					}
+				}
+			}
+		}
+	}
+}
+
+func BenchmarkPeerClockReads(b *testing.B) {
+	for _, operation := range []string{"RTT", "Snapshot", "Liveness"} {
+		for _, mode := range []string{"Unchanged", "Updated"} {
+			b.Run(operation+"/"+mode, func(b *testing.B) {
+				health := NewPeerHealthTable(ClockConfig{})
+				clock := health.GetOrCreate(2).clock
+				now := time.Now()
+				tick := ClockTick{NodeID: 2}
+
+				update := func() {
+					tick.Seq++
+					now = now.Add(50*time.Millisecond + time.Duration(tick.Seq%17)*time.Millisecond)
+					tick.WallClock = now.UnixNano() - int64(2*time.Millisecond)
+					clock.observeTick(&tick, now)
+					clock.observeEcho(int64(8 * time.Millisecond))
+				}
+				for range 65 {
+					update()
+				}
+
+				b.ReportAllocs()
+
+				for b.Loop() {
+					if mode == "Updated" {
+						update()
+					}
+
+					switch operation {
+					case "RTT":
+						health.GetRTT(2)
+					case "Snapshot":
+						health.ClockStats(2)
+					case "Liveness":
+						clock.livenessTimeout(health.cfg)
+					}
+				}
+			})
+		}
+	}
+}
 
 func TestClockWindow(t *testing.T) {
 	w := newClockWindow(4)
@@ -71,6 +151,39 @@ func TestClockWindow(t *testing.T) {
 	}
 }
 
+func TestPeerHealthRTT(t *testing.T) {
+	health := NewPeerHealthTable(ClockConfig{})
+	if got := health.GetRTT(2); got != 0 {
+		t.Fatalf("unknown peer RTT = %v, want 0", got)
+	}
+
+	clock := health.GetOrCreate(2).clock
+	now := time.Now()
+	check := func(want time.Duration) {
+		t.Helper()
+
+		got := health.GetRTT(2)
+
+		stats, _ := health.ClockStats(2)
+		if got != want || stats.RTTMin != got {
+			t.Fatalf("RTT = %v, snapshot RTT = %v, want %v", got, stats.RTTMin, want)
+		}
+	}
+	check(0)
+	clock.observeTick(&ClockTick{WallClock: now.UnixNano() + int64(5*time.Millisecond)}, now)
+	check(0) // no outbound sample
+	clock.observeEcho(int64(3 * time.Millisecond))
+	check(0) // negative derived RTT is not primed
+	clock.observeTick(&ClockTick{WallClock: now.UnixNano(), JumpNs: 1}, now)
+	clock.observeEcho(0)
+	check(0) // zero derived RTT is not primed
+	clock.observeTick(&ClockTick{WallClock: now.UnixNano() - int64(2*time.Millisecond), JumpNs: 1}, now)
+	clock.observeEcho(int64(8 * time.Millisecond))
+	check(10 * time.Millisecond)
+	clock.observeTick(&ClockTick{WallClock: now.UnixNano(), JumpNs: 1}, now)
+	check(0) // clock jump clears outbound samples
+}
+
 // TestSkewAndRTTDerivation drives the windows with a synthetic geometry —
 // peer clock ahead by S=100ms, one-way delays 2ms inbound / 8ms outbound
 // (6ms asymmetry) — and checks the derived values against the design doc's
@@ -103,7 +216,7 @@ func TestSkewAndRTTDerivation(t *testing.T) {
 		s.observeEcho(int64(dOut + skew + jitter))
 	}
 
-	st := s.snapshot(base.Add(time.Duration(samples-1)*50*time.Millisecond + 30*time.Millisecond))
+	st := s.snapshot()
 	if !st.Primed {
 		t.Fatalf("stats should be primed, got %+v", st)
 	}
@@ -126,11 +239,6 @@ func TestSkewAndRTTDerivation(t *testing.T) {
 	// δ_B: ticks arrived every 50ms.
 	if st.TickInterval != 50*time.Millisecond {
 		t.Fatalf("TickInterval = %v, expected 50ms", st.TickInterval)
-	}
-
-	// ε = elapsed since last arrival + RTT_min.
-	if want := 30*time.Millisecond + st.RTTMin; st.Epsilon != want {
-		t.Fatalf("Epsilon = %v, expected %v", st.Epsilon, want)
 	}
 }
 
