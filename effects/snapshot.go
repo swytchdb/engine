@@ -48,6 +48,9 @@ import (
 // post-resolution state.
 var errHorizonRetryNeeded = errors.New("reconstruct: horizon ancestor resolved, retry")
 
+// Disabled until invalidation accounts for adjudication on associated keys.
+const reducedReadCacheEnabled = false
+
 // leafState is the per-key payload attached to each critbit leaf (the trie's
 // T). It carries the cached subdag for the key so reads reuse the prepared
 // structure instead of rebuilding it. It is created once per key and mutated
@@ -191,6 +194,10 @@ func (e *Engine) prepareDag(d *dag, key string, tips []Tip) error {
 			d.topoOrder = cs.topoOrder
 			d.lcaTip = cs.lcaTip
 
+			if d.activeTxnID == "" {
+				e.installBoundSubdags(d)
+			}
+
 			return nil
 		}
 	}
@@ -199,9 +206,91 @@ func (e *Engine) prepareDag(d *dag, key string, tips []Tip) error {
 		return err
 	}
 
+	// A transaction reads its captured frontier. Installing historical tips
+	// into other keys here would change the live frontier underneath its
+	// preflight checks, even when those tips are already ancestors.
+	if d.activeTxnID == "" {
+		e.installBoundSubdags(d)
+	}
+
 	e.publishSubdag(ls, d, tips)
 
 	return nil
+}
+
+// installBoundSubdags makes an ancestral bind discovered on one key reachable
+// from its other subscribed keys too. Fetching effects only fills the vertex
+// pool; it does not run HandleRemote's multi-key indexing. Validate each branch
+// before installing its bind as an additional tip. A subsequent read prunes the
+// tip if it is already an ancestor of a newer value.
+func (e *Engine) installBoundSubdags(root *dag) {
+	type branch struct {
+		key  string
+		bind Tip
+	}
+
+	seen := make(map[branch]bool)
+
+	queue := []*dag{root}
+	for len(queue) > 0 {
+		d := queue[len(queue)-1]
+		queue = queue[:len(queue)-1]
+
+		for offset, eff := range d.nodes {
+			bind := eff.GetTxnBind()
+			if bind == nil {
+				continue
+			}
+
+			seen[branch{d.key, offset}] = true
+			for _, kb := range bind.GetKeys() {
+				key := string(kb.GetKey())
+
+				b := branch{key, offset}
+				if seen[b] {
+					continue
+				}
+
+				seen[b] = true
+
+				if _, subscribed := e.subscriptions.Load(key); !subscribed {
+					continue
+				}
+
+				tips := e.index.Contains(key)
+				if tips != nil && tips.Contains(offset) {
+					continue
+				}
+
+				if ls := e.index.LoadData(key); ls != nil && tips != nil {
+					if cs := ls.subdag.Load(); cs != nil && cs != evictedSubdag &&
+						tipsEqual(cs.tips, tips.Tips()) && slices.Contains(cs.topoOrder, offset) {
+						continue
+					}
+				}
+				// Do not add a redundant ancestor to a live frontier: a
+				// transaction can capture it before the next read prunes it,
+				// then mistake that pruning for a concurrent write at Flush.
+				candidates, _, err := NormalizeCloudTipCandidates(key, []Tip{offset}, tips.Tips(), func(t Tip) (*pb.Effect, error) {
+					return e.getEffect(key, t)
+				})
+				if err != nil || len(candidates) == 0 {
+					continue
+				}
+
+				associated := newDag(e, key, "")
+				if err := associated.prepare([]Tip{offset}); err != nil {
+					slog.Debug("installBoundSubdags: skipping unreachable branch", "key", key, "bind", offset, "error", err)
+
+					continue
+				}
+
+				e.updateIndex(key, nil, offset)
+
+				queue = append(queue, associated)
+			}
+		}
+	}
 }
 
 // materializeSubdag rebuilds the node map for a cached subdag from the vertex
@@ -290,8 +379,8 @@ type verdictEntry struct {
 	snapshotTip Tip
 }
 
-// verdictMap accumulates snapshot-supplied verdicts during a walk so binds
-// already adjudicated can skip pairwise fork choice.
+// verdictMap accumulates snapshot-supplied verdicts during a walk. Recorded
+// losses suppress binds; recorded wins still need checks against concurrent binds.
 type verdictMap map[string]verdictEntry
 
 // harvest folds a snapshot's TxnVerdicts into the map. First-seen wins;
@@ -338,11 +427,17 @@ func isJSONType(t pb.ValueType) bool {
 // element-level expiry for KEYED collections, and auto-delete of empty
 // collections (Redis semantics: empty lists/sets/hashes/zsets don't exist).
 func filterSnapshot(result *pb.ReducedEffect) *pb.ReducedEffect {
+	return filterSnapshotAt(result, time.Now())
+}
+
+// Historical Context reads use their established boundary for expiration.
+// Live reads retain wall-clock expiration through filterSnapshot.
+func filterSnapshotAt(result *pb.ReducedEffect, now time.Time) *pb.ReducedEffect {
 	if result == nil {
 		return nil
 	}
 	// Key-level expiry
-	if result.GetExpiresAt() != nil && time.Now().After(result.GetExpiresAt().AsTime()) {
+	if result.GetExpiresAt() != nil && now.After(result.GetExpiresAt().AsTime()) {
 		return nil
 	}
 	// JSON nodes manage their own emptiness: an empty object/array (or a
@@ -353,7 +448,6 @@ func filterSnapshot(result *pb.ReducedEffect) *pb.ReducedEffect {
 	}
 	// Filter expired elements from KEYED collections
 	if len(result.GetNetAdds()) > 0 {
-		now := time.Now()
 		cloned := false
 
 		for k, elem := range result.GetNetAdds() {
@@ -628,7 +722,7 @@ func (e *Engine) reconstructLocal(key string) (*pb.ReducedEffect, []Tip, int) {
 	// filtering and compaction use copy-on-write before changing it. The memo is
 	// bypassed while any txn is mid-horizon: a conservative guard that keeps the
 	// cache out of the in-flight-visibility window entirely.
-	horizonClear := e.horizon == nil || e.horizon.Empty()
+	horizonClear := reducedReadCacheEnabled && (e.horizon == nil || e.horizon.Empty())
 
 	ls := e.index.LoadData(key)
 	if ls == nil {
@@ -791,7 +885,12 @@ func (e *Engine) ensureSubscribedMode(key string, allowAsync bool) error {
 	offset := e.nextOffset()
 
 	if e.effectCache != nil {
-		e.effectCache.PutSized(offset, eff, len(data))
+		if err := e.effectCache.PutSized(offset, eff, len(data)); err != nil {
+			e.subscriptions.Delete(ownedKey)
+			state.markFailed()
+
+			return err
+		}
 	}
 
 	e.updateIndex(ownedKey, nil, offset)
@@ -1172,6 +1271,10 @@ func (e *Engine) retryBootstrap(key string, state *subscriptionState, nackTips [
 //
 // Returns the reduced result and the number of effects walked.
 func (e *Engine) reconstruct(key string, tips []Tip, txID string, waitForHorizon bool) (*pb.ReducedEffect, int, error) {
+	return e.reconstructWithView(key, tips, txID, waitForHorizon, nil)
+}
+
+func (e *Engine) reconstructWithView(key string, tips []Tip, txID string, waitForHorizon bool, view *snapshotReadView) (*pb.ReducedEffect, int, error) {
 	slog.Debug("reconstruct: start", "key", key, "tips", tips, "txn_id", txID, "wait_for_horizon", waitForHorizon)
 
 	var (
@@ -1219,27 +1322,32 @@ func (e *Engine) reconstruct(key string, tips []Tip, txID string, waitForHorizon
 		crossKeyWalked = 0
 		resultFromSnapshot = false
 
-		expandKeys, bindsByKey, snapshotVerdicts, err = e.bindKeyClosure(key)
-		if err != nil {
-			return nil, 0, err
-		}
-
-		atomicallyLost = make(map[string]struct{})
-
-		for txnID, entry := range snapshotVerdicts {
-			if entry.verdict == pb.Verdict_LOST {
-				atomicallyLost[txnID] = struct{}{}
-			}
-		}
-
-		for k := range expandKeys {
-			losers, walked := e.losersOnKey(k, bindsByKey[k], snapshotVerdicts)
-			if k != key {
-				crossKeyWalked += walked
+		if view != nil {
+			expandKeys, snapshotVerdicts = view.keys, view.verdicts
+			atomicallyLost, crossKeyWalked = view.lost, view.walked
+		} else {
+			expandKeys, bindsByKey, snapshotVerdicts, err = e.bindKeyClosure(key)
+			if err != nil {
+				return nil, 0, err
 			}
 
-			for txnID := range losers {
-				atomicallyLost[txnID] = struct{}{}
+			atomicallyLost = make(map[string]struct{})
+
+			for txnID, entry := range snapshotVerdicts {
+				if entry.verdict == pb.Verdict_LOST {
+					atomicallyLost[txnID] = struct{}{}
+				}
+			}
+
+			for k := range expandKeys {
+				losers, walked := e.losersOnKey(k, bindsByKey[k], snapshotVerdicts)
+				if k != key {
+					crossKeyWalked += walked
+				}
+
+				for txnID := range losers {
+					atomicallyLost[txnID] = struct{}{}
+				}
 			}
 		}
 
@@ -1269,7 +1377,13 @@ func (e *Engine) reconstruct(key string, tips []Tip, txID string, waitForHorizon
 		}
 
 		d = newDag(e, key, txID)
-		if err := e.prepareDag(d, key, tips); err != nil {
+		if view != nil && view.historical {
+			err = d.prepare(tips)
+		} else {
+			err = e.prepareDag(d, key, tips)
+		}
+
+		if err != nil {
 			return nil, 0, err
 		}
 
@@ -1279,6 +1393,10 @@ func (e *Engine) reconstruct(key string, tips []Tip, txID string, waitForHorizon
 		var isInvisible func(string) bool
 		if e.horizon != nil && !e.horizon.Empty() {
 			isInvisible = e.horizon.IsInvisible
+		}
+
+		if view != nil {
+			isInvisible = view.isInvisible
 		}
 
 		// Propagate HorizonSet invisibility along DAG dep edges. A visible
@@ -1428,6 +1546,10 @@ func (e *Engine) reconstruct(key string, tips []Tip, txID string, waitForHorizon
 			return nil
 		})
 		if errors.Is(err, errHorizonRetryNeeded) {
+			if view != nil {
+				return nil, 0, err // the entire batch must retry with fresh decisions
+			}
+
 			continue
 		}
 
@@ -1454,7 +1576,7 @@ func (e *Engine) reconstruct(key string, tips []Tip, txID string, waitForHorizon
 	// be temporarily unavailable. Only prune when at least one real
 	// DAG tip is committed (present in the current index) to avoid
 	// removing tips superseded only by an in-flight transaction.
-	if len(tips) > 1 {
+	if view == nil && len(tips) > 1 {
 		inputSet := make(map[Tip]bool, len(tips))
 		for _, t := range tips {
 			inputSet[t] = true
@@ -1577,14 +1699,40 @@ func bindsShareBase(a, b *forkChoiceBindEntry) bool {
 // surface as a winner. Failing the read on bootstrap error is correct:
 // we can't reconstruct K without authoritative state on K'.
 //
-// bindsByKey[K'] is the set of bind NewTip[K'] offsets discovered during
+// bindsByKey[K'] is the set of bind envelope offsets discovered during
 // the closure walk. Callers pass these as extra starting tips to
 // losersOnKey(K') so the per-key walk reaches those binds even when an
 // intervening snapshot on K' would otherwise truncate the walk before
 // them.
 func (e *Engine) bindKeyClosure(startKey string) (map[string]struct{}, map[string][]Tip, verdictMap, error) {
-	keys := map[string]struct{}{startKey: {}}
+	return e.bindKeyClosureFrom([]string{startKey}, func(key string) ([]Tip, error) {
+		if err := e.ensureSubscribed(key); err != nil {
+			return nil, err
+		}
+
+		return e.index.Contains(key).Tips(), nil
+	}, false)
+}
+
+// bindKeyClosureFrom shares the same traversal between live single-key reads
+// and batch reads with a captured frontier. Batch reads require every branch
+// to be available before deciding which transactions survive.
+func (e *Engine) bindKeyClosureFrom(startKeys []string, tipsFor func(string) ([]Tip, error), strict bool) (map[string]struct{}, map[string][]Tip, verdictMap, error) {
+	keys := make(map[string]struct{})
 	bindsByKey := make(map[string][]Tip)
+
+	var queue []string
+
+	queued := make(map[string]bool)
+	for _, key := range startKeys {
+		if !queued[key] {
+			keys[key] = struct{}{}
+			queue = append(queue, key)
+			queued[key] = true
+		}
+	}
+
+	visitedByKey := make(map[string]map[Tip]bool)
 	seenBindTip := make(map[string]map[Tip]struct{})
 	addBindTip := func(k string, t Tip) {
 		s, ok := seenBindTip[k]
@@ -1598,25 +1746,26 @@ func (e *Engine) bindKeyClosure(startKey string) (map[string]struct{}, map[strin
 		}
 
 		s[t] = struct{}{}
+
 		bindsByKey[k] = append(bindsByKey[k], t)
+		if !queued[k] {
+			queue = append(queue, k)
+			queued[k] = true
+		}
 	}
 	verdicts := make(verdictMap)
 
-	queue := []string{startKey}
 	for len(queue) > 0 {
 		k := queue[len(queue)-1]
 		queue = queue[:len(queue)-1]
+		queued[k] = false
 
-		if err := e.ensureSubscribed(k); err != nil {
+		frontier, err := tipsFor(k)
+		if err != nil {
 			return nil, nil, nil, err
 		}
 
-		tipSet := e.index.Contains(k)
-
-		var startTips []Tip
-		if tipSet != nil {
-			startTips = append(startTips, tipSet.Tips()...)
-		}
+		startTips := append([]Tip(nil), frontier...)
 
 		startTips = append(startTips, bindsByKey[k]...)
 		if len(startTips) == 0 {
@@ -1626,7 +1775,11 @@ func (e *Engine) bindKeyClosure(startKey string) (map[string]struct{}, map[strin
 		// dep, which would truncate closure expansion. For closure
 		// discovery we only need to find binds reachable from tips,
 		// not a complete DAG — skip missing refs and keep going.
-		visited := make(map[Tip]bool)
+		visited := visitedByKey[k]
+		if visited == nil {
+			visited = make(map[Tip]bool)
+			visitedByKey[k] = visited
+		}
 
 		stack := append([]Tip(nil), startTips...)
 		for len(stack) > 0 {
@@ -1641,6 +1794,10 @@ func (e *Engine) bindKeyClosure(startKey string) (map[string]struct{}, map[strin
 
 			eff, err := e.getEffect(k, t)
 			if err != nil {
+				if strict {
+					return nil, nil, nil, err
+				}
+
 				continue
 			}
 
@@ -1649,21 +1806,13 @@ func (e *Engine) bindKeyClosure(startKey string) (map[string]struct{}, map[strin
 				for _, kb := range bind.GetKeys() {
 					other := string(kb.GetKey())
 					if other != k {
-						// Cross-key NewTip: seed losersOnKey's walk on
-						// `other` so it reaches this bind even when the
-						// only path goes through the current key.
-						// Same-key NewTip is already reachable from
-						// `other`'s own tipset; recording it here just
-						// piles redundant starting tips into long
-						// single-key chains and explodes the pairwise
-						// reach check.
-						addBindTip(other, r(kb.GetNewTip()))
+						// Start at the envelope: NewTip is its ancestor
+						// and cannot lead a backwards walk to this bind.
+						// A new anchor also requeues an already visited key.
+						addBindTip(other, t)
 					}
 
-					if _, ok := keys[other]; !ok {
-						keys[other] = struct{}{}
-						queue = append(queue, other)
-					}
+					keys[other] = struct{}{}
 				}
 				// Bind dep: same-key NewTip.
 				for _, kb := range bind.GetKeys() {
@@ -1705,22 +1854,23 @@ func (e *Engine) bindKeyClosure(startKey string) (map[string]struct{}, map[strin
 // losersOnKey returns the txnIDs of binds on `key` that lost fork choice,
 // plus the count of effects walked. Binds with a LOST verdict in any
 // reachable snapshot (or in snapshotVerdicts from the caller) bypass the
-// pairwise hash comparison; binds with a WON verdict skip the pass
-// entirely. The unadjudicated tail still runs pairwise hash + predicate
-// refinement. extraTips augments the starting set with NewTip[key] offsets
+// pairwise hash comparison. WON only records a decision against the competitors
+// known to that snapshot, so those binds still run pairwise hash + predicate
+// refinement against concurrent binds. extraTips augments the starting set with bind envelopes
 // the caller harvested on other closure keys.
 func (e *Engine) losersOnKey(key string, extraTips []Tip, snapshotVerdicts verdictMap) (map[string]struct{}, int) {
+	var isInvisible func(string) bool
+	if e.horizon != nil && !e.horizon.Empty() {
+		isInvisible = e.horizon.IsInvisible
+	}
+
+	return e.losersOnKeyAt(key, e.index.Contains(key).Tips(), extraTips, snapshotVerdicts, isInvisible, true)
+}
+
+func (e *Engine) losersOnKeyAt(key string, tips, extraTips []Tip, snapshotVerdicts verdictMap, isInvisible func(string) bool, reportConflicts bool) (map[string]struct{}, int) {
 	losers := make(map[string]struct{})
 
-	tipSet := e.index.Contains(key)
-	if tipSet == nil && len(extraTips) == 0 {
-		return losers, 0
-	}
-
-	var startTips []Tip
-	if tipSet != nil {
-		startTips = append(startTips, tipSet.Tips()...)
-	}
+	startTips := append([]Tip(nil), tips...)
 
 	if len(extraTips) > 0 {
 		seen := make(map[Tip]struct{}, len(startTips))
@@ -1740,11 +1890,6 @@ func (e *Engine) losersOnKey(key string, extraTips []Tip, snapshotVerdicts verdi
 
 	if len(startTips) == 0 {
 		return losers, 0
-	}
-
-	var isInvisible func(string) bool
-	if e.horizon != nil && !e.horizon.Empty() {
-		isInvisible = e.horizon.IsInvisible
 	}
 
 	// Local verdict map, seeded from any verdicts the caller harvested via
@@ -1851,7 +1996,7 @@ func (e *Engine) losersOnKey(key string, extraTips []Tip, snapshotVerdicts verdi
 		verdictSrc Tip
 	}
 
-	var unadjudicated []seenBind
+	var candidates []seenBind
 
 	verdictAdjudicated := make(map[string]bindWithSource)
 
@@ -1862,34 +2007,37 @@ func (e *Engine) losersOnKey(key string, extraTips []Tip, snapshotVerdicts verdi
 			}
 
 			verdictAdjudicated[b.txnID] = bindWithSource{seenBind: b, verdictSrc: entry.snapshotTip}
+			if entry.verdict == pb.Verdict_WON {
+				candidates = append(candidates, b)
+			}
 
 			continue
 		}
 
-		unadjudicated = append(unadjudicated, b)
+		candidates = append(candidates, b)
 	}
 
-	// Chain detection: if every unadjudicated bind's ConsumedTips on this
-	// key contains another unadjudicated bind's anchor offset, the binds
+	// Chain detection: if every candidate bind's ConsumedTips on this
+	// key contains another candidate bind's anchor offset, the binds
 	// form a total order via consumed-bind edges (each bind explicitly
 	// built on its predecessor's committed bind). No two can be
 	// DAG-concurrent on this key, so no losers — skip the O(N²) pairwise
 	// and ancestor work entirely. Common in sequential single-writer
 	// workloads (XADD, LPUSH, INCR), where this is the difference
 	// between O(N²) and O(N).
-	if len(unadjudicated) > 1 {
-		bindOffsetToIdx := make(map[Tip]int, len(unadjudicated))
-		for i := range unadjudicated {
-			bindOffsetToIdx[unadjudicated[i].bindOffset] = i
+	if len(candidates) > 1 {
+		bindOffsetToIdx := make(map[Tip]int, len(candidates))
+		for i := range candidates {
+			bindOffsetToIdx[candidates[i].bindOffset] = i
 		}
 
 		rootBinds := 0
 		chained := true
 
-		for i := range unadjudicated {
+		for i := range candidates {
 			consumesSibling := false
 
-			for _, ct := range unadjudicated[i].consumed {
+			for _, ct := range candidates[i].consumed {
 				if _, ok := bindOffsetToIdx[ct]; ok {
 					consumesSibling = true
 
@@ -1961,15 +2109,36 @@ func (e *Engine) losersOnKey(key string, extraTips []Tip, snapshotVerdicts verdi
 		return found
 	}
 
-	// Pairwise fork choice over the unadjudicated tail.
-	for i := range unadjudicated {
-		b := &unadjudicated[i]
-		for j := range unadjudicated {
+	// Check reporting eligibility once per envelope for this scan, and defer
+	// document reads and effects until adjudication is complete.
+	var reportable map[Tip]bool
+	if reportConflicts && !strings.HasPrefix(key, conflictKeyPrefix) && len(candidates) > 1 {
+		reportable = make(map[Tip]bool, len(candidates))
+		for _, b := range candidates {
+			if verdicts[b.txnID].verdict == pb.Verdict_WON {
+				reportable[b.bindOffset] = e.unresolvedConflictTip(key, b.bindOffset, startTips, reaches)
+			}
+		}
+	}
+
+	type conflictPair struct {
+		binds [2]Tip
+		txns  [2]string
+	}
+
+	var conflicts []conflictPair
+
+	seenConflicts := make(map[[2]string]struct{})
+
+	// Pairwise fork choice over all candidates, including snapshot winners.
+	for i := range candidates {
+		b := &candidates[i]
+		for j := range candidates {
 			if i == j {
 				continue
 			}
 
-			other := &unadjudicated[j]
+			other := &candidates[j]
 			if reaches(b.newTip, other.newTip) || reaches(other.newTip, b.newTip) {
 				continue
 			}
@@ -1989,7 +2158,35 @@ func (e *Engine) losersOnKey(key string, extraTips []Tip, snapshotVerdicts verdi
 
 			losers[b.txnID] = struct{}{}
 
-			break
+			canReport := reportable[b.bindOffset]
+			if canReport && reportable[other.bindOffset] {
+				pair := [2]string{b.txnID, other.txnID}
+				if pair[1] < pair[0] {
+					pair[0], pair[1] = pair[1], pair[0]
+				}
+
+				if _, seen := seenConflicts[pair]; !seen {
+					seenConflicts[pair] = struct{}{}
+
+					conflicts = append(conflicts, conflictPair{
+						binds: [2]Tip{b.bindOffset, other.bindOffset},
+						txns:  [2]string{b.txnID, other.txnID},
+					})
+				}
+			}
+
+			// Reporting needs every competing WON pair, even after this
+			// candidate has already lost to another transaction.
+			if !canReport {
+				break
+			}
+		}
+	}
+
+	checks := make(map[string]conflictDocumentCheck)
+	for _, pair := range conflicts {
+		if err := e.emitConflict(key, pair.binds[0], pair.binds[1], checks); err != nil {
+			slog.Warn("conflict report emission failed", "key", key, "txn", pair.txns[0], "competing_txn", pair.txns[1], "error", err)
 		}
 	}
 
@@ -2021,7 +2218,7 @@ func (e *Engine) losersOnKey(key string, extraTips []Tip, snapshotVerdicts verdi
 			"binds_seen", seen,
 			"losers", loserList,
 			"snapshot_adjudicated", len(verdictAdjudicated),
-			"pairwise_candidates", len(unadjudicated))
+			"pairwise_candidates", len(candidates))
 	}
 
 	return losers, walked

@@ -84,6 +84,7 @@ func TestBindConsumedTipsSubstitutesForeignInflightTip(t *testing.T) {
 	// both index and effectCache. This is what a correct ConsumedTips/deps
 	// SHOULD reference.
 	base := Tip{99, 400}
+
 	baseEff := &pb.Effect{
 		Key:            []byte(key),
 		Hlc:            sTs(400),
@@ -96,7 +97,10 @@ func TestBindConsumedTipsSubstitutesForeignInflightTip(t *testing.T) {
 			Value:      &pb.DataEffect_Raw{Raw: []byte("90")},
 		}},
 	}
-	e.effectCache.Put(base, baseEff)
+	if err := e.effectCache.Put(base, baseEff); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
 	e.index.Insert(key, nil, keytrie.NewTipSet(base))
 
 	// Step 3: inject the FOREIGN in-flight tx-marked effect on the same key:

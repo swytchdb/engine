@@ -27,23 +27,33 @@ import (
 	"time"
 )
 
-// HLC is a thin wrapper around the OS monotonic clock.
-// Exists solely for testability (injectable clock).
+// HLC projects the OS monotonic clock onto a fixed wall-time origin. Its
+// serialized timestamps retain elapsed intervals across wall-clock steps.
+// A new engine incarnation establishes a new clock domain on restart.
 type HLC struct {
 	clock func() time.Time
 }
 
 // NewHLC creates a new clock.
 func NewHLC() *HLC {
-	return &HLC{clock: time.Now}
+	origin := time.Now()
+
+	return newElapsedClock(origin, func() time.Duration { return time.Since(origin) })
 }
 
-// Now returns the current monotonic timestamp in nanoseconds.
+func newElapsedClock(origin time.Time, elapsed func() time.Duration) *HLC {
+	return &HLC{clock: func() time.Time { return origin.Add(elapsed()) }}
+}
+
+// Now returns a timestamp whose wall representation advances with monotonic
+// elapsed time. Unlike serializing time.Now directly, dropping Go's private
+// monotonic component does not reintroduce subsequent wall-clock adjustments.
 func (h *HLC) Now() time.Time {
 	return h.clock()
 }
 
-// SetClock sets a custom clock function (for testing).
+// SetClock replaces the final timestamp source for testing. Except in tests of
+// malformed clock evidence, the source must preserve the elapsed-clock contract.
 func (h *HLC) SetClock(clock func() time.Time) {
 	h.clock = clock
 }

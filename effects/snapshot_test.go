@@ -75,8 +75,11 @@ func (l *snapshotLog) putEffect(eff *pb.Effect) Tip {
 	t := Tip{l.nodeID, off}
 
 	data, _ := proto.Marshal(eff)
+
 	l.entries[t] = data
-	l.effectCache.Put(t, proto.Clone(eff).(*pb.Effect))
+	if err := l.effectCache.Put(t, proto.Clone(eff).(*pb.Effect)); err != nil {
+		panic(fmt.Errorf("populate snapshot log: %w", err))
+	}
 
 	return t
 }
@@ -155,6 +158,10 @@ func TestGetSnapshot_SingleEffect(t *testing.T) {
 }
 
 func TestGetSnapshot_ReusesImmutableReducedMemo(t *testing.T) {
+	if !reducedReadCacheEnabled {
+		t.Skip("materialized read cache disabled pending cross-key invalidation")
+	}
+
 	log := newSnapshotLog()
 	e := newSnapshotEngine(log)
 
@@ -1260,10 +1267,8 @@ func TestSubscriptionBootstrap_FetchesRemoteState(t *testing.T) {
 	localLog := newSnapshotLog()
 
 	bc := &bootstrapBroadcaster{
-		mockBroadcaster: mockBroadcaster{
-			peerIDs:                 []pb.NodeID{2},
-			allRegionPeersReachable: true,
-		},
+		peerIDs:                 []pb.NodeID{2},
+		allRegionPeersReachable: true,
 	}
 	// The remote engine's broadcaster needs to forward NACKs to the local engine
 	// We'll set this up after creating the local engine
@@ -2068,8 +2073,11 @@ func TestGetSnapshot_JepsenDAG14(t *testing.T) {
 		}
 
 		data, _ := proto.Marshal(eff)
+
 		log.entries[off[id]] = data
-		log.effectCache.Put(off[id], proto.Clone(eff).(*pb.Effect))
+		if err := log.effectCache.Put(off[id], proto.Clone(eff).(*pb.Effect)); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
 	}
 
 	depsOf := func(ids ...int) []*pb.EffectRef {
@@ -2582,8 +2590,11 @@ func TestGetSnapshot_AbortedCrossKeyBind_JepsenG1aRepro(t *testing.T) {
 		}
 
 		data, _ := proto.Marshal(eff)
+
 		log.entries[tip] = data
-		log.effectCache.Put(tip, proto.Clone(eff).(*pb.Effect))
+		if err := log.effectCache.Put(tip, proto.Clone(eff).(*pb.Effect)); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
 
 		return tip
 	}
@@ -2698,8 +2709,11 @@ func TestLosersOnKey_TwoConcurrentBindsLowerHashWins(t *testing.T) {
 		}
 
 		data, _ := proto.Marshal(eff)
+
 		log.entries[tip] = data
-		log.effectCache.Put(tip, proto.Clone(eff).(*pb.Effect))
+		if err := log.effectCache.Put(tip, proto.Clone(eff).(*pb.Effect)); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
 
 		return tip
 	}
@@ -2781,8 +2795,11 @@ func TestLosersOnKey_XDependsOnYsAncestorsButNotNewTip(t *testing.T) {
 		}
 
 		data, _ := proto.Marshal(eff)
+
 		log.entries[tip] = data
-		log.effectCache.Put(tip, proto.Clone(eff).(*pb.Effect))
+		if err := log.effectCache.Put(tip, proto.Clone(eff).(*pb.Effect)); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
 
 		return tip
 	}
@@ -2945,8 +2962,11 @@ func TestLosersOnKey_SharedAncestorConcurrentBinds(t *testing.T) {
 		}
 
 		data, _ := proto.Marshal(eff)
+
 		log.entries[tip] = data
-		log.effectCache.Put(tip, proto.Clone(eff).(*pb.Effect))
+		if err := log.effectCache.Put(tip, proto.Clone(eff).(*pb.Effect)); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
 
 		return tip
 	}
@@ -3076,8 +3096,11 @@ func TestLosersOnKey_SideChannelMakesSequential(t *testing.T) {
 		}
 
 		data, _ := proto.Marshal(eff)
+
 		log.entries[tip] = data
-		log.effectCache.Put(tip, proto.Clone(eff).(*pb.Effect))
+		if err := log.effectCache.Put(tip, proto.Clone(eff).(*pb.Effect)); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
 
 		return tip
 	}
@@ -3192,8 +3215,11 @@ func TestIsRealConflict_TransitiveReachMakesSequential(t *testing.T) {
 		}
 
 		data, _ := proto.Marshal(eff)
+
 		log.entries[tip] = data
-		log.effectCache.Put(tip, proto.Clone(eff).(*pb.Effect))
+		if err := log.effectCache.Put(tip, proto.Clone(eff).(*pb.Effect)); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
 
 		return tip
 	}
@@ -3304,8 +3330,11 @@ func TestBindKeyClosure_ExpandsViaBindKeysField(t *testing.T) {
 		}
 
 		data, _ := proto.Marshal(eff)
+
 		log.entries[tip] = data
-		log.effectCache.Put(tip, proto.Clone(eff).(*pb.Effect))
+		if err := log.effectCache.Put(tip, proto.Clone(eff).(*pb.Effect)); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
 
 		return tip
 	}
@@ -3369,8 +3398,11 @@ func TestReconstruct_VerdictSnapshotSurvivesCompaction(t *testing.T) {
 		}
 
 		data, _ := proto.Marshal(eff)
+
 		log.entries[tip] = data
-		log.effectCache.Put(tip, proto.Clone(eff).(*pb.Effect))
+		if err := log.effectCache.Put(tip, proto.Clone(eff).(*pb.Effect)); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
 
 		return tip
 	}
@@ -3616,7 +3648,9 @@ func TestReconstruct_TxCutoffDoesNotHideCrossKeyForkLoser(t *testing.T) {
 		}
 
 		log.entries[tip] = data
-		log.effectCache.Put(tip, proto.Clone(eff).(*pb.Effect))
+		if err := log.effectCache.Put(tip, proto.Clone(eff).(*pb.Effect)); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
 
 		return tip
 	}

@@ -79,6 +79,7 @@ type Beacon struct {
 
 	selfRegistered bool
 	stopOnce       sync.Once
+	safety         *safetyWatcher
 }
 
 // New creates a beacon. Call Start to begin discovery and membership.
@@ -89,6 +90,7 @@ func New(cfg Config, engine *effects.Engine, pm *cluster.PeerManager) *Beacon {
 		pm:           pm,
 		topoRefresh:  make(chan struct{}, 1),
 		removeSignal: make(chan struct{}, 1),
+		safety:       newSafetyWatcher(engine),
 	}
 	// A cloud-pushed "delete this server" command applies through the same
 	// membership REMOVE_OP path the local sweeps use.
@@ -297,6 +299,7 @@ func (b *Beacon) Start(ctx context.Context) (err error) {
 // Stop sends a REMOVE_OP for this node and stops background loops.
 func (b *Beacon) Stop() {
 	b.stopOnce.Do(func() {
+		b.safety.stop()
 		b.unregisterSelf()
 
 		if b.cancel != nil {

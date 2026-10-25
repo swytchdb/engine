@@ -185,10 +185,6 @@ func TestTickExchangeMeasuresRTT(t *testing.T) {
 		t.Fatalf("A's clock stats for B should be primed, got %+v", st)
 	}
 
-	if st.Epsilon < st.RTTMin {
-		t.Fatalf("staleness bound %v should include RTTMin %v", st.Epsilon, st.RTTMin)
-	}
-
 	// B has only seen A's tick (one inbound offset) and no echo yet.
 	if rtt := healthB.GetRTT(1); rtt != 0 {
 		t.Fatalf("B should not have RTT for A before an echo, got %v", rtt)
@@ -285,7 +281,7 @@ func TestJumpFlaggedTickResetsOffsets(t *testing.T) {
 	ph := health.Get(2)
 	ph.clock.observeEcho(int64(5 * time.Millisecond))
 
-	if st := ph.clock.snapshot(time.Now()); !st.Primed {
+	if st := ph.clock.snapshot(); !st.Primed {
 		t.Fatalf("stats should be primed before the jump, got %+v", st)
 	}
 
@@ -295,7 +291,7 @@ func TestJumpFlaggedTickResetsOffsets(t *testing.T) {
 		NodeID: 2, Seq: 2, WallClock: time.Now().UnixNano(), JumpNs: int64(time.Minute),
 	})
 
-	if st := ph.clock.snapshot(time.Now()); st.Primed {
+	if st := ph.clock.snapshot(); st.Primed {
 		t.Fatalf("stats should be unprimed after a jump reset, got %+v", st)
 	}
 

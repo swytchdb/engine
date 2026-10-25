@@ -89,10 +89,8 @@ func TestReadMissRehydratesFromCloud(t *testing.T) {
 	// whole closure, so the install walk runs entirely locally — zero
 	// per-effect network fetches.
 	bc := &selectiveBroadcaster{
-		mockBroadcaster: mockBroadcaster{
-			allRegionPeersReachable: true,
-			peerIDs:                 []pb.NodeID{7},
-		},
+		allRegionPeersReachable: true,
+		peerIDs:                 []pb.NodeID{7},
 	}
 	e := newTestEngine(bc)
 	fake := &fakeCloudReader{
@@ -171,11 +169,9 @@ func TestReadMissPartialSidecarFetchesStraggler(t *testing.T) {
 	// The sidecar carries only the tip; the dep is the straggler, served by
 	// the broadcaster.
 	bc := &selectiveBroadcaster{
-		mockBroadcaster: mockBroadcaster{
-			allRegionPeersReachable: true,
-			peerIDs:                 []pb.NodeID{7},
-		},
-		fetchable: map[Tip][]byte{depTip: depWire},
+		allRegionPeersReachable: true,
+		peerIDs:                 []pb.NodeID{7},
+		fetchable:               map[Tip][]byte{depTip: depWire},
 	}
 	e := newTestEngine(bc)
 	fake := &fakeCloudReader{
@@ -209,9 +205,7 @@ func TestReadMissPartialSidecarFetchesStraggler(t *testing.T) {
 // round-trip.
 func TestReadMissCloudEmptyStillMisses(t *testing.T) {
 	bc := &selectiveBroadcaster{
-		mockBroadcaster: mockBroadcaster{
-			allRegionPeersReachable: true,
-		},
+		allRegionPeersReachable: true,
 	}
 	e := newTestEngine(bc)
 	fake := &fakeCloudReader{tips: map[string][]Tip{}} // Cloud holds nothing
@@ -250,9 +244,7 @@ func TestReadMissCloudEmptyStillMisses(t *testing.T) {
 // back mid-outage must still rehydrate the key).
 func TestReadMissCloudErrorFailsRead(t *testing.T) {
 	bc := &selectiveBroadcaster{
-		mockBroadcaster: mockBroadcaster{
-			allRegionPeersReachable: true,
-		},
+		allRegionPeersReachable: true,
 	}
 	e := newTestEngine(bc)
 	fake := &fakeCloudReader{err: context.DeadlineExceeded}
@@ -302,11 +294,9 @@ func TestReadMissServesReadableSubsetAndMarksPending(t *testing.T) {
 	holed := Tip{9, 4} // blob provably absent from cloud storage
 
 	bc := &partialHoleBroadcaster{
-		mockBroadcaster: mockBroadcaster{
-			allRegionPeersReachable: true,
-			peerIDs:                 []pb.NodeID{7},
-		},
-		fetchable: map[Tip][]byte{reachable: wire},
+		allRegionPeersReachable: true,
+		peerIDs:                 []pb.NodeID{7},
+		fetchable:               map[Tip][]byte{reachable: wire},
 	}
 	e := newTestEngine(bc)
 	fake := &fakeCloudReader{
@@ -353,9 +343,7 @@ func TestReadMissAllTipsPendingFailsRead(t *testing.T) {
 	holed := Tip{9, 4}
 
 	bc := &holedFetchBroadcaster{
-		mockBroadcaster: mockBroadcaster{
-			allRegionPeersReachable: true,
-		},
+		allRegionPeersReachable: true,
 	}
 	e := newTestEngine(bc)
 	fake := &fakeCloudReader{

@@ -43,6 +43,8 @@ import (
 // callbacks in redis, ORM dialect hooks in sql) stays in the
 // transport package.
 type RuntimeConfig struct {
+	// DataDir enables the engine's local resident-effect mirror.
+	DataDir string
 	// MemoryLimit caps effects-engine memory at a fixed byte count.
 	// Mutually exclusive with MemoryLimitPercent — set one or the
 	// other. Forwarded to effects.EngineConfig.
@@ -139,6 +141,7 @@ type Runtime struct {
 	// when AsyncJoin is false, making Stop's drain a no-op.
 	joinCancel context.CancelFunc
 	joinWG     sync.WaitGroup
+	safety     *safetyWatcher // standalone runtime has no membership beacon
 }
 
 // NewRuntime builds and starts the engine. If cfg.ClusterPassphrase
@@ -157,13 +160,18 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 		log = slog.Default()
 	}
 
-	engine := effects.NewEngine(effects.EngineConfig{
+	engine, err := effects.OpenEngine(ctx, effects.EngineConfig{
+		DataDir:            cfg.DataDir,
 		NodeID:             pb.NewNodeID(),
 		DefaultMode:        effects.SafeMode,
 		MemoryLimit:        cfg.MemoryLimit,
 		MemoryLimitPercent: cfg.MemoryLimitPercent,
 		CompressValues:     cfg.CompressValues,
 	})
+	if err != nil {
+		return nil, err
+	}
+
 	log.Info("effects engine initialized", "node_id", engine.NodeID())
 
 	// The connection secret is derive-and-drop: everything needed later comes
@@ -222,6 +230,11 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 
 	// Single-node mode: done.
 	if passphrase == "" {
+		rt.safety = newSafetyWatcher(engine)
+		if err := rt.safety.start(ctx); err != nil {
+			return nil, errors.Join(err, closeRuntimeOnError(rt))
+		}
+
 		log.Debug("no cluster passphrase, running single-node")
 
 		return rt, nil
@@ -358,6 +371,12 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 		rt.joinWG.Go(func() {
 			if err := b.Start(joinCtx); err != nil {
 				log.Warn("cluster join did not complete; serving solo, will converge in background", "error", err)
+
+				return
+			}
+
+			if err := b.startSafety(joinCtx); err != nil {
+				log.Warn("post-bootstrap safety configuration failed", "error", err)
 			}
 		})
 	} else {
@@ -369,6 +388,9 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 		}
 
 		rt.Beacon = b
+		if err := b.startSafety(ctx); err != nil {
+			return nil, errors.Join(err, closeRuntimeOnError(rt))
+		}
 	}
 
 	log.Info("cluster runtime ready",
@@ -395,6 +417,10 @@ func (r *Runtime) Stop() error {
 	}
 
 	r.joinWG.Wait()
+
+	if r.safety != nil {
+		r.safety.stop()
+	}
 
 	var errs []error
 

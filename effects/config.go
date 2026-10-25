@@ -44,6 +44,8 @@ type KeyRangeRule struct {
 
 // EngineConfig holds configuration for creating an Engine.
 type EngineConfig struct {
+	// DataDir enables a local mirror of resident effects. Empty keeps memory-only behavior.
+	DataDir       string
 	NodeID        pb.NodeID
 	Broadcaster   Broadcaster     // nil for standalone
 	RTTProvider   PeerRTTProvider // nil disables RTT-based leader selection

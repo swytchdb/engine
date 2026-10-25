@@ -288,8 +288,13 @@ func TestPendingTipsIndex(t *testing.T) {
 	tipA := effects.Tip{1, 10}
 	tipB := effects.Tip{1, 11}
 
-	engine.EffectCache().PutSized(tipA, effA, 64)
-	engine.EffectCache().PutSized(tipB, effB, 64)
+	if err := engine.EffectCache().PutSized(tipA, effA, 64); err != nil {
+		t.Fatalf("PutSized: %v", err)
+	}
+
+	if err := engine.EffectCache().PutSized(tipB, effB, 64); err != nil {
+		t.Fatalf("PutSized: %v", err)
+	}
 
 	cs.handleLocalEffect(tipA, effA)
 	cs.handleLocalEffect(tipB, effB)
@@ -359,8 +364,13 @@ func TestOutboxPinsKeyUntilDrained(t *testing.T) {
 	tipA := effects.Tip{1, 1000}
 	tipB := effects.Tip{1, 1001}
 
-	engine.EffectCache().PutSized(tipA, effA, 64)
-	engine.EffectCache().PutSized(tipB, effB, 64)
+	if err := engine.EffectCache().PutSized(tipA, effA, 64); err != nil {
+		t.Fatalf("PutSized: %v", err)
+	}
+
+	if err := engine.EffectCache().PutSized(tipB, effB, 64); err != nil {
+		t.Fatalf("PutSized: %v", err)
+	}
 
 	cs.handleLocalEffect(tipA, effA)
 
@@ -390,8 +400,12 @@ func TestOutboxPinsKeyUntilDrained(t *testing.T) {
 	// A key with no live leaf (the eviction path's own unsubscribe mint):
 	// enqueue takes no pin, drain releases none.
 	ghost := &pb.Effect{Key: []byte("never-indexed")}
+
 	ghostTip := effects.Tip{1, 1002}
-	engine.EffectCache().PutSized(ghostTip, ghost, 64)
+	if err := engine.EffectCache().PutSized(ghostTip, ghost, 64); err != nil {
+		t.Fatalf("PutSized: %v", err)
+	}
+
 	cs.handleLocalEffect(ghostTip, ghost)
 
 	if cs.pendingKeys["never-indexed"].pinned {
@@ -430,8 +444,12 @@ func TestSubscriptionMintDoesNotOpenGate(t *testing.T) {
 		Key:  []byte("k"),
 		Kind: &pb.Effect_Subscription{Subscription: &pb.SubscriptionEffect{SubscriberNodeId: 1}},
 	}
+
 	tip := effects.Tip{1, 10}
-	engine.EffectCache().PutSized(tip, sub, 64)
+	if err := engine.EffectCache().PutSized(tip, sub, 64); err != nil {
+		t.Fatalf("PutSized: %v", err)
+	}
+
 	cs.handleLocalEffect(tip, sub)
 
 	if cs.cloudMayHold(CloudKeyName(keyNameKey, []byte("k"))) {
@@ -449,8 +467,12 @@ func TestSubscriptionMintDoesNotOpenGate(t *testing.T) {
 			Value: &pb.DataEffect_Raw{Raw: []byte("v")},
 		}},
 	}
+
 	dataTip := effects.Tip{1, 11}
-	engine.EffectCache().PutSized(dataTip, data, 64)
+	if err := engine.EffectCache().PutSized(dataTip, data, 64); err != nil {
+		t.Fatalf("PutSized: %v", err)
+	}
+
 	cs.handleLocalEffect(dataTip, data)
 
 	if !cs.cloudMayHold(CloudKeyName(keyNameKey, []byte("k"))) {
@@ -819,9 +841,17 @@ func ancestrySync(t *testing.T, engine *effects.Engine) (*CloudSync, effects.Tip
 	midEff := &pb.Effect{Key: []byte("k"), Deps: []*pb.EffectRef{{NodeId: root[0], Offset: root[1]}}}
 	oursEff := &pb.Effect{Key: []byte("k"), Deps: []*pb.EffectRef{{NodeId: mid[0], Offset: mid[1]}}}
 
-	engine.EffectCache().PutSized(root, rootEff, 64)
-	engine.EffectCache().PutSized(mid, midEff, 64)
-	engine.EffectCache().PutSized(ours, oursEff, 64)
+	if err := engine.EffectCache().PutSized(root, rootEff, 64); err != nil {
+		t.Fatalf("PutSized: %v", err)
+	}
+
+	if err := engine.EffectCache().PutSized(mid, midEff, 64); err != nil {
+		t.Fatalf("PutSized: %v", err)
+	}
+
+	if err := engine.EffectCache().PutSized(ours, oursEff, 64); err != nil {
+		t.Fatalf("PutSized: %v", err)
+	}
 
 	return cs, root, mid, ours, oursEff
 }
@@ -882,9 +912,16 @@ func TestForeignDependenciesRequireExplicitCloudFetch(t *testing.T) {
 	foreignRoot := effects.Tip{foreignNode, 1}
 	foreignDep := effects.Tip{foreignNode, 2}
 	rootEff := &pb.Effect{Key: []byte("k")}
+
 	depEff := &pb.Effect{Key: []byte("k"), Deps: []*pb.EffectRef{{NodeId: foreignRoot[0], Offset: foreignRoot[1]}}}
-	engine.EffectCache().PutSized(foreignRoot, rootEff, 64)
-	engine.EffectCache().PutSized(foreignDep, depEff, 64)
+	if err := engine.EffectCache().PutSized(foreignRoot, rootEff, 64); err != nil {
+		t.Fatalf("PutSized: %v", err)
+	}
+
+	if err := engine.EffectCache().PutSized(foreignDep, depEff, 64); err != nil {
+		t.Fatalf("PutSized: %v", err)
+	}
+
 	oursEff.Deps = []*pb.EffectRef{{NodeId: foreignDep[0], Offset: foreignDep[1]}}
 
 	cs.handleLocalEffect(ours, oursEff)

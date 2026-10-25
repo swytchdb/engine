@@ -60,7 +60,8 @@ type Context struct {
 	txnID       string
 	keys        map[string]*contextKey
 	watchedKeys map[string]*watchedKeyState // keys registered via Watch with WATCH-time state
-	txSnapshot  keytrie.KeyIndex            // frozen index snapshot for SSI reads (nil outside MULTI/EXEC)
+	txSnapshot  *transactionSnapshot        // compact boundary and lazily captured causal history
+	readErr     error                       // failed transactional reads must not flush queued writes
 
 	// readOnly marks a context used only for read-only, non-transactional
 	// commands. Such a context may answer a read-miss from the cluster key
@@ -108,7 +109,8 @@ type subOp struct {
 // engine's state is unchanged until Flush, so reverting the
 // Context's pending keys is sufficient to roll back.
 type ContextSavepoint struct {
-	keys map[string]*contextKey
+	keys    map[string]*contextKey
+	readErr error
 }
 
 // TakeSavepoint captures a deep-enough copy of the Context's pending
@@ -118,7 +120,8 @@ type ContextSavepoint struct {
 // values — notifies, elementIDs — are immutable once added).
 func (c *Context) TakeSavepoint() *ContextSavepoint {
 	snap := &ContextSavepoint{
-		keys: make(map[string]*contextKey, len(c.keys)),
+		keys:    make(map[string]*contextKey, len(c.keys)),
+		readErr: c.readErr,
 	}
 	for k, ck := range c.keys {
 		cloned := *ck
@@ -169,6 +172,10 @@ func (c *Context) RestoreSavepoint(sp *ContextSavepoint) {
 	}
 
 	c.keys = restored
+	// Explicit command rollback discards its partial writes and handles its
+	// read failure. Unhandled failures still prevent Flush from committing.
+	// Snapshot membership stays fixed: rollback cannot undo exposed values.
+	c.readErr = sp.readErr
 }
 
 // NewContext creates a new write context bound to the engine.
@@ -234,8 +241,34 @@ func (c *Context) TraceCtx() context.Context {
 // yet in the context use the snapshot instead of the live index, and a
 // NOOP is emitted to record the read in the causal structure.
 func (c *Context) GetSnapshot(key string) (*pb.ReducedEffect, []Tip, error) {
+	if c != nil && c.txSnapshot != nil && slog.Default().Enabled(c.TraceCtx(), slog.LevelDebug) {
+		s := c.txSnapshot
+
+		decisions, ambiguous, evidence := len(s.decided), s.ambiguous, s.clocks
+		defer func() {
+			slog.DebugContext(c.TraceCtx(), "mvcc: read work", "key", key,
+				"additional_history", len(s.decided) > decisions,
+				"additional_evidence", s.clocks != evidence,
+				"ambiguous_inclusion", s.ambiguous > ambiguous,
+				"failed", c.readErr != nil)
+		}()
+	}
+
+	result, tips, err := c.getSnapshot(key)
+	if err != nil && c != nil && c.txSnapshot != nil {
+		c.readErr = err
+	}
+
+	return result, tips, err
+}
+
+func (c *Context) getSnapshot(key string) (*pb.ReducedEffect, []Tip, error) {
 	if c == nil {
 		return nil, nil, nil
+	}
+
+	if c.readErr != nil {
+		return nil, nil, c.readErr
 	}
 
 	if tracing.Enabled() {
@@ -326,7 +359,12 @@ func (c *Context) GetSnapshot(key string) (*pb.ReducedEffect, []Tip, error) {
 	var baseTips []Tip
 
 	if c.txSnapshot != nil {
-		if ts := c.txSnapshot.Contains(key); ts != nil {
+		ts, err := c.txSnapshot.tips(c.TraceCtx(), key)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		if ts != nil {
 			// Match getSnapshotFromTx: resolve pending-tx tips to their
 			// pre-tx deps so a later read in the same txn walks the same
 			// committed-as-of-snapshot DAG as the first read did.
@@ -349,12 +387,22 @@ func (c *Context) GetSnapshot(key string) (*pb.ReducedEffect, []Tip, error) {
 	// returning. Without this the read can return a list that excludes a
 	// bind which the very next read (post-promotion) will include —
 	// :incompatible-order on a single key.
-	result, _, err := c.engine.reconstruct(key, reconTips, c.txnID, true)
+	var view *snapshotReadView
+	if c.txSnapshot != nil {
+		view = c.txSnapshot.views[key]
+		reconTips = append(reconTips, view.anchors[key]...)
+	}
+
+	result, _, err := c.engine.reconstructWithView(key, reconTips, c.txnID, true, view)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	result = filterSnapshot(result)
+	if c.txSnapshot != nil {
+		result = filterSnapshotAt(result, c.txSnapshot.expiryAt)
+	} else {
+		result = filterSnapshot(result)
+	}
 
 	// Return initialTips — these are the committed tips from before our writes.
 	var tips []Tip
@@ -365,29 +413,89 @@ func (c *Context) GetSnapshot(key string) (*pb.ReducedEffect, []Tip, error) {
 	return result, tips, nil
 }
 
+// GetSnapshots reads an ordinary batch from a shared reconstruction view.
+// Transactional and pending-effect contexts retain their SSI/read-your-writes
+// path, including read-set NOOPs; they must not switch to a live read view.
+func (c *Context) GetSnapshots(keys []string) ([]*pb.ReducedEffect, error) {
+	results := make([]*pb.ReducedEffect, len(keys))
+	if c == nil {
+		return results, nil
+	}
+
+	if c.readErr != nil {
+		return nil, c.readErr
+	}
+
+	if c.inTx || c.txSnapshot != nil || len(c.keys) != 0 {
+		if c.txSnapshot != nil {
+			s := c.txSnapshot
+			decisions, ambiguous, evidence := len(s.decided), s.ambiguous, s.clocks
+
+			if err := c.txSnapshot.prepare(c.TraceCtx(), keys); err != nil {
+				c.readErr = err
+
+				return nil, err
+			}
+
+			slog.DebugContext(c.TraceCtx(), "mvcc: batch preparation work", "keys", keys,
+				"additional_history", len(s.decided) > decisions,
+				"additional_evidence", s.clocks != evidence,
+				"ambiguous_inclusion", s.ambiguous > ambiguous)
+		}
+
+		for i, key := range keys {
+			var err error
+
+			results[i], _, err = c.GetSnapshot(key)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		return results, nil
+	}
+
+	results, err := c.engine.GetSnapshots(c.TraceCtx(), keys)
+	if err != nil {
+		return nil, err
+	}
+
+	for i := range results {
+		results[i] = filterSnapshot(results[i])
+	}
+
+	return results, nil
+}
+
 // getSnapshotFromTx reads a key from the SSI snapshot and emits a NOOP
 // to record the read in the causal log for the Bind's read set.
 func (c *Context) getSnapshotFromTx(key string) (*pb.ReducedEffect, []Tip, error) {
 	slog.Debug("getSnapshotFromTx: entry", "key", key, "txn_id", c.txnID)
 
-	tips := c.txSnapshot.Contains(key)
-	if tips == nil {
-		return nil, nil, nil // key didn't exist at snapshot time
+	tips, err := c.txSnapshot.tips(c.TraceCtx(), key)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if tips == nil && len(c.txSnapshot.views[key].anchors[key]) == 0 {
+		return nil, nil, nil // no history belongs to this key in the fixed cut
 	}
 
 	snapshotTips := tips.Tips()
 
 	tipOffsets := c.engine.resolveTipDeps(snapshotTips)
+
+	tipOffsets = append(append([]Tip(nil), tipOffsets...), c.txSnapshot.views[key].anchors[key]...)
 	if len(tipOffsets) == 0 {
 		return nil, nil, nil
 	}
 	// waitForHorizon=true: SSI-snapshot read served back to the client.
-	result, _, err := c.engine.reconstruct(key, tipOffsets, c.txnID, true)
+	result, _, err := c.engine.reconstructWithView(key, tipOffsets, c.txnID, true, c.txSnapshot.views[key])
 	if err != nil {
 		return nil, nil, err
 	}
 
-	result = filterSnapshot(result)
+	result = filterSnapshotAt(result, c.txSnapshot.expiryAt)
 
 	// Emit a NOOP to record this read in the causal structure.
 	// The Bind will include this key in its read set.
@@ -503,10 +611,10 @@ func (c *Context) BeginTx() {
 	if c.txnID == "" {
 		c.txnID = c.engine.generateTxnID()
 	}
-	// SSI: snapshot the index at txn start so every read/emit within
-	// the txn sees a consistent committed state.
+	// O(1) with respect to indexed keys: capture only the temporal boundary.
+	// Histories and bind closures are selected when a key is accessed.
 	if c.txSnapshot == nil {
-		c.txSnapshot = c.engine.index.Snapshot()
+		c.txSnapshot = c.engine.newTransactionSnapshot()
 	}
 }
 
@@ -521,7 +629,7 @@ func (c *Context) CheckWatches() bool {
 	// case where CheckWatches is called without a prior BeginTx (no
 	// transactional emits before EXEC).
 	if c.txSnapshot == nil {
-		c.txSnapshot = c.engine.index.Snapshot()
+		c.txSnapshot = c.engine.newTransactionSnapshot()
 	}
 
 	if len(c.watchedKeys) == 0 {
@@ -584,6 +692,7 @@ func (c *Context) Abort() {
 	c.inTx = false
 	c.txnID = ""
 	c.txSnapshot = nil
+	c.readErr = nil
 }
 
 // Emit writes a single effect to the log. The context tracks per-key
@@ -601,6 +710,10 @@ func (c *Context) Abort() {
 // tips the handler actually read, not whatever the index contains now.
 // Pure writes (SET, LPUSH) omit snapshotTips and Emit reads the index.
 func (c *Context) Emit(eff *pb.Effect, snapshotTips ...[]Tip) error {
+	if c.readErr != nil {
+		return c.readErr
+	}
+
 	key := string(eff.GetKey())
 
 	// The effect must dep-reference our own SubscriptionEffect, or the
@@ -635,7 +748,14 @@ func (c *Context) Emit(eff *pb.Effect, snapshotTips ...[]Tip) error {
 		if len(snapshotTips) > 0 && snapshotTips[0] != nil {
 			tips = keytrie.NewTipSet(snapshotTips[0]...)
 		} else if c.txSnapshot != nil {
-			tips = c.txSnapshot.Contains(key) // SSI: use snapshot, not live index
+			var err error
+
+			tips, err = c.txSnapshot.tips(c.TraceCtx(), key)
+			if err != nil {
+				c.readErr = err
+
+				return err
+			}
 		} else {
 			tips = c.engine.index.Contains(key)
 		}
@@ -820,7 +940,9 @@ func (c *Context) rawEmit(eff *pb.Effect) (Tip, *pb.OffsetNotify, error) {
 	// (no-broadcaster) path has nothing to marshal, so it falls back to Put.
 	if c.engine.broadcaster == nil {
 		if c.engine.effectCache != nil {
-			c.engine.effectCache.Put(offset, eff)
+			if err := c.engine.effectCache.Put(offset, eff); err != nil {
+				return Tip{}, nil, err
+			}
 		}
 
 		c.engine.fireLocalEffect(offset, eff)
@@ -834,7 +956,9 @@ func (c *Context) rawEmit(eff *pb.Effect) (Tip, *pb.OffsetNotify, error) {
 	}
 
 	if c.engine.effectCache != nil {
-		c.engine.effectCache.PutSized(offset, eff, len(data))
+		if err := c.engine.effectCache.PutSized(offset, eff, len(data)); err != nil {
+			return Tip{}, nil, err
+		}
 	}
 
 	c.engine.fireLocalEffect(offset, eff)
@@ -847,6 +971,13 @@ func (c *Context) rawEmit(eff *pb.Effect) (Tip, *pb.OffsetNotify, error) {
 // Flush updates the index for all touched keys and broadcasts all
 // notifications per key for durability, then resets the context for reuse.
 func (c *Context) Flush() error {
+	if c.readErr != nil {
+		err := c.readErr
+		c.Abort()
+
+		return err
+	}
+
 	if tracing.Enabled() {
 		_, flushSpan := tracing.Tracer().Start(c.TraceCtx(), "effects.flush",
 			trace.WithAttributes(attribute.Int("flush.keys", len(c.keys))))
@@ -880,7 +1011,10 @@ func (c *Context) flushNonTx() error {
 		// Handle flush-all: wipe index before broadcasting
 		if key == FlushKey {
 			slog.Info("Flush: flush-all effect, wiping index")
-			c.engine.FlushIndex()
+
+			if err := c.engine.FlushIndex(); err != nil {
+				return err
+			}
 			// Broadcast to peers but skip index update (already wiped)
 			if c.engine.broadcaster != nil {
 				for _, n := range ck.notifies {
@@ -1754,6 +1888,7 @@ func (c *Context) reset() {
 	c.inTx = false
 	c.txnID = ""
 	c.txSnapshot = nil
+	c.readErr = nil
 }
 
 // updateIndex performs a CAS loop to merge the new offset into the
@@ -1784,6 +1919,10 @@ func (e *Engine) updateIndex(key string, initialTips *keytrie.TipSet, lastOffset
 			// Insert fires the trie's refDelta hook (applyRefDelta), which
 			// increfs the added tips and decrefs the consumed ones — no manual
 			// refcount call here.
+			if current.Len() != newTips.Len() || !current.ContainsAll(newTips.Tips()) {
+				e.notifyKeyChanged(key)
+			}
+
 			return
 		}
 
@@ -1814,6 +1953,10 @@ func (e *Engine) installTips(key string, tips []Tip) {
 
 		newTips := keytrie.NewTipSet(offsets...)
 		if _, ok := e.index.Insert(key, current, newTips); ok {
+			if current.Len() != newTips.Len() || !current.ContainsAll(newTips.Tips()) {
+				e.notifyKeyChanged(key)
+			}
+
 			return
 		}
 

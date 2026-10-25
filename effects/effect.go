@@ -75,19 +75,22 @@ func (e *Engine) isServed(key []byte) bool {
 	return sub
 }
 
-// putIngested pools a fetched/ingested effect, choosing owned vs cache residency
-// by whether we serve its key. The single routing point for every ingest path
+// putIngested pools a fetched/ingested effect, taking ownership for each served
+// key in a bind, or its single key otherwise. The routing point for every ingest path
 // (HandleRemote, backfill, NACK causal-chain prefetch, getEffect's storeWireData).
-func (e *Engine) putIngested(tip Tip, eff *pb.Effect, protoLen int) {
+func (e *Engine) putIngested(tip Tip, eff *pb.Effect, protoLen int) error {
 	if e.effectCache == nil {
-		return
+		return nil
 	}
 
-	if e.isServed(eff.GetKey()) {
-		e.effectCache.PutSized(tip, eff, protoLen)
-	} else {
-		e.effectCache.PutSizedCache(tip, eff, protoLen)
+	if err := e.effectCache.putSized(tip, eff, protoLen, e.isServed); err != nil {
+		return err
 	}
+	// Preserve the actual receipt observation even when the application has
+	// not read this key yet. A later prepared DAG fills any missing parents.
+	e.observeTemporal(tip, eff, true)
+
+	return nil
 }
 
 // bootstrapCollector collects NACKs during subscription bootstrapping.
@@ -100,6 +103,7 @@ type bootstrapCollector struct {
 // Lock-free: the log uses CAS, the index manages its own concurrency,
 // and safety config is swapped atomically.
 type Engine struct {
+	recovery atomic.Pointer[recoveryRun]
 	// index is the per-key tip frontier. Its leaf payload is *leafState,
 	// which carries the cached subdag (and, later, eviction metadata) for
 	// each key — one structure, the trie, owns both the tips and the
@@ -108,8 +112,9 @@ type Engine struct {
 	broadcaster Broadcaster // nil for standalone
 	cloudReader CloudReader // nil when no cloud is configured (standalone/dev)
 
-	nodeID pb.NodeID
-	clock  *crdt.HLC
+	nodeID   pb.NodeID
+	clock    *crdt.HLC
+	temporal temporalEvidence
 
 	// In-memory offset generator (no durable log)
 	nextOff atomic.Uint64
@@ -208,6 +213,7 @@ type Engine struct {
 	OnKeyDataAdded func(key string) // wake oldest waiter (data inserted)
 	OnKeyDeleted   func(key string) // wake all waiters (key removed)
 	OnFlushAll     func()           // wake all waiters across all keys
+	keyChanged     atomic.Pointer[func(string)]
 
 	// OnLocalEffect fires once for every effect this node mints and persists —
 	// data/meta/bind via Context, verdict snapshots, subscriptions,
@@ -329,7 +335,13 @@ func (e *Engine) nextOffset() Tip {
 const FlushKey = "__swytch:flush"
 
 // FlushIndex deletes all keys from the index and evicts all cache entries.
-func (e *Engine) FlushIndex() {
+func (e *Engine) FlushIndex() error {
+	if e.effectCache != nil && e.effectCache.mirror != nil {
+		if err := e.effectCache.mirror.Reset(); err != nil {
+			return err
+		}
+	}
+
 	e.flushGeneration.Add(1)
 	slog.Info("FlushIndex: wiping all keys from index")
 
@@ -345,6 +357,10 @@ func (e *Engine) FlushIndex() {
 
 		e.index.Delete(key, tips)
 	}
+
+	e.notifyKeyChanged(FlushKey)
+
+	return nil
 }
 
 // GetLock returns a striped lock for the given key using FNV-1a hashing.
@@ -373,8 +389,8 @@ func (sm *safetyMap) modeForKey(key string) SafetyMode {
 	return sm.defaultMode
 }
 
-// NewEngine creates a new Engine from the given configuration.
-func NewEngine(cfg EngineConfig) *Engine {
+// newEngine initializes in-memory structures. OpenEngine owns startup/recovery.
+func newEngine(cfg EngineConfig) *Engine {
 	e := &Engine{
 		index:              keytrie.NewCritbit[leafState](),
 		broadcaster:        cfg.Broadcaster,
@@ -412,7 +428,6 @@ func NewEngine(cfg EngineConfig) *Engine {
 	}
 
 	e.memTarget = memTarget
-	e.startMemoryGovernor(memTarget)
 
 	// System keys ("__swytch:*": membership, flush, ...) are commutative
 	// protocol metadata and must never be quorum-gated — a node has to be able
@@ -854,7 +869,9 @@ func (e *Engine) classifyCloudTips(key string, tips []Tip, sidecar []CloudEffect
 				continue
 			}
 
-			e.putIngested(ce.Tip, ce.Eff, ce.ProtoLen)
+			if err := e.putIngested(ce.Tip, ce.Eff, ce.ProtoLen); err != nil {
+				return cloudTipClassification{}, err
+			}
 		}
 	}
 
@@ -961,7 +978,9 @@ func (e *Engine) mintLocalEffect(key string, currentSet *keytrie.TipSet, eff *pb
 
 	offset := e.nextOffset()
 	if e.effectCache != nil {
-		e.effectCache.PutSized(offset, eff, len(data))
+		if err := e.effectCache.PutSized(offset, eff, len(data)); err != nil {
+			return Tip{}, err
+		}
 	}
 
 	e.updateIndex(key, currentSet, offset)
@@ -977,6 +996,8 @@ func (e *Engine) mintLocalEffect(key string, currentSet *keytrie.TipSet, eff *pb
 
 // fireLocalEffect invokes OnLocalEffect for a freshly-minted persisted effect.
 func (e *Engine) fireLocalEffect(offset Tip, eff *pb.Effect) {
+	e.observeTemporal(offset, eff, false)
+
 	e.localEffectMu.RLock()
 	defer e.localEffectMu.RUnlock()
 
@@ -1449,7 +1470,9 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 
 	// Cache deserialized effect — owned if we serve its key, reclaimable cache
 	// (no creation ref) if we only need it to read through (e.g. cross-key).
-	e.putIngested(r(notify.GetOrigin()), eff, len(protoData))
+	if err := e.putIngested(r(notify.GetOrigin()), eff, len(protoData)); err != nil {
+		return nil, err
+	}
 
 	// Verdict-snapshot arrival ends horizon wait for every txn it adjudicates.
 	e.applySnapshotVerdicts(eff)
@@ -1458,7 +1481,10 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 	if string(eff.GetKey()) == FlushKey {
 		if data := eff.GetData(); data != nil && data.GetOp() == pb.EffectOp_REMOVE_OP {
 			slog.Info("HandleRemote: received flush-all from peer", "node", notify.GetOrigin().GetNodeId())
-			e.FlushIndex()
+
+			if err := e.FlushIndex(); err != nil {
+				return nil, err
+			}
 
 			if e.OnFlushAll != nil {
 				e.OnFlushAll()
@@ -1769,7 +1795,9 @@ func (e *Engine) handleBackfill(notify *pb.OffsetNotify) error {
 	}
 
 	if !fromCache {
-		e.putIngested(r(notify.GetOrigin()), eff, len(protoData))
+		if err := e.putIngested(r(notify.GetOrigin()), eff, len(protoData)); err != nil {
+			return err
+		}
 	}
 
 	// Verdict-snapshot arrival ends horizon wait for every txn it adjudicates.
@@ -2473,7 +2501,9 @@ func (e *Engine) prefetchEffects(refs []Tip) {
 			continue
 		}
 
-		e.putIngested(res.ref, eff, len(protoData))
+		if err := e.putIngested(res.ref, eff, len(protoData)); err != nil {
+			slog.Error("durability: failed to store fetched effect", "tip", res.ref, "error", err)
+		}
 	}
 }
 
@@ -2559,7 +2589,7 @@ func (e *Engine) releaseChainRefs(key string, tips []Tip, ls *leafState) {
 
 		visited[t] = struct{}{}
 
-		eff, ok := e.effectCache.decrefChainNode(t)
+		eff, ok := e.effectCache.decrefChainNode(key, t)
 		if !ok {
 			continue // not resident — nothing below to release
 		}
@@ -2615,13 +2645,17 @@ func (e *Engine) broadcastUnsubscribe(key string, tips []Tip) {
 			// unsubscribed — so it is dropped right after the hook: whoever
 			// increfed there (or nobody) owns the vertex from here.
 			if e.effectCache != nil {
-				e.effectCache.PutSized(offset, unsub, len(data))
+				if err := e.effectCache.PutSized(offset, unsub, len(data)); err != nil {
+					slog.Error("durability: failed to store unsubscribe", "error", err)
+
+					return
+				}
 			}
 
 			e.fireLocalEffect(offset, unsub)
 
 			if e.effectCache != nil {
-				e.effectCache.Decref(offset)
+				e.effectCache.decrefChainNode(key, offset)
 			}
 
 			notify := BuildOffsetNotify(e.nodeID, offset, unsub, data, nil)
@@ -2637,7 +2671,9 @@ func (e *Engine) broadcastUnsubscribe(key string, tips []Tip) {
 
 // Close performs graceful shutdown of the engine and its background components.
 func (e *Engine) Close() error {
-	e.closed.Store(true)
+	if e.closed.Swap(true) {
+		return nil
+	}
 
 	if e.antiEntropyStop != nil {
 		close(e.antiEntropyStop)
@@ -2651,6 +2687,12 @@ func (e *Engine) Close() error {
 
 	if e.spokenBinds != nil {
 		e.spokenBinds.Close()
+	}
+
+	if e.effectCache != nil && e.effectCache.mirror != nil {
+		e.reclaimUnreferenced()
+
+		return e.effectCache.mirror.Close()
 	}
 
 	return nil
@@ -2785,7 +2827,9 @@ func (e *Engine) probeAndFetchKey(key string) {
 		return
 	}
 
-	notify := BuildOffsetNotify(e.nodeID, Tip{0, uint64(hlc.GetSeconds())}, eff, data, nil)
+	// The offset is synthetic because discovery is never persisted, but the
+	// origin node must identify us: the peer routes its NACK reply there.
+	notify := BuildOffsetNotify(e.nodeID, Tip{uint64(e.nodeID), uint64(hlc.GetSeconds())}, eff, data, nil)
 
 	collector := &bootstrapCollector{
 		nacks: make(chan *pb.NackNotify, 64),
@@ -2954,9 +2998,7 @@ func (e *Engine) storeWireData(offset Tip, wireData []byte) error {
 		return err
 	}
 
-	e.putIngested(offset, eff, len(protoData))
-
-	return nil
+	return e.putIngested(offset, eff, len(protoData))
 }
 
 // depsMatchTips checks if the effect's deps are a subset of current tips.

@@ -25,7 +25,5 @@ package cluster
 
 import "errors"
 
-var (
-	// ErrPeerUnavailable is returned when a peer connection is not established.
-	ErrPeerUnavailable = errors.New("peer unavailable")
-)
+// ErrPeerUnavailable is returned when a peer connection is not established.
+var ErrPeerUnavailable = errors.New("peer unavailable")

@@ -72,6 +72,7 @@ func TestConcurrentRowWritesSharedBase_WeWin(t *testing.T) {
 	theirTxnID := "them-tx"
 	theirRWOffset := Tip{5, 699}
 	theirHLC := timestamppb.New(time.Unix(0, 10))
+
 	theirRW := &pb.Effect{
 		Key:            []byte("k"),
 		Hlc:            theirHLC,
@@ -83,7 +84,9 @@ func TestConcurrentRowWritesSharedBase_WeWin(t *testing.T) {
 			Columns: []*pb.TypedValue{{Kind: pb.TypedValue_INT, IntVal: 42}},
 		}},
 	}
-	e.effectCache.Put(theirRWOffset, theirRW)
+	if err := e.effectCache.Put(theirRWOffset, theirRW); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
 
 	theirBindOffset := Tip{5, 700}
 	theirBindHLC := timestamppb.New(time.Unix(0, 11))
@@ -111,7 +114,9 @@ func TestConcurrentRowWritesSharedBase_WeWin(t *testing.T) {
 			},
 		}},
 	}
-	e.effectCache.Put(theirBindOffset, theirBind)
+	if err := e.effectCache.Put(theirBindOffset, theirBind); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
 
 	bc.replicateToResults = map[pb.NodeID]*pb.NackNotify{
 		99: {
