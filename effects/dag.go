@@ -185,10 +185,10 @@ func (d *dag) shouldEmit(t Tip, eff *pb.Effect) bool {
 	return true
 }
 
-// bfs explores the graph from tips following deps. A snapshot is the LCA
-// when either: (1) a dep we follow is already visited and is a snapshot
-// (paths converged), or (2) we dequeue a snapshot with an empty queue
-// (no concurrent paths). All visited nodes are stored in d.nodes.
+// bfs explores the graph from tips following deps. The dependency frontier
+// is separate from the queue: visiting a root finishes work, but does not
+// make that path converge with another path. A snapshot can terminate the
+// walk only when it is the sole remaining frontier entry.
 //
 // Only state-carrying snapshots terminate the walk. Verdict-only snapshots
 // (State == nil) are opaque markers for fork-choice adjudication; their
@@ -197,8 +197,21 @@ func (d *dag) shouldEmit(t Tip, eff *pb.Effect) bool {
 // single dead-end tip and no way to recover the underlying chain.
 func (d *dag) bfs(tips []Tip, lcaTip *Tip) error {
 	queue := make([]Tip, 0, len(tips)*2)
+	snapshots := make([]Tip, 0, len(tips))
+	frontier := make(map[Tip]struct{}, len(tips))
+	enqueue := func(t Tip, eff *pb.Effect) {
+		if snap := eff.GetSnapshot(); snap != nil && snap.GetState() != nil {
+			snapshots = append(snapshots, t)
+		} else {
+			queue = append(queue, t)
+		}
+	}
 
 	for _, t := range tips {
+		if d.visited[t] {
+			continue
+		}
+
 		eff, err := d.engine.getEffect(d.key, t)
 		if err != nil {
 			return err
@@ -206,16 +219,30 @@ func (d *dag) bfs(tips []Tip, lcaTip *Tip) error {
 
 		d.visited[t] = true
 		d.nodes[t] = eff
-		queue = append(queue, t)
+		// A standalone subscription tip carries no data ancestry. If another
+		// path later references it, it becomes part of that path's frontier.
+		if eff.GetSubscription() == nil || len(eff.GetDeps()) > 0 {
+			frontier[t] = struct{}{}
+		}
+
+		enqueue(t, eff)
 	}
 
-	for len(queue) > 0 {
-		cur := queue[0]
-		queue = queue[1:]
+	for len(queue) > 0 || len(snapshots) > 0 {
+		var cur Tip
+		if len(queue) > 0 {
+			cur = queue[0]
+			queue = queue[1:]
+		} else {
+			// Let ordinary paths reach a pending snapshot before expanding
+			// its ancestry. Each effect is still fetched and expanded once.
+			cur = snapshots[0]
+			snapshots = snapshots[1:]
+		}
 
 		eff := d.nodes[cur]
 
-		if snap := eff.GetSnapshot(); snap != nil && snap.GetState() != nil && len(queue) == 0 {
+		if snap := eff.GetSnapshot(); snap != nil && snap.GetState() != nil && len(frontier) == 1 {
 			*lcaTip = cur
 
 			return nil
@@ -235,9 +262,18 @@ func (d *dag) bfs(tips []Tip, lcaTip *Tip) error {
 			refs = eff.GetDeps()
 		}
 
+		// Roots finish queued work without resolving their dependency path.
+		if len(refs) > 0 {
+			delete(frontier, cur)
+		}
+
 		for _, ref := range refs {
 			dt := r(ref)
 			if d.visited[dt] {
+				if dep := d.nodes[dt]; dep.GetSubscription() != nil && len(dep.GetDeps()) == 0 {
+					frontier[dt] = struct{}{}
+				}
+
 				continue
 			}
 
@@ -248,7 +284,18 @@ func (d *dag) bfs(tips []Tip, lcaTip *Tip) error {
 
 			d.visited[dt] = true
 			d.nodes[dt] = depEff
-			queue = append(queue, dt)
+			frontier[dt] = struct{}{}
+			enqueue(dt, depEff)
+		}
+	}
+
+	// A root snapshot may have been processed before a longer path reached
+	// it. Its frontier entry survives even though its queue entry is gone.
+	if len(frontier) == 1 {
+		for t := range frontier {
+			if snap := d.nodes[t].GetSnapshot(); snap != nil && snap.GetState() != nil {
+				*lcaTip = t
+			}
 		}
 	}
 
