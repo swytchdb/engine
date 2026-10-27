@@ -852,6 +852,30 @@ func (pm *PeerManager) UpdateTopology(newCfg *ClusterConfig) {
 	}
 }
 
+// WaitForInitialConnections waits for one connection attempt to each currently
+// configured peer. A failed attempt counts; reconnects continue in the background.
+// Peers added later are covered by a subsequent call, not an unbounded barrier.
+func (pm *PeerManager) WaitForInitialConnections(ctx context.Context) error {
+	token := pm.mu.RLock()
+
+	attempts := make([]<-chan struct{}, 0, len(pm.peers))
+	for _, pc := range pm.peers {
+		attempts = append(attempts, pc.firstAttempt)
+	}
+
+	pm.mu.RUnlock(token)
+
+	for _, done := range attempts {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-done:
+		}
+	}
+
+	return ctx.Err()
+}
+
 // WaitForPeer blocks until the given peer's stream is ready or context is cancelled.
 func (pm *PeerManager) WaitForPeer(ctx context.Context, nodeID NodeId) bool {
 	for {

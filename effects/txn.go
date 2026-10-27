@@ -96,14 +96,84 @@ type pendingTxnKey struct {
 // node. All call sites must reach the same answer so the client's
 // abort/commit signal matches the cluster's view of the bind.
 func (e *Engine) isRealConflict(ptxn *pendingTxn, key string, detail *pb.NackTipDetail) bool {
+	conflict, _ := e.checkNackConflict(ptxn, key, detail)
+
+	return conflict
+}
+
+// checkNackConflict unwraps snapshots and other non-data markers before applying
+// fork choice. A snapshot at the peer's frontier is not a cutoff: only ancestry
+// already shared with our transaction can be skipped. Missing competing history
+// cannot authorize a commit. Keep the defeated bind anchors from the same pass
+// so flushTx publishes the same decisions for wrapped and unwrapped competitors.
+func (e *Engine) checkNackConflict(ptxn *pendingTxn, key string, detail *pb.NackTipDetail) (bool, map[string]Tip) {
+	queue := []*pb.NackTipDetail{detail}
+	visited := make(map[Tip]bool)
+
+	var defeated map[string]Tip
+
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		tip := r(cur.GetRef())
+
+		if visited[tip] {
+			continue
+		}
+
+		visited[tip] = true
+
+		if cur.GetIsData() || cur.GetIsBind() {
+			if e.isRealConflictTip(ptxn, key, cur) {
+				return true, nil
+			}
+
+			if txn := e.defeatedCompetitor(ptxn, key, cur); txn != "" {
+				if defeated == nil {
+					defeated = make(map[string]Tip)
+				}
+
+				defeated[txn] = tip
+			}
+
+			continue
+		}
+
+		if tip != (Tip{}) && e.reachesFromTxOnKey(ptxn, &key, tip) {
+			continue
+		}
+
+		for _, dep := range cur.GetDeps() {
+			dt := r(dep)
+			if visited[dt] || e.reachesFromTxOnKey(ptxn, &key, dt) {
+				continue
+			}
+
+			eff, err := e.getEffect(key, dt)
+			if err != nil {
+				return true, nil
+			}
+
+			queue = append(queue, nackTipDetail(dt, eff))
+		}
+	}
+
+	return false, defeated
+}
+
+// nackTipOrdered proves that a data effect or bind is causally ordered with our
+// transaction. Wrappers must be expanded first: a snapshot may merge our own
+// bind with an independent competitor, and its edge to us cannot excuse that
+// other branch.
+func (e *Engine) nackTipOrdered(ptxn *pendingTxn, key string, detail *pb.NackTipDetail) bool {
 	for _, dep := range detail.GetDeps() {
 		if r(dep) == ptxn.bindOffset {
-			return false
+			return true
 		}
 
 		for _, pk := range ptxn.keys {
-			if r(dep) == pk.newTip {
-				return false
+			if pk.key == key && r(dep) == pk.newTip {
+				return true
 			}
 		}
 	}
@@ -112,9 +182,34 @@ func (e *Engine) isRealConflict(ptxn *pendingTxn, key string, detail *pb.NackTip
 		target := r(detail.GetRef())
 
 		var zero Tip
-		if target != zero && e.reachesFromTx(ptxn, target) {
-			return false
+		if target != zero && e.reachesFromTxOnKey(ptxn, &key, target) {
+			return true
 		}
+	}
+
+	// Descendancy can also run through data, noops, or snapshots; the direct
+	// dependency shortcut above alone misses those paths.
+	var theirs pendingTxn
+	for _, dep := range detail.GetDeps() {
+		theirs.keys = append(theirs.keys, pendingTxnKey{key: key, newTip: r(dep)})
+	}
+
+	if e.reachesFromTxOnKey(&theirs, &key, ptxn.bindOffset) {
+		return true
+	}
+
+	for _, pk := range ptxn.keys {
+		if pk.key == key && e.reachesFromTxOnKey(&theirs, &key, pk.newTip) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (e *Engine) isRealConflictTip(ptxn *pendingTxn, key string, detail *pb.NackTipDetail) bool {
+	if e.nackTipOrdered(ptxn, key, detail) {
+		return false
 	}
 
 	// Commutative effects: never conflict
@@ -182,14 +277,20 @@ func (e *Engine) isRealConflict(ptxn *pendingTxn, key string, detail *pb.NackTip
 }
 
 // reachesFromTx returns true if target is in the DAG ancestry of our
-// pending tx (its bind offset or any per-key NewTip), walking eff.Deps
-// via the local effect cache. Walks until the cache runs out — a miss
-// stops that branch rather than fetching, so an unreachable verdict is
-// "we can't confirm sequentiality from local state" not "they are
-// definitely concurrent."
+// pending tx (its bind offset or any per-key NewTip), following dependencies
+// and bind NewTips via getEffect. Unavailable effects stop that branch, so false
+// means "we cannot prove ancestry", not "definitely concurrent".
 // reachesFromTx requires every target to be in the transaction's ancestry.
 // Missing intermediate effects cannot prove a path. Targets share one walk.
 func (e *Engine) reachesFromTx(ptxn *pendingTxn, targets ...Tip) bool {
+	return e.reachesFromTxOnKey(ptxn, nil, targets...)
+}
+
+// A key-scoped proof follows only that key's bind NewTip. Global reachability
+// can order transactions through another key while their branches on this key
+// remain concurrent. A nil key retains the cross-key proof used by admission;
+// an empty string is still a real key.
+func (e *Engine) reachesFromTxOnKey(ptxn *pendingTxn, key *string, targets ...Tip) bool {
 	var zero Tip
 
 	remaining := make(map[Tip]struct{}, len(targets))
@@ -222,7 +323,9 @@ func (e *Engine) reachesFromTx(ptxn *pendingTxn, targets ...Tip) bool {
 	push(ptxn.bindOffset)
 
 	for _, pk := range ptxn.keys {
-		push(pk.newTip)
+		if key == nil || pk.key == *key {
+			push(pk.newTip)
+		}
 	}
 
 	for len(stack) > 0 {
@@ -235,12 +338,34 @@ func (e *Engine) reachesFromTx(ptxn *pendingTxn, targets ...Tip) bool {
 			return true
 		}
 
-		eff, err := e.getEffect("", cur)
+		var fetchKey string
+		if key != nil {
+			fetchKey = *key
+		}
+
+		eff, err := e.getEffect(fetchKey, cur)
 		if err != nil {
 			continue
 		}
 
-		for _, dep := range eff.GetDeps() {
+		refs := allDeps(eff)
+		if key != nil {
+			if bind := eff.GetTxnBind(); bind != nil {
+				refs = nil
+
+				for _, kb := range bind.GetKeys() {
+					if string(kb.GetKey()) == *key {
+						refs = []*pb.EffectRef{kb.GetNewTip()}
+
+						break
+					}
+				}
+			} else if string(eff.GetKey()) != *key {
+				continue
+			}
+		}
+
+		for _, dep := range refs {
 			push(r(dep))
 		}
 	}
@@ -340,20 +465,7 @@ func (e *Engine) defeatedCompetitor(ptxn *pendingTxn, key string, detail *pb.Nac
 	// must not enter defeatedSet. Without these, our post-commit snapshot
 	// records LOST for a transaction that committed cleanly elsewhere
 	// and propagates the wrong verdict.
-	for _, dep := range detail.GetDeps() {
-		if r(dep) == ptxn.bindOffset {
-			return ""
-		}
-
-		for _, pk := range ptxn.keys {
-			if r(dep) == pk.newTip {
-				return ""
-			}
-		}
-	}
-
-	var zero Tip
-	if theirBindOffset != zero && e.reachesFromTx(ptxn, theirBindOffset) {
+	if e.nackTipOrdered(ptxn, key, detail) {
 		return ""
 	}
 

@@ -413,6 +413,7 @@ func TestDefeatedCompetitor_TheirBindReachableViaDeps_NotDefeated(t *testing.T) 
 	// Our bind: causally-after theirs. Deps include theirBindOffset.
 	ourBindOffset := Tip{42, 200}
 	if err := e.effectCache.Put(ourBindOffset, &pb.Effect{
+		Key:  []byte("k"),
 		Deps: []*pb.EffectRef{{NodeId: 5, Offset: 100}},
 	}); err != nil {
 		t.Fatalf("Put: %v", err)

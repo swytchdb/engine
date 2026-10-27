@@ -92,6 +92,16 @@ func New(cfg Config, engine *effects.Engine, pm *cluster.PeerManager) *Beacon {
 		removeSignal: make(chan struct{}, 1),
 		safety:       newSafetyWatcher(engine),
 	}
+	// Both projections observe index changes, including snapshots and backfill.
+	// Callbacks only signal: reconstruction here would reenter the engine.
+	engine.SetOnKeyChanged(func(key string) {
+		b.safety.notify(key)
+
+		if key == MembershipKey || key == effects.FlushKey {
+			b.NotifyMembershipChanged()
+		}
+	})
+
 	// A cloud-pushed "delete this server" command applies through the same
 	// membership REMOVE_OP path the local sweeps use.
 	if cfg.Cloud != nil {
@@ -262,16 +272,15 @@ func (b *Beacon) Start(ctx context.Context) (err error) {
 		return err
 	}
 
-	// Phase 3: Wait until the membership key converges on every
-	// candidate peer — guaranteed to terminate because all peers are
-	// now registering themselves concurrently in their own Phase 2.
-	if err := b.waitForMembershipConverged(b.ctx); err != nil {
+	// Phase 3: Exchange membership and attempt each discovered peer before
+	// opening the transport. Unreachable members need not converge first.
+	if err := b.joinMembership(b.ctx); err != nil {
 		return err
 	}
 
 	// Phase 4: Reactive topology projection. The membership key is a normal
 	// key; the connection table is just a projection of it, rebuilt whenever
-	// the key changes (signalled via OnKeyDataAdded → NotifyMembershipChanged).
+	// the index changes (signalled via SetOnKeyChanged → NotifyMembershipChanged).
 	// No polling, and crucially no write-back: we never re-register to "fix" a
 	// stale read — a stale read is a coherence problem to solve in the engine,
 	// not paper over here.
@@ -347,7 +356,7 @@ func (b *Beacon) waitForSymmetricPeers(ctx context.Context) error {
 // primeSubscription triggers an early subscription to the membership key
 // by calling GetSnapshot. NACKs from peers carry their existing membership
 // tips into the local engine. Errors are non-fatal since the subscription
-// will be retried during waitForMembershipConverged.
+// will be followed by the explicit join membership exchange.
 func (b *Beacon) primeSubscription() {
 	ctx := b.engine.NewContext()
 
@@ -418,11 +427,11 @@ func (b *Beacon) unregisterSelf() {
 // topologyLoop keeps the PeerManager's connection table as a reactive
 // projection of the __swytch:members key. It reads once at startup, then
 // rebuilds topology each time the key changes — driven by
-// NotifyMembershipChanged (wired to OnKeyDataAdded, which fires on both local
-// writes and remote effect arrivals). No poll.
+// NotifyMembershipChanged (wired to the index-change observer, including
+// snapshots and backfill). No poll.
 //
-// It runs in its own goroutine precisely because OnKeyDataAdded fires
-// synchronously inside Flush / HandleRemote: doing the read there would
+// It runs in its own goroutine because the observer fires synchronously
+// inside index updates: doing the read there would
 // deadlock the write that triggered it (GetSnapshot → ensureSubscribed can
 // block on peer ACKs). So the callback only signals; the read happens here.
 //
@@ -473,18 +482,16 @@ func (b *Beacon) NotifyMembershipChanged() {
 // the live owner of the address ever evaluates it true, so this cannot
 // ping-pong the way compensating re-inserts did.
 func (b *Beacon) refreshTopology() {
-	ctx := b.engine.NewContext()
-
-	snapshot, _, err := ctx.GetSnapshot(MembershipKey)
+	// Observation must not emit compaction snapshots: their arrival triggers
+	// the same observer on every peer and can create a refresh feedback loop.
+	snapshot, _, err := b.engine.NewReadOnlyContext().GetSnapshot(MembershipKey)
 	if err != nil {
-		if flushErr := ctx.Flush(); flushErr != nil {
-			slog.Error("beacon: failed membership read flush", "error", flushErr)
-		}
-
 		slog.Debug("beacon: membership snapshot read failed", "error", err)
 
 		return
 	}
+
+	ctx := b.engine.NewContext()
 
 	selfID := uint64(b.cfg.NodeID)
 	for _, m := range parseMembership(snapshot) {

@@ -71,9 +71,10 @@ type PeerConn struct {
 	// it runs on inbound QUIC connections.
 	onConnected func(*quic.Conn)
 
-	mu          sync.Mutex
-	cancel      context.CancelFunc
-	streamReady atomic.Bool
+	mu           sync.Mutex
+	cancel       context.CancelFunc
+	streamReady  atomic.Bool
+	firstAttempt chan struct{}
 }
 
 // newPeerConn creates a new PeerConn but does not connect.
@@ -89,13 +90,14 @@ func newPeerConn(
 	onConnected func(*quic.Conn),
 ) *PeerConn {
 	return &PeerConn{
-		nodeID:      nodeID,
-		addr:        addr,
-		region:      peerRegion,
-		localRegion: localRegion,
-		handler:     handler,
-		tlsConfig:   tlsConfig,
-		onConnected: onConnected,
+		nodeID:       nodeID,
+		addr:         addr,
+		region:       peerRegion,
+		localRegion:  localRegion,
+		handler:      handler,
+		tlsConfig:    tlsConfig,
+		onConnected:  onConnected,
+		firstAttempt: make(chan struct{}),
 	}
 }
 
@@ -268,6 +270,11 @@ func (pc *PeerConn) IsStreamReady() bool {
 func (pc *PeerConn) connectLoop(ctx context.Context) {
 	backoff := backoffBase
 
+	var first sync.Once
+
+	attempted := func() { first.Do(func() { close(pc.firstAttempt) }) }
+	defer attempted()
+
 	for {
 		if ctx.Err() != nil {
 			return
@@ -275,6 +282,7 @@ func (pc *PeerConn) connectLoop(ctx context.Context) {
 
 		err := pc.dial(ctx)
 		if err != nil {
+			attempted()
 			slog.Warn("failed to dial peer", "peer", pc.nodeID, "address", pc.addr, "error", err)
 
 			select {
@@ -300,6 +308,8 @@ func (pc *PeerConn) connectLoop(ctx context.Context) {
 		if pc.onConnected != nil {
 			pc.onConnected(pc.quicConn)
 		}
+
+		attempted()
 
 		// Wait for connection to close
 		<-pc.quicConn.Context().Done()

@@ -112,8 +112,8 @@ type RuntimeConfig struct {
 	// own durable store (e.g. the cloud dataplane's internal S3): OnLocalEffect
 	// sees every persisted local mint, CloudReader answers read-misses with a
 	// tip frontier, CDNFetcher joins the blob-fetch race, and OnKeyDataAdded
-	// fires on every key change (NewRuntime chains its own membership handling
-	// on top). Mutually exclusive with ConnectionSecret, which wires Swytch
+	// wakes data consumers. Membership uses the separate index-change observer.
+	// Mutually exclusive with ConnectionSecret, which wires Swytch
 	// Cloud through these same seams internally. All optional.
 	OnLocalEffect  func(offset effects.Tip, eff *pb.Effect)
 	OnKeyDataAdded func(key string)
@@ -339,25 +339,6 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 		Passphrase:    passphrase,
 		Cloud:         cloudSync,
 	}, engine, pm)
-
-	// Membership is a normal key; the live connection table is just a reactive
-	// projection of it. Rebuild topology whenever the membership key changes —
-	// a local write or a peer's effect arriving — instead of polling. Chained
-	// so a transport that installs its own OnKeyDataAdded later (e.g. redis)
-	// preserves this. OnKeyDataAdded fires synchronously inside Flush /
-	// HandleRemote, so we only signal here and do the GetSnapshot on the
-	// beacon's own goroutine — calling back into the engine inline would
-	// deadlock the very write that triggered us.
-	prevOnKeyDataAdded := engine.OnKeyDataAdded
-	engine.OnKeyDataAdded = func(key string) {
-		if prevOnKeyDataAdded != nil {
-			prevOnKeyDataAdded(key)
-		}
-
-		if key == MembershipKey {
-			b.NotifyMembershipChanged()
-		}
-	}
 
 	if cfg.AsyncJoin {
 		// Local engine + QUIC listener are already up; run the blocking

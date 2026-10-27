@@ -45,9 +45,16 @@ func TestStartCancellationAfterRegistrationRollsBackMembership(t *testing.T) {
 		}
 	})
 
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
 	registered := make(chan struct{}, 1)
 	engine.OnKeyDataAdded = func(key string) {
 		if key == MembershipKey {
+			// Cancel before registration returns, so rollback is exercised
+			// independently of how quickly the subsequent join attempt finishes.
+			cancel()
+
 			select {
 			case registered <- struct{}{}:
 			default:
@@ -71,12 +78,6 @@ func TestStartCancellationAfterRegistrationRollsBackMembership(t *testing.T) {
 		NodeID:        nodeID,
 		AdvertiseAddr: "127.0.0.1:7380",
 	}, engine, &cluster.PeerManager{})
-	// Force the post-registration convergence wait without bootstrapping a
-	// real transport. A zero PeerManager has no health table, so the symmetric
-	// peer gate is a no-op while convergence still waits for one non-self entry.
-	b.expectedPeers = 1
-
-	ctx, cancel := context.WithCancel(t.Context())
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -85,7 +86,6 @@ func TestStartCancellationAfterRegistrationRollsBackMembership(t *testing.T) {
 
 	select {
 	case <-registered:
-		cancel()
 	case <-time.After(5 * time.Second):
 		t.Fatal("self-registration did not complete")
 	}

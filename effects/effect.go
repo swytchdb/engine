@@ -2259,35 +2259,7 @@ func (e *Engine) buildEnrichedNack(key string, conflicting *pb.EffectRef, tips [
 		}
 
 		nack.Tips = append(nack.Tips, toPbRef(tp))
-
-		detail := &pb.NackTipDetail{
-			Ref:             toPbRef(tp),
-			Hlc:             eff.GetHlc(),
-			IsTransactional: eff.GetTxnId() != "",
-			Deps:            eff.GetDeps(),
-		}
-		if data := eff.GetData(); data != nil {
-			detail.IsData = true
-			detail.Collection = data.GetCollection()
-			detail.ElementId = data.GetId()
-			detail.Op = data.GetOp()
-		}
-
-		if bind := eff.GetTxnBind(); bind != nil {
-			detail.IsBind = true
-			detail.BindHlc = bind.GetTxnHlc()
-			detail.BindNodeId = bind.GetOriginatorNodeId()
-
-			detail.BindForkChoiceHash = ComputeForkChoiceHash(pb.NodeID(bind.GetOriginatorNodeId()), bind.GetTxnHlc())
-			for _, kb := range bind.GetKeys() {
-				detail.BindConsumedTips = append(detail.BindConsumedTips, &pb.KeyConsumedTips{
-					Key:          kb.GetKey(),
-					ConsumedTips: kb.GetConsumedTips(),
-				})
-			}
-		}
-
-		nack.TipDetails = append(nack.TipDetails, detail)
+		nack.TipDetails = append(nack.TipDetails, nackTipDetail(tp, eff))
 	}
 
 	nack.CausalChain = e.collectCausalChain(key, tips)
@@ -2295,10 +2267,44 @@ func (e *Engine) buildEnrichedNack(key string, conflicting *pb.EffectRef, tips [
 	return nack
 }
 
+// nackTipDetail gives fetched ancestry the same classification as an advertised
+// frontier tip. It does not walk or attach a prefetch chain.
+func nackTipDetail(tp Tip, eff *pb.Effect) *pb.NackTipDetail {
+	detail := &pb.NackTipDetail{
+		Ref:             toPbRef(tp),
+		Hlc:             eff.GetHlc(),
+		IsTransactional: eff.GetTxnId() != "",
+		Deps:            eff.GetDeps(),
+	}
+	if data := eff.GetData(); data != nil {
+		detail.IsData = true
+		detail.Collection = data.GetCollection()
+		detail.ElementId = data.GetId()
+		detail.Op = data.GetOp()
+	}
+
+	if bind := eff.GetTxnBind(); bind != nil {
+		detail.IsBind = true
+		detail.BindHlc = bind.GetTxnHlc()
+		detail.BindNodeId = bind.GetOriginatorNodeId()
+		detail.BindForkChoiceHash = ComputeForkChoiceHash(pb.NodeID(bind.GetOriginatorNodeId()), bind.GetTxnHlc())
+
+		for _, kb := range bind.GetKeys() {
+			detail.BindConsumedTips = append(detail.BindConsumedTips, &pb.KeyConsumedTips{
+				Key:          kb.GetKey(),
+				ConsumedTips: kb.GetConsumedTips(),
+			})
+		}
+	}
+
+	return detail
+}
+
 // collectCausalChain walks the local DAG from tips to the LCA snapshot
-// (BFS, same stop condition as dag.bfs) and returns every effect ref in
-// the active path. The receiver can bulk-fetch all of them instead of
-// discovering the chain one hop at a time.
+// and returns the discovered refs, including missing dependencies. As in
+// dag.bfs, only convergence of the dependency frontier permits a snapshot
+// cutoff; roots and cache misses do not resolve a path. The receiver can
+// bulk-fetch these refs instead of discovering the chain one hop at a time.
 func (e *Engine) collectCausalChain(key string, tips []keytrie.EffectRef) []*pb.EffectRef {
 	if e.effectCache == nil || len(tips) == 0 {
 		return nil
@@ -2308,29 +2314,62 @@ func (e *Engine) collectCausalChain(key string, tips []keytrie.EffectRef) []*pb.
 
 	visited := make(map[Tip]bool, len(tips)*4)
 	queue := make([]Tip, 0, len(tips))
+	snapshots := make([]Tip, 0, len(tips))
+	frontier := make(map[Tip]struct{}, len(tips))
 
 	var chain []*pb.EffectRef
 
-	for _, tp := range tips {
-		if tp == zero || visited[tp] {
-			continue
+	enqueue := func(tp Tip, standalone bool) {
+		if tp == zero {
+			return
+		}
+
+		eff, ok := e.effectCache.Get(tp)
+		if visited[tp] {
+			if !standalone && ok && eff.GetSubscription() != nil && len(eff.GetDeps()) == 0 {
+				frontier[tp] = struct{}{}
+			}
+
+			return
 		}
 
 		visited[tp] = true
-		queue = append(queue, tp)
+		frontier[tp] = struct{}{}
 		chain = append(chain, toPbRef(tp))
+
+		if !ok {
+			return
+		}
+
+		if standalone && eff.GetSubscription() != nil && len(eff.GetDeps()) == 0 {
+			delete(frontier, tp)
+		}
+
+		if snap := eff.GetSnapshot(); snap != nil && snap.GetState() != nil {
+			snapshots = append(snapshots, tp)
+		} else {
+			queue = append(queue, tp)
+		}
 	}
 
-	for len(queue) > 0 {
-		cur := queue[0]
-		queue = queue[1:]
+	for _, tp := range tips {
+		enqueue(tp, true)
+	}
+
+	for len(queue) > 0 || len(snapshots) > 0 {
+		var cur Tip
+		if len(queue) > 0 {
+			cur, queue = queue[0], queue[1:]
+		} else {
+			cur, snapshots = snapshots[0], snapshots[1:]
+		}
 
 		eff, ok := e.effectCache.Get(cur)
 		if !ok {
 			continue
 		}
 
-		if snap := eff.GetSnapshot(); snap != nil && snap.GetState() != nil && len(queue) == 0 {
+		if snap := eff.GetSnapshot(); snap != nil && snap.GetState() != nil && len(frontier) == 1 {
 			break
 		}
 
@@ -2348,15 +2387,12 @@ func (e *Engine) collectCausalChain(key string, tips []keytrie.EffectRef) []*pb.
 			refs = eff.GetDeps()
 		}
 
-		for _, ref := range refs {
-			dt := r(ref)
-			if dt == zero || visited[dt] {
-				continue
-			}
+		if len(refs) > 0 {
+			delete(frontier, cur)
+		}
 
-			visited[dt] = true
-			queue = append(queue, dt)
-			chain = append(chain, ref)
+		for _, ref := range refs {
+			enqueue(r(ref), false)
 		}
 	}
 
@@ -2366,10 +2402,10 @@ func (e *Engine) collectCausalChain(key string, tips []keytrie.EffectRef) []*pb.
 // ingestNackTips fetches and processes effects referenced in a NACK's
 // tip details so the local DAG catches up with the peer's view.
 //
-// When the NACK includes a CausalChain (the sender pre-walked its DAG
-// from tips to LCA), all refs are fetched in parallel — no sequential
-// dep discovery needed. Falls back to BFS dep-walking for old peers
-// that don't populate the chain.
+// CausalChain prefetch is only a cache warmer. The synchronous per-key walk
+// still discovers dependencies and stops only at a common state snapshot.
+// Failed fetches remain unresolved frontier entries, so they cannot make an
+// unrelated snapshot authoritative merely by exhausting the work queue.
 func (e *Engine) ingestNackTips(nack *pb.NackNotify) {
 	if nack == nil || e.broadcaster == nil {
 		return
@@ -2382,25 +2418,25 @@ func (e *Engine) ingestNackTips(nack *pb.NackNotify) {
 	var zero Tip
 
 	visited := make(map[Tip]bool)
-
 	queue := make([]Tip, 0, len(nack.GetTipDetails()))
-	for _, d := range nack.GetTipDetails() {
-		if d == nil || d.GetRef() == nil {
-			continue
+	snapshots := make([]Tip, 0, len(nack.GetTipDetails()))
+	frontier := make(map[Tip]struct{}, len(nack.GetTipDetails()))
+	nodes := make(map[Tip]*pb.Effect)
+	enqueue := func(off Tip, standalone bool) {
+		if off == zero {
+			return
 		}
 
-		queue = append(queue, r(d.GetRef()))
-	}
+		if visited[off] {
+			if eff := nodes[off]; !standalone && eff.GetSubscription() != nil && len(eff.GetDeps()) == 0 {
+				frontier[off] = struct{}{}
+			}
 
-	for len(queue) > 0 {
-		off := queue[0]
-		queue = queue[1:]
-
-		if off == zero || visited[off] {
-			continue
+			return
 		}
 
 		visited[off] = true
+		frontier[off] = struct{}{}
 
 		notify := &pb.OffsetNotify{
 			Origin: toPbRef(off),
@@ -2410,18 +2446,67 @@ func (e *Engine) ingestNackTips(nack *pb.NackNotify) {
 			slog.Debug("ingestNackTips: handleBackfill failed",
 				"ref", off, "error", err)
 
-			continue
+			return
 		}
 
-		if e.effectCache != nil {
-			if cached, ok := e.effectCache.Get(off); ok {
-				if snap := cached.GetSnapshot(); snap != nil && snap.GetState() != nil && len(queue) == 0 {
+		if e.effectCache == nil {
+			return
+		}
+
+		eff, ok := e.effectCache.Get(off)
+		if !ok {
+			return
+		}
+
+		nodes[off] = eff
+		if standalone && eff.GetSubscription() != nil && len(eff.GetDeps()) == 0 {
+			delete(frontier, off)
+		}
+
+		if snap := eff.GetSnapshot(); snap != nil && snap.GetState() != nil {
+			snapshots = append(snapshots, off)
+		} else {
+			queue = append(queue, off)
+		}
+	}
+
+	for _, detail := range nack.GetTipDetails() {
+		enqueue(r(detail.GetRef()), true)
+	}
+
+	for len(queue) > 0 || len(snapshots) > 0 {
+		var cur Tip
+		if len(queue) > 0 {
+			cur, queue = queue[0], queue[1:]
+		} else {
+			cur, snapshots = snapshots[0], snapshots[1:]
+		}
+
+		eff := nodes[cur]
+		if snap := eff.GetSnapshot(); snap != nil && snap.GetState() != nil && len(frontier) == 1 {
+			break
+		}
+
+		var refs []*pb.EffectRef
+
+		if bind := eff.GetTxnBind(); bind != nil {
+			for _, kb := range bind.GetKeys() {
+				if string(kb.GetKey()) == string(nack.GetKey()) {
+					refs = []*pb.EffectRef{kb.GetNewTip()}
+
 					break
 				}
-
-				stack := fromPbRefs(cached.GetDeps())
-				queue = append(queue, stack...)
 			}
+		} else {
+			refs = eff.GetDeps()
+		}
+
+		if len(refs) > 0 {
+			delete(frontier, cur)
+		}
+
+		for _, ref := range refs {
+			enqueue(r(ref), false)
 		}
 	}
 }
