@@ -186,13 +186,15 @@ func (h *HorizonSet) Add(txnID string, bindOffset Tip, bind *pb.TransactionalBin
 	for k := range allKeys {
 		targetGroup.allKeys[k] = struct{}{}
 	}
+
+	groupSize := len(targetGroup.entries)
 	targetGroup.mu.Unlock()
 	h.mu.Unlock()
 
 	h.entries.Store(txnID, entry)
 
 	slog.Debug("HorizonSet.Add", "txnID", txnID, "bindOffset", bindOffset,
-		"group_size", len(targetGroup.entries))
+		"group_size", groupSize)
 }
 
 // HorizonWait is a handle returned by WaitForClear. It carries the

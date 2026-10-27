@@ -477,28 +477,27 @@ func (c *Context) getSnapshotFromTx(key string) (*pb.ReducedEffect, []Tip, error
 		return nil, nil, err
 	}
 
-	if tips == nil && len(c.txSnapshot.views[key].anchors[key]) == 0 {
-		return nil, nil, nil // no history belongs to this key in the fixed cut
-	}
-
 	snapshotTips := tips.Tips()
 
 	tipOffsets := c.engine.resolveTipDeps(snapshotTips)
 
 	tipOffsets = append(append([]Tip(nil), tipOffsets...), c.txSnapshot.views[key].anchors[key]...)
-	if len(tipOffsets) == 0 {
-		return nil, nil, nil
-	}
-	// waitForHorizon=true: SSI-snapshot read served back to the client.
-	result, _, err := c.engine.reconstructWithView(key, tipOffsets, c.txnID, true, c.txSnapshot.views[key])
-	if err != nil {
-		return nil, nil, err
+
+	var result *pb.ReducedEffect
+	if len(tipOffsets) != 0 {
+		// waitForHorizon=true: SSI-snapshot read served back to the client.
+		result, _, err = c.engine.reconstructWithView(key, tipOffsets, c.txnID, true, c.txSnapshot.views[key])
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 
 	result = filterSnapshotAt(result, c.txSnapshot.expiryAt)
 
-	// Emit a NOOP to record this read in the causal structure.
-	// The Bind will include this key in its read set.
+	// Record every successful read, including absence. An empty historical
+	// frontier is still a dependency: omitting it from c.keys would omit it
+	// from SSI validation and the Bind, allowing absent-key write skew.
+	// Emit retains the frozen data frontier, adding only subscription metadata.
 	if err := c.Emit(&pb.Effect{
 		Key:  []byte(key),
 		Kind: &pb.Effect_Noop{Noop: &pb.NoopEffect{}},
@@ -722,8 +721,17 @@ func (c *Context) Emit(eff *pb.Effect, snapshotTips ...[]Tip) error {
 	// a definite miss (GetSnapshot's free-miss gate), so ANY context can reach
 	// Emit unsubscribed — authority is claimed here, where state is created.
 	// Allocation-free no-op when already subscribed.
-	if err := c.engine.ensureSubscribed(key); err != nil {
-		return err
+	var subscribeErr error
+	if c.inTx {
+		// A fresh transactional key must discover its peer subscribers before
+		// commit; an async announcement can leave both origins believing solo.
+		subscribeErr = c.engine.ensureSubscribedBlocking(key)
+	} else {
+		subscribeErr = c.engine.ensureSubscribed(key)
+	}
+
+	if subscribeErr != nil {
+		return subscribeErr
 	}
 
 	if tracing.Enabled() {
@@ -758,6 +766,24 @@ func (c *Context) Emit(eff *pb.Effect, snapshotTips ...[]Tip) error {
 			}
 		} else {
 			tips = c.engine.index.Contains(key)
+		}
+
+		if c.inTx {
+			// Subscribing after BeginTx creates metadata outside the fixed
+			// data snapshot. Consume those subscription tips as well: leaving
+			// them orphaned loses the shared causal base and can make future
+			// retries abort forever on an already-spoken subscription tip.
+			// Never adopt newer data, binds, or snapshots from the live index.
+			deps := append([]Tip(nil), tips.Tips()...)
+			for _, tip := range c.engine.index.Contains(key).Tips() {
+				if parent, ok := c.engine.effectCache.Get(tip); ok && parent.GetSubscription() != nil {
+					deps = append(deps, tip)
+				}
+			}
+
+			if len(deps) != 0 {
+				tips = keytrie.NewTipSet(deps...)
+			}
 		}
 
 		ck = &contextKey{initialTips: tips, readOnly: c.inTx}
