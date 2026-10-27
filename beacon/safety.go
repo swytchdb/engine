@@ -22,18 +22,20 @@ type safetyWatcher struct {
 
 func newSafetyWatcher(engine *effects.Engine) *safetyWatcher {
 	w := &safetyWatcher{engine: engine, changed: make(chan struct{}, 1)}
-	engine.SetOnKeyChanged(func(key string) {
-		if key != effects.ClusterSafetyKey && key != effects.KeySafetyKey && key != effects.FlushKey {
-			return
-		}
-
-		select {
-		case w.changed <- struct{}{}:
-		default:
-		}
-	})
+	engine.SetOnKeyChanged(w.notify)
 
 	return w
+}
+
+func (w *safetyWatcher) notify(key string) {
+	if key != effects.ClusterSafetyKey && key != effects.KeySafetyKey && key != effects.FlushKey {
+		return
+	}
+
+	select {
+	case w.changed <- struct{}{}:
+	default:
+	}
 }
 
 func (w *safetyWatcher) refresh() error {

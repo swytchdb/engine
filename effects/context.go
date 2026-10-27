@@ -29,6 +29,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log/slog"
+	"maps"
 	rand "math/rand/v2"
 	"sort"
 	"sync"
@@ -1655,7 +1656,8 @@ func (c *Context) flushTx() error {
 					c.engine.ingestNackTips(nack)
 
 					for _, detail := range nack.GetTipDetails() {
-						if c.engine.isRealConflict(ptxn, string(nack.GetKey()), detail) {
+						conflict, defeated := c.engine.checkNackConflict(ptxn, string(nack.GetKey()), detail)
+						if conflict {
 							slog.Debug("flushTx: real conflict detected, aborting",
 								"bind_offset", bindOffset,
 								"nack_key", string(nack.GetKey()),
@@ -1668,9 +1670,7 @@ func (c *Context) flushTx() error {
 							break
 						}
 
-						if beaten := c.engine.defeatedCompetitor(ptxn, string(nack.GetKey()), detail); beaten != "" {
-							defeatedSet[beaten] = r(detail.GetRef())
-						}
+						maps.Copy(defeatedSet, defeated)
 					}
 
 					if ptxn.state.Load() == txnStateAborted {

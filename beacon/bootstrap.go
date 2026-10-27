@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/swytchdb/engine/cluster"
@@ -39,7 +40,7 @@ import (
 // bootstrap performs peer discovery (DNS, or the cloud membership roster when
 // --cloud is set), installs a temporary topology, and waits for at least one
 // peer to become reachable. It does NOT read authoritative membership — that
-// happens in waitForMembershipConverged after self-registration, because
+// happens in joinMembership after self-registration, because
 // every node's bootstrap waits for the others to be visible and nobody is
 // visible until they've registered themselves. Reading membership before
 // registerSelf deadlocks the fleet when nodes start simultaneously.
@@ -253,99 +254,135 @@ func (b *Beacon) resolveJoinAddrWithRetry(ctx context.Context) ([]string, error)
 	}
 }
 
-// waitForMembershipConverged blocks until the membership key shows
-// every DNS-discovered candidate peer. This is required for correctness:
-// a node that accepts client traffic before its topology matches the
-// full cluster will call UpdateTopology with a partial peer list,
-// disconnect the rest, and subsequent SafeMode writes will either
-// fail with region-partitioned or — worse — silently commit without
-// replicating to peers the node doesn't know about.
-//
-// Called AFTER registerSelf so the fleet-wide deadlock is broken:
-// every node has published its own entry by the time it starts
-// waiting for the others. On solo mode (expectedPeers == 0) this is
-// a no-op.
-func (b *Beacon) waitForMembershipConverged(ctx context.Context) error {
-	if b.expectedPeers == 0 {
-		return nil
+// joinMembership attempts a membership exchange with every known peer before
+// serving traffic. A seed's address count is not the cluster's membership count:
+// project the exchanged roster and also attempt peers learned through it.
+// Failed peers do not hold join open waiting for full convergence; normal
+// reconnection and membership observation continue after this initial attempt.
+// Self-registration precedes this so simultaneous joiners can discover each other.
+func (b *Beacon) joinMembership(ctx context.Context) error {
+	attempted := make(map[cluster.NodeId]bool)
+
+	for {
+		if err := b.pm.WaitForInitialConnections(ctx); err != nil {
+			return err
+		}
+
+		var peers []cluster.NodeId
+
+		for _, peer := range b.pm.PeerIDs() {
+			if !attempted[peer] {
+				peers = append(peers, peer)
+			}
+		}
+
+		if len(peers) > 0 {
+			if err := b.exchangeMembership(ctx, peers); err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+
+				slog.Warn("beacon: membership exchange incomplete; continuing after attempt", "error", err)
+			}
+
+			for _, peer := range peers {
+				attempted[peer] = true
+			}
+		}
+
+		snapshot, _, err := b.engine.NewReadOnlyContext().GetSnapshot(MembershipKey)
+		if err != nil {
+			return err
+		}
+
+		b.syncMembership(snapshot)
+
+		if len(peers) == 0 {
+			// Projection can discover peers even without an exchange (e.g.
+			// an inbound arrival during bootstrap). Attempt those as well.
+			pending := false
+			for _, peer := range b.pm.PeerIDs() {
+				pending = pending || !attempted[peer]
+			}
+
+			if !pending {
+				return ctx.Err()
+			}
+		}
 	}
+}
 
-	waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	members, err := b.readMembershipWithRetry(waitCtx, b.expectedPeers)
+// exchangeMembership reannounces the existing membership tips, including our
+// registration, and ingests the peers' NACK frontiers before returning. A cached
+// read alone does neither. Reuse normal effect replication; no new membership
+// records or compaction snapshots are minted by the exchange.
+func (b *Beacon) exchangeMembership(ctx context.Context, peers []cluster.NodeId) error {
+	_, tips, err := b.engine.NewReadOnlyContext().GetSnapshot(MembershipKey)
 	if err != nil {
 		return err
 	}
 
-	slog.Info("beacon: discovered members from effects", "count", len(members))
-	b.mu.Lock()
-	b.members = members
-	b.mu.Unlock()
-	b.updateTopology(members)
+	var notifies []*pb.OffsetNotify
 
-	return nil
-}
-
-// readMembershipWithRetry polls GetSnapshot(MembershipKey) until the
-// cluster has enough same-region peers reachable to satisfy SafeMode
-// AND the parsed membership contains at least expectedPeers non-self
-// entries (matching the DNS-discovered non-self candidate count), or
-// ctx is cancelled. parseMembership returns the full member set
-// including self; the threshold must compare apples-to-apples or the
-// loop returns early with a partial topology that drops a slow
-// registrant.
-func (b *Beacon) readMembershipWithRetry(ctx context.Context, expectedPeers int) ([]Member, error) {
-	backoff := 100 * time.Millisecond
-
-	const maxBackoff = 1 * time.Second
-
-	selfID := uint64(b.cfg.NodeID)
-
-	for {
-		ectx := b.engine.NewContext()
-
-		snapshot, _, err := ectx.GetSnapshot(MembershipKey)
-		if flushErr := ectx.Flush(); flushErr != nil {
-			return nil, errors.Join(err, fmt.Errorf("flush membership read: %w", flushErr))
+	for _, tip := range tips {
+		eff, ok := b.engine.EffectCache().Get(tip)
+		if !ok {
+			return fmt.Errorf("membership tip %v unavailable", tip)
 		}
 
-		if err == nil {
-			members := parseMembership(snapshot)
-			nonSelf := 0
+		wire, err := effects.MarshalEffect(eff)
+		if err != nil {
+			return err
+		}
 
-			for _, m := range members {
-				if m.NodeID != selfID {
-					nonSelf++
+		notifies = append(notifies, effects.BuildOffsetNotify(pb.NodeID(tip[0]), tip, eff, wire, ctx))
+	}
+
+	type response struct {
+		nacks []*pb.NackNotify
+		err   error
+	}
+
+	responses := make(chan response, len(peers))
+
+	var wg sync.WaitGroup
+	for _, peer := range peers {
+		wg.Go(func() {
+			var res response
+
+			for _, notify := range notifies {
+				if ctx.Err() != nil {
+					res.err = errors.Join(res.err, ctx.Err())
+
+					break
+				}
+
+				nacks, err := b.pm.ReplicateTo(notify, notify.GetEffectData(), peer)
+
+				res.nacks = append(res.nacks, nacks...)
+				if err != nil {
+					res.err = fmt.Errorf("peer %d: %w", peer, err)
+
+					break
 				}
 			}
 
-			if nonSelf >= expectedPeers {
-				return members, nil
-			}
+			responses <- res
+		})
+	}
 
-			slog.Debug("beacon: membership not fully converged",
-				"have", nonSelf, "want", expectedPeers, "backoff", backoff)
-		} else if errors.Is(err, effects.ErrRegionPartitioned) {
-			slog.Debug("beacon: membership read waiting for peers",
-				"error", err, "backoff", backoff)
-		} else {
-			return nil, err
-		}
+	wg.Wait()
+	close(responses)
 
-		select {
-		case <-ctx.Done():
-			return nil, errors.Join(ctx.Err(), err)
-		case <-time.After(backoff):
-		}
-
-		if backoff < maxBackoff {
-			backoff *= 2
-			if backoff > maxBackoff {
-				backoff = maxBackoff
-			}
+	var errs []error
+	for res := range responses {
+		errs = append(errs, res.err)
+		for _, nack := range res.nacks {
+			errs = append(errs, b.engine.HandleNack(nack))
 		}
 	}
+
+	return errors.Join(errs...)
 }
 
 // filterSelf removes addresses that match this node's advertise address.
