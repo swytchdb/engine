@@ -181,7 +181,7 @@ func newTestEngine(bc Broadcaster) *Engine {
 		pendingTxTips:     xsync.NewMap[Tip, []Tip](),
 		txAbortCounts:     xsync.NewMap[string, *atomic.Int32](),
 		pendingBootstraps: xsync.NewMap[string, *bootstrapCollector](),
-		spokenBinds:       clox.NewCloxCache[Tip, []Tip](clox.ConfigFromCapacity(256)),
+		spokenBinds:       clox.NewCloxCache[Tip, *spokenBindHistory](clox.ConfigFromCapacity(256)),
 		effectCache:       newVertexPool(),
 	}
 	e.safety.Store(&safetyMap{defaultMode: UnsafeMode})
@@ -818,7 +818,7 @@ func newTxnTestEngine(bc Broadcaster) *Engine {
 		pendingTxTips:     xsync.NewMap[Tip, []Tip](),
 		txAbortCounts:     xsync.NewMap[string, *atomic.Int32](),
 		pendingBootstraps: xsync.NewMap[string, *bootstrapCollector](),
-		spokenBinds:       clox.NewCloxCache[Tip, []Tip](clox.ConfigFromCapacity(256)),
+		spokenBinds:       clox.NewCloxCache[Tip, *spokenBindHistory](clox.ConfigFromCapacity(256)),
 		effectCache:       newVertexPool(),
 	}
 	e.safety.Store(&safetyMap{defaultMode: UnsafeMode})
@@ -2034,11 +2034,11 @@ func TestSpokenBinds_PopulatedOnHandleRemoteBind(t *testing.T) {
 
 	e.handleRemoteBind(bind, Tip{uint64(remoteNodeID), 12}, "txn-remote")
 
-	if binds, ok := e.spokenBinds.Get(ct1, 0); !ok || len(binds) != 1 || binds[0] != (Tip{uint64(remoteNodeID), 12}) {
+	if binds, ok := e.spokenBinds.Get(ct1, 0); !ok || len(binds.snapshot()) != 1 || binds.snapshot()[0] != (Tip{uint64(remoteNodeID), 12}) {
 		t.Fatalf("expected consuming bind for %v, got %v", ct1, binds)
 	}
 
-	if binds, ok := e.spokenBinds.Get(ct2, 0); !ok || len(binds) != 1 || binds[0] != (Tip{uint64(remoteNodeID), 12}) {
+	if binds, ok := e.spokenBinds.Get(ct2, 0); !ok || len(binds.snapshot()) != 1 || binds.snapshot()[0] != (Tip{uint64(remoteNodeID), 12}) {
 		t.Fatalf("expected consuming bind for %v, got %v", ct2, binds)
 	}
 }
@@ -2075,7 +2075,9 @@ func TestSpokenBinds_PreflightAbortsOnHit(t *testing.T) {
 	}
 
 	spokenTip := tips.Tips()[0]
-	e.spokenBinds.Put(spokenTip, []Tip{{99, 1}})
+	history := &spokenBindHistory{}
+	history.add(Tip{99, 1})
+	e.spokenBinds.Put(spokenTip, history)
 
 	// Start a transactional emit on "k" — pre-flight should abort.
 	ctx2 := e.NewContext()

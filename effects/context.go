@@ -1242,7 +1242,7 @@ func (c *Context) flushTx() error {
 			// consuming binds so we can check actual reachability below.
 			if c.engine.spokenBinds != nil {
 				if binds, spoken := c.engine.spokenBinds.Get(t, 0); spoken {
-					spokenBinds = append(spokenBinds, binds...)
+					spokenBinds = append(spokenBinds, binds.snapshot()...)
 				}
 			}
 		}

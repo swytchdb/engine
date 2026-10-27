@@ -242,8 +242,8 @@ type Engine struct {
 	// tip is only a conflict when the new transaction does not also depend
 	// on every bind we already took a position on. The bounded cache
 	// supplements the structural preflight and checkCompetingBinds walk.
-	spokenBinds   *clox.CloxCache[Tip, []Tip]
-	spokenBindsMu sync.Mutex // serializes immutable-list updates
+	spokenBinds   *clox.CloxCache[Tip, *spokenBindHistory]
+	spokenBindsMu sync.Mutex // serializes append-only history updates
 
 	// Anti-entropy
 	antiEntropyStop chan struct{}
@@ -404,7 +404,7 @@ func newEngine(cfg EngineConfig) *Engine {
 		pendingBootstraps:  xsync.NewMap[string, *bootstrapCollector](),
 		peerKeyFilters:     make(map[pb.NodeID]*peerKeyFilter),
 		effectCache:        newVertexPool(),
-		spokenBinds:        clox.NewCloxCache[Tip, []Tip](clox.ConfigFromCapacity(8192)),
+		spokenBinds:        clox.NewCloxCache[Tip, *spokenBindHistory](clox.ConfigFromCapacity(8192)),
 		compressValues:     cfg.CompressValues,
 	}
 
@@ -1897,11 +1897,13 @@ func (e *Engine) handleRemoteBind(bind *pb.TransactionalBindEffect, bindOffset T
 			for _, ct := range kb.GetConsumedTips() {
 				tip := r(ct)
 
-				binds, _ := e.spokenBinds.Get(tip, 0)
-				if !slices.Contains(binds, bindOffset) {
-					// Readers walk the returned slice without holding our lock.
-					e.spokenBinds.Put(tip, append(slices.Clone(binds), bindOffset))
+				history, ok := e.spokenBinds.Get(tip, 0)
+				if !ok {
+					history = &spokenBindHistory{}
 				}
+
+				history.add(bindOffset)
+				e.spokenBinds.Put(tip, history)
 			}
 		}
 	}
