@@ -187,10 +187,22 @@ func (e *Engine) isRealConflict(ptxn *pendingTxn, key string, detail *pb.NackTip
 // stops that branch rather than fetching, so an unreachable verdict is
 // "we can't confirm sequentiality from local state" not "they are
 // definitely concurrent."
-func (e *Engine) reachesFromTx(ptxn *pendingTxn, target Tip) bool {
+// reachesFromTx requires every target to be in the transaction's ancestry.
+// Missing intermediate effects cannot prove a path. Targets share one walk.
+func (e *Engine) reachesFromTx(ptxn *pendingTxn, targets ...Tip) bool {
 	var zero Tip
-	if target == zero {
-		return false
+
+	remaining := make(map[Tip]struct{}, len(targets))
+	for _, target := range targets {
+		if target == zero {
+			return false
+		}
+
+		remaining[target] = struct{}{}
+	}
+
+	if len(remaining) == 0 {
+		return true
 	}
 
 	visited := make(map[Tip]struct{})
@@ -217,7 +229,9 @@ func (e *Engine) reachesFromTx(ptxn *pendingTxn, target Tip) bool {
 		cur := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
 
-		if cur == target {
+		delete(remaining, cur)
+
+		if len(remaining) == 0 {
 			return true
 		}
 
