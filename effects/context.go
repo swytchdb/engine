@@ -1199,6 +1199,8 @@ func (c *Context) flushTx() error {
 	// In (b), our emit won't dep-reference the remote bind so the two
 	// commit DAG-concurrent. Abort here rather than let fork-choice
 	// surface the inconsistency as G1a / incompatible-order later.
+	var spokenBinds []Tip
+
 	for key, ck := range c.keys {
 		if ck.initialTips == nil {
 			continue // first write to a brand-new key
@@ -1236,20 +1238,11 @@ func (c *Context) flushTx() error {
 
 				return ErrTxnAborted
 			}
-			// Abort if we already ACKed/NACKed a remote bind that consumed
-			// this tip — emitting now would commit DAG-concurrent with it.
+			// A retained consumed tip may be redundant ancestry. Remember the
+			// consuming binds so we can check actual reachability below.
 			if c.engine.spokenBinds != nil {
-				if _, spoken := c.engine.spokenBinds.Get(t, 0); spoken {
-					slog.Debug("flushTx: pre-flight aborting, spoke on consumed tip",
-						"key", key, "tip", t)
-
-					for _, ck3 := range c.keys {
-						c.engine.pendingTxTips.Delete(ck3.lastOffset)
-					}
-
-					c.reset()
-
-					return ErrTxnAborted
+				if binds, spoken := c.engine.spokenBinds.Get(t, 0); spoken {
+					spokenBinds = append(spokenBinds, binds.snapshot()...)
 				}
 			}
 		}
@@ -1274,6 +1267,29 @@ func (c *Context) flushTx() error {
 
 			for _, ck3 := range c.keys {
 				c.engine.pendingTxTips.Delete(ck3.lastOffset)
+			}
+
+			c.reset()
+
+			return ErrTxnAborted
+		}
+	}
+
+	if len(spokenBinds) > 0 {
+		// Reuse the NACK conflict check's DAG walk over our actual emitted
+		// dependencies. Including P alone is not enough: every known consumer
+		// of P must be in our past, even if ingestion has not indexed it yet.
+		candidate := &pendingTxn{keys: make([]pendingTxnKey, 0, len(c.keys))}
+		for _, ck := range c.keys {
+			candidate.keys = append(candidate.keys, pendingTxnKey{newTip: ck.lastOffset})
+		}
+
+		if !c.engine.reachesFromTx(candidate, spokenBinds...) {
+			slog.Debug("flushTx: pre-flight aborting, spoken bind is not an ancestor",
+				"binds", spokenBinds)
+
+			for _, ck := range c.keys {
+				c.engine.pendingTxTips.Delete(ck.lastOffset)
 			}
 
 			c.reset()

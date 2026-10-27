@@ -181,7 +181,7 @@ func newTestEngine(bc Broadcaster) *Engine {
 		pendingTxTips:     xsync.NewMap[Tip, []Tip](),
 		txAbortCounts:     xsync.NewMap[string, *atomic.Int32](),
 		pendingBootstraps: xsync.NewMap[string, *bootstrapCollector](),
-		spokenBinds:       clox.NewCloxCache[Tip, struct{}](clox.ConfigFromCapacity(256)),
+		spokenBinds:       clox.NewCloxCache[Tip, *spokenBindHistory](clox.ConfigFromCapacity(256)),
 		effectCache:       newVertexPool(),
 	}
 	e.safety.Store(&safetyMap{defaultMode: UnsafeMode})
@@ -818,7 +818,7 @@ func newTxnTestEngine(bc Broadcaster) *Engine {
 		pendingTxTips:     xsync.NewMap[Tip, []Tip](),
 		txAbortCounts:     xsync.NewMap[string, *atomic.Int32](),
 		pendingBootstraps: xsync.NewMap[string, *bootstrapCollector](),
-		spokenBinds:       clox.NewCloxCache[Tip, struct{}](clox.ConfigFromCapacity(256)),
+		spokenBinds:       clox.NewCloxCache[Tip, *spokenBindHistory](clox.ConfigFromCapacity(256)),
 		effectCache:       newVertexPool(),
 	}
 	e.safety.Store(&safetyMap{defaultMode: UnsafeMode})
@@ -2002,8 +2002,8 @@ func TestFlushTx_ConsumesTips_LinearChain(t *testing.T) {
 }
 
 // TestSpokenBinds_PopulatedOnHandleRemoteBind verifies that handleRemoteBind
-// inserts every (key, consumedTip) pair from the bind's ConsumedTips into
-// spokenBinds. handleRemoteBind is the canonical entry point HandleRemote
+// records the bind offset under every consumed tip in spokenBinds.
+// handleRemoteBind is the canonical entry point HandleRemote
 // uses for every remote bind it processes — ACK and NACK paths both pass
 // through here, so populating once at this site covers both response shapes.
 func TestSpokenBinds_PopulatedOnHandleRemoteBind(t *testing.T) {
@@ -2034,19 +2034,18 @@ func TestSpokenBinds_PopulatedOnHandleRemoteBind(t *testing.T) {
 
 	e.handleRemoteBind(bind, Tip{uint64(remoteNodeID), 12}, "txn-remote")
 
-	if _, ok := e.spokenBinds.Get(ct1, 0); !ok {
-		t.Fatalf("expected spokenBinds to contain %v after handleRemoteBind, got miss", ct1)
+	if binds, ok := e.spokenBinds.Get(ct1, 0); !ok || len(binds.snapshot()) != 1 || binds.snapshot()[0] != (Tip{uint64(remoteNodeID), 12}) {
+		t.Fatalf("expected consuming bind for %v, got %v", ct1, binds)
 	}
 
-	if _, ok := e.spokenBinds.Get(ct2, 0); !ok {
-		t.Fatalf("expected spokenBinds to contain %v after handleRemoteBind, got miss", ct2)
+	if binds, ok := e.spokenBinds.Get(ct2, 0); !ok || len(binds.snapshot()) != 1 || binds.snapshot()[0] != (Tip{uint64(remoteNodeID), 12}) {
+		t.Fatalf("expected consuming bind for %v, got %v", ct2, binds)
 	}
 }
 
 // TestSpokenBinds_PreflightAbortsOnHit verifies that emitting a local bind
-// whose initialTips include a spoken (key, tip) pair is rejected by the
-// pre-flight check with ErrTxnAborted. No predicate refinement: the speech
-// act is structural and unconditional.
+// whose initialTips share a spoken tip is rejected when the consuming bind
+// cannot be proved to be an ancestor, even if it is absent from the index.
 func TestSpokenBinds_PreflightAbortsOnHit(t *testing.T) {
 	e := NewTestEngine()
 	defer func() { _ = e.Close() }()
@@ -2069,16 +2068,16 @@ func TestSpokenBinds_PreflightAbortsOnHit(t *testing.T) {
 		t.Fatalf("seed flush: %v", err)
 	}
 
-	// Mark the current tip on "k" as spoken — simulating an earlier
-	// HandleRemote where we ACKed/NACKed a remote bind that consumed
-	// this tip.
+	// Record a consuming bind which has not yet appeared in the index.
 	tips := e.index.Contains("k")
 	if tips == nil || len(tips.Tips()) == 0 {
 		t.Fatalf("expected at least one tip on 'k' after seed")
 	}
 
 	spokenTip := tips.Tips()[0]
-	e.spokenBinds.Put(spokenTip, struct{}{})
+	history := &spokenBindHistory{}
+	history.add(Tip{99, 1})
+	e.spokenBinds.Put(spokenTip, history)
 
 	// Start a transactional emit on "k" — pre-flight should abort.
 	ctx2 := e.NewContext()
@@ -2131,11 +2130,7 @@ func TestSpokenBinds_PreflightAllowsOnMiss(t *testing.T) {
 		t.Fatalf("tx emit: %v", err)
 	}
 
-	if err := ctx2.Flush(); err != nil && !errors.Is(err, ErrTxnAborted) {
-		// Standalone tests have no broadcaster, so flushTx commits
-		// without subscriber-response waits. Any non-abort outcome is
-		// fine for this test; we just need to confirm the pre-flight
-		// did not fire.
-		t.Logf("flush returned %v (may be ok for standalone tx)", err)
+	if err := ctx2.Flush(); err != nil {
+		t.Fatalf("uncontended transaction should commit: %v", err)
 	}
 }

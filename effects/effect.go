@@ -238,13 +238,12 @@ type Engine struct {
 	// Horizon wait for bind visibility
 	horizon *HorizonSet
 
-	// ConsumedTips of remote binds we have ACKed/NACKed. flushTx's
-	// pre-flight aborts when a new local bind's pre-tx tip is in here:
-	// emitting from that fork point would commit DAG-concurrent with the
-	// remote bind we already took a position on. Cache eviction is safe
-	// because the stale-tip / new-foreign-tip checks in flushTx catch
-	// the same divergence structurally.
-	spokenBinds *clox.CloxCache[Tip, struct{}]
+	// Remote binds indexed by the tips they consumed. A shared consumed
+	// tip is only a conflict when the new transaction does not also depend
+	// on every bind we already took a position on. The bounded cache
+	// supplements the structural preflight and checkCompetingBinds walk.
+	spokenBinds   *clox.CloxCache[Tip, *spokenBindHistory]
+	spokenBindsMu sync.Mutex // serializes append-only history updates
 
 	// Anti-entropy
 	antiEntropyStop chan struct{}
@@ -405,7 +404,7 @@ func newEngine(cfg EngineConfig) *Engine {
 		pendingBootstraps:  xsync.NewMap[string, *bootstrapCollector](),
 		peerKeyFilters:     make(map[pb.NodeID]*peerKeyFilter),
 		effectCache:        newVertexPool(),
-		spokenBinds:        clox.NewCloxCache[Tip, struct{}](clox.ConfigFromCapacity(8192)),
+		spokenBinds:        clox.NewCloxCache[Tip, *spokenBindHistory](clox.ConfigFromCapacity(8192)),
 		compressValues:     cfg.CompressValues,
 	}
 
@@ -1888,13 +1887,23 @@ func (e *Engine) handleRemoteBind(bind *pb.TransactionalBindEffect, bindOffset T
 		})
 	}
 
-	// Cache every consumed tip this bind forked from so flushTx's
-	// pre-flight will abort a future local emit that forks from the
-	// same point.
+	// Retain each consuming bind, not just a boolean for its shared base.
+	// flushTx must prove those binds are ancestors before reusing that base.
 	if e.spokenBinds != nil {
+		e.spokenBindsMu.Lock()
+		defer e.spokenBindsMu.Unlock()
+
 		for _, kb := range bind.GetKeys() {
 			for _, ct := range kb.GetConsumedTips() {
-				e.spokenBinds.Put(r(ct), struct{}{})
+				tip := r(ct)
+
+				history, ok := e.spokenBinds.Get(tip, 0)
+				if !ok {
+					history = &spokenBindHistory{}
+				}
+
+				history.add(bindOffset)
+				e.spokenBinds.Put(tip, history)
 			}
 		}
 	}
