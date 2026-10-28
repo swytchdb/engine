@@ -36,6 +36,11 @@ import (
 // encounters a real conflict that cannot be resolved.
 var ErrTxnAborted = errors.New("transaction aborted")
 
+// ErrTxnAmbiguous is returned when a published bind could not be confirmed by
+// every subscriber. Its effects may become visible; callers must not treat
+// this as a definite abort or automatically retry the transaction.
+var ErrTxnAmbiguous = errors.New("transaction outcome unknown; commit may have occurred")
+
 // ErrRegionPartitioned is returned by Flush in SafeMode when not all
 // same-region peers are reachable.
 var ErrRegionPartitioned = errors.New("region partitioned: not all same-region peers are reachable")
@@ -63,6 +68,7 @@ const (
 	txnStatePending   uint32 = 0
 	txnStateCommitted uint32 = 1
 	txnStateAborted   uint32 = 2
+	txnStateAmbiguous uint32 = 3
 )
 
 // pendingTxn tracks a transaction awaiting NACK resolution.
@@ -502,6 +508,18 @@ func commitPendingTxn(ptxn *pendingTxn) bool {
 // abortPendingTxn CAS-sets the state to aborted and closes the done channel.
 func abortPendingTxn(ptxn *pendingTxn) bool {
 	if ptxn.state.CompareAndSwap(txnStatePending, txnStateAborted) {
+		close(ptxn.done)
+
+		return true
+	}
+
+	return false
+}
+
+// markPendingTxnAmbiguous ends the local wait without claiming a cluster-wide
+// commit or abort. A known conflict that already aborted the txn takes priority.
+func markPendingTxnAmbiguous(ptxn *pendingTxn) bool {
+	if ptxn.state.CompareAndSwap(txnStatePending, txnStateAmbiguous) {
 		close(ptxn.done)
 
 		return true

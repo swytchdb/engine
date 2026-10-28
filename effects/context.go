@@ -1685,11 +1685,11 @@ func (c *Context) flushTx() error {
 
 			if ptxn.state.Load() != txnStateAborted {
 				if responseCount < len(subscribers) {
-					slog.Warn("flushTx: not all subscribers responded, aborting",
+					slog.Warn("flushTx: not all subscribers responded, outcome unknown",
 						"bind_offset", bindOffset,
 						"responses", responseCount,
 						"subscribers", len(subscribers))
-					abortPendingTxn(ptxn)
+					markPendingTxnAmbiguous(ptxn)
 				} else if commitPendingTxn(ptxn) {
 					slog.Debug("flushTx: all subscribers responded, committed",
 						"bind_offset", bindOffset,
@@ -1701,7 +1701,7 @@ func (c *Context) flushTx() error {
 			// chance to set txnStateAborted via isRealConflict. The bind
 			// must not become visible before this decision is made.
 			if c.engine.horizon != nil {
-				if ptxn.state.Load() == txnStateAborted {
+				if ptxn.state.Load() != txnStateCommitted {
 					c.engine.horizon.Abort(c.txnID)
 				} else {
 					c.engine.horizon.MakeVisible(c.txnID)
@@ -1777,15 +1777,23 @@ func (c *Context) flushTx() error {
 
 	c.engine.pendingTxns.Delete(bindOffset)
 
-	if state == txnStateAborted {
-		slog.Debug("Flush: transaction aborted", "bind_offset", bindOffset)
-		// Clean up pending tx tips — but NOT when horizon is active
-		// (effects stay invisible, timer cleans up)
+	if state != txnStateCommitted {
+		// Release local pending state. Horizon.Abort already did this when
+		// enabled; neither path retracts the published bind from peers.
 		if c.engine.horizon == nil {
 			for _, pk := range ptxn.keys {
 				c.engine.pendingTxTips.Delete(pk.newTip)
 			}
 		}
+
+		if state == txnStateAmbiguous {
+			slog.Debug("Flush: transaction outcome unknown", "bind_offset", bindOffset)
+			c.reset()
+
+			return ErrTxnAmbiguous
+		}
+
+		slog.Debug("Flush: transaction aborted", "bind_offset", bindOffset)
 
 		// Check serialization escalation (only if no leader already active)
 		for _, pk := range ptxn.keys {
@@ -1847,8 +1855,8 @@ func (c *Context) flushTx() error {
 // The membership filter is what lets a departed peer's stale id fall out
 // lazily instead of needing an eager scrub on peer removal: PeerIDs() shrinks
 // only on genuine topology removal, so a member that is merely unreachable
-// stays in the required set (flushTx then aborts when it can't respond,
-// preserving AtMostOneCommit), while a truly departed peer is dropped so the
+// stays in the required set (flushTx then reports an ambiguous outcome when it
+// can't respond), while a truly departed peer is dropped so the
 // key can still make progress.
 func (c *Context) collectSubscribers() []pb.NodeID {
 	var members map[pb.NodeID]struct{}

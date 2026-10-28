@@ -1903,7 +1903,6 @@ func (e *Engine) losersOnKeyAt(key string, tips, extraTips []Tip, snapshotVerdic
 		bindOffset Tip // bind anchor offset (the TransactionalBindEffect's own offset)
 		newTip     Tip
 		hash       []byte
-		consumed   []Tip // ConsumedTips on this key
 	}
 
 	var binds []seenBind
@@ -1948,15 +1947,11 @@ func (e *Engine) losersOnKeyAt(key string, tips, extraTips []Tip, snapshotVerdic
 
 		if bind := eff.GetTxnBind(); bind != nil {
 			if isInvisible == nil || !isInvisible(eff.GetTxnId()) {
-				var (
-					newTip   Tip
-					consumed []Tip
-				)
+				var newTip Tip
 
 				for _, kb := range bind.GetKeys() {
 					if string(kb.GetKey()) == key {
 						newTip = r(kb.GetNewTip())
-						consumed = fromPbRefs(kb.GetConsumedTips())
 
 						break
 					}
@@ -1969,7 +1964,6 @@ func (e *Engine) losersOnKeyAt(key string, tips, extraTips []Tip, snapshotVerdic
 						bindOffset: t,
 						newTip:     newTip,
 						hash:       eff.GetForkChoiceHash(),
-						consumed:   consumed,
 					})
 				}
 			}
@@ -2017,54 +2011,10 @@ func (e *Engine) losersOnKeyAt(key string, tips, extraTips []Tip, snapshotVerdic
 		candidates = append(candidates, b)
 	}
 
-	// Chain detection: if every candidate bind's ConsumedTips on this
-	// key contains another candidate bind's anchor offset, the binds
-	// form a total order via consumed-bind edges (each bind explicitly
-	// built on its predecessor's committed bind). No two can be
-	// DAG-concurrent on this key, so no losers — skip the O(N²) pairwise
-	// and ancestor work entirely. Common in sequential single-writer
-	// workloads (XADD, LPUSH, INCR), where this is the difference
-	// between O(N²) and O(N).
-	if len(candidates) > 1 {
-		bindOffsetToIdx := make(map[Tip]int, len(candidates))
-		for i := range candidates {
-			bindOffsetToIdx[candidates[i].bindOffset] = i
-		}
-
-		rootBinds := 0
-		chained := true
-
-		for i := range candidates {
-			consumesSibling := false
-
-			for _, ct := range candidates[i].consumed {
-				if _, ok := bindOffsetToIdx[ct]; ok {
-					consumesSibling = true
-
-					break
-				}
-			}
-
-			if !consumesSibling {
-				rootBinds++
-				if rootBinds > 1 {
-					chained = false
-
-					break
-				}
-			}
-		}
-
-		if chained {
-			return losers, walked
-		}
-	}
-
 	// Ancestor closures computed lazily on first reach query. Cached so
 	// each bind's parent DAG is walked at most once across all pairs.
 	// Fetches via e.getEffect (CloxCache-backed) instead of holding a
-	// separate nodes map, so the discovery walk doesn't pay for an
-	// extra map slot per visited effect when chain-detect short-circuits.
+	// separate nodes map during discovery.
 	ancestorsOf := make(map[Tip]map[Tip]struct{})
 	buildAncestors := func(start Tip) map[Tip]struct{} {
 		if cached, ok := ancestorsOf[start]; ok {
