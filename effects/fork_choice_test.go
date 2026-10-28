@@ -95,3 +95,70 @@ func TestForkChoiceLess_EliminatesHLCBias(t *testing.T) {
 		t.Fatalf("expected mixed winners, got %d/%d for node1", wins, trials)
 	}
 }
+
+func TestLosersOnKeyAt_SharedRootFork(t *testing.T) {
+	for _, shape := range []string{"fork", "merge", "snapshot", "snapshot-descendant"} {
+		for _, reverse := range []bool{false, true} {
+			name := shape
+			if reverse {
+				name += "/reversed"
+			}
+
+			t.Run(name, func(t *testing.T) {
+				log := newSnapshotLog()
+				e := newSnapshotEngine(log)
+				addBind := func(txn string, hash byte, consumed ...Tip) Tip {
+					data := log.putEffect(&pb.Effect{
+						Key: []byte("k"), NodeId: 1, Hlc: sTs(100), TxnId: txn,
+						Deps: toPbRefs(consumed), Kind: &pb.Effect_Noop{Noop: &pb.NoopEffect{}},
+					})
+
+					return log.putEffect(&pb.Effect{
+						Key: []byte("k"), NodeId: 1, Hlc: sTs(100), TxnId: txn, ForkChoiceHash: []byte{hash},
+						Deps: toPbRefs([]Tip{data}),
+						Kind: &pb.Effect_TxnBind{TxnBind: &pb.TransactionalBindEffect{
+							Keys: []*pb.TransactionalBindEffect_KeyBind{{
+								Key: []byte("k"), NewTip: toPbRef(data), ConsumedTips: toPbRefs(consumed),
+							}},
+						}},
+					})
+				}
+
+				// A common root does not make the siblings a chain. Adding a
+				// merge or snapshot must not change which sibling loses.
+				root := addBind("root", 0x40)
+				winner := addBind("winner", 0x10, root)
+				loser := addBind("loser", 0x20, root)
+
+				tips := []Tip{winner, loser}
+				if reverse {
+					tips[0], tips[1] = tips[1], tips[0]
+				}
+
+				switch shape {
+				case "merge":
+					tips = []Tip{addBind("descendant", 0x30, tips...)}
+				case "snapshot", "snapshot-descendant":
+					snapshot := log.putEffect(&pb.Effect{
+						Key: []byte("k"), NodeId: 1, Hlc: sTs(100), Deps: toPbRefs(tips),
+						Kind: &pb.Effect_Snapshot{Snapshot: &pb.SnapshotEffect{}},
+					})
+
+					tips = []Tip{snapshot}
+					if shape == "snapshot-descendant" {
+						tips = []Tip{addBind("descendant", 0x30, snapshot)}
+					}
+				}
+
+				losers, _ := e.losersOnKeyAt("k", tips, nil, nil, nil, false)
+				if _, found := losers["loser"]; !found {
+					t.Fatalf("concurrent sibling escaped fork choice: %v", losers)
+				}
+
+				if len(losers) != 1 {
+					t.Fatalf("unexpected other losers: %v", losers)
+				}
+			})
+		}
+	}
+}
