@@ -66,7 +66,7 @@ func (e *Engine) conflictHeads(key string, tips []Tip) []Tip {
 
 		eff, err := e.getEffect(key, t)
 		if err == nil && eff.GetSnapshot() != nil && len(eff.GetSnapshot().GetTxnVerdicts()) > 0 {
-			stack = append(stack, fromPbRefs(eff.GetDeps())...)
+			stack = appendRefs(stack, eff.GetDeps())
 
 			continue
 		}
@@ -307,24 +307,8 @@ func (e *Engine) describeConflictKey(bind *pb.Effect, kb *pb.TransactionalBindEf
 func (e *Engine) conflictHistoricalState(key string, tips []Tip) (*pb.ReducedEffect, error) {
 	view := &snapshotReadView{engine: e, historical: true, resolved: map[string][]Tip{key: tips}, lost: make(map[string]struct{})}
 
-	var err error
-
-	view.keys, view.anchors, view.verdicts, err = e.bindKeyClosureFrom([]string{key}, func(k string) ([]Tip, error) { return view.resolved[k], nil }, true)
-	if err != nil {
+	if err := view.discover([]string{key}, func(k string) ([]Tip, error) { return view.resolved[k], nil }); err != nil {
 		return nil, err
-	}
-
-	for txn, entry := range view.verdicts {
-		if entry.verdict == pb.Verdict_LOST {
-			view.lost[txn] = struct{}{}
-		}
-	}
-
-	for k := range view.keys {
-		losers, _ := e.losersOnKeyAt(k, view.resolved[k], view.anchors[k], view.verdicts, nil, false)
-		for txn := range losers {
-			view.lost[txn] = struct{}{}
-		}
 	}
 
 	state, _, err := e.reconstructWithView(key, tips, "", false, view)

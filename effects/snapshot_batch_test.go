@@ -99,7 +99,7 @@ func TestSnapshotReadView_ValidatesAssociatedFrontiers(t *testing.T) {
 	e := asymmetricLottery("alice")
 
 	v := newSnapshotReadView(e, context.Background())
-	if err := v.discover([]string{"payout:alice"}); err != nil {
+	if err := v.discover([]string{"payout:alice"}, v.capture); err != nil {
 		t.Fatal(err)
 	}
 

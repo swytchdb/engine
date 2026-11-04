@@ -41,7 +41,7 @@ func (s *transactionSnapshot) tips(ctx context.Context, key string) (*keytrie.Ti
 
 	v := s.views[key]
 
-	tips := append([]Tip(nil), v.resolved[key]...)
+	tips := v.resolved[key]
 	if len(tips) == 0 {
 		return nil, nil
 	}
@@ -85,7 +85,7 @@ func (s *transactionSnapshot) contains(ctx context.Context, key string, target T
 
 			seen[tip] = true
 
-			frontier = append(frontier, fromPbRefs(eff.GetDeps())...)
+			frontier = appendRefs(frontier, eff.GetDeps())
 		}
 	}
 
@@ -224,7 +224,7 @@ func (s *transactionSnapshot) prepare(ctx context.Context, requested []string) e
 	}
 
 	live := newSnapshotReadView(s.engine, ctx)
-	if err := live.discover(keys); err != nil {
+	if err := live.discover(keys, live.capture); err != nil {
 		return err
 	}
 
@@ -254,14 +254,10 @@ func (s *transactionSnapshot) prepare(ctx context.Context, requested []string) e
 	// early read-admission gate. Existing inclusion/exclusion decisions win
 	// over subsequent numerical tightening.
 	s.clocks = s.engine.clockEvidence()
-	selected := make(map[string][]Tip)
-	frontier := func(key string) ([]Tip, error) {
+
+	view, err := s.engine.historicalReadView(ctx, keys, func(key string) ([]Tip, error) {
 		if old := s.views[key]; old != nil {
 			return old.resolved[key], nil
-		}
-
-		if tips, ok := selected[key]; ok {
-			return tips, nil
 		}
 
 		_, err := live.capture(key)
@@ -274,17 +270,10 @@ func (s *transactionSnapshot) prepare(ctx context.Context, requested []string) e
 		// tips into stale ancestors before the existing commit protocol.
 		tips := live.frontier[key].Tips()
 
-		tips, err = s.engine.historicalFrontier(ctx, key, tips, func(t Tip, eff *pb.Effect) (bool, error) {
+		return s.engine.historicalFrontier(ctx, key, tips, func(t Tip, eff *pb.Effect) (bool, error) {
 			return s.member(ctx, t, eff, make(map[Tip]bool))
 		})
-		if err == nil {
-			selected[key] = tips
-		}
-
-		return tips, err
-	}
-
-	view, err := s.engine.historicalReadView(ctx, keys, frontier)
+	})
 	if err != nil {
 		return err
 	}

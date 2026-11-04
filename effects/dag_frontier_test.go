@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
+	"github.com/swytchdb/engine/keytrie"
 )
 
 // S correctly summarizes A+B, but L bypasses it:
@@ -129,5 +130,44 @@ func TestDAGSnapshotDependencyFrontier(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func TestReconstructionPrunesOnlyCommittedAncestors(t *testing.T) {
+	for _, committed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("committed=%t", committed), func(t *testing.T) {
+			log := newSnapshotLog()
+			e := newSnapshotEngine(log)
+			root := log.putEffect(&pb.Effect{
+				Key: []byte("k"), Hlc: sTs(1), NodeId: 1,
+				Kind: &pb.Effect_Data{Data: scalarInsertInt(pb.MergeRule_ADDITIVE_INT, 1)},
+			})
+			child := log.putEffect(&pb.Effect{
+				Key: []byte("k"), Hlc: sTs(2), NodeId: 1, TxnId: "pending", Deps: toPbRefs([]Tip{root}),
+				Kind: &pb.Effect_Data{Data: scalarInsertInt(pb.MergeRule_ADDITIVE_INT, 1)},
+			})
+			unknown := Tip{99, 99}
+			indexed := []Tip{root, unknown}
+
+			if committed {
+				indexed = append(indexed, child)
+			}
+
+			e.index.Insert("k", nil, keytrie.NewTipSet(indexed...))
+
+			state, _, err := e.reconstruct("k", []Tip{root, child, root}, "pending", false)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if state.GetScalar().GetIntVal() != 2 {
+				t.Fatal("duplicate frontier replayed an ancestor twice")
+			}
+
+			current := e.index.Contains("k")
+			if current.Contains(root) == committed || !current.Contains(unknown) || current.Contains(child) != committed {
+				t.Fatalf("pruning changed an uncommitted or unwalked frontier: %v", current.Tips())
+			}
+		})
 	}
 }

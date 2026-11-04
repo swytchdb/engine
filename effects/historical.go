@@ -54,7 +54,7 @@ func (e *Engine) historicalFrontier(ctx context.Context, key string, tips []Tip,
 		if bind := eff.GetTxnBind(); bind != nil {
 			for _, kb := range bind.GetKeys() {
 				if string(kb.GetKey()) == key {
-					stack = append(stack, fromPbRefs(kb.GetConsumedTips())...)
+					stack = appendRefs(stack, kb.GetConsumedTips())
 
 					break
 				}
@@ -62,7 +62,7 @@ func (e *Engine) historicalFrontier(ctx context.Context, key string, tips []Tip,
 		} else {
 			// Snapshot.Deps describe the state it compacted. PrevSnapshot
 			// alone can skip intervening writes, so it is not a substitute.
-			stack = append(stack, fromPbRefs(eff.GetDeps())...)
+			stack = appendRefs(stack, eff.GetDeps())
 		}
 	}
 
@@ -76,7 +76,8 @@ func (e *Engine) historicalFrontier(ctx context.Context, key string, tips []Tip,
 func (e *Engine) historicalReadView(ctx context.Context, keys []string, frontier func(string) ([]Tip, error)) (*snapshotReadView, error) {
 	v := newSnapshotReadView(e, ctx)
 	v.historical = true
-	capture := func(key string) ([]Tip, error) {
+
+	err := v.discover(keys, func(key string) ([]Tip, error) {
 		if tips, ok := v.resolved[key]; ok {
 			return tips, nil
 		}
@@ -87,28 +88,9 @@ func (e *Engine) historicalReadView(ctx context.Context, keys []string, frontier
 		}
 
 		return tips, err
-	}
-
-	var err error
-
-	v.keys, v.anchors, v.verdicts, err = e.bindKeyClosureFrom(keys, capture, true)
+	})
 	if err != nil {
 		return nil, err
-	}
-
-	for txn, entry := range v.verdicts {
-		if entry.verdict == pb.Verdict_LOST {
-			v.lost[txn] = struct{}{}
-		}
-	}
-
-	for key := range v.keys {
-		losers, walked := e.losersOnKeyAt(key, v.resolved[key], v.anchors[key], v.verdicts, v.isInvisible, false)
-
-		v.walked += walked
-		for txn := range losers {
-			v.lost[txn] = struct{}{}
-		}
 	}
 
 	return v, nil

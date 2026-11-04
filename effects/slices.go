@@ -18,6 +18,16 @@ func refsContain(refs []*pb.EffectRef, tip Tip) bool {
 	return false
 }
 
+// appendRefs extends traversal scratch without allocating an intermediate slice.
+func appendRefs(tips []Tip, refs []*pb.EffectRef) []Tip {
+	tips = slices.Grow(tips, len(refs))
+	for _, ref := range refs {
+		tips = append(tips, r(ref))
+	}
+
+	return tips
+}
+
 // compactTips sorts and deduplicates owned scratch storage in place. Callers
 // must not pass a published TipSet's slice.
 func compactTips(tips []Tip) []Tip {

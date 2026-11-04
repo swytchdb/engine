@@ -245,3 +245,45 @@ func TestSubscribersShrinkAndReturnIndependentSnapshots(t *testing.T) {
 		t.Fatal("empty subscriber set retained storage")
 	}
 }
+
+func TestPeerFiltersReleaseDepartedStorage(t *testing.T) {
+	e := newHorizonTestEngine()
+	baseline := e.keyFilterBytes()
+
+	// Insert out of order, including duplicate connection announcements.
+	for id := pb.NodeID(129); id >= 2; id-- {
+		e.NotePeerConnected(id)
+		e.NotePeerConnected(id)
+	}
+
+	if e.unfilteredPeers != 128 || len(e.peerKeyFilters) != 128 {
+		t.Fatal("duplicate connection added a peer twice")
+	}
+
+	e.peerFilterAdd(129, "retained")
+
+	for id := pb.NodeID(2); id < 129; id++ {
+		e.DropPeer(id)
+	}
+
+	if e.unfilteredPeers != 1 || len(e.peerKeyFilters) != 1 || cap(e.peerKeyFilters) > 8 {
+		t.Fatalf("departures retained peer storage: len=%d cap=%d unknown=%d", len(e.peerKeyFilters), cap(e.peerKeyFilters), e.unfilteredPeers)
+	}
+
+	if !e.peerKeyFilters[0].maybeContains("retained") {
+		t.Fatal("shrinking storage lost the remaining peer's filter")
+	}
+
+	e.DropPeer(129)
+	e.DropPeer(129)
+
+	if e.peerKeyFilters != nil || e.unfilteredPeers != 0 || e.keyFilterBytes() != baseline {
+		t.Fatal("last departure retained filter storage or accounting")
+	}
+
+	e.NotePeerConnected(129)
+
+	if !e.clusterMaybeHasKey("new-after-reconnect") {
+		t.Fatal("reconnecting peer reused stale absence evidence")
+	}
+}

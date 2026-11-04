@@ -24,9 +24,11 @@
 package effects
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 	"strings"
 
@@ -65,6 +67,16 @@ type dag struct {
 	// invisibility propagation in reconstruct) read this between
 	// prepare and iterate.
 	topoOrder []Tip
+}
+
+// dagTip carries the effect while sorting, avoiding map lookups per comparison.
+type dagTip struct {
+	tip Tip
+	eff *pb.Effect
+}
+
+func compareDagTips(a, b dagTip) int {
+	return bytes.Compare(a.eff.GetForkChoiceHash(), b.eff.GetForkChoiceHash())
 }
 
 func newDag(engine *Engine, key string, activeTxnID string) *dag {
@@ -127,26 +139,17 @@ func (d *dag) prepare(tips []Tip) error {
 	d.topoOrder = make([]Tip, 0, len(d.nodes))
 	topoVisited := make(map[Tip]bool, len(d.nodes))
 
-	type pair struct {
-		tip Tip
-		eff *pb.Effect
-	}
-
-	sortedTips := make([]pair, 0, len(tips))
-	for _, t := range tips {
-		if eff, ok := d.nodes[t]; ok {
-			sortedTips = append(sortedTips, pair{t, eff})
+	sortedTips := make([]dagTip, 0, len(tips))
+	for _, tip := range tips {
+		if eff, ok := d.nodes[tip]; ok {
+			sortedTips = append(sortedTips, dagTip{tip, eff})
 		}
 	}
 
-	if len(sortedTips) > 1 {
-		sort.Slice(sortedTips, func(i, j int) bool {
-			return ForkChoiceLess(sortedTips[i].eff.GetForkChoiceHash(), sortedTips[j].eff.GetForkChoiceHash())
-		})
-	}
+	slices.SortFunc(sortedTips, compareDagTips)
 
-	for _, p := range sortedTips {
-		d.topoCollect(p.tip, topoVisited)
+	for _, entry := range sortedTips {
+		d.topoCollect(entry.tip, topoVisited)
 	}
 
 	return nil
@@ -195,6 +198,7 @@ func (d *dag) shouldEmit(t Tip, eff *pb.Effect) bool {
 // single dead-end tip and no way to recover the underlying chain.
 func (d *dag) bfs(tips []Tip, lcaTip *Tip) error {
 	queue := make([]Tip, 0, len(tips)*2)
+	queuePos := 0
 	snapshots := make([]Tip, 0, len(tips))
 	frontier := make(map[Tip]struct{}, len(tips))
 	enqueue := func(t Tip, eff *pb.Effect) {
@@ -228,8 +232,13 @@ func (d *dag) bfs(tips []Tip, lcaTip *Tip) error {
 	for len(queue) > 0 || len(snapshots) > 0 {
 		var cur Tip
 		if len(queue) > 0 {
-			cur = queue[0]
-			queue = queue[1:]
+			cur = queue[queuePos]
+			queuePos++
+
+			if queuePos == len(queue) {
+				queue = queue[:0]
+				queuePos = 0
+			}
 		} else {
 			// Let ordinary paths reach a pending snapshot before expanding
 			// its ancestry. Each effect is still fetched and expanded once.
@@ -370,28 +379,20 @@ func (d *dag) topoCollect(t Tip, visited map[Tip]bool) {
 		return
 	}
 
-	// Follow deps within collected set
+	// A chain needs no sorting buffer. Only forks collect and order siblings.
 	refs := d.keyDeps(eff)
-
-	if len(refs) > 0 {
-		type pair struct {
-			tip Tip
-			eff *pb.Effect
-		}
-
-		deps := make([]pair, 0, len(refs))
+	if len(refs) == 1 {
+		d.topoCollect(r(refs[0]), visited)
+	} else if len(refs) > 1 {
+		deps := make([]dagTip, 0, len(refs))
 		for _, ref := range refs {
-			dt := r(ref)
-			if de, ok := d.nodes[dt]; ok {
-				deps = append(deps, pair{dt, de})
+			tip := r(ref)
+			if dep, ok := d.nodes[tip]; ok {
+				deps = append(deps, dagTip{tip, dep})
 			}
 		}
 
-		if len(deps) > 1 {
-			sort.Slice(deps, func(i, j int) bool {
-				return ForkChoiceLess(deps[i].eff.GetForkChoiceHash(), deps[j].eff.GetForkChoiceHash())
-			})
-		}
+		slices.SortFunc(deps, compareDagTips)
 
 		for _, dep := range deps {
 			d.topoCollect(dep.tip, visited)

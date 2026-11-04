@@ -28,10 +28,8 @@ type snapshotReadView struct {
 func newSnapshotReadView(e *Engine, ctx context.Context) *snapshotReadView {
 	return &snapshotReadView{
 		engine: e, ctx: ctx,
-		frontier:  make(map[string]*keytrie.TipSet),
-		resolved:  make(map[string][]Tip),
-		invisible: make(map[string]bool),
-		lost:      make(map[string]struct{}),
+		resolved: make(map[string][]Tip),
+		lost:     make(map[string]struct{}),
 	}
 }
 
@@ -48,6 +46,10 @@ func (v *snapshotReadView) capture(key string) ([]Tip, error) {
 		}
 
 		tips := v.engine.index.Contains(key)
+		if v.frontier == nil {
+			v.frontier = make(map[string]*keytrie.TipSet)
+		}
+
 		v.frontier[key] = tips
 		v.resolved[key] = v.engine.resolveTipDeps(tips.Tips())
 	}
@@ -65,6 +67,10 @@ func (v *snapshotReadView) isInvisible(txn string) bool {
 	invisible, ok := v.invisible[txn]
 	if !ok {
 		invisible = v.engine.horizon != nil && v.engine.horizon.IsInvisible(txn)
+		if v.invisible == nil {
+			v.invisible = make(map[string]bool)
+		}
+
 		v.invisible[txn] = invisible
 	}
 
@@ -88,10 +94,12 @@ func (v *snapshotReadView) valid() bool {
 	return true
 }
 
-func (v *snapshotReadView) discover(keys []string) error {
+// discover applies the same closure and arbitration rules to live and historical
+// frontiers. Historical views never report conflicts or consult live visibility.
+func (v *snapshotReadView) discover(keys []string, frontier func(string) ([]Tip, error)) error {
 	var err error
 
-	v.keys, v.anchors, v.verdicts, err = v.engine.bindKeyClosureFrom(keys, v.capture, true)
+	v.keys, v.anchors, v.verdicts, err = v.engine.bindKeyClosureFrom(keys, frontier, true)
 	if err != nil {
 		return err
 	}
@@ -103,7 +111,7 @@ func (v *snapshotReadView) discover(keys []string) error {
 	}
 
 	for key := range v.keys {
-		losers, walked := v.engine.losersOnKeyAt(key, v.resolved[key], v.anchors[key], v.verdicts, v.isInvisible, true)
+		losers, walked := v.engine.losersOnKeyAt(key, v.resolved[key], v.anchors[key], v.verdicts, v.isInvisible, !v.historical)
 
 		v.walked += walked
 		for txn := range losers {
@@ -140,7 +148,7 @@ func (e *Engine) GetSnapshots(ctx context.Context, keys []string) ([]*pb.Reduced
 		}
 
 		view := newSnapshotReadView(e, ctx)
-		if err := view.discover(keys); err != nil {
+		if err := view.discover(keys, view.capture); err != nil {
 			if !view.valid() {
 				continue
 			}

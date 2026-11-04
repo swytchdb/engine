@@ -177,9 +177,10 @@ func (e *Engine) keyFilterBytes() int64 {
 	e.keyFilterMu.RLock()
 	defer e.keyFilterMu.RUnlock()
 
-	n := e.ownKeyFilter.residentBytes() + memsize.Alloc(int64(cap(e.ownFilterBytes))) + memsize.Map(len(e.peerKeyFilters), 16)
-	for _, filter := range e.peerKeyFilters {
-		n += memsize.Alloc(int64(unsafe.Sizeof(*filter))) + filter.bulk.residentBytes() + filter.realtime.residentBytes()
+	n := e.ownKeyFilter.residentBytes() + memsize.Alloc(int64(cap(e.ownFilterBytes))) + memsize.Alloc(int64(cap(e.peerKeyFilters))*int64(unsafe.Sizeof(peerKeyFilter{})))
+	for i := range e.peerKeyFilters {
+		filter := &e.peerKeyFilters[i]
+		n += filter.bulk.residentBytes() + filter.realtime.residentBytes()
 	}
 
 	return n

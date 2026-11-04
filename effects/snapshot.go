@@ -1514,66 +1514,40 @@ func (e *Engine) reconstructWithView(key string, tips []Tip, txID string, waitFo
 	// DAG tip is committed (present in the current index) to avoid
 	// removing tips superseded only by an in-flight transaction.
 	if view == nil && len(tips) > 1 {
-		inputSet := make(map[Tip]bool, len(tips))
-		for _, t := range tips {
-			inputSet[t] = true
-		}
-
 		hasChild := make(map[Tip]bool, len(tips))
+		for _, t := range tips {
+			hasChild[t] = false
+		}
 
 		for _, eff := range d.nodes {
 			for _, dep := range eff.GetDeps() {
 				dt := r(dep)
-				if inputSet[dt] {
+				if _, input := hasChild[dt]; input {
 					hasChild[dt] = true
 				}
 			}
 		}
 
-		realTips := make(map[Tip]bool, len(tips))
+		currentIndex := e.index.Contains(key)
+		hasCommitted := false
+
+		var stale []Tip
+
 		for _, t := range tips {
-			if _, ok := d.nodes[t]; ok && !hasChild[t] {
-				realTips[t] = true
+			if _, readable := d.nodes[t]; !readable {
+				continue
+			}
+
+			if hasChild[t] {
+				stale = append(stale, t)
+			} else if currentIndex != nil && currentIndex.Contains(t) {
+				hasCommitted = true
 			}
 		}
 
-		if len(realTips) < len(tips) {
-			currentIndex := e.index.Contains(key)
-			if currentIndex != nil {
-				indexSet := make(map[Tip]bool)
-				for _, t := range currentIndex.Tips() {
-					indexSet[t] = true
-				}
-
-				hasCommitted := false
-
-				for t := range realTips {
-					if indexSet[t] {
-						hasCommitted = true
-
-						break
-					}
-				}
-
-				if hasCommitted {
-					var stale []Tip
-
-					for _, t := range tips {
-						if realTips[t] {
-							continue
-						}
-
-						if _, ok := d.nodes[t]; ok {
-							stale = append(stale, t)
-						}
-					}
-
-					if len(stale) > 0 {
-						slog.Debug("reconstruct: pruning stale tips", "key", key, "stale", stale)
-						e.index.RemoveTips(key, stale)
-					}
-				}
-			}
+		if hasCommitted && len(stale) > 0 {
+			slog.Debug("reconstruct: pruning stale tips", "key", key, "stale", stale)
+			e.index.RemoveTips(key, stale)
 		}
 	}
 

@@ -141,14 +141,13 @@ type Engine struct {
 	// the connection handshake, real-time from inbound SubscriptionEffects
 	// (see cuckoo.go and keyfilter.go). unfilteredPeers counts connected
 	// peers whose bulk filter hasn't arrived: until it does, the peer is
-	// presumed to hold every key. Guarded by keyFilterMu (plain map + mutex,
-	// never sync.Map).
+	// presumed to hold every key. keyFilterMu owns the filters and peer slice.
 	keyFilterMu       sync.RWMutex
 	ownKeyFilter      CuckooChain
 	ownFilterVer      uint64
 	ownFilterBytes    []byte // cached marshal of ownKeyFilter at ownFilterBytesVer
 	ownFilterBytesVer uint64
-	peerKeyFilters    map[pb.NodeID]*peerKeyFilter
+	peerKeyFilters    []peerKeyFilter // sorted by nodeID; shrinks on departure
 	unfilteredPeers   int
 
 	// Deserialized effect store — effects are immutable once written.
@@ -168,7 +167,6 @@ type Engine struct {
 	cachedDagBytes  atomic.Int64
 	subscriberBytes atomic.Int64
 	memWake         chan struct{}
-	reclaimMu       sync.Mutex
 	keyMemoryMu     sync.Mutex
 	keyOwners       map[string]keyOwner
 	keyHighWater    int
@@ -408,7 +406,6 @@ func newEngine(cfg EngineConfig) *Engine {
 		pendingTxTips:      xsync.NewMap[keytrie.EffectRef, []Tip](),
 		txAbortCounts:      xsync.NewMap[string, *atomic.Int32](),
 		pendingBootstraps:  xsync.NewMap[string, *bootstrapCollector](),
-		peerKeyFilters:     make(map[pb.NodeID]*peerKeyFilter),
 		effectCache:        newVertexPool(),
 		spokenBinds:        clox.NewCloxCache[Tip, *spokenBindHistory](clox.ConfigFromCapacity(8192)),
 		compressValues:     cfg.CompressValues,
@@ -2055,7 +2052,7 @@ func (e *Engine) evaluateBindForkChoice(bind *pb.TransactionalBindEffect, bindOf
 							continue
 						}
 
-						stack = append(stack, fromPbRefs(depEff.GetDeps())...)
+						stack = appendRefs(stack, depEff.GetDeps())
 					}
 
 					if !isDescendant {
@@ -2932,7 +2929,7 @@ func (e *Engine) probeAndFetchKey(key string) {
 
 		if e.effectCache != nil {
 			if cached, ok := e.effectCache.Get(off); ok {
-				fetchStack = append(fetchStack, fromPbRefs(cached.GetDeps())...)
+				fetchStack = appendRefs(fetchStack, cached.GetDeps())
 
 				continue
 			}
@@ -2960,7 +2957,7 @@ func (e *Engine) probeAndFetchKey(key string) {
 			continue
 		}
 
-		fetchStack = append(fetchStack, fromPbRefs(fetchedEff.GetDeps())...)
+		fetchStack = appendRefs(fetchStack, fetchedEff.GetDeps())
 	}
 
 	slog.Debug("anti-entropy: synced", "key", key, "fetched", len(fetched), "new_tips", len(missing))
