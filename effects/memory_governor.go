@@ -24,6 +24,7 @@
 package effects
 
 import (
+	"context"
 	"log/slog"
 	"math"
 	"runtime/debug"
@@ -62,6 +63,7 @@ func (e *Engine) startMemoryGovernor(targetBytes int64) {
 
 func (e *Engine) memoryGovernorLoop() {
 	defer e.memGovWg.Done()
+	defer e.setMemoryPressure(false)
 
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -80,7 +82,9 @@ func (e *Engine) memoryGovernorLoop() {
 			return
 		case <-e.memWake:
 			if wake == nil {
-				wakeTimer.Reset(50 * time.Millisecond)
+				// Detect pressure promptly: at bulk-ingest rates a 50ms
+				// debounce admits hundreds of MiB before pacing can begin.
+				wakeTimer.Reset(time.Millisecond)
 				wake = wakeTimer.C
 			}
 
@@ -104,9 +108,14 @@ func (e *Engine) memoryGovernorLoop() {
 // drains deferred releases before measuring again; GC timing cannot repeat a
 // deficit that logical reclamation has already satisfied.
 func (e *Engine) evictToTarget(target int64) MemoryStats {
+	// Apply pacing before draining: producers can otherwise keep an expensive
+	// reclaim pass busy while continuing to add owned state unchecked.
+	e.setMemoryPressure(e.residentMemory().ResidentBytes > target)
 	e.reclaimUnreferenced()
 
 	s := e.residentMemory()
+
+	e.setMemoryPressure(s.ResidentBytes > target)
 	defer e.evictBudget.Store(0)
 
 	if s.ResidentBytes <= target {
@@ -133,6 +142,7 @@ func (e *Engine) evictToTarget(target int64) MemoryStats {
 
 		e.reclaimUnreferenced()
 		s = e.residentMemory()
+		e.setMemoryPressure(s.ResidentBytes > target)
 	}
 
 	return s
@@ -147,11 +157,52 @@ const evictBatchSize = 4096
 // re-measured and drained on following ticks.
 const maxDrainPerTick = 1 << 18 // 262144
 
-// backpressure coalesces a governor wake after ingest/flush. Eviction and its
-// deferred walks run together in the background. Writes do not wait for GC or
-// for the operating system to reclaim pages.
-func (e *Engine) backpressure() {
+// memoryPressure is one continuous period above the owned-capacity target.
+// Only the governor publishes/closes it; writers only load and wait.
+type memoryPressure struct {
+	relieved chan struct{}
+}
+
+func (e *Engine) setMemoryPressure(over bool) {
+	if over {
+		if e.memPressure.Load() == nil {
+			e.memPressure.Store(&memoryPressure{relieved: make(chan struct{})})
+		}
+
+		return
+	}
+
+	if pressure := e.memPressure.Swap(nil); pressure != nil {
+		close(pressure.relieved)
+	}
+}
+
+// Bound post-publication pacing so pinned state, a transaction holding locks,
+// or replication needed for progress can never wait indefinitely for eviction.
+// This is overload pacing, not a hard admission limit on individual effects.
+const maxMemoryPacing = 25 * time.Millisecond
+
+// backpressure coalesces a governor wake after publication. Above the owned
+// target, pause new work on this producer until reclamation catches up, with
+// a bounded escape for pinned state. Never wait on GC, RSS or OS scavenging;
+// cancellation after publication only ends the wait, not the committed write.
+func (e *Engine) backpressure(ctx context.Context) {
 	e.wakeMemoryGovernor()
+
+	pressure := e.memPressure.Load()
+	if pressure == nil || e.closed.Load() {
+		return
+	}
+
+	timer := time.NewTimer(maxMemoryPacing)
+	defer timer.Stop()
+
+	select {
+	case <-pressure.relieved:
+	case <-e.memGovStop:
+	case <-ctx.Done():
+	case <-timer.C:
+	}
 }
 
 // drainEvictBudget evicts up to maxKeys keys, decrementing the shared evictBudget

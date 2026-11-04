@@ -26,10 +26,74 @@ package effects
 import (
 	"slices"
 	"testing"
+	"testing/synctest"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
 	"google.golang.org/protobuf/proto"
 )
+
+func TestMemoryPacingRemoteAdditionalBindKey(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := newTestEngineForEphemeral(t)
+		e.subscriptions.Store("local", &subscriptionState{ready: make(chan struct{})})
+		e.setMemoryPressure(true)
+
+		bind := &pb.Effect{
+			Key: []byte("remote"), Hlc: sTs(50), NodeId: 2, TxnId: "2:50:1",
+			ForkChoiceHash: ComputeForkChoiceHash(2, sTs(50)),
+			Kind: &pb.Effect_TxnBind{TxnBind: &pb.TransactionalBindEffect{
+				TxnHlc: sTs(50), OriginatorNodeId: 2,
+				Keys: []*pb.TransactionalBindEffect_KeyBind{
+					{Key: []byte("remote"), NewTip: &pb.EffectRef{NodeId: 2, Offset: 3900}},
+					{Key: []byte("local"), NewTip: &pb.EffectRef{NodeId: 2, Offset: 3950}},
+				},
+			}},
+		}
+
+		data, err := proto.Marshal(bind)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		callback := make(chan struct{}, 1)
+		e.OnKeyDataAdded = func(key string) {
+			if key == "local" {
+				callback <- struct{}{}
+			}
+		}
+		result := make(chan error, 1)
+
+		go func() {
+			_, err := e.HandleRemote(BuildOffsetNotify(2, Tip{2, 4000}, bind, data, nil))
+			result <- err
+		}()
+
+		synctest.Wait()
+
+		select {
+		case err := <-result:
+			t.Fatalf("owned additional bind key did not trigger pacing: %v", err)
+		default:
+		}
+
+		if e.index.Contains("local") == nil || e.index.Contains("remote") != nil {
+			t.Fatal("index participation changed or publication was delayed")
+		}
+
+		select {
+		case <-callback:
+		default:
+			t.Fatal("pacing delayed the published bind's callback")
+		}
+
+		e.setMemoryPressure(false)
+		synctest.Wait()
+
+		if err := <-result; err != nil {
+			t.Fatal(err)
+		}
+	})
+}
 
 // Rule 1 (docs/reconstruction.md): HandleRemote must never update the
 // index for a key the local node is not subscribed to. The bind's bytes

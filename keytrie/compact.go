@@ -25,7 +25,6 @@ package keytrie
 
 import (
 	"log/slog"
-	"sync/atomic"
 	"unsafe"
 )
 
@@ -65,6 +64,10 @@ const (
 	// badly fragmented trie converges over several reap cycles instead of one
 	// long stall.
 	compactMaxChunksPerPass = 256
+
+	// compactBatchSize bounds slots examined under one exclusive lock hold.
+	// Both arenas yield to readers/writers between batches, even within a chunk.
+	compactBatchSize = 64
 )
 
 // compactMinWasteBytes gates compaction entirely while the reclaimable waste
@@ -152,7 +155,7 @@ func (c *Critbit[T]) compactLeafChunks(maxChunks int) int {
 	return evacuated
 }
 
-// evacuateLeafChunk empties one leaf chunk under a single reap write-lock hold.
+// evacuateLeafChunk empties one leaf chunk in bounded reap write-lock holds.
 // Live leaves are relocated, dead-pending leaves are unlinked, ghosts forfeit
 // their warm-restart hint (a ghost stranded in a near-empty chunk is stale
 // anyway), and orphan husks need nothing — the identity-checked descent skips
@@ -163,6 +166,16 @@ func (c *Critbit[T]) compactLeafChunks(maxChunks int) int {
 // which is safe: a full counter means every remaining slot is an
 // already-accounted husk whose disposal below is a no-op.
 func (c *Critbit[T]) evacuateLeafChunk(chunk []critNode[T]) bool {
+	for start := 0; start < len(chunk); start += compactBatchSize {
+		if !c.evacuateLeafBatch(chunk[start:min(start+compactBatchSize, len(chunk))]) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func (c *Critbit[T]) evacuateLeafBatch(batch []critNode[T]) bool {
 	c.reapMu.Lock()
 	defer c.reapMu.Unlock()
 
@@ -170,8 +183,8 @@ func (c *Critbit[T]) evacuateLeafChunk(chunk []critNode[T]) bool {
 		return false
 	}
 
-	for i := range chunk {
-		n := &chunk[i]
+	for i := range batch {
+		n := &batch[i]
 		if n.deleted.Load() {
 			if n.freq.Load() < 0 {
 				// Ghost: shed ghost status (unlinkLeaf refuses freq < 0), then
@@ -249,14 +262,11 @@ func (c *Critbit[T]) relocateLeaf(old *critNode[T]) bool {
 
 // compactInternalChunks evacuates up to maxChunks sparse internal chunks.
 // The arena's retired-slot counters identify sparse, fully allocated chunks.
-// One write-lock DFS relocates selected nodes before visiting their children.
-// Children therefore always splice through their current parent. Each
-// relocated husk is accounted through recordReaped, which fires the drop when
-// the victim's last slot dies — compaction never drops a chunk directly.
+// Scan their slots directly, not the whole trie. Retired slots have nil children;
+// survivors find their current parent along a descendant leaf's key path.
+// Each relocated husk is accounted through recordReaped, which fires the drop
+// when the victim's last slot dies — compaction never drops a chunk directly.
 func (c *Critbit[T]) compactInternalChunks(maxChunks int) int {
-	c.reapMu.Lock()
-	defer c.reapMu.Unlock()
-
 	if c.closed.Load() || maxChunks <= 0 || c.root.Load() == nil {
 		return 0
 	}
@@ -271,67 +281,89 @@ func (c *Critbit[T]) compactInternalChunks(maxChunks int) int {
 
 	threshold := int(chunkSize) * compactOccupancyPct / 100
 
-	var selection [64]bool
-
-	selected := selection[:min(len(chunks), len(selection))]
-	if len(chunks) > len(selection) {
-		selected = make([]bool, len(chunks))
-	}
-
-	victims := 0
-	for ci := 0; ci < len(chunks) && ci < tail && victims < maxChunks; ci++ {
-		if chunks[ci] == nil {
+	evacuated := 0
+	for ci := 0; ci < len(chunks) && ci < tail && evacuated < maxChunks; ci++ {
+		chunk := chunks[ci]
+		if chunk == nil {
 			continue
 		}
 		// Recycled chunks awaiting re-allocation look sparse but are refilling;
 		// see the same skip in compactLeafChunks.
-		if chunks[ci].outstanding.Load() > 0 {
+		if chunk.outstanding.Load() > 0 {
 			continue
 		}
 
-		// All slots before tail have been allocated. With writers excluded,
-		// every slot is either linked or accounted by recordReaped.
-		if int(chunkSize)-int(chunks[ci].reaped.Load()) <= threshold {
-			selected[ci] = true
-			victims++
-		}
-	}
-
-	if victims == 0 {
-		return 0
-	}
-
-	// A link is either the root or a parent's child slot. Relocating through
-	// the link avoids separate root handling and parent/direction bookkeeping.
-	stack := make([]*atomic.Pointer[critNode[T]], 0, 64)
-
-	stack = append(stack, &c.root)
-	for len(stack) > 0 {
-		link := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-
-		node := link.Load()
-		if node.isLeaf {
+		// Advisory selection: the write lock in each batch waits for any
+		// in-flight allocation/publication, and relocation revalidates identity.
+		if int(chunkSize)-int(chunk.reaped.Load()) > threshold {
 			continue
 		}
 
-		if int(node.chunkIdx) < len(selected) && selected[node.chunkIdx] {
-			n2 := c.allocInternalNode(node.bytePos, node.otherbits)
-			n2.child[0].Store(node.child[0].Load())
-			n2.child[1].Store(node.child[1].Load())
-			link.Store(n2)
-
-			c.readRevision++
-			c.retireInternal(node)
-			node = n2
-		}
-
-		for dir := range 2 {
-			if ch := node.child[dir].Load(); ch != nil && !ch.isLeaf {
-				stack = append(stack, &node.child[dir])
-			}
+		if c.evacuateInternalChunk(chunk.nodes) {
+			evacuated++
 		}
 	}
 
-	return victims
+	return evacuated
+}
+
+func (c *Critbit[T]) evacuateInternalChunk(chunk []critNode[T]) bool {
+	for start := 0; start < len(chunk); start += compactBatchSize {
+		if !c.evacuateInternalBatch(chunk[start:min(start+compactBatchSize, len(chunk))]) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func (c *Critbit[T]) evacuateInternalBatch(batch []critNode[T]) bool {
+	c.reapMu.Lock()
+	defer c.reapMu.Unlock()
+
+	if c.closed.Load() {
+		return false
+	}
+
+	for i := range batch {
+		c.relocateInternal(&batch[i])
+	}
+
+	return true
+}
+
+// relocateInternal uses one descendant's key to locate the incoming link.
+// Internal arena order need not match tree order: a previously moved parent
+// is found at its current location. The write lock excludes structural changes
+// throughout both descents and the splice. Old chunk generations remain safe
+// across batches because retirement clears their children before recycling;
+// arrays are never reused in place.
+func (c *Critbit[T]) relocateInternal(old *critNode[T]) bool {
+	leaf := old.child[0].Load()
+	for leaf != nil && !leaf.isLeaf {
+		leaf = leaf.child[0].Load()
+	}
+
+	if leaf == nil {
+		return false // retired or never published
+	}
+
+	link := &c.root
+	for node := link.Load(); node != old; node = link.Load() {
+		if node == nil || node.isLeaf {
+			return false // no longer linked
+		}
+
+		link = &node.child[getDirection(leaf.key, node.bytePos, node.otherbits)]
+	}
+
+	n2 := c.allocInternalNode(old.bytePos, old.otherbits)
+	n2.child[0].Store(old.child[0].Load())
+	n2.child[1].Store(old.child[1].Load())
+	link.Store(n2)
+
+	c.readRevision++
+	c.retireInternal(old)
+
+	return true
 }

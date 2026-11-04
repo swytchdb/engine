@@ -155,8 +155,8 @@ func collectAllocations(v reflect.Value, allocations map[uintptr]int64) {
 			return false
 		}
 
-		_, seen := allocations[address]
-		allocations[address] = max(allocations[address], memsize.Alloc(size))
+		previous, seen := allocations[address]
+		allocations[address] = max(previous, memsize.Alloc(size))
 
 		return !seen
 	}

@@ -25,6 +25,7 @@ package effects
 
 import (
 	"bytes"
+	"fmt"
 	"runtime"
 	"sync"
 	"testing"
@@ -32,6 +33,35 @@ import (
 	pb "github.com/swytchdb/engine/cluster/proto"
 	"google.golang.org/protobuf/proto"
 )
+
+func BenchmarkProtoMemoryChurn(b *testing.B) {
+	for _, resident := range []int{1024, 65536, 262144} {
+		b.Run(fmt.Sprint(resident), func(b *testing.B) {
+			var memory protoMemory
+
+			effects := make([]*pb.Effect, resident)
+			for i := range effects {
+				effects[i] = scalarSet(fmt.Sprint(i), "value")
+				memory.change(effects[i], 1)
+			}
+
+			i := 0
+
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			for b.Loop() {
+				next := scalarSet("replacement", "value")
+				memory.change(next, 1)
+				memory.change(effects[i], -1)
+				effects[i] = next
+				i = (i + 1) % len(effects)
+			}
+
+			runtime.KeepAlive(effects)
+		})
+	}
+}
 
 func TestMemoryProtobufSharedSnapshotBuffer(t *testing.T) {
 	p := newVertexPool()

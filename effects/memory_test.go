@@ -32,11 +32,111 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
 	"github.com/swytchdb/engine/keytrie"
 )
+
+func TestMemoryPacing(t *testing.T) {
+	for _, end := range []string{"relief", "cancellation", "shutdown", "timeout"} {
+		t.Run(end, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				e := &Engine{memGovStop: make(chan struct{})}
+				e.setMemoryPressure(true)
+
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+
+				done := make(chan struct{})
+
+				go func() {
+					e.backpressure(ctx)
+					close(done)
+				}()
+
+				synctest.Wait()
+
+				select {
+				case <-done:
+					t.Fatal("writer did not wait for reclamation")
+				default:
+				}
+
+				switch end {
+				case "relief":
+					e.setMemoryPressure(false)
+				case "cancellation":
+					cancel()
+				case "shutdown":
+					close(e.memGovStop)
+				case "timeout":
+					time.Sleep(maxMemoryPacing)
+				}
+
+				synctest.Wait()
+
+				select {
+				case <-done:
+				default:
+					t.Fatal("writer remained blocked")
+				}
+			})
+		})
+	}
+}
+
+func TestMemoryPacingAfterPublication(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := NewEngine(EngineConfig{DefaultMode: UnsafeMode})
+
+		t.Cleanup(func() {
+			if err := e.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+		e.setMemoryPressure(true)
+
+		c := e.NewContext()
+		if err := c.Emit(scalarSet("paced", "committed")); err != nil {
+			t.Fatal(err)
+		}
+
+		result := make(chan error, 1)
+		go func() { result <- c.Flush() }()
+
+		synctest.Wait()
+
+		select {
+		case err := <-result:
+			t.Fatalf("write returned before relief: %v", err)
+		default:
+		}
+
+		state, _, _, err := e.GetSnapshot("paced")
+		if err != nil || string(state.GetScalar().GetRaw()) != "committed" {
+			t.Fatalf("pacing held up publication: %v", err)
+		}
+		// Read-only/empty flushes must not join the pressure wait.
+		started := time.Now()
+
+		if err := e.NewReadOnlyContext().Flush(); err != nil {
+			t.Fatal(err)
+		}
+
+		if time.Since(started) != 0 {
+			t.Fatal("read-only flush was paced")
+		}
+
+		e.evictToTarget(e.residentMemory().ResidentBytes)
+		synctest.Wait()
+
+		if err := <-result; err != nil {
+			t.Fatalf("pacing changed the commit result: %v", err)
+		}
+	})
+}
 
 func TestMemoryEvictionStopsWithoutGC(t *testing.T) {
 	e := NewEngine(EngineConfig{DefaultMode: UnsafeMode})
@@ -80,6 +180,10 @@ func TestMemoryEvictionStopsWithoutGC(t *testing.T) {
 
 	if after.ResidentBytes > target {
 		t.Fatalf("did not reclaim to target: before=%d after=%d target=%d", before.ResidentBytes, after.ResidentBytes, target)
+	}
+
+	if e.memPressure.Load() != nil {
+		t.Fatal("writers still paced after logical reclamation without GC")
 	}
 
 	keys, victims := e.KeyCount(), e.effectCache.ColdEvictions()

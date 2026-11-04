@@ -156,8 +156,9 @@ type Engine struct {
 	effectCache *VertexPool
 
 	// Memory governor lifecycle (owned-capacity eviction).
-	memGovStop chan struct{}
-	memGovWg   sync.WaitGroup
+	memGovStop  chan struct{}
+	memGovWg    sync.WaitGroup
+	memPressure atomic.Pointer[memoryPressure]
 
 	// memTarget is the resolved byte budget the governor holds the pool under
 	// (0 = unbounded). Exposed via MemoryTarget for heartbeat telemetry.
@@ -1414,14 +1415,10 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 		}
 	}
 
+	indexed := canonicalIndexable
 	if canonicalIndexable {
 		// Consume deps and add the new tip in a single index transition.
 		e.updateIndex(key, keytrie.NewTipSet(fromPbRefs(deps)...), r(notify.GetOrigin()))
-		// Remote inserts pay their own eviction debt: a subscribed node that runs
-		// no local commands never reaches Flush's back-pressure, so without this its
-		// pool would grow unbounded on replication traffic and dump the whole debt
-		// on the next read. Owned ingest (we serve this key) makes room as it lands.
-		e.backpressure()
 	}
 
 	if bind := eff.GetTxnBind(); bind != nil {
@@ -1446,6 +1443,8 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 				"key", kbKey, "bind_offset", notify.GetOrigin(),
 				"pre_tips", preOffsets)
 			e.updateIndex(kbKey, nil, r(notify.GetOrigin()))
+
+			indexed = true
 			postTips := e.index.Contains(kbKey)
 
 			var postOffsets []Tip
@@ -1457,6 +1456,12 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 				"key", kbKey, "bind_offset", notify.GetOrigin(),
 				"post_tips", postOffsets)
 		}
+	}
+
+	if indexed {
+		// Pace owned replication even when only an additional bind key is
+		// served here. Finish all indexing and callbacks before waiting.
+		defer e.backpressure(context.Background())
 	}
 
 	// Collect NACKs to return synchronously (replaces async SendNack calls).

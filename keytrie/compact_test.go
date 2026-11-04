@@ -25,10 +25,92 @@ package keytrie
 
 import (
 	"fmt"
+	"slices"
 	"sync"
 	"testing"
 	"unsafe"
 )
+
+// Arena slots are allocated by insertion order, not parent-before-child order.
+// Relocation must find the current incoming link even after an ancestor or a
+// descendant has moved, and revisiting an old generation must not retire twice.
+func TestCompact_InternalArenaOrderAndStaleSlots(t *testing.T) {
+	for _, reverse := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reverse=%t", reverse), func(t *testing.T) {
+			c := NewCritbit[int]()
+			c.internalArena.init(8, nil)
+			c.reapRunning.Store(true)
+
+			keys := make([]string, 0, 264)
+			keys = append(keys, "", "a", "aa", "ab", "b", "ba", "z", "za")
+
+			for i := range 128 {
+				keys = append(keys, fmt.Sprintf("key-%03d", (i*53)%128))
+			}
+
+			for i, key := range keys {
+				c.Insert(key, nil, NewTipSet(tip(uint64(i+1))))
+			}
+
+			var nodes []*critNode[int]
+			for _, chunk := range c.internalArena.list.Load().chunks {
+				for i := range chunk.nodes {
+					if n := &chunk.nodes[i]; n.child[0].Load() != nil {
+						nodes = append(nodes, n)
+					}
+				}
+			}
+
+			if reverse {
+				slices.Reverse(nodes)
+			}
+
+			for _, node := range nodes {
+				c.reapMu.Lock()
+				moved := c.relocateInternal(node)
+				c.reapMu.Unlock()
+
+				if !moved || node.child[0].Load() != nil || node.child[1].Load() != nil {
+					t.Fatal("linked internal node was not relocated and cleared")
+				}
+			}
+
+			// Refilling recycled indices must not make the old arrays live again.
+			for i := range 128 {
+				key := fmt.Sprintf("fresh-%03d", i)
+				keys = append(keys, key)
+				c.Insert(key, nil, NewTipSet(tip(uint64(len(keys)))))
+			}
+
+			before := c.internalArena.residentBytes()
+			for _, node := range nodes {
+				c.reapMu.Lock()
+				moved := c.relocateInternal(node)
+				c.reapMu.Unlock()
+
+				if moved {
+					t.Fatal("retired generation relocated twice")
+				}
+			}
+
+			if c.internalArena.residentBytes() != before {
+				t.Fatal("revisiting retired slots changed arena accounting")
+			}
+
+			for i, key := range keys {
+				if ts := c.Contains(key); ts == nil || !ts.Contains(tip(uint64(i+1))) {
+					t.Fatalf("key %q lost or changed after relocation", key)
+				}
+			}
+
+			slices.Sort(keys)
+
+			if got := c.Keys(); !slices.Equal(got, keys) {
+				t.Fatal("range changed after internal relocation")
+			}
+		})
+	}
+}
 
 // drainAllReaps runs the reap machinery to quiescence synchronously (the
 // production path is the async maybeReap goroutine).

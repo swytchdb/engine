@@ -997,8 +997,10 @@ func (c *Context) Flush() error {
 		defer flushSpan.End()
 	}
 
-	// Wake the governor once per command. Eviction, deferred reference release,
-	// and remeasurement run together in the background, independently of GC.
+	// Pace only contexts that published effects. An empty/read-only flush must
+	// not wait behind write pressure. Publication finishes before the wait.
+	wrote := len(c.keys) != 0
+
 	var err error
 	if !c.inTx {
 		err = c.flushNonTx()
@@ -1006,7 +1008,13 @@ func (c *Context) Flush() error {
 		err = c.flushTx()
 	}
 
-	c.engine.backpressure()
+	if wrote {
+		c.engine.backpressure(c.TraceCtx())
+	} else {
+		// Reads can fetch/cache effects too; keep background reclamation
+		// prompt without making readers join the write-pressure wait.
+		c.engine.wakeMemoryGovernor()
+	}
 
 	return err
 }
