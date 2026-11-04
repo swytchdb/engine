@@ -40,6 +40,31 @@ func (c *Critbit[T]) keyBytes(key string) int64 {
 	return memsize.Alloc(int64(len(key)))
 }
 
+// Retire only after detaching under reapMu's write lock, or for an unpublished
+// CAS loser while holding its read lock. All public readers copy their result
+// under that lock, so fields can be cleared without invalidating escaped values.
+// Clear before recording the slot: the final record may drop/recycle its array.
+func (c *Critbit[T]) retireLeaf(leaf *critNode[T]) {
+	key, tips, data := leaf.key, leaf.tips.Load(), leaf.data.Load()
+	leaf.key = ""
+	leaf.tips.Store(nil)
+	leaf.data.Store(nil)
+	leaf.deleted.Store(true)
+	c.leafArena.addExtra(leaf.chunkIdx, -c.keyBytes(key)-tipSetBytes(tips)-payloadBytes(data))
+
+	if c.releaseKey != nil && key != "" {
+		c.releaseKey(key)
+	}
+
+	c.leafArena.recordReaped(leaf.chunkIdx)
+}
+
+func (c *Critbit[T]) retireInternal(node *critNode[T]) {
+	node.child[0].Store(nil)
+	node.child[1].Store(nil)
+	c.internalArena.recordReaped(node.chunkIdx)
+}
+
 func (a *critbitArena[T]) residentBytes() int64 {
 	list := a.list.Load()
 	if list == nil {
@@ -63,28 +88,13 @@ func (a *critbitArena[T]) residentBytes() int64 {
 // slots), current frontier arrays, and payload headers. Maintenance queue
 // allocations are excluded from primary-cache ownership.
 // Externally interned keys and payload contents belong to their shared owner.
-// Keys stay charged until their arena chunk is dropped. Relocation transfers
-// the tips/payload charge without modifying husks visible to concurrent readers.
+// Retired fields are cleared under the structural write lock before their
+// capacity is credited. Arrays are never reused in place; results retained only
+// by callers remain outside cache ownership.
 func (c *Critbit[T]) ResidentBytes() int64 {
 	if c.closed.Load() {
 		return 0
 	}
 
 	return int64(unsafe.Sizeof(*c)) + c.leafArena.residentBytes() + c.internalArena.residentBytes()
-}
-
-// SetKeyOwnership shares key storage with an external cache owner. Configure
-// only on an empty trie before use. Ghosts and detached slots retain their key
-// reference until their containing chunk is dropped; no reader fields change.
-func (c *Critbit[T]) SetKeyOwnership(retain func(string) string, release func(string)) {
-	if retain == nil || release == nil {
-		panic("keytrie: key ownership requires retain and release")
-	}
-
-	c.retainKey = retain
-	c.leafArena.dropNode = func(n *critNode[T]) {
-		if n.key != "" {
-			release(n.key)
-		}
-	}
 }

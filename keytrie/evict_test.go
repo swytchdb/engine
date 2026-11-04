@@ -413,8 +413,12 @@ func TestGraduationGatedByPressure(t *testing.T) {
 }
 
 // findLeaf scans the leaf arena for a leaf carrying key, ghosts included
-// (Contains hides deleted leaves). Test-only; not concurrency-safe.
+// (Contains hides deleted leaves). Test-only; inserts must be quiescent. The
+// read lock excludes background retirement while inspecting immutable keys.
 func findLeaf[T any](c *Critbit[T], key string) *critNode[T] {
+	c.reapMu.RLock()
+	defer c.reapMu.RUnlock()
+
 	for _, chunk := range c.leafArena.list.Load().chunks {
 		for i := range chunk {
 			if n := &chunk[i]; n.key == key {

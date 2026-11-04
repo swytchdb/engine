@@ -97,7 +97,7 @@ type critNode[T any] struct {
 	data atomic.Pointer[T] // 8 bytes,  offset 72 (leaf payload, 8-aligned)
 	// lastDecayEpoch is the eviction-decay epoch this leaf last absorbed; the
 	// sweep steps freq down by the elapsed epochs on visit (see decayLeaf).
-	// Atomic because ghost promotion resets it from the lock-free read path
+	// Atomic because ghost promotion and the sweep can share the read lock
 	// while the sweep writes it under evictMu.
 	lastDecayEpoch atomic.Uint64 // 8 bytes,  offset 80
 }
@@ -169,25 +169,40 @@ type Critbit[T any] struct {
 	// consumer could re-enter.
 	refDelta func(added, removed []EffectRef, droppedData *T)
 
-	initOnce  sync.Once
-	retainKey func(string) string
+	// Optional shared key ownership, configured before publishing the trie.
+	// The owner accounts for interned key storage; each leaf holds one reference.
+	retainKey  func(string) string
+	releaseKey func(string)
+
+	initOnce sync.Once
 	// Two arenas of the same node type — leaves and internal nodes never migrate
 	// between roles (isLeaf is set at alloc and never flipped), so a node born in
 	// one arena dies there. Splitting them lets the eviction sweep scan only the
 	// leaf arena (dense, no internal-node skipping) and lets the sweep reclaim a
 	// whole leaf chunk once every slot in it is dead. Individual slots are never
-	// reused in place (that would require synchronizing every lock-free reader
-	// against reinitialization); reclamation is at chunk granularity, and a
+	// reused in place; reclamation is at chunk granularity, and a
 	// reclaimed chunk's slot range is recycled through a fresh, never-published
 	// array via the arena free list (see dropChunk).
 	leafArena     critbitArena[critNode[T]]
 	internalArena critbitArena[critNode[T]]
 
-	// reapMu coordinates structural modifications. Inserts take a
-	// read-lock (concurrent inserts proceed in parallel). The reaper
-	// takes a write-lock so no insert can be mid-CAS on a child
-	// pointer while the reaper unlinks a subtree.
-	reapMu xsync.RBMutex
+	// reapMu protects node lifetimes. Readers and inserts share the read lock;
+	// the reaper takes the write lock to detach nodes and clear their fields.
+	reapMu sync.RWMutex
+	// Incremented under the write lock when existing paths are detached. Range
+	// cursors restart after their last key instead of following retired nodes.
+	readRevision uint64
+}
+
+// SetKeyOwnership shares key allocations with an external primary-cache owner.
+// Set it only on an empty trie before concurrent use. Relocations transfer a
+// reference; deletion releases it when the leaf is physically unlinked.
+func (c *Critbit[T]) SetKeyOwnership(retain func(string) string, release func(string)) {
+	if retain == nil || release == nil {
+		panic("keytrie: key ownership requires retain and release")
+	}
+
+	c.retainKey, c.releaseKey = retain, release
 }
 
 // NewCritbit creates a new crit-bit trie with leaf payload type T.
@@ -217,7 +232,9 @@ type arenaChunkList[T any] struct {
 	chunks      [][]T
 	reaped      []*atomic.Int64
 	outstanding []*atomic.Int64
-	extra       []*atomic.Int64
+	// extra charges keys, current tip sets and payload headers retained by
+	// each chunk, including dead slots and ghosts, until their fields clear.
+	extra []*atomic.Int64
 }
 
 type critbitArena[T any] struct {
@@ -233,7 +250,7 @@ type critbitArena[T any] struct {
 	// no Size) so dropChunk can pre-check room for a whole chunk before committing
 	// a recycle. MPMC: many allocators dequeue, dropChunk enqueues under growMu.
 	// Reuse is safe because recycling installs a brand-new chunk array — its slots
-	// have never been published, so no lock-free reader can hold a pointer into
+	// have never been published, so no reader can hold a pointer into
 	// them, while the dead array goes to GC exactly as the nil path does.
 	freeList  *xsync.MPMCQueue[uint64]
 	freeCount atomic.Int64
@@ -243,7 +260,6 @@ type critbitArena[T any] struct {
 	// every slot, so the eviction sweep (which scans the arena directly) skips a
 	// slot until allocLeafNode + Insert have written and published a real leaf.
 	initNode func(*T)
-	dropNode func(*T)
 }
 
 func (a *critbitArena[T]) init(chunkSize int, initNode func(*T)) {
@@ -319,8 +335,7 @@ func (a *critbitArena[T]) recordReaped(chunkIdx uint32) {
 }
 
 // dropChunk handles a fully-unlinked chunk. The dead array is always released to
-// GC (it is no longer referenced by list once we swap), so a stale lock-free
-// reader still pointing into it stays valid until it drops its own pointer.
+// GC after its detached fields are cleared and list releases the array.
 //
 // When the free list has room for a whole chunk, it RECYCLES: a fresh empty chunk
 // takes the slot's place and its pristine slots return to the free list for
@@ -349,14 +364,6 @@ func (a *critbitArena[T]) dropChunk(chunkIdx uint32) {
 	newChunks := make([][]T, len(list.chunks))
 	copy(newChunks, list.chunks)
 
-	if a.dropNode != nil {
-		for i := range list.chunks[chunkIdx] {
-			a.dropNode(&list.chunks[chunkIdx][i])
-		}
-	}
-
-	list.extra[chunkIdx].Store(0)
-
 	if a.freeCount.Load()+int64(a.chunkSize) <= int64(a.freeCap) {
 		fresh := make([]T, a.chunkSize)
 		if a.initNode != nil {
@@ -370,6 +377,7 @@ func (a *critbitArena[T]) dropChunk(chunkIdx uint32) {
 		list.outstanding[chunkIdx].Store(int64(a.chunkSize))
 		// Publish the fresh chunk before its slots become reachable via the free
 		// list, so a concurrent alloc that dequeues an index sees the new array.
+		list.extra[chunkIdx].Store(0)
 		a.list.Store(&arenaChunkList[T]{chunks: newChunks, reaped: list.reaped, outstanding: list.outstanding, extra: list.extra})
 
 		base := uint64(chunkIdx) * a.chunkSize
@@ -418,14 +426,6 @@ func (a *critbitArena[T]) grow(needed uint64) {
 
 func (a *critbitArena[T]) clear() {
 	a.growMu.Lock()
-	if a.dropNode != nil {
-		for _, chunk := range a.list.Load().chunks {
-			for i := range chunk {
-				a.dropNode(&chunk[i])
-			}
-		}
-	}
-
 	a.list.Store(&arenaChunkList[T]{})
 	a.next.Store(0)
 	// Drain stale recycled indices: they point into chunks the reset just dropped,
@@ -581,40 +581,37 @@ func (c *Critbit[T]) Insert(key string, old *TipSet, newTips *TipSet) (*TipSet, 
 			return nil, false
 		}
 
-		rt := c.reapMu.RLock()
+		c.reapMu.RLock()
 
-		// The root MUST be loaded under the read lock: the reaper and the
-		// compactor (write lock) detach nodes whose child pointers remain
-		// valid-looking and writable. A root captured before the lock can name
-		// a path through a detached node, and a structural CAS landing on such
-		// a node succeeds — silently linking the new leaf into an unreachable
-		// subtree. Under the lock, every node reachable from root is linked.
+		// Load the root under the read lock so reclamation cannot detach and
+		// clear a path before insertion finishes following it. A structural
+		// CAS on a detached node would link a leaf into an unreachable subtree.
 		rootNode := c.root.Load()
 
 		if rootNode == nil {
 			newNode := c.allocLeafNode(key, newTips) // deleted=true, pop under the read lock
 			if c.root.CompareAndSwap(nil, newNode) {
 				newNode.deleted.Store(false) // publish only after linking
-				c.reapMu.RUnlock(rt)
+				c.reapMu.RUnlock()
 				c.size.Add(1)
 				c.fireTipDelta(old, newTips, nil)
 
 				return nil, true
 			}
 
-			c.reapMu.RUnlock(rt)
 			// Lost the CAS: newNode is an unlinked orphan, still deleted=true, so
 			// the sweep skips it. Its slot is never reused; account it reaped now,
 			// or its chunk could never reach a full count and would be pinned from
 			// reclamation forever by this one dead slot.
-			c.leafArena.recordReaped(newNode.chunkIdx)
+			c.retireLeaf(newNode)
+			c.reapMu.RUnlock()
 
 			continue
 		}
 
 		bestLeaf := c.findBestMatch(rootNode, key)
 		if bestLeaf == nil {
-			c.reapMu.RUnlock(rt)
+			c.reapMu.RUnlock()
 
 			continue
 		}
@@ -643,7 +640,7 @@ func (c *Critbit[T]) Insert(key string, old *TipSet, newTips *TipSet) (*TipSet, 
 					}
 				}
 
-				c.reapMu.RUnlock(rt)
+				c.reapMu.RUnlock()
 				c.fireTipDelta(old, newTips, nil)
 
 				return nil, true
@@ -651,7 +648,7 @@ func (c *Critbit[T]) Insert(key string, old *TipSet, newTips *TipSet) (*TipSet, 
 
 			tips := bestLeaf.tips.Load()
 
-			c.reapMu.RUnlock(rt)
+			c.reapMu.RUnlock()
 
 			return tips, false
 		}
@@ -677,7 +674,7 @@ func (c *Critbit[T]) Insert(key string, old *TipSet, newTips *TipSet) (*TipSet, 
 					}
 				}
 
-				c.reapMu.RUnlock(rt)
+				c.reapMu.RUnlock()
 				c.fireTipDelta(old, newTips, nil)
 
 				return nil, true
@@ -685,7 +682,7 @@ func (c *Critbit[T]) Insert(key string, old *TipSet, newTips *TipSet) (*TipSet, 
 
 			tips := bestLeaf.tips.Load()
 
-			c.reapMu.RUnlock(rt)
+			c.reapMu.RUnlock()
 
 			return tips, false
 		}
@@ -699,19 +696,19 @@ func (c *Critbit[T]) Insert(key string, old *TipSet, newTips *TipSet) (*TipSet, 
 		ok := c.insertNode(rootNode, newInternal, newLeafNode, newDir, oldDir, bytePos, otherbits)
 		if ok {
 			newLeafNode.deleted.Store(false) // publish after linking, before releasing the read lock
-			c.reapMu.RUnlock(rt)
+			c.reapMu.RUnlock()
 			c.size.Add(1)
 			c.fireTipDelta(old, newTips, nil)
 
 			return nil, true
 		}
 
-		c.reapMu.RUnlock(rt)
 		// Lost: newLeafNode/newInternal are unlinked orphans (leaf still
 		// deleted=true, so the sweep skips it). Account both slots reaped so
 		// they don't pin their chunks from reclamation, then retry.
-		c.leafArena.recordReaped(newLeafNode.chunkIdx)
-		c.internalArena.recordReaped(newInternal.chunkIdx)
+		c.retireLeaf(newLeafNode)
+		c.retireInternal(newInternal)
+		c.reapMu.RUnlock()
 	}
 }
 
@@ -821,8 +818,8 @@ func (c *Critbit[T]) Pin(key string) bool {
 		return false
 	}
 
-	rt := c.reapMu.RLock()
-	defer c.reapMu.RUnlock(rt)
+	c.reapMu.RLock()
+	defer c.reapMu.RUnlock()
 
 	root := c.root.Load()
 	if root == nil {
@@ -858,8 +855,8 @@ func (c *Critbit[T]) Unpin(key string) bool {
 		return false
 	}
 
-	rt := c.reapMu.RLock()
-	defer c.reapMu.RUnlock(rt)
+	c.reapMu.RLock()
+	defer c.reapMu.RUnlock()
 
 	root := c.root.Load()
 	if root == nil {
@@ -881,6 +878,9 @@ func (c *Critbit[T]) Unpin(key string) bool {
 // Contains checks if a key exists and returns its TipSet.
 // Returns nil if the key doesn't exist or is deleted.
 func (c *Critbit[T]) Contains(key string) *TipSet {
+	c.reapMu.RLock()
+	defer c.reapMu.RUnlock()
+
 	if c.closed.Load() {
 		return nil
 	}
@@ -899,10 +899,13 @@ func (c *Critbit[T]) Contains(key string) *TipSet {
 }
 
 // LoadData returns the existing leaf payload without installing one. Like
-// Contains, it is a lock-free, stale-tolerant read: compaction leaves relocated
-// husk payloads intact, so a reader that captured the old leaf still observes
-// the same *T. A successful lookup records the access for eviction policy.
+// Contains, it holds the structural read lock until it has copied the payload
+// pointer. The returned payload remains valid after the leaf is retired.
+// A successful lookup records the access for eviction policy.
 func (c *Critbit[T]) LoadData(key string) *T {
+	c.reapMu.RLock()
+	defer c.reapMu.RUnlock()
+
 	if c.closed.Load() {
 		return nil
 	}
@@ -990,8 +993,8 @@ func (c *Critbit[T]) LoadOrStoreData(key string, def *T) (*T, bool) {
 		return nil, false
 	}
 
-	rt := c.reapMu.RLock()
-	defer c.reapMu.RUnlock(rt)
+	c.reapMu.RLock()
+	defer c.reapMu.RUnlock()
 
 	rootNode := c.root.Load()
 	if rootNode == nil {
@@ -1067,18 +1070,18 @@ func (c *Critbit[T]) RemoveTips(key string, refs []EffectRef) {
 		removeSet[r] = true
 	}
 
-	rt := c.reapMu.RLock()
+	c.reapMu.RLock()
 
 	rootNode := c.root.Load()
 	if rootNode == nil {
-		c.reapMu.RUnlock(rt)
+		c.reapMu.RUnlock()
 
 		return
 	}
 
 	leaf := c.findBestMatch(rootNode, key)
 	if leaf == nil || leaf.key != key || leaf.isDeleted() {
-		c.reapMu.RUnlock(rt)
+		c.reapMu.RUnlock()
 
 		return
 	}
@@ -1086,7 +1089,7 @@ func (c *Critbit[T]) RemoveTips(key string, refs []EffectRef) {
 	for {
 		current := leaf.tips.Load()
 		if current == nil {
-			c.reapMu.RUnlock(rt)
+			c.reapMu.RUnlock()
 
 			return
 		}
@@ -1100,7 +1103,7 @@ func (c *Critbit[T]) RemoveTips(key string, refs []EffectRef) {
 		}
 
 		if len(kept) == len(current.Tips()) {
-			c.reapMu.RUnlock(rt)
+			c.reapMu.RUnlock()
 
 			return // nothing to remove
 		}
@@ -1108,7 +1111,7 @@ func (c *Critbit[T]) RemoveTips(key string, refs []EffectRef) {
 		newTips := NewTipSet(kept...)
 		if leaf.tips.CompareAndSwap(current, newTips) {
 			c.leafArena.addExtra(leaf.chunkIdx, tipSetBytes(newTips)-tipSetBytes(current))
-			c.reapMu.RUnlock(rt)
+			c.reapMu.RUnlock()
 			c.fireTipDelta(current, newTips, nil)
 
 			return
@@ -1128,31 +1131,31 @@ func (c *Critbit[T]) DeleteAndSnapshot(key string, old *TipSet) *TipSet {
 		return nil
 	}
 
-	rt := c.reapMu.RLock()
+	c.reapMu.RLock()
 
 	rootNode := c.root.Load()
 	if rootNode == nil {
-		c.reapMu.RUnlock(rt)
+		c.reapMu.RUnlock()
 
 		return nil
 	}
 
 	leaf := c.findBestMatch(rootNode, key)
 	if leaf == nil || leaf.key != key {
-		c.reapMu.RUnlock(rt)
+		c.reapMu.RUnlock()
 
 		return nil
 	}
 
 	if !leaf.deleted.CompareAndSwap(false, true) {
-		c.reapMu.RUnlock(rt)
+		c.reapMu.RUnlock()
 
 		return nil
 	}
 
 	if !leaf.tips.CompareAndSwap(old, nil) {
 		leaf.deleted.Store(false)
-		c.reapMu.RUnlock(rt)
+		c.reapMu.RUnlock()
 
 		return nil
 	}
@@ -1162,7 +1165,7 @@ func (c *Critbit[T]) DeleteAndSnapshot(key string, old *TipSet) *TipSet {
 	c.releaseLeafMemory(leaf, old, droppedData)
 	c.size.Add(-1)
 
-	c.reapMu.RUnlock(rt)
+	c.reapMu.RUnlock()
 
 	// Release the tips and the payload's references — DeleteAndSnapshot bypasses
 	// the eviction notify, so this is the only refcount signal for FlushIndex.
@@ -1226,99 +1229,15 @@ func (c *Critbit[T]) ArenaBytes() int64 {
 }
 
 func (c *Critbit[T]) Range(fn func(key string) bool) {
-	if c.closed.Load() || fn == nil {
-		return
-	}
-
-	rootNode := c.root.Load()
-	if rootNode != nil {
-		c.rangeNode(rootNode, fn)
-	}
-}
-
-func (c *Critbit[T]) rangeNode(node *critNode[T], fn func(key string) bool) bool {
-	if node == nil {
-		return true
-	}
-
-	if node.isLeaf {
-		if !node.isDeleted() {
-			return fn(node.key)
-		}
-
-		return true
-	}
-
-	if left := node.child[0].Load(); left != nil {
-		if !c.rangeNode(left, fn) {
-			return false
-		}
-	}
-
-	if right := node.child[1].Load(); right != nil {
-		return c.rangeNode(right, fn)
-	}
-
-	return true
+	c.rangeKeys("", "", false, fn)
 }
 
 func (c *Critbit[T]) RangeFrom(after string, fn func(key string) bool) {
-	if c.closed.Load() || fn == nil {
-		return
-	}
-
-	if after == "" {
-		c.Range(fn)
-
-		return
-	}
-
-	rootNode := c.root.Load()
-	if rootNode != nil {
-		c.rangeFromNode(rootNode, after, fn)
-	}
-}
-
-func (c *Critbit[T]) rangeFromNode(node *critNode[T], after string, fn func(key string) bool) bool {
-	if node == nil {
-		return true
-	}
-
-	if node.isLeaf {
-		if !node.isDeleted() && node.key > after {
-			return fn(node.key)
-		}
-
-		return true
-	}
-
-	if left := node.child[0].Load(); left != nil {
-		if !c.rangeFromNode(left, after, fn) {
-			return false
-		}
-	}
-
-	if right := node.child[1].Load(); right != nil {
-		return c.rangeFromNode(right, after, fn)
-	}
-
-	return true
+	c.rangeKeys("", after, after != "", fn)
 }
 
 func (c *Critbit[T]) RangePrefix(prefix string, fn func(key string) bool) {
-	if c.closed.Load() || fn == nil {
-		return
-	}
-
-	rootNode := c.root.Load()
-	if rootNode == nil {
-		return
-	}
-
-	subtree := c.findPrefixSubtree(rootNode, prefix)
-	if subtree != nil {
-		c.rangePrefixNode(subtree, prefix, fn)
-	}
+	c.rangeKeys(prefix, "", false, fn)
 }
 
 func (c *Critbit[T]) findPrefixSubtree(node *critNode[T], prefix string) *critNode[T] {
@@ -1333,34 +1252,6 @@ func (c *Critbit[T]) findPrefixSubtree(node *critNode[T], prefix string) *critNo
 	}
 
 	return current
-}
-
-func (c *Critbit[T]) rangePrefixNode(node *critNode[T], prefix string, fn func(key string) bool) bool {
-	if node == nil {
-		return true
-	}
-
-	if node.isLeaf {
-		if !node.isDeleted() {
-			if len(node.key) >= len(prefix) && node.key[:len(prefix)] == prefix {
-				return fn(node.key)
-			}
-		}
-
-		return true
-	}
-
-	if left := node.child[0].Load(); left != nil {
-		if !c.rangePrefixNode(left, prefix, fn) {
-			return false
-		}
-	}
-
-	if right := node.child[1].Load(); right != nil {
-		return c.rangePrefixNode(right, prefix, fn)
-	}
-
-	return true
 }
 
 func (c *Critbit[T]) Keys() []string {
@@ -1400,6 +1291,9 @@ func (c *Critbit[T]) MatchPattern(pattern string) []string {
 }
 
 func (c *Critbit[T]) FirstWithPrefix(prefix string, claim bool) (string, bool, ReleaseClaimFunc) {
+	c.reapMu.RLock()
+	defer c.reapMu.RUnlock()
+
 	if c.closed.Load() {
 		return "", false, nil
 	}
@@ -1457,6 +1351,9 @@ func (c *Critbit[T]) findLeftmost(node *critNode[T], prefix string) (string, *cr
 }
 
 func (c *Critbit[T]) LastWithPrefix(prefix string, claim bool) (string, bool, ReleaseClaimFunc) {
+	c.reapMu.RLock()
+	defer c.reapMu.RUnlock()
+
 	if c.closed.Load() {
 		return "", false, nil
 	}
@@ -1526,6 +1423,9 @@ func (c *Critbit[T]) NextWithPrefix(prefix, after string, claim bool) (string, b
 	if len(after) < len(prefix) || after[:len(prefix)] != prefix {
 		return c.FirstWithPrefix(prefix, claim)
 	}
+
+	c.reapMu.RLock()
+	defer c.reapMu.RUnlock()
 
 	for {
 		rootNode := c.root.Load()
@@ -1599,6 +1499,9 @@ func (c *Critbit[T]) PrevWithPrefix(prefix, before string, claim bool) (string, 
 		return c.LastWithPrefix(prefix, claim)
 	}
 
+	c.reapMu.RLock()
+	defer c.reapMu.RUnlock()
+
 	for {
 		rootNode := c.root.Load()
 		if rootNode == nil {
@@ -1652,6 +1555,9 @@ func (c *Critbit[T]) PrevWithPrefix(prefix, before string, claim bool) (string, 
 }
 
 func (c *Critbit[T]) TryClaimKey(key string) (exists bool, release ReleaseClaimFunc) {
+	c.reapMu.RLock()
+	defer c.reapMu.RUnlock()
+
 	if c.closed.Load() {
 		return false, nil
 	}
@@ -1768,8 +1674,9 @@ func (c *Critbit[T]) unlinkLeaf(leaf *critNode[T]) bool {
 
 	if root == leaf {
 		c.root.Store(nil)
+		c.readRevision++
 		c.deletedCount.Add(-1)
-		c.leafArena.recordReaped(leaf.chunkIdx)
+		c.retireLeaf(leaf)
 
 		return true
 	}
@@ -1813,8 +1720,9 @@ func (c *Critbit[T]) unlinkLeaf(leaf *critNode[T]) bool {
 	}
 
 	c.deletedCount.Add(-1)
-	c.leafArena.recordReaped(leaf.chunkIdx)
-	c.internalArena.recordReaped(p.chunkIdx)
+	c.readRevision++
+	c.retireInternal(p)
+	c.retireLeaf(leaf)
 
 	return true
 }
@@ -1839,8 +1747,9 @@ func (c *Critbit[T]) reap() int {
 		// Ghosts (deleted, freq < 0) are retained for warm restart.
 		if root.isDeleted() && root.freq.Load() >= 0 {
 			c.root.Store(nil)
+			c.readRevision++
 			c.deletedCount.Add(-1)
-			c.leafArena.recordReaped(root.chunkIdx)
+			c.retireLeaf(root)
 
 			return 1
 		}
@@ -1889,8 +1798,9 @@ func (c *Critbit[T]) reap() int {
 
 			// Both the deleted leaf and the internal node it collapsed are now
 			// unlinked; tell each arena so it can drop a fully-dead chunk.
-			c.leafArena.recordReaped(child.chunkIdx)
-			c.internalArena.recordReaped(node.chunkIdx)
+			c.readRevision++
+			c.retireInternal(node)
+			c.retireLeaf(child)
 
 			if !sibling.isLeaf {
 				queue = append(queue, bfsEntry{
@@ -1936,7 +1846,19 @@ func (c *Critbit[T]) Close() error {
 	}
 
 	c.root.Store(nil)
+	c.readRevision++
 	c.size.Store(0)
+
+	if c.releaseKey != nil {
+		for _, chunk := range c.leafArena.list.Load().chunks {
+			for i := range chunk {
+				if key := chunk[i].key; key != "" {
+					c.releaseKey(key)
+				}
+			}
+		}
+	}
+
 	c.leafArena.clear()
 	c.internalArena.clear()
 

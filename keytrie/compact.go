@@ -48,11 +48,9 @@ import (
 //   - Splices are identity-checked by descent, exactly like unlinkLeaf: a slot
 //     whose key path resolves to a different node is an orphan husk and is
 //     skipped, and stale reapQueue entries no-op the same way.
-//   - Pure readers (Contains, Range) are lock-free and stale-tolerant: the
-//     husk's fields are left intact — deleted flag, tips, and payload — so a
-//     reader that captured the old pointer mid-descent finishes with a correct
-//     answer, and GC keeps the dropped chunk's memory alive until the last
-//     such reader lets go (the same grace dropChunk has always relied on).
+//   - Readers copy their result under the reap read lock. The write lock gives
+//     relocation a grace period to clear the detached slot's references. Range
+//     cursors restart on readRevision changes before reading an old path.
 //   - TipSets and leaf payloads move by pointer, so escaped *T references and
 //     tip refcounts are untouched; no refDelta fires for a relocation.
 const (
@@ -202,10 +200,9 @@ func (c *Critbit[T]) evacuateLeafChunk(chunk []critNode[T]) bool {
 }
 
 // relocateLeaf copies a live leaf into a fresh slot and splices it in place of
-// the original. Caller holds the reap write lock. The husk is left untouched —
-// still live-looking, sharing the same TipSet and payload pointers — so a
-// stale lock-free reader finishes through it correctly; it is unreachable from
-// the tree the moment the splice lands, and its slot is accounted right here so
+// the original. Caller holds the reap write lock. The detached slot's references
+// are cleared after the splice; readers have finished copying their result.
+// Its slot is accounted right here so
 // the chunk's counter can fire the drop. Returns false when the slot isn't
 // actually linked (an orphan husk, accounted at abandonment).
 func (c *Critbit[T]) relocateLeaf(old *critNode[T]) bool {
@@ -248,14 +245,11 @@ func (c *Critbit[T]) relocateLeaf(old *critNode[T]) bool {
 	n2.pins.Store(old.pins.Load())
 	n2.tips.Store(old.tips.Load())
 	n2.data.Store(old.data.Load())
-	// Transfer the shared tips/payload charge; the husk remains read-safe.
 	c.leafArena.addExtra(ci, c.keyBytes(n2.key)+tipSetBytes(n2.tips.Load())+payloadBytes(n2.data.Load()))
-	c.releaseLeafMemory(old, old.tips.Load(), old.data.Load())
 	n2.freq.Store(old.freq.Load())
 	n2.lastAccess.Store(old.lastAccess.Load())
 	// Publish before splicing: unreachable until the splice, and the write lock
-	// excludes the sweep, so no scanner can see it early — while a lock-free
-	// reader arriving through the new parent pointer must find deleted=false.
+	// excludes scanners until the relocated leaf is ready.
 	n2.deleted.Store(false)
 
 	if p == nil {
@@ -264,7 +258,8 @@ func (c *Critbit[T]) relocateLeaf(old *critNode[T]) bool {
 		p.child[pDir].Store(n2)
 	}
 
-	c.leafArena.recordReaped(old.chunkIdx)
+	c.readRevision++
+	c.retireLeaf(old)
 
 	return true
 }
@@ -289,11 +284,12 @@ func (c *Critbit[T]) compactInternalChunks(maxChunks int) int {
 	// Pass 1 (shared lock, concurrent with traffic): count linked internals
 	// per chunk.
 	counts := make([]int, len(chunks))
-	rt := c.reapMu.RLock()
+
+	c.reapMu.RLock()
 
 	root := c.root.Load()
 	if root == nil {
-		c.reapMu.RUnlock(rt)
+		c.reapMu.RUnlock()
 
 		return 0
 	}
@@ -320,7 +316,7 @@ func (c *Critbit[T]) compactInternalChunks(maxChunks int) int {
 		}
 	}
 
-	c.reapMu.RUnlock(rt)
+	c.reapMu.RUnlock()
 
 	threshold := int(chunkSize) * compactOccupancyPct / 100
 
@@ -411,7 +407,8 @@ func (c *Critbit[T]) compactInternalChunks(maxChunks int) int {
 		}
 
 		replaced[m.node] = n2
-		c.internalArena.recordReaped(m.node.chunkIdx)
+		c.readRevision++
+		c.retireInternal(m.node)
 	}
 
 	return len(victims)

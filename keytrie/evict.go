@@ -268,7 +268,7 @@ func (c *Critbit[T]) EvictBatch(want int) int {
 	// reap write lock — the only thing that frees/reclaims a leaf slot — so a
 	// published leaf's fields (including the non-atomic key) cannot be mutated
 	// mid-read.
-	rt := c.reapMu.RLock()
+	c.reapMu.RLock()
 
 	c.sweepLeaves(window, func(leaf *critNode[T]) {
 		access := leaf.lastAccess.Load()
@@ -432,7 +432,7 @@ func (c *Critbit[T]) EvictBatch(want int) int {
 		c.evictedUnprot.Add(uint64(len(victims)))
 	}
 
-	c.reapMu.RUnlock(rt)
+	c.reapMu.RUnlock()
 
 	// Release tip/payload references and notify, outside the lock (the consumer
 	// callbacks may re-enter the trie).
@@ -501,8 +501,8 @@ func (c *Critbit[T]) decayEpoch() uint64 {
 // decayLeaf absorbs a leaf's pending eviction-driven frequency decay: one −1
 // step per decay epoch elapsed since its last sweep visit, floor 1. The CAS on
 // lastDecayEpoch elects a single decayer per epoch — the sweep runs under
-// evictMu, but ghost promotion also writes the field from the lock-free read
-// path; the freq CAS loop rides out concurrent bumpAccess bumps.
+// evictMu, but ghost promotion also writes the field under the shared read
+// lock; the freq CAS loop rides out concurrent bumpAccess bumps.
 func decayLeaf[T any](leaf *critNode[T], epoch uint64) {
 	last := leaf.lastDecayEpoch.Load()
 	if last >= epoch || !leaf.lastDecayEpoch.CompareAndSwap(last, epoch) {
