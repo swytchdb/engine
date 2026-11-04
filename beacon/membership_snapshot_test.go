@@ -150,7 +150,9 @@ func TestMembershipObservationDoesNotCompact(t *testing.T) {
 	e.SetOnLocalEffect(func(_ effects.Tip, _ *pb.Effect) { minted.Add(1) })
 
 	for range 20 {
-		b.refreshTopology()
+		if err := b.refreshTopology(); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	if minted.Load() != 0 {

@@ -484,6 +484,7 @@ func filterSnapshotAt(result *pb.ReducedEffect, now time.Time) *pb.ReducedEffect
 //
 // Cache hit returns immediately. On miss, walks the causal DAG from
 // the index tip set and reconstructs via ReduceBranch + canonical merge.
+// Unavailable ancestry returns an error, never a successful missing value.
 func (e *Engine) GetSnapshot(key string) (*pb.ReducedEffect, []Tip, int, error) {
 	// Free miss: nothing local (no tips, no subscription record) and no peer
 	// filter admits the key — there is no state to bootstrap and no writer to
@@ -500,7 +501,10 @@ func (e *Engine) GetSnapshot(key string) (*pb.ReducedEffect, []Tip, int, error) 
 		}
 	}
 
-	result, tips, chainLen := e.reconstructLocal(key)
+	result, tips, chainLen, err := e.reconstructLocal(key)
+	if err != nil {
+		return nil, nil, 0, err
+	}
 
 	// Tiered storage: a nil result can mean three things and only two warrant
 	// a Cloud consult. "Not-known nil" — no local history, or the key was
@@ -556,7 +560,10 @@ func (e *Engine) GetSnapshot(key string) (*pb.ReducedEffect, []Tip, int, error) 
 						return nil, nil, 0, err
 					}
 
-					result, tips, chainLen = e.reconstructLocal(key)
+					result, tips, chainLen, err = e.reconstructLocal(key)
+					if err != nil {
+						return nil, nil, 0, err
+					}
 				}
 
 				if ls == nil {
@@ -579,7 +586,10 @@ func (e *Engine) GetSnapshot(key string) (*pb.ReducedEffect, []Tip, int, error) 
 				// Lost the single-flight race: a concurrent reader already
 				// resolved (or found pending) this leaf's Cloud consult while
 				// we waited on cloudMu. Serve its result.
-				result, tips, chainLen = e.reconstructLocal(key)
+				result, tips, chainLen, err = e.reconstructLocal(key)
+				if err != nil {
+					return nil, nil, 0, err
+				}
 			}
 		}
 
@@ -670,10 +680,10 @@ func (e *Engine) subscriptionOnlyTips(tips []Tip) bool {
 // reconstructLocal builds a key's materialized state from the tips already in
 // the local index (installed by subscription bootstrap, peer arrivals, or a
 // Cloud rehydrate). It never reaches outside the node for the frontier, so a nil
-// result means the cluster — as this node currently sees it — holds no committed
-// value. Split out of GetSnapshot so the Cloud read-miss backstop can retry it
-// after installing Cloud's frontier.
-func (e *Engine) reconstructLocal(key string) (*pb.ReducedEffect, []Tip, int) {
+// result with no error means the cluster — as this node currently sees it —
+// holds no committed value. Split out of GetSnapshot so the Cloud read-miss
+// backstop can retry it after installing Cloud's frontier.
+func (e *Engine) reconstructLocal(key string) (*pb.ReducedEffect, []Tip, int, error) {
 	// Read index tips once — these are the tips the returned snapshot
 	// corresponds to.
 	indexTips := e.index.Contains(key)
@@ -689,13 +699,13 @@ func (e *Engine) reconstructLocal(key string) (*pb.ReducedEffect, []Tip, int) {
 			slog.Debug("GetSnapshot: no tips", "key", key)
 		}
 
-		return nil, nil, 0
+		return nil, nil, 0, nil
 	}
 
 	// Visibility fence: exclude in-progress tx tips, substitute pre-tx deps
 	tipOffsets := e.resolveTipDeps(snapshotTips)
 	if len(tipOffsets) == 0 {
-		return nil, nil, 0
+		return nil, nil, 0, nil
 	}
 
 	// Client reads wait for in-flight binds. Recompute adjudication even when
@@ -706,9 +716,9 @@ func (e *Engine) reconstructLocal(key string) (*pb.ReducedEffect, []Tip, int) {
 
 	result, chainLen, err := e.reconstruct(key, tipOffsets, "", true)
 	if err != nil {
-		slog.Debug("GetSnapshot: reconstruction incomplete, returning empty", "key", key, "error", err)
-
-		return nil, nil, 0
+		// A missing dependency makes the value unknown, not absent. In
+		// particular, membership observers must retain their last valid view.
+		return nil, nil, 0, err
 	}
 
 	// Sync serialization state from reconstruction result before filtering
@@ -729,17 +739,17 @@ func (e *Engine) reconstructLocal(key string) (*pb.ReducedEffect, []Tip, int) {
 	if result != nil && !isJSONType(result.GetTypeTag()) &&
 		result.GetScalar() == nil && len(result.GetNetAdds()) == 0 && len(result.GetOrderedElements()) == 0 &&
 		(result.GetOp() == pb.EffectOp_UNKNOWN_OP || result.GetOp() == pb.EffectOp_REMOVE_OP) {
-		return nil, snapshotTips, 0
+		return nil, snapshotTips, 0, nil
 	}
 	// reconstruct may return a nil result with a non-zero chainLen when the
 	// walk visits a verdict-only snapshot at the LCA, an all-lost bind set,
 	// or a chain of NoopEffects. The caller's compaction branch keys on
 	// chainLen and dereferences result; zero chainLen here so it doesn't.
 	if result == nil {
-		return nil, snapshotTips, 0
+		return nil, snapshotTips, 0, nil
 	}
 
-	return result, snapshotTips, chainLen
+	return result, snapshotTips, chainLen, nil
 }
 
 // ensureSubscribed records local subscription and emits a SubscriptionEffect.

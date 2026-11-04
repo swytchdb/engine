@@ -75,6 +75,15 @@ func TestRuntimeSSIAbsentKeyWriteSkew(t *testing.T) {
 
 			select {
 			case <-ctx.Done():
+				for _, rt := range []*Runtime{first, second} {
+					pm := rt.PeerManager
+					t.Logf("node=%d members=%v peers=%v alive=%v majority=%v allReachable=%v",
+						rt.Engine.NodeID(), rt.Beacon.Members(), pm.PeerIDs(), pm.HealthTable().AlivePeerIDs(),
+						pm.InMajorityPartition(), pm.AllRegionPeersReachable())
+					membership, tips, membershipErr := rt.Engine.NewReadOnlyContext().GetSnapshot(MembershipKey)
+					t.Logf("node=%d membership=%v tips=%v error=%v", rt.Engine.NodeID(), parseMembership(membership), tips, membershipErr)
+				}
+
 				t.Fatalf("key %s never converged to %q: result=%v err=%v", key, want, result, err)
 			case <-time.After(10 * time.Millisecond):
 			}

@@ -43,7 +43,9 @@ func BenchmarkMembershipRefresh(b *testing.B) {
 			b.ResetTimer()
 
 			for b.Loop() {
-				beacon.refreshTopology()
+				if err := beacon.refreshTopology(); err != nil {
+					b.Fatal(err)
+				}
 			}
 		})
 	}

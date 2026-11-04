@@ -25,6 +25,7 @@ package beacon
 
 import (
 	"log/slog"
+	"time"
 
 	"github.com/swytchdb/engine/cluster"
 	pb "github.com/swytchdb/engine/cluster/proto"
@@ -51,14 +52,37 @@ func (b *Beacon) Members() []Member {
 func (b *Beacon) topologyLoop() {
 	// Initial projection: don't wait for the first signal, or the topology
 	// stays pinned to the DNS-synthetic view until something writes the key.
-	b.refreshTopology()
+	backoff := 100 * time.Millisecond
 
-	for {
+	for b.ctx.Err() == nil {
+		if err := b.refreshTopology(); err != nil {
+			// A transport handover can briefly make membership ancestry
+			// unavailable. Retain the last topology and retry even if no new
+			// tip arrives: duplicate notifications don't change the index.
+			slog.Debug("beacon: membership projection failed; retrying", "error", err, "backoff", backoff)
+			timer := time.NewTimer(backoff)
+
+			select {
+			case <-b.ctx.Done():
+				timer.Stop()
+
+				return
+			case <-b.topoRefresh:
+				timer.Stop()
+			case <-timer.C:
+			}
+
+			backoff = min(2*backoff, 3*time.Second)
+
+			continue
+		}
+
+		backoff = 100 * time.Millisecond
+
 		select {
 		case <-b.ctx.Done():
 			return
 		case <-b.topoRefresh:
-			b.refreshTopology()
 		}
 	}
 }
@@ -83,14 +107,12 @@ func signal(ch chan<- struct{}) {
 // A different ID at our bound host:port belongs to a dead incarnation. Check
 // on every change because bootstrap or backfill may reveal it after startup.
 // Once removal commits, the entry disappears and the sweep becomes a no-op.
-func (b *Beacon) refreshTopology() {
+func (b *Beacon) refreshTopology() error {
 	// Observation must not emit compaction snapshots: their arrival triggers
 	// the same observer on every peer and can create a refresh feedback loop.
 	snapshot, _, err := b.engine.NewReadOnlyContext().GetSnapshot(MembershipKey)
 	if err != nil {
-		slog.Debug("beacon: membership snapshot read failed", "error", err)
-
-		return
+		return err
 	}
 
 	var ctx *effects.Context
@@ -119,6 +141,8 @@ func (b *Beacon) refreshTopology() {
 	}
 
 	b.syncMembership(snapshot)
+
+	return nil
 }
 
 // syncMembership copies the roster and updates the PeerManager only when
