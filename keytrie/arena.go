@@ -68,7 +68,7 @@ type critbitArena[T any] struct {
 	// Reuse is safe because recycling installs a brand-new chunk array — its slots
 	// have never been published, so no reader can hold a pointer into
 	// them, while the dead array goes to GC exactly as the nil path does.
-	freeList  *xsync.MPMCQueue[uint64]
+	freeList  atomic.Pointer[xsync.MPMCQueue[uint64]] // allocated on first recycle
 	freeCount atomic.Int64
 	freeCap   uint64
 	// initNode, if set, runs on every node of a freshly-grown chunk before that
@@ -86,7 +86,6 @@ func (a *critbitArena[T]) init(chunkSize int, initNode func(*T)) {
 	a.chunkSize = uint64(chunkSize)
 	a.initNode = initNode
 	a.freeCap = freeSlotCapacity
-	a.freeList = xsync.NewMPMCQueue[uint64](freeSlotCapacity)
 	a.list.Store(&arenaChunkList[T]{})
 }
 
@@ -98,14 +97,16 @@ func (a *critbitArena[T]) alloc() (*T, uint32) {
 	// lock (read or write) from claim through publish, so a compaction pass —
 	// which skips chunks with outstanding recycled slots — can never evacuate the
 	// chunk out from under a half-initialized slot.
-	if idx, ok := a.freeList.TryDequeue(); ok {
-		a.freeCount.Add(-1)
-		chunkIdx := idx / a.chunkSize
-		list := a.list.Load()
-		chunk := list.chunks[chunkIdx]
-		chunk.outstanding.Add(-1)
+	if free := a.freeList.Load(); free != nil {
+		if idx, ok := free.TryDequeue(); ok {
+			a.freeCount.Add(-1)
+			chunkIdx := idx / a.chunkSize
+			list := a.list.Load()
+			chunk := list.chunks[chunkIdx]
+			chunk.outstanding.Add(-1)
 
-		return &chunk.nodes[idx%a.chunkSize], uint32(chunkIdx)
+			return &chunk.nodes[idx%a.chunkSize], uint32(chunkIdx)
+		}
 	}
 
 	// Fast path: atomically claim a fresh slot index. No lock needed.
@@ -181,11 +182,17 @@ func (a *critbitArena[T]) dropChunk(chunkIdx uint32) {
 		// list, so a concurrent alloc that dequeues an index sees the new array.
 		a.list.Store(&arenaChunkList[T]{chunks: newChunks})
 
+		free := a.freeList.Load()
+		if free == nil {
+			free = xsync.NewMPMCQueue[uint64](freeSlotCapacity)
+			a.freeList.Store(free)
+		}
+
 		a.freeCount.Add(int64(a.chunkSize))
 
 		base := uint64(chunkIdx) * a.chunkSize
 		for i := uint64(0); i < a.chunkSize; i++ {
-			a.freeList.TryEnqueue(base + i) // room pre-checked: cannot fail
+			free.TryEnqueue(base + i) // room pre-checked: cannot fail
 		}
 
 		return
@@ -230,18 +237,10 @@ func (a *critbitArena[T]) grow(needed uint64) {
 func (a *critbitArena[T]) clear() {
 	a.list.Store(&arenaChunkList[T]{})
 	a.next.Store(0)
-	// Drain stale recycled indices: they point into chunks the reset just dropped,
-	// so a later alloc must not hand them out. clear assumes no concurrent alloc
-	// (same as the list/next reset above).
-	if a.freeList != nil {
-		for {
-			if _, ok := a.freeList.TryDequeue(); !ok {
-				break
-			}
-		}
-
-		a.freeCount.Store(0)
-	}
+	// No allocator can still use the old queue. Release its backing storage as
+	// well as the stale indices instead of retaining an empty queue after Close.
+	a.freeList.Store(nil)
+	a.freeCount.Store(0)
 }
 
 // bytes returns the backing-array footprint of the arena: the sum of the

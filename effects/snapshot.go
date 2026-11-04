@@ -770,12 +770,12 @@ func (e *Engine) ensureSubscribedBlocking(key string) error {
 }
 
 func (e *Engine) ensureSubscribedMode(key string, allowAsync bool) error {
-	unsafe := e.modeForKey(key) == UnsafeMode
+	isUnsafe := e.modeForKey(key) == UnsafeMode
 	// Allocation-free fast path: Emit calls this on every effect, so the
 	// already-subscribed case must not pay the state+channel allocation the
 	// LoadOrStore below needs.
 	if existing, ok := e.subscriptions.Load(key); ok {
-		return e.awaitSubscription(existing, unsafe)
+		return e.awaitSubscription(existing, isUnsafe)
 	}
 	// Callers on the Redis hot path may borrow key from a pooled command
 	// buffer. A new subscription outlives that command, so own the map/trie key
@@ -787,7 +787,7 @@ func (e *Engine) ensureSubscribedMode(key string, allowAsync bool) error {
 	if existing, loaded := e.subscriptions.LoadOrStore(ownedKey, state); loaded {
 		e.releaseKey(ownedKey)
 
-		return e.awaitSubscription(existing, unsafe)
+		return e.awaitSubscription(existing, isUnsafe)
 	}
 
 	if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
@@ -858,7 +858,7 @@ func (e *Engine) ensureSubscribedMode(key string, allowAsync bool) error {
 	// filter hasn't arrived yet forces clusterMaybeHasKey true, so a fresh
 	// node always takes the blocking bootstrap below.
 	if allowAsync &&
-		(e.inMajorityPartition() || unsafe) && !e.clusterMaybeHasKey(ownedKey) {
+		(e.inMajorityPartition() || isUnsafe) && !e.clusterMaybeHasKey(ownedKey) {
 		go e.broadcaster.BroadcastWithData(notify, notify.GetEffectData())
 
 		succeeded = true
@@ -895,7 +895,7 @@ func (e *Engine) ensureSubscribedMode(key string, allowAsync bool) error {
 			// UnsafeMode: unreachable peers never block. Proceed with local
 			// state; the subscription announce reaches recovering peers via
 			// the peer-recovery re-announce, and branches merge later.
-			if unsafe {
+			if isUnsafe {
 				succeeded = true
 
 				return nil
@@ -927,7 +927,7 @@ done:
 	// concurrent waiters re-check incomplete after their <-ready and
 	// also surface ErrBootstrapIncomplete. UnsafeMode skips the gate:
 	// there is no majority to protect, only branches to merge.
-	if !unsafe && !e.broadcaster.InMajorityPartition() {
+	if !isUnsafe && !e.broadcaster.InMajorityPartition() {
 		e.dropSubscription(ownedKey)
 		state.markFailed()
 
@@ -981,7 +981,7 @@ done:
 	state.incomplete.Store(true)
 	go e.retryBootstrap(ownedKey, state, unique)
 
-	if unsafe {
+	if isUnsafe {
 		return nil
 	}
 

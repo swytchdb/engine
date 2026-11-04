@@ -1,0 +1,193 @@
+package keytrie
+
+import (
+	"fmt"
+	"slices"
+	"testing"
+)
+
+func TestReapRemovesDeadSubtreesInOnePass(t *testing.T) {
+	for _, survivors := range []int{0, 1, 17} {
+		t.Run(fmt.Sprint(survivors), func(t *testing.T) {
+			c := NewCritbit[struct{}]()
+
+			t.Cleanup(func() { closeTestTrie(t, c) })
+
+			c.reapRunning.Store(true)
+			defer c.reapRunning.Store(false)
+
+			var want []string
+
+			for i := range 128 {
+				key := fmt.Sprintf("key:%03d", i)
+				c.Insert(key, nil, NewTipSet(tip(1)))
+
+				if i < survivors {
+					want = append(want, key)
+				} else {
+					c.Delete(key, c.Contains(key))
+				}
+			}
+
+			if got := c.reap(); got != 128-survivors {
+				t.Fatalf("one pass removed %d leaves, want %d", got, 128-survivors)
+			}
+
+			if got := c.Keys(); !slices.Equal(got, want) {
+				t.Fatalf("survivors = %v, want %v", got, want)
+			}
+
+			if c.deletedCount.Load() != 0 {
+				t.Fatal("dead leaves remain linked")
+			}
+
+			drainAllReaps(c) // queued pointers to retired leaves must be harmless
+
+			if c.deletedCount.Load() != 0 || c.Size() != int64(survivors) {
+				t.Fatal("stale queued leaves changed accounting")
+			}
+		})
+	}
+}
+
+func TestTipDeltaTransitions(t *testing.T) {
+	first := NewTipSet(tip(1), tip(2))
+	second := NewTipSet(tip(2), tip(3))
+
+	data := 42
+	for _, tt := range []struct {
+		name           string
+		old, next      *TipSet
+		data           *int
+		added, removed []EffectRef
+	}{
+		{name: "insert", next: first, added: first.Tips()},
+		{name: "delete", old: first, removed: first.Tips()},
+		{name: "overlap", old: first, next: second, added: []EffectRef{tip(3)}, removed: []EffectRef{tip(1)}},
+		{name: "same", old: first, next: first},
+		{name: "equal", old: first, next: NewTipSet(first.Tips()...)},
+		{name: "payload", old: first, next: first, data: &data},
+		{name: "empty", old: NewTipSet(), next: first, added: first.Tips()},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var c Critbit[int]
+
+			calls := 0
+
+			c.SetRefDelta(func(added, removed []EffectRef, dropped *int) {
+				calls++
+
+				if !slices.Equal(added, tt.added) || !slices.Equal(removed, tt.removed) || dropped != tt.data {
+					t.Fatalf("delta = %v / %v / %v", added, removed, dropped)
+				}
+			})
+			c.fireTipDelta(tt.old, tt.next, tt.data)
+
+			wantCalls := 0
+			if len(tt.added)+len(tt.removed) > 0 || tt.data != nil {
+				wantCalls = 1
+			}
+
+			if calls != wantCalls {
+				t.Fatalf("hook called %d times, want %d", calls, wantCalls)
+			}
+		})
+	}
+}
+
+func BenchmarkTipDeltaInsertDelete(b *testing.B) {
+	var c Critbit[struct{}]
+
+	refs := 0
+
+	c.SetRefDelta(func(added, removed []EffectRef, _ *struct{}) {
+		refs += len(added) - len(removed)
+	})
+
+	tips := NewTipSet(tip(1), tip(2))
+
+	b.ReportAllocs()
+
+	for b.Loop() {
+		c.fireTipDelta(nil, tips, nil)
+		c.fireTipDelta(tips, nil, nil)
+	}
+
+	if refs != 0 {
+		b.Fatal("unbalanced references")
+	}
+}
+
+func BenchmarkEvictBatchReinsert(b *testing.B) {
+	for _, want := range []int{1, 16, 128} {
+		b.Run(fmt.Sprint(want), func(b *testing.B) {
+			c := NewCritbit[struct{}]()
+
+			b.Cleanup(func() { closeTestTrie(b, c) })
+
+			c.reapRunning.Store(true)
+			defer c.reapRunning.Store(false)
+
+			tips := NewTipSet(tip(1))
+
+			c.SetEvictHooks(nil, func(key string, _ []EffectRef, _ *struct{}) {
+				c.Insert(key, nil, tips)
+			}, nil)
+
+			for i := range 1024 {
+				c.Insert(fmt.Sprintf("key:%04d", i), nil, tips)
+			}
+
+			b.ReportAllocs()
+
+			for b.Loop() {
+				if got := c.EvictBatch(want); got != want {
+					b.Fatalf("evicted %d, want %d", got, want)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkReapLiveTree(b *testing.B) {
+	c := NewCritbit[struct{}]()
+
+	b.Cleanup(func() { closeTestTrie(b, c) })
+
+	tips := NewTipSet(tip(1))
+	for i := range 4096 {
+		c.Insert(fmt.Sprintf("key:%04d", i), nil, tips)
+	}
+
+	b.ReportAllocs()
+
+	for b.Loop() {
+		c.reap()
+	}
+}
+
+func BenchmarkCompactDenseInternal(b *testing.B) {
+	c := NewCritbit[struct{}]()
+
+	b.Cleanup(func() { closeTestTrie(b, c) })
+
+	tips := NewTipSet(tip(1))
+	for i := range 8192 {
+		c.Insert(fmt.Sprintf("key:%04d", i), nil, tips)
+	}
+
+	b.ReportAllocs()
+
+	for b.Loop() {
+		c.compactInternalChunks(16)
+	}
+}
+
+func BenchmarkCritbitLifecycle(b *testing.B) {
+	b.ReportAllocs()
+
+	for b.Loop() {
+		c := NewCritbit[struct{}]()
+		closeTestTrie(b, c)
+	}
+}

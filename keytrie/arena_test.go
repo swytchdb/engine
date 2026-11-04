@@ -45,3 +45,30 @@ func TestArenaDropsChunkWhenRecycleQueueIsFull(t *testing.T) {
 		t.Fatalf("allocation reused a dropped chunk: %d", chunk)
 	}
 }
+
+func TestArenaClearDiscardsRecycledSlots(t *testing.T) {
+	var arena critbitArena[int]
+	arena.init(2, nil)
+
+	for range 2 {
+		node, _ := arena.alloc()
+		*node = 42
+	}
+
+	arena.recordReaped(0)
+	arena.recordReaped(0)
+	arena.clear()
+
+	for i := range 5 {
+		node, chunk := arena.alloc()
+		if chunk != uint32(i/2) || *node != 0 {
+			t.Fatalf("allocation after clear returned chunk %d, value %d", chunk, *node)
+		}
+
+		*node = i + 1
+	}
+
+	if arena.freeCount.Load() != 0 {
+		t.Fatal("clear retained recycled slots")
+	}
+}

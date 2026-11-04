@@ -413,10 +413,10 @@ func mustDecodeEffect(t *testing.T, notify *pb.OffsetNotify) *pb.Effect {
 		t.Fatalf("wire data truncated")
 	}
 
-	proto := data[4+keyLen:]
+	pr := data[4+keyLen:]
 
 	eff := &pb.Effect{}
-	if err := unmarshalProto(proto, eff); err != nil {
+	if err := unmarshalProto(pr, eff); err != nil {
 		t.Fatalf("unmarshal effect: %v", err)
 	}
 

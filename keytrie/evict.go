@@ -142,6 +142,7 @@ func (c *Critbit[T]) SetEvictHooks(decider func(key string) bool, notify func(ke
 
 // SetRefDelta installs the per-tip refcount hook, fired on every leaf tip-set
 // transition (insert, remove, delete, eviction). See the refDelta field.
+// The added and removed slices are immutable and may share TipSet storage.
 func (c *Critbit[T]) SetRefDelta(fn func(added, removed []EffectRef, droppedData *T)) {
 	c.refDelta = fn
 }
@@ -258,10 +259,17 @@ func (c *Critbit[T]) EvictBatch(want int) int {
 		access uint64
 	}
 
-	cands := make([]cand, 0, window)
+	// The usual 128-leaf window needs no heap scratch. Larger requests grow
+	// local slices as needed; nothing is retained on the trie between calls.
+	var candidates, ghostStorage [minSweep]cand
+
+	cands := candidates[:0]
+	if window > len(candidates) {
+		cands = make([]cand, 0, window)
+	}
 
 	var (
-		ghosts   []cand // ghosts seen this sweep, sorted oldest-first below
+		ghosts   = ghostStorage[:0] // sorted oldest-first below
 		fbVictim *critNode[T]
 		fbAccess = uint64(math.MaxUint64)
 	)
@@ -353,7 +361,10 @@ func (c *Critbit[T]) EvictBatch(want int) int {
 		data *T
 	}
 
-	victims := make([]evicted, 0, len(cands))
+	var notifications [minSweep / 2]evicted
+
+	victims := notifications[:0]
+
 	for _, cd := range cands {
 		leaf := cd.leaf
 		if !c.claimForEviction(leaf) {
@@ -445,12 +456,7 @@ func (c *Critbit[T]) EvictBatch(want int) int {
 		c.fireTipDelta(v.tips, nil, v.data)
 
 		if c.evictNotify != nil {
-			var tipRefs []EffectRef
-			if v.tips != nil {
-				tipRefs = v.tips.Tips()
-			}
-
-			c.evictNotify(v.key, tipRefs, v.data)
+			c.evictNotify(v.key, v.tips.Tips(), v.data)
 		}
 	}
 

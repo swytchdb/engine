@@ -23,8 +23,10 @@
 
 package keytrie
 
+import "sync/atomic"
+
 // enqueueReap queues a leaf that just went dead for background unlinking. A drop
-// (full queue) bumps reapDropped so maybeReap falls back to a full BFS, which
+// (full queue) bumps reapDropped so maybeReap falls back to a full traversal, which
 // rediscovers stragglers — nothing is leaked, the fast path is just bypassed.
 func (c *Critbit[T]) enqueueReap(leaf *critNode[T]) {
 	if c.reapQueue == nil || !c.reapQueue.TryEnqueue(leaf) {
@@ -41,11 +43,10 @@ func (c *Critbit[T]) maybeReap() {
 		// Fast path: unlink the leaves we already know are dead, in small batches.
 		for c.drainReap() > 0 {
 		}
-		// Backstop: if any pushes were dropped on a full queue, a full BFS pass
+		// Backstop: if any pushes were dropped on a full queue, a full traversal
 		// rediscovers those stragglers so nothing lingers linked forever.
 		if c.reapDropped.Swap(0) > 0 {
-			for c.reap() > 0 {
-			}
+			c.reap()
 		}
 		// Unlinking alone frees a chunk only when every one of its slots died;
 		// under churn, survivors fragment across chunks and the arenas ratchet.
@@ -141,28 +142,32 @@ func (c *Critbit[T]) unlinkLeaf(leaf *critNode[T]) bool {
 		return false // a different leaf occupies this key path now
 	}
 
-	sibling := p.child[1-pDir].Load()
-	if sibling == nil {
-		return false
+	link := &c.root
+	if gp != nil {
+		link = &gp.child[gpDir]
 	}
 
-	if gp == nil {
-		c.root.Store(sibling)
-	} else {
-		gp.child[gpDir].Store(sibling)
-	}
-
-	c.deletedCount.Add(-1)
-	c.readRevision++
-	c.retireInternal(p)
-	c.retireLeaf(leaf)
+	c.pruneLeaf(link, p, pDir)
 
 	return true
 }
 
-// reap does a single BFS walk pruning every deleted leaf it finds.
-// Takes the write-lock on reapMu so no structural insert can race.
-// Returns the number of deleted leaves unlinked.
+// pruneLeaf replaces parent with the dead leaf's sibling. Both reclamation
+// paths use this operation under reapMu's write lock, so retirement and path
+// invalidation have one owner. link points to parent, dir to the dead leaf.
+func (c *Critbit[T]) pruneLeaf(link *atomic.Pointer[critNode[T]], parent *critNode[T], dir int) {
+	leaf := parent.child[dir].Load()
+	link.Store(parent.child[1-dir].Load())
+	c.deletedCount.Add(-1)
+	c.readRevision++
+	c.retireInternal(parent)
+	c.retireLeaf(leaf)
+}
+
+// reap prunes all dead leaves in one depth-first pass. The stack holds links
+// into reachable parents, using space proportional to tree depth rather than
+// key count. Children are processed before their parent, so a dead subtree
+// collapses all the way to the root without another pass.
 func (c *Critbit[T]) reap() int {
 	if c.closed.Load() {
 		return 0
@@ -176,88 +181,51 @@ func (c *Critbit[T]) reap() int {
 		return 0
 	}
 
-	if root.isLeaf {
-		// Ghosts (deleted, freq < 0) are retained for warm restart.
-		if root.isDeleted() && root.freq.Load() >= 0 {
-			c.root.Store(nil)
-			c.readRevision++
-			c.deletedCount.Add(-1)
-			c.retireLeaf(root)
+	reaped := 0
 
-			return 1
+	type frame struct {
+		link    *atomic.Pointer[critNode[T]]
+		visited bool
+	}
+
+	stack := make([]frame, 0, 64)
+	stack = append(stack, frame{link: &c.root})
+
+	for len(stack) > 0 {
+		f := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		node := f.link.Load()
+
+		if node.isLeaf {
+			continue
 		}
 
-		return 0
-	}
+		if !f.visited {
+			stack = append(stack, frame{link: f.link, visited: true})
 
-	type bfsEntry struct {
-		node          *critNode[T]
-		parent        *critNode[T]
-		dirFromParent int
-	}
+			for dir := range 2 {
+				if child := node.child[dir].Load(); !child.isLeaf {
+					stack = append(stack, frame{link: &node.child[dir]})
+				}
+			}
 
-	reaped := 0
-	queue := make([]bfsEntry, 1, 64)
-	queue[0] = bfsEntry{node: root}
-
-	for i := 0; i < len(queue); i++ {
-		e := queue[i]
-		node := e.node
-
-		pruned := false
+			continue
+		}
 
 		for dir := range 2 {
 			child := node.child[dir].Load()
-			// Skip live leaves, internal nodes, and ghosts (freq < 0).
-			if child == nil || !child.isLeaf || !child.isDeleted() || child.freq.Load() < 0 {
-				continue
-			}
+			if child.isLeaf && child.isDeleted() && child.freq.Load() >= 0 {
+				c.pruneLeaf(f.link, node, dir)
 
-			sibling := node.child[1-dir].Load()
-			if sibling == nil {
-				continue
-			}
+				reaped++
 
-			if e.parent == nil {
-				c.root.Store(sibling)
-			} else {
-				e.parent.child[e.dirFromParent].Store(sibling)
-			}
-
-			c.deletedCount.Add(-1)
-
-			reaped++
-			pruned = true
-
-			// Both the deleted leaf and the internal node it collapsed are now
-			// unlinked; tell each arena so it can drop a fully-dead chunk.
-			c.readRevision++
-			c.retireInternal(node)
-			c.retireLeaf(child)
-
-			if !sibling.isLeaf {
-				queue = append(queue, bfsEntry{
-					node:          sibling,
-					parent:        e.parent,
-					dirFromParent: e.dirFromParent,
-				})
-			}
-
-			break
-		}
-
-		if !pruned {
-			for dir := range 2 {
-				child := node.child[dir].Load()
-				if child != nil && !child.isLeaf {
-					queue = append(queue, bfsEntry{
-						node:          child,
-						parent:        node,
-						dirFromParent: dir,
-					})
-				}
+				break
 			}
 		}
+	}
+
+	if root = c.root.Load(); root.isLeaf && c.unlinkLeaf(root) {
+		reaped++
 	}
 
 	return reaped

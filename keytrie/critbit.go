@@ -43,7 +43,7 @@ const (
 	// are pushed here at delete time (we already know which node went dead, so
 	// there is no need to BFS the tree to rediscover them); a background worker
 	// drains it in small batches under brief write-lock holds. On overflow a push
-	// is dropped and a full-BFS reap is scheduled as a backstop, so nothing leaks.
+	// is dropped and a full-tree reap is scheduled as a backstop, so nothing leaks.
 	reapQueueCapacity = 1 << 16
 
 	// reapBatchSize is how many queued leaves the worker unlinks per write-lock
@@ -119,7 +119,7 @@ type Critbit[T any] struct {
 	// reapQueue holds leaves that have gone dead (deleted/evicted) and need to be
 	// unlinked from the tree. Populated at delete time, drained by a background
 	// worker (see drainReap) so the unlink never rides the hot path. reapDropped
-	// counts pushes lost to a full queue; a non-zero value schedules a full-BFS
+	// counts pushes lost to a full queue; a non-zero value schedules a full-tree
 	// reap as a backstop.
 	reapQueue   *xsync.MPMCQueue[*critNode[T]]
 	reapDropped atomic.Int64
@@ -515,28 +515,6 @@ func shouldInsertBefore(newBytePos uint32, newOtherbits uint8, curBytePos uint32
 	return newBytePos < curBytePos || newBytePos == curBytePos && newOtherbits < curOtherbits
 }
 
-// tipSetDiff returns the tips added (in newTips, not old) and removed (in old,
-// not newTips) for a tip-set transition. Tip sets are small, so a linear scan is cheap.
-func tipSetDiff(old, newTips *TipSet) (added, removed []EffectRef) {
-	if newTips != nil {
-		for _, t := range newTips.tips {
-			if old == nil || !old.Contains(t) {
-				added = append(added, t)
-			}
-		}
-	}
-
-	if old != nil {
-		for _, t := range old.tips {
-			if newTips == nil || !newTips.Contains(t) {
-				removed = append(removed, t)
-			}
-		}
-	}
-
-	return added, removed
-}
-
 // fireTipDelta reports a leaf tip-set transition to the refDelta hook (if any).
 // droppedData is the leaf payload released by a delete/eviction, else nil.
 func (c *Critbit[T]) fireTipDelta(old, newTips *TipSet, droppedData *T) {
@@ -544,7 +522,29 @@ func (c *Critbit[T]) fireTipDelta(old, newTips *TipSet, droppedData *T) {
 		return
 	}
 
-	added, removed := tipSetDiff(old, newTips)
+	var added, removed []EffectRef
+
+	switch {
+	case old == newTips:
+		// No tip change; the payload may still need releasing.
+	case old.Len() == 0:
+		added = newTips.Tips()
+	case newTips.Len() == 0:
+		removed = old.Tips()
+	default:
+		for _, t := range newTips.tips {
+			if !old.Contains(t) {
+				added = append(added, t)
+			}
+		}
+
+		for _, t := range old.tips {
+			if !newTips.Contains(t) {
+				removed = append(removed, t)
+			}
+		}
+	}
+
 	if len(added) > 0 || len(removed) > 0 || droppedData != nil {
 		c.refDelta(added, removed, droppedData)
 	}

@@ -25,6 +25,7 @@ package keytrie
 
 import (
 	"log/slog"
+	"sync/atomic"
 	"unsafe"
 )
 
@@ -74,7 +75,7 @@ var compactMinWasteBytes = int64(32 << 20)
 // maybeCompact runs a bounded compaction pass when the arenas hold
 // substantially more slots than the tree has linked nodes. Called from the
 // reap goroutine (serialized by reapRunning), so it never runs concurrently
-// with itself, drainReap, or the BFS reap.
+// with itself, drainReap, or the full-tree reap.
 func (c *Critbit[T]) maybeCompact() {
 	if c.closed.Load() {
 		return
@@ -266,13 +267,19 @@ func (c *Critbit[T]) relocateLeaf(old *critNode[T]) bool {
 }
 
 // compactInternalChunks evacuates up to maxChunks sparse internal chunks.
-// Internal nodes carry no key, so victims are found by walking the tree:
-// one shared-lock DFS counts linked internals per chunk (advisory), then one
-// write-lock DFS relocates selected nodes before visiting their children.
+// The arena's retired-slot counters identify sparse, fully allocated chunks.
+// One write-lock DFS relocates selected nodes before visiting their children.
 // Children therefore always splice through their current parent. Each
 // relocated husk is accounted through recordReaped, which fires the drop when
 // the victim's last slot dies — compaction never drops a chunk directly.
 func (c *Critbit[T]) compactInternalChunks(maxChunks int) int {
+	c.reapMu.Lock()
+	defer c.reapMu.Unlock()
+
+	if c.closed.Load() || maxChunks <= 0 || c.root.Load() == nil {
+		return 0
+	}
+
 	list := c.internalArena.list.Load()
 	chunks, chunkSize := list.chunks, c.internalArena.chunkSize
 
@@ -281,46 +288,15 @@ func (c *Critbit[T]) compactInternalChunks(maxChunks int) int {
 		return 0
 	}
 
-	// Pass 1 (shared lock, concurrent with traffic): count linked internals
-	// per chunk.
-	counts := make([]int, len(chunks))
-
-	c.reapMu.RLock()
-
-	root := c.root.Load()
-	if root == nil {
-		c.reapMu.RUnlock()
-
-		return 0
-	}
-
-	stack := make([]*critNode[T], 0, 64)
-
-	stack = append(stack, root)
-	for len(stack) > 0 {
-		n := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-
-		if n.isLeaf {
-			continue
-		}
-
-		if int(n.chunkIdx) < len(counts) {
-			counts[n.chunkIdx]++
-		}
-
-		for dir := range 2 {
-			if ch := n.child[dir].Load(); ch != nil && !ch.isLeaf {
-				stack = append(stack, ch)
-			}
-		}
-	}
-
-	c.reapMu.RUnlock()
-
 	threshold := int(chunkSize) * compactOccupancyPct / 100
 
-	// Reuse counts as a selection mask; chunk indices are dense.
+	var selection [64]bool
+
+	selected := selection[:min(len(chunks), len(selection))]
+	if len(chunks) > len(selection) {
+		selected = make([]bool, len(chunks))
+	}
+
 	victims := 0
 	for ci := 0; ci < len(chunks) && ci < tail && victims < maxChunks; ci++ {
 		if chunks[ci] == nil {
@@ -332,8 +308,10 @@ func (c *Critbit[T]) compactInternalChunks(maxChunks int) int {
 			continue
 		}
 
-		if counts[ci] <= threshold {
-			counts[ci] = -1
+		// All slots before tail have been allocated. With writers excluded,
+		// every slot is either linked or accounted by recordReaped.
+		if int(chunkSize)-int(chunks[ci].reaped.Load()) <= threshold {
+			selected[ci] = true
 			victims++
 		}
 	}
@@ -342,55 +320,34 @@ func (c *Critbit[T]) compactInternalChunks(maxChunks int) int {
 		return 0
 	}
 
-	// Pass 2 (write lock): relocate parents before descending into their children.
-	c.reapMu.Lock()
-	defer c.reapMu.Unlock()
+	// A link is either the root or a parent's child slot. Relocating through
+	// the link avoids separate root handling and parent/direction bookkeeping.
+	stack := make([]*atomic.Pointer[critNode[T]], 0, 64)
 
-	if c.closed.Load() {
-		return 0
-	}
+	stack = append(stack, &c.root)
+	for len(stack) > 0 {
+		link := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
 
-	root = c.root.Load()
-	if root == nil {
-		return 0
-	}
-
-	type frame struct {
-		node   *critNode[T]
-		parent *critNode[T]
-		dir    int
-	}
-
-	fstack := make([]frame, 0, 64)
-
-	fstack = append(fstack, frame{node: root})
-	for len(fstack) > 0 {
-		f := fstack[len(fstack)-1]
-		fstack = fstack[:len(fstack)-1]
-
-		if f.node.isLeaf {
+		node := link.Load()
+		if node.isLeaf {
 			continue
 		}
 
-		if int(f.node.chunkIdx) < len(counts) && counts[f.node.chunkIdx] == -1 {
-			n2 := c.allocInternalNode(f.node.bytePos, f.node.otherbits)
-			n2.child[0].Store(f.node.child[0].Load())
-			n2.child[1].Store(f.node.child[1].Load())
-
-			if f.parent == nil {
-				c.root.Store(n2)
-			} else {
-				f.parent.child[f.dir].Store(n2)
-			}
+		if int(node.chunkIdx) < len(selected) && selected[node.chunkIdx] {
+			n2 := c.allocInternalNode(node.bytePos, node.otherbits)
+			n2.child[0].Store(node.child[0].Load())
+			n2.child[1].Store(node.child[1].Load())
+			link.Store(n2)
 
 			c.readRevision++
-			c.retireInternal(f.node)
-			f.node = n2
+			c.retireInternal(node)
+			node = n2
 		}
 
 		for dir := range 2 {
-			if ch := f.node.child[dir].Load(); ch != nil && !ch.isLeaf {
-				fstack = append(fstack, frame{node: ch, parent: f.node, dir: dir})
+			if ch := node.child[dir].Load(); ch != nil && !ch.isLeaf {
+				stack = append(stack, &node.child[dir])
 			}
 		}
 	}

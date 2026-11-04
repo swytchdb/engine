@@ -42,7 +42,7 @@ func (c *Critbit[T]) Pin(key string) bool {
 	}
 
 	leaf.pins.Add(1)
-	// Dekker partner of EvictBatch's post-claim pins re-check: if the sweep
+	// partner of EvictBatch's post-claim pins re-check: if the sweep
 	// claimed this leaf between our liveness check and the Add, exactly one of
 	// us observes the other — undo so the hold is never stranded on an evicted
 	// leaf (a ghost promotion would resurrect it as a permanent pin).
