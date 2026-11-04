@@ -254,7 +254,7 @@ func TestMemoryConcurrentPublicationAndEviction(t *testing.T) {
 	}
 }
 
-func TestMemorySubscriberMapReleasedOnce(t *testing.T) {
+func TestMemorySubscribersReleasedOnce(t *testing.T) {
 	e := NewEngine(EngineConfig{})
 
 	t.Cleanup(func() {
@@ -268,8 +268,8 @@ func TestMemorySubscriberMapReleasedOnce(t *testing.T) {
 	e.addPeerSubscriber("key", 1)
 	e.removePeerSubscriber("key", 1)
 
-	if charged == 0 || e.subscriberBytes.Load() != charged {
-		t.Fatal("subscriber map capacity must remain charged after deletion")
+	if charged == 0 || e.subscriberBytes.Load() != 0 {
+		t.Fatal("last unsubscribe must release subscriber capacity")
 	}
 
 	ls := e.index.LoadData("key")
@@ -278,7 +278,7 @@ func TestMemorySubscriberMapReleasedOnce(t *testing.T) {
 	e.addPeerSubscriber("key", 2)
 
 	if e.subscriberBytes.Load() != 0 {
-		t.Fatal("evicted subscriber map remained or was resurrected")
+		t.Fatal("evicted subscribers remained or were resurrected")
 	}
 }
 

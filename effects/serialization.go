@@ -29,7 +29,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/puzpuzpuz/xsync/v4"
 	pb "github.com/swytchdb/engine/cluster/proto"
 )
 
@@ -64,12 +63,6 @@ const serializationReleaseQuietPeriod = 5 * time.Second
 // serializationReleaseCheckInterval is how often the leader checks for
 // quiet serialized keys.
 const serializationReleaseCheckInterval = 2 * time.Second
-
-// initSerializationState creates the serialization state map on the engine.
-// Called from NewEngine.
-func initSerializationState() *xsync.Map[string, *keySerializationState] {
-	return xsync.NewMap[string, *keySerializationState]()
-}
 
 // startSerializationRelease launches a background goroutine that
 // periodically checks for quiet serialized keys and releases them.

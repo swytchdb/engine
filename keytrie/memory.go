@@ -3,7 +3,7 @@ package keytrie
 import (
 	"unsafe"
 
-	"github.com/swytchdb/engine/internal/memsize"
+	"github.com/swytchdb/engine/memsize"
 )
 
 func tipSetBytes(tips *TipSet) int64 {

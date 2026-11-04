@@ -6,7 +6,7 @@ import (
 	"strings"
 	"unsafe"
 
-	"github.com/swytchdb/engine/internal/memsize"
+	"github.com/swytchdb/engine/memsize"
 )
 
 // MemoryStats separates cache ownership from GC/OS residency. Capacity estimates
@@ -46,8 +46,6 @@ func readRuntimeMemory() runtimeMemory {
 		used: int64(s[3].Value.Uint64()) - int64(s[4].Value.Uint64()), cycles: s[5].Value.Uint64(),
 	}
 }
-
-func subscriberMapBytes(highWater int) int64 { return memsize.Map(highWater, 8) }
 
 func (e *Engine) residentMemory() MemoryStats {
 	s := MemoryStats{CacheTargetBytes: e.cacheTarget, GoMemoryLimitBytes: e.goMemoryLimit}

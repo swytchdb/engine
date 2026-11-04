@@ -38,7 +38,7 @@ import (
 	"unsafe"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
-	"github.com/swytchdb/engine/internal/memsize"
+	"github.com/swytchdb/engine/memsize"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -106,10 +106,9 @@ type leafState struct {
 	// is evicted; a departed peer's stale id is filtered against current
 	// membership at broadcast time (collectSubscribers), so no eager scrub on
 	// peer removal is needed. Guarded by subMu; lazily allocated.
-	subMu               sync.Mutex
-	subscribers         map[pb.NodeID]struct{}
-	subscriberHighWater int
-	subscriberBytes     int64
+	subMu           sync.Mutex
+	subscribers     []pb.NodeID
+	subscriberBytes int64
 }
 
 // reducedResult is a cached materialized read keyed on the exact tip set it was

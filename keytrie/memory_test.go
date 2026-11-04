@@ -5,7 +5,7 @@ import (
 	"testing"
 	"unsafe"
 
-	"github.com/swytchdb/engine/internal/memsize"
+	"github.com/swytchdb/engine/memsize"
 )
 
 func TestMemoryFrontiersPayloadsAndDeadKeys(t *testing.T) {

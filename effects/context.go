@@ -1838,64 +1838,6 @@ func (c *Context) flushTx() error {
 	return nil
 }
 
-// collectSubscribers gathers unique subscriber node IDs across all touched
-// keys, filtered to peers that are still current cluster members. Subscriber
-// sets live on each key's leaf (leafState.subscribers), maintained
-// incrementally by ensureSubscribed (peers that NACK back are subscribed) and
-// HandleRemote (foreign SubscriptionEffect arrival/unsubscribe). Reading the
-// DAG via reconstruct here was the prior implementation; it produced
-// subscribers:0 whenever reconstruct legitimately returned a Subscribers-less
-// result (verdict-only snapshot at LCA, all-lost bind set, NoopEffect chain),
-// which silently dropped the bind broadcast and produced missing verdict
-// snapshots downstream.
-//
-// The membership filter is what lets a departed peer's stale id fall out
-// lazily instead of needing an eager scrub on peer removal: PeerIDs() shrinks
-// only on genuine topology removal, so a member that is merely unreachable
-// stays in the required set (flushTx then reports an ambiguous outcome when it
-// can't respond), while a truly departed peer is dropped so the
-// key can still make progress.
-func (c *Context) collectSubscribers() []pb.NodeID {
-	var members map[pb.NodeID]struct{}
-
-	if c.engine.broadcaster != nil {
-		ids := c.engine.broadcaster.PeerIDs()
-
-		members = make(map[pb.NodeID]struct{}, len(ids))
-		for _, id := range ids {
-			members[id] = struct{}{}
-		}
-	}
-
-	seen := make(map[pb.NodeID]struct{})
-
-	for key := range c.keys {
-		ls, _ := c.engine.index.LoadOrStoreData(key, &leafState{})
-		if ls == nil {
-			continue
-		}
-
-		ls.subMu.Lock()
-		for id := range ls.subscribers {
-			if members != nil {
-				if _, ok := members[id]; !ok {
-					continue
-				}
-			}
-
-			seen[id] = struct{}{}
-		}
-		ls.subMu.Unlock()
-	}
-
-	result := make([]pb.NodeID, 0, len(seen))
-	for id := range seen {
-		result = append(result, id)
-	}
-
-	return result
-}
-
 // emitSerializationEffect emits a serialization request for a key without
 // a transaction so it becomes visible immediately. Under heavy contention
 // the transactional path would abort or remain invisible behind pending

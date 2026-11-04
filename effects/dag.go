@@ -56,7 +56,6 @@ type dag struct {
 	engine      *Engine
 	key         string
 	activeTxnID string
-	visited     map[Tip]bool
 	nodes       map[Tip]*pb.Effect
 	lcaTip      Tip
 	// topoOrder is the post-order DFS sequence of every tip reached
@@ -101,7 +100,6 @@ func (d *dag) walk(tips []Tip, processor func(*pb.Effect) error) error {
 // prepare runs BFS + LCA trim and builds d.topoOrder. Safe to read
 // d.nodes and d.topoOrder after this returns successfully.
 func (d *dag) prepare(tips []Tip) error {
-	d.visited = make(map[Tip]bool, len(tips)*8)
 	d.nodes = make(map[Tip]*pb.Effect, len(tips)*8)
 
 	if err := d.bfs(tips, &d.lcaTip); err != nil {
@@ -208,7 +206,7 @@ func (d *dag) bfs(tips []Tip, lcaTip *Tip) error {
 	}
 
 	for _, t := range tips {
-		if d.visited[t] {
+		if _, seen := d.nodes[t]; seen {
 			continue
 		}
 
@@ -217,7 +215,6 @@ func (d *dag) bfs(tips []Tip, lcaTip *Tip) error {
 			return err
 		}
 
-		d.visited[t] = true
 		d.nodes[t] = eff
 		// A standalone subscription tip carries no data ancestry. If another
 		// path later references it, it becomes part of that path's frontier.
@@ -248,19 +245,7 @@ func (d *dag) bfs(tips []Tip, lcaTip *Tip) error {
 			return nil
 		}
 
-		var refs []*pb.EffectRef
-
-		if bind := eff.GetTxnBind(); bind != nil {
-			for _, kb := range bind.GetKeys() {
-				if string(kb.GetKey()) == d.key {
-					refs = []*pb.EffectRef{kb.GetNewTip()}
-
-					break
-				}
-			}
-		} else {
-			refs = eff.GetDeps()
-		}
+		refs := d.keyDeps(eff)
 
 		// Roots finish queued work without resolving their dependency path.
 		if len(refs) > 0 {
@@ -269,8 +254,8 @@ func (d *dag) bfs(tips []Tip, lcaTip *Tip) error {
 
 		for _, ref := range refs {
 			dt := r(ref)
-			if d.visited[dt] {
-				if dep := d.nodes[dt]; dep.GetSubscription() != nil && len(dep.GetDeps()) == 0 {
+			if dep, seen := d.nodes[dt]; seen {
+				if dep.GetSubscription() != nil && len(dep.GetDeps()) == 0 {
 					frontier[dt] = struct{}{}
 				}
 
@@ -282,7 +267,6 @@ func (d *dag) bfs(tips []Tip, lcaTip *Tip) error {
 				return err
 			}
 
-			d.visited[dt] = true
 			d.nodes[dt] = depEff
 			frontier[dt] = struct{}{}
 			enqueue(dt, depEff)
@@ -322,8 +306,6 @@ func (d *dag) trimAncestorsOfLCA() {
 		return
 	}
 
-	folded := make(map[Tip]struct{})
-
 	stack := make([]Tip, 0, len(lcaEff.GetDeps()))
 	for _, dep := range lcaEff.GetDeps() {
 		stack = append(stack, r(dep))
@@ -333,40 +315,35 @@ func (d *dag) trimAncestorsOfLCA() {
 		cur := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
 
-		if _, seen := folded[cur]; seen {
-			continue
-		}
-
-		folded[cur] = struct{}{}
-
 		eff, ok := d.nodes[cur]
 		if !ok {
 			continue
 		}
 
-		var refs []*pb.EffectRef
+		// Removing a node also marks it visited, so shared ancestors need no
+		// separate set and are expanded only once.
+		delete(d.nodes, cur)
 
-		if bind := eff.GetTxnBind(); bind != nil {
-			for _, kb := range bind.GetKeys() {
-				if string(kb.GetKey()) == d.key {
-					refs = []*pb.EffectRef{kb.GetNewTip()}
-
-					break
-				}
-			}
-		} else {
-			refs = eff.GetDeps()
-		}
-
-		for _, dep := range refs {
+		for _, dep := range d.keyDeps(eff) {
 			stack = append(stack, r(dep))
 		}
 	}
+}
 
-	for t := range folded {
-		delete(d.nodes, t)
-		delete(d.visited, t)
+// keyDeps follows a bind through this key's new tip, not through other keys.
+// All traversal phases use the same rule for the per-key graph.
+func (d *dag) keyDeps(eff *pb.Effect) []*pb.EffectRef {
+	if bind := eff.GetTxnBind(); bind != nil {
+		for _, kb := range bind.GetKeys() {
+			if string(kb.GetKey()) == d.key {
+				return []*pb.EffectRef{kb.GetNewTip()}
+			}
+		}
+
+		return nil
 	}
+
+	return eff.GetDeps()
 }
 
 // topoCollect does a post-order DFS within the collected nodes, recording
@@ -394,19 +371,7 @@ func (d *dag) topoCollect(t Tip, visited map[Tip]bool) {
 	}
 
 	// Follow deps within collected set
-	var refs []*pb.EffectRef
-
-	if bind := eff.GetTxnBind(); bind != nil {
-		for _, kb := range bind.GetKeys() {
-			if string(kb.GetKey()) == d.key {
-				refs = []*pb.EffectRef{kb.GetNewTip()}
-
-				break
-			}
-		}
-	} else {
-		refs = eff.GetDeps()
-	}
+	refs := d.keyDeps(eff)
 
 	if len(refs) > 0 {
 		type pair struct {

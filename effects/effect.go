@@ -403,7 +403,7 @@ func newEngine(cfg EngineConfig) *Engine {
 		nodeID:             pb.NewNodeID(),
 		clock:              crdt.NewHLC(),
 		rttProvider:        cfg.RTTProvider,
-		serializationState: initSerializationState(),
+		serializationState: xsync.NewMap[string, *keySerializationState](),
 		subscriptions:      xsync.NewMap[string, *subscriptionState](),
 		pendingTxns:        xsync.NewMap[keytrie.EffectRef, *pendingTxn](),
 		pendingTxTips:      xsync.NewMap[keytrie.EffectRef, []Tip](),
@@ -514,106 +514,6 @@ func (e *Engine) VertexCount() int {
 // rather than slot-bounded, so this is its capacity for heartbeat telemetry.
 func (e *Engine) MemoryTarget() int64 {
 	return e.memTarget
-}
-
-// addPeerSubscriber records that peer is subscribed to key. Idempotent.
-// Called from ensureSubscribed (peers that NACK back during bootstrap)
-// and HandleRemote (foreign SubscriptionEffect arrival). The subscriber set
-// lives on the key's leaf; if the key has no leaf (never read/written or
-// already evicted), there is nothing to subscribe to and the call is a no-op.
-func (e *Engine) addPeerSubscriber(key string, peer pb.NodeID) {
-	if peer == e.nodeID {
-		return
-	}
-
-	ls, _ := e.index.LoadOrStoreData(key, &leafState{})
-	if ls == nil {
-		return
-	}
-
-	ls.subMu.Lock()
-	if ls.subdag.Load() == evictedSubdag {
-		ls.subMu.Unlock()
-
-		return
-	}
-
-	if ls.subscribers == nil {
-		ls.subscribers = make(map[pb.NodeID]struct{})
-	}
-
-	ls.subscribers[peer] = struct{}{}
-	if len(ls.subscribers) > ls.subscriberHighWater {
-		ls.subscriberHighWater = len(ls.subscribers)
-		cost := subscriberMapBytes(ls.subscriberHighWater)
-		e.subscriberBytes.Add(cost - ls.subscriberBytes)
-		ls.subscriberBytes = cost
-	}
-	ls.subMu.Unlock()
-}
-
-// removePeerSubscriber removes peer from the subscriber set for key.
-// Called from HandleRemote on a foreign unsubscribe SubscriptionEffect.
-func (e *Engine) removePeerSubscriber(key string, peer pb.NodeID) {
-	ls, _ := e.index.LoadOrStoreData(key, &leafState{})
-	if ls == nil {
-		return
-	}
-
-	ls.subMu.Lock()
-	delete(ls.subscribers, peer)
-	ls.subMu.Unlock()
-}
-
-// snapshotSubscribers returns the key's current subscriber set in the proto
-// map form, for stamping into a compaction SnapshotEffect's reduced state so
-// the set survives chain compaction and is available to a bootstrapping peer.
-// Returns nil when there are no subscribers. Sourced from the authoritative
-// leafState set — no DAG walk.
-func (e *Engine) snapshotSubscribers(key string) map[uint64]bool {
-	ls, _ := e.index.LoadOrStoreData(key, &leafState{})
-	if ls == nil {
-		return nil
-	}
-
-	ls.subMu.Lock()
-	defer ls.subMu.Unlock()
-
-	if len(ls.subscribers) == 0 {
-		return nil
-	}
-
-	m := make(map[uint64]bool, len(ls.subscribers))
-	for id := range ls.subscribers {
-		m[uint64(id)] = true
-	}
-
-	return m
-}
-
-// PeerSubscribers returns the current subscriber set for key. The returned
-// slice is a snapshot; callers may iterate without holding any lock. It is
-// unfiltered by membership — flushTx's collectSubscribers applies the
-// current-membership filter at broadcast time.
-func (e *Engine) PeerSubscribers(key string) []pb.NodeID {
-	ls, _ := e.index.LoadOrStoreData(key, &leafState{})
-	if ls == nil {
-		return nil
-	}
-
-	ls.subMu.Lock()
-	defer ls.subMu.Unlock()
-
-	if len(ls.subscribers) == 0 {
-		return nil
-	}
-
-	result := make([]pb.NodeID, 0, len(ls.subscribers))
-	for id := range ls.subscribers {
-		result = append(result, id)
-	}
-
-	return result
 }
 
 // DropPeer releases per-peer cached state when a peer permanently leaves the
@@ -1877,7 +1777,7 @@ func (e *Engine) handleRemoteBind(bind *pb.TransactionalBindEffect, bindOffset T
 		// and reconstruct picks a different winner — the earlier read
 		// becomes a retroactive lie.
 		e.horizon.Add(txnID, bindOffset, bind)
-		e.horizon.ScheduleMakeVisible(txnID, e.horizon.computeHorizonWait())
+		e.horizon.ScheduleMakeVisible(txnID, horizonFallbackWait)
 	} else {
 		// Standalone: remove bound key tips from pendingTxTips immediately
 		for _, kb := range bind.GetKeys() {

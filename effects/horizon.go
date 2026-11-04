@@ -25,6 +25,7 @@ package effects
 
 import (
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -34,25 +35,21 @@ import (
 
 // horizonEntry tracks a single Bind that is in its horizon wait period.
 type horizonEntry struct {
-	group      *horizonGroup
-	bindOffset Tip
-	txnID      string
-	keyNewTips map[string]Tip // key → data effect offset (for pendingTxTips cleanup)
-	waiters    xsync.RBMutex
+	group   *horizonGroup
+	txnID   string
+	bind    *pb.TransactionalBindEffect // immutable; owns keys and new tips
+	waiters xsync.RBMutex
 }
 
 // horizonGroup tracks a group of competing Binds that share at least one
 // consumed Tip on an overlapping key. Visibility is driven externally:
 // flushTx calls MakeVisible / Abort on the originator side; handleRemoteBind
 // schedules MakeVisible via ScheduleMakeVisible on the remote-arrival side
-// (1×RTT timer).
+// (crash-fallback timer).
 type horizonGroup struct {
-	mu       sync.Mutex
-	entries  map[string]*horizonEntry // txnID → entry
-	bindKeys map[string][]Tip         // key → consumed tips (for overlap detection)
-	allKeys  map[string]struct{}      // union of all keys in group
-	timer    *time.Timer              // scheduled MakeVisible (remote-arrival path)
-	visible  bool
+	entries  []*horizonEntry
+	bindKeys map[string][]Tip // key → consumed tips (for overlap detection)
+	timer    *time.Timer      // scheduled MakeVisible (remote-arrival path)
 }
 
 // HorizonSet tracks Binds in their horizon wait period. Effects from
@@ -60,7 +57,7 @@ type horizonGroup struct {
 // completes.
 type HorizonSet struct {
 	entries *xsync.Map[string, *horizonEntry] // txnID → entry (fast lookup)
-	mu      sync.Mutex                        // protects group creation/merge
+	mu      sync.Mutex                        // owns groups, entry.group, and all lifecycle mutations
 	groups  []*horizonGroup                   // all active groups
 	engine  *Engine
 
@@ -83,118 +80,64 @@ func newHorizonSet(engine *Engine) *HorizonSet {
 // premature visibility, holding longer just delays the rare crash case.
 const horizonFallbackWait = 5 * time.Second
 
-// computeHorizonWait returns the duration the remote-arrival path should
-// hold a bind invisible before making it visible, when no verdict snapshot
-// arrives. Returns horizonFallbackWait — long enough that the originator's
-// snapshot almost always wins the race and shortcuts the wait, but short
-// enough that a crashed originator doesn't hang reads indefinitely.
-func (h *HorizonSet) computeHorizonWait() time.Duration {
-	return horizonFallbackWait
-}
-
 // Add registers a Bind in the invisible set. The bind stays invisible
 // until MakeVisible, Abort, or a timer scheduled via ScheduleMakeVisible
 // fires. If the bind's keys overlap with an existing group's consumed tips,
 // it joins that group; otherwise a new group is created.
 func (h *HorizonSet) Add(txnID string, bindOffset Tip, bind *pb.TransactionalBindEffect) {
-	consumedByKey := make(map[string][]Tip, len(bind.GetKeys()))
-	newTips := make(map[string]Tip, len(bind.GetKeys()))
-
-	allKeys := make(map[string]struct{}, len(bind.GetKeys()))
-	for _, kb := range bind.GetKeys() {
-		k := string(kb.GetKey())
-		consumedByKey[k] = fromPbRefs(kb.GetConsumedTips())
-		newTips[k] = r(kb.GetNewTip())
-		allKeys[k] = struct{}{}
-	}
-
-	entry := &horizonEntry{
-		bindOffset: bindOffset,
-		txnID:      txnID,
-		keyNewTips: newTips,
-		waiters:    xsync.RBMutex{},
-	}
-	// immediately prevent concurrent access to this entry
-	entry.waiters.Lock()
-
 	h.mu.Lock()
-	newBind := &forkChoiceBindEntry{keys: consumedByKey}
+	defer h.mu.Unlock()
 
-	var overlapping []*horizonGroup
+	// A redelivered bind must not replace an entry with blocked readers.
+	if _, exists := h.entries.Load(txnID); exists {
+		return
+	}
 
-	for _, g := range h.groups {
-		if g.visible {
+	var target *horizonGroup
+
+	for _, group := range h.groups {
+		if !group.overlaps(bind) {
 			continue
 		}
 
-		g.mu.Lock()
-		if groupOverlaps(g, newBind) {
-			overlapping = append(overlapping, g)
+		if target == nil {
+			target = group
+
+			continue
 		}
-		g.mu.Unlock()
+
+		for _, entry := range group.entries {
+			entry.group = target
+		}
+
+		target.entries = append(target.entries, group.entries...)
+		for key, tips := range group.bindKeys {
+			target.bindKeys[key] = append(target.bindKeys[key], tips...)
+		}
+
+		group.entries = nil
 	}
 
-	var targetGroup *horizonGroup
-	if len(overlapping) == 0 {
-		targetGroup = &horizonGroup{
-			entries:  make(map[string]*horizonEntry),
-			bindKeys: make(map[string][]Tip),
-			allKeys:  make(map[string]struct{}),
-		}
-		h.groups = append(h.groups, targetGroup)
-	} else if len(overlapping) == 1 {
-		targetGroup = overlapping[0]
+	if target == nil {
+		target = &horizonGroup{bindKeys: make(map[string][]Tip, len(bind.GetKeys()))}
+		h.groups = append(h.groups, target)
 	} else {
-		targetGroup = overlapping[0]
-		targetGroup.mu.Lock()
-		for _, other := range overlapping[1:] {
-			other.mu.Lock()
-			for tid, e := range other.entries {
-				e.group = targetGroup
-				targetGroup.entries[tid] = e
-			}
-
-			for k, tips := range other.bindKeys {
-				targetGroup.bindKeys[k] = append(targetGroup.bindKeys[k], tips...)
-			}
-
-			for k := range other.allKeys {
-				targetGroup.allKeys[k] = struct{}{}
-			}
-
-			if other.timer != nil {
-				other.timer.Stop()
-				other.timer = nil
-			}
-
-			other.visible = true // consumed
-			other.mu.Unlock()
-		}
-		targetGroup.mu.Unlock()
-
-		h.groups = filterGroups(h.groups)
+		h.pruneGroups()
 	}
 
-	targetGroup.mu.Lock()
-	entry.group = targetGroup
+	entry := &horizonEntry{group: target, txnID: txnID, bind: bind}
+	entry.waiters.Lock()
+	target.entries = append(target.entries, entry)
 
-	targetGroup.entries[txnID] = entry
-	for k, tips := range consumedByKey {
-		targetGroup.bindKeys[k] = append(targetGroup.bindKeys[k], tips...)
+	for _, kb := range bind.GetKeys() {
+		key := string(kb.GetKey())
+		target.bindKeys[key] = append(target.bindKeys[key], fromPbRefs(kb.GetConsumedTips())...)
 	}
-
-	for k := range allKeys {
-		targetGroup.allKeys[k] = struct{}{}
-	}
-
-	groupSize := len(targetGroup.entries)
-	targetGroup.mu.Unlock()
-	h.mu.Unlock()
 
 	h.entries.Store(txnID, entry)
 
 	slog.Debug("HorizonSet.Add", "txnID", txnID, "bindOffset", bindOffset,
-		"group_size", groupSize)
+		"group_size", len(target.entries))
 }
 
 // HorizonWait is a handle returned by WaitForClear. It carries the
@@ -236,19 +179,15 @@ func (w *HorizonWait) Release() {
 // avoid racing the snapshot under normal conditions. Resets any
 // existing timer on the group; a later-joining bind extends the wait.
 func (h *HorizonSet) ScheduleMakeVisible(txnID string, wait time.Duration) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
 	entry, ok := h.entries.Load(txnID)
 	if !ok {
 		return
 	}
 
 	group := entry.group
-	group.mu.Lock()
-	if group.visible {
-		group.mu.Unlock()
-
-		return
-	}
-
 	if group.timer != nil {
 		group.timer.Stop()
 	}
@@ -259,54 +198,43 @@ func (h *HorizonSet) ScheduleMakeVisible(txnID string, wait time.Duration) {
 	} else {
 		group.timer = time.AfterFunc(wait, fn)
 	}
-	group.mu.Unlock()
 }
 
 // MakeVisible promotes an entire group: removes all txnIDs from the invisible
 // set, cleans up pendingTxTips, evicts cache, and fires OnKeyDataAdded callbacks.
 func (h *HorizonSet) MakeVisible(txnID string) {
+	h.mu.Lock()
+
 	entry, ok := h.entries.Load(txnID)
 	if !ok {
+		h.mu.Unlock()
+
 		return
 	}
 
 	group := entry.group
-	group.mu.Lock()
-	if group.visible {
-		group.mu.Unlock()
+	count := len(group.entries)
 
-		return
-	}
+	var keys []string
 
-	group.visible = true
-	if group.timer != nil {
-		group.timer.Stop()
-		group.timer = nil
-	}
-
-	entries := make([]*horizonEntry, 0, len(group.entries))
-	for _, e := range group.entries {
-		entries = append(entries, e)
-	}
-	group.mu.Unlock()
-
-	allKeys := make(map[string]struct{})
-
-	for _, e := range entries {
-		if et, ok := h.entries.Load(e.txnID); ok {
-			et.waiters.Unlock()
+	for _, member := range group.entries {
+		for _, kb := range member.bind.GetKeys() {
+			keys = append(keys, string(kb.GetKey()))
 		}
 
-		h.entries.Delete(e.txnID)
-
-		for k, newTip := range e.keyNewTips {
-			h.engine.pendingTxTips.Delete(newTip)
-
-			allKeys[k] = struct{}{}
-		}
+		h.resolve(member)
 	}
 
-	for k := range allKeys {
+	group.entries = nil
+
+	h.pruneGroups()
+	h.mu.Unlock()
+
+	// User callbacks run outside the lifecycle lock and once per live key.
+	slices.Sort(keys)
+
+	keys = slices.Compact(keys)
+	for _, k := range keys {
 		h.engine.ownFilterAdd(k)
 
 		if h.engine.OnKeyDataAdded != nil {
@@ -314,12 +242,8 @@ func (h *HorizonSet) MakeVisible(txnID string) {
 		}
 	}
 
-	h.mu.Lock()
-	h.groups = filterGroups(h.groups)
-	h.mu.Unlock()
-
 	slog.Debug("HorizonSet.MakeVisible", "txnID", txnID,
-		"promoted_count", len(entries), "keys", len(allKeys))
+		"promoted_count", count, "keys", len(keys))
 }
 
 // Abort removes a single entry from the horizon set without promoting it.
@@ -330,38 +254,20 @@ func (h *HorizonSet) MakeVisible(txnID string) {
 // Other entries in the same group are unaffected — they continue waiting
 // on their own visibility trigger (timer or explicit MakeVisible).
 func (h *HorizonSet) Abort(txnID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
 	entry, ok := h.entries.Load(txnID)
 	if !ok {
 		return
 	}
 
-	h.entries.Delete(txnID)
-	entry.waiters.Unlock()
-
 	group := entry.group
-	group.mu.Lock()
-	delete(group.entries, txnID)
+	i := slices.Index(group.entries, entry)
+	group.entries = shrinkSlice(slices.Delete(group.entries, i, i+1))
 
-	for _, newTip := range entry.keyNewTips {
-		h.engine.pendingTxTips.Delete(newTip)
-	}
-
-	isEmpty := len(group.entries) == 0
-	if isEmpty {
-		if group.timer != nil {
-			group.timer.Stop()
-			group.timer = nil
-		}
-
-		group.visible = true // marker for filterGroups
-	}
-	group.mu.Unlock()
-
-	if isEmpty {
-		h.mu.Lock()
-		h.groups = filterGroups(h.groups)
-		h.mu.Unlock()
-	}
+	h.resolve(entry)
+	h.pruneGroups()
 
 	slog.Debug("HorizonSet.Abort", "txnID", txnID)
 }
@@ -382,22 +288,12 @@ func (h *HorizonSet) Empty() bool {
 	return h.entries.Size() == 0
 }
 
-// groupOverlaps checks if a horizon group has any overlapping key with shared
-// consumed tips against a new bind entry. Caller must hold g.mu.
-func groupOverlaps(g *horizonGroup, newBind *forkChoiceBindEntry) bool {
-	for key, newBase := range newBind.keys {
-		existingBase, ok := g.bindKeys[key]
-		if !ok {
-			continue
-		}
-
-		existingSet := make(map[Tip]bool, len(existingBase))
-		for _, off := range existingBase {
-			existingSet[off] = true
-		}
-
-		for _, off := range newBase {
-			if existingSet[off] {
+// overlaps checks shared consumed tips without building a temporary set.
+// The owning HorizonSet's mutex protects the group.
+func (g *horizonGroup) overlaps(bind *pb.TransactionalBindEffect) bool {
+	for _, kb := range bind.GetKeys() {
+		for _, ref := range kb.GetConsumedTips() {
+			if slices.Contains(g.bindKeys[string(kb.GetKey())], r(ref)) {
 				return true
 			}
 		}
@@ -406,20 +302,32 @@ func groupOverlaps(g *horizonGroup, newBind *forkChoiceBindEntry) bool {
 	return false
 }
 
-// filterGroups removes groups that are marked as visible.
-func filterGroups(groups []*horizonGroup) []*horizonGroup {
-	n := 0
+// resolve releases one bind's bookkeeping before waking readers. Caller holds h.mu.
+func (h *HorizonSet) resolve(entry *horizonEntry) {
+	for _, kb := range entry.bind.GetKeys() {
+		h.engine.pendingTxTips.Delete(r(kb.GetNewTip()))
+	}
 
-	for _, g := range groups {
-		if !g.visible {
-			groups[n] = g
-			n++
+	h.entries.Delete(entry.txnID)
+	entry.waiters.Unlock()
+}
+
+// pruneGroups releases completed/merged groups and their timer and key storage.
+// Caller holds h.mu.
+func (h *HorizonSet) pruneGroups() {
+	h.groups = slices.DeleteFunc(h.groups, func(group *horizonGroup) bool {
+		if len(group.entries) != 0 {
+			return false
 		}
-	}
 
-	for i := n; i < len(groups); i++ {
-		groups[i] = nil
-	}
+		if group.timer != nil {
+			group.timer.Stop()
+			group.timer = nil
+		}
 
-	return groups[:n]
+		group.bindKeys = nil
+
+		return true
+	})
+	h.groups = shrinkSlice(h.groups)
 }

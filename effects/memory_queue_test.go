@@ -6,7 +6,7 @@ import (
 	"testing"
 	"unsafe"
 
-	"github.com/swytchdb/engine/internal/memsize"
+	"github.com/swytchdb/engine/memsize"
 )
 
 func TestMemoryMaintenanceQueuesCannotCausePrimaryEviction(t *testing.T) {

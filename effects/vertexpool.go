@@ -28,6 +28,7 @@ import (
 	"log/slog"
 	"math"
 	"runtime/debug"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -37,7 +38,7 @@ import (
 
 	pb "github.com/swytchdb/engine/cluster/proto"
 	"github.com/swytchdb/engine/durability"
-	"github.com/swytchdb/engine/internal/memsize"
+	"github.com/swytchdb/engine/memsize"
 )
 
 // vertexOverhead accounts for the wrapper and conservative concurrent-map slack.
@@ -56,10 +57,9 @@ type vertex struct {
 	temporal atomic.Uint32
 	// Creation references belong to individual keys. A positive refs count
 	// alone cannot distinguish ownership from another subdag's adoption pin.
-	creationMu        sync.Mutex
-	creationKeys      map[string]struct{}
-	creationHighWater int
-	creationBytes     int64
+	creationMu    sync.Mutex
+	creationKeys  []string // sorted, unique; usually just the effect's own key
+	creationBytes int64
 }
 
 // VertexPool is the engine's deserialized effect store: a map from Tip to
@@ -172,11 +172,22 @@ func (p *VertexPool) PutSized(tip Tip, eff *pb.Effect, protoLen int) error {
 
 // putSized takes creation references only for keys accepted by owns. Local
 // emission owns the whole keyset (nil); remote ingestion owns served keys.
-func (p *VertexPool) putSized(tip Tip, eff *pb.Effect, protoLen int, owns func([]byte) bool) error {
-	keys := make(map[string]struct{})
+func (p *VertexPool) putSized(tip Tip, eff *pb.Effect, _ int, owns func([]byte) bool) error {
+	return p.put(tip, eff, true, owns)
+}
+
+// missingCreationKeys returns only new owners. Ordinary effects own one key;
+// binds own their distinct keys. Re-delivery of an owned effect allocates nothing.
+func missingCreationKeys(eff *pb.Effect, existing []string, owns func([]byte) bool) []string {
+	var keys []string
+
 	add := func(key []byte) {
-		if owns == nil || owns(key) {
-			keys[string(key)] = struct{}{}
+		if owns != nil && !owns(key) {
+			return
+		}
+
+		if _, found := slices.BinarySearch(existing, string(key)); !found {
+			keys = append(keys, string(key))
 		}
 	}
 
@@ -188,24 +199,38 @@ func (p *VertexPool) putSized(tip Tip, eff *pb.Effect, protoLen int, owns func([
 		add(eff.GetKey())
 	}
 
-	if len(keys) == 0 {
-		return p.PutSizedCache(tip, eff, protoLen)
-	}
+	slices.Sort(keys)
 
+	return slices.Compact(keys)
+}
+
+// put owns persistence, publication, and accounting for both owned and cache-only
+// effects. Creation references are initialized before a vertex is published.
+func (p *VertexPool) put(tip Tip, eff *pb.Effect, takeOwnership bool, owns func([]byte) bool) error {
 	if p.mirror != nil {
 		lock := &p.mirrorLocks[(tip[0]^tip[1])%256]
 		lock.Lock()
 		defer lock.Unlock()
 
-		if err := p.persist(tip, eff); err != nil {
+		data, err := MarshalEffect(eff)
+		if err != nil {
+			return err
+		}
+
+		if err := p.mirror.Put(tip, data); err != nil {
 			return err
 		}
 	}
 
 	v, loaded := p.m.Load(tip)
 	if !loaded {
-		nv := &vertex{eff: eff, size: vertexOverhead, creationKeys: keys}
-		nv.refs.Store(int32(len(keys)))
+		nv := &vertex{eff: eff, size: vertexOverhead}
+		if takeOwnership {
+			nv.creationKeys = missingCreationKeys(eff, nil, owns)
+		}
+
+		owners := len(nv.creationKeys)
+		nv.refs.Store(int32(owners))
 		p.owned.change(eff, 1)
 		p.vertexBytes.Add(nv.size)
 		p.accountCreation(nv)
@@ -214,17 +239,16 @@ func (p *VertexPool) putSized(tip Tip, eff *pb.Effect, protoLen int, owns func([
 		if loaded {
 			p.owned.change(eff, -1)
 			p.vertexBytes.Add(-nv.size - nv.creationBytes)
+		} else if owners == 0 {
+			p.enqueueReclaim(tip)
 		}
 	}
 
-	if loaded {
+	if loaded && takeOwnership {
 		v.creationMu.Lock()
 		defer v.creationMu.Unlock()
 
-		for key := range v.creationKeys {
-			delete(keys, key)
-		}
-
+		keys := missingCreationKeys(eff, v.creationKeys, owns)
 		if len(keys) == 0 {
 			return nil
 		}
@@ -240,14 +264,8 @@ func (p *VertexPool) putSized(tip Tip, eff *pb.Effect, protoLen int, owns func([
 			}
 		}
 
-		if v.creationKeys == nil {
-			v.creationKeys = keys
-		} else {
-			for key := range keys {
-				v.creationKeys[key] = struct{}{}
-			}
-		}
-
+		v.creationKeys = append(v.creationKeys, keys...)
+		slices.Sort(v.creationKeys)
 		p.accountCreation(v)
 	}
 
@@ -268,41 +286,7 @@ func (p *VertexPool) putSized(tip Tip, eff *pb.Effect, protoLen int, owns func([
 // enqueued as a reclaim candidate at birth — without this an un-adopted cache
 // fetch would never be reclaimed (there is no full-map scan to catch it).
 func (p *VertexPool) PutSizedCache(tip Tip, eff *pb.Effect, _ int) error {
-	if p.mirror != nil {
-		lock := &p.mirrorLocks[(tip[0]^tip[1])%256]
-		lock.Lock()
-		defer lock.Unlock()
-
-		if err := p.persist(tip, eff); err != nil {
-			return err
-		}
-	}
-
-	if _, loaded := p.m.Load(tip); loaded {
-		return nil
-	}
-
-	nv := &vertex{eff: eff, size: vertexOverhead}
-	p.owned.change(eff, 1)
-	p.vertexBytes.Add(nv.size)
-
-	if _, loaded := p.m.LoadOrStore(tip, nv); !loaded {
-		p.enqueueReclaim(tip)
-	} else {
-		p.owned.change(eff, -1)
-		p.vertexBytes.Add(-nv.size)
-	}
-
-	return nil
-}
-
-func (p *VertexPool) persist(tip Tip, eff *pb.Effect) error {
-	data, err := MarshalEffect(eff)
-	if err != nil {
-		return err
-	}
-
-	return p.mirror.Put(tip, data)
+	return p.put(tip, eff, false, nil)
 }
 
 // delete removes tip from the pool and counts a reclaim. It does NOT touch the
@@ -352,8 +336,8 @@ func (p *VertexPool) decrefChainNode(key string, tip Tip) (*pb.Effect, bool) {
 	}
 
 	v.creationMu.Lock()
-	if _, owned := v.creationKeys[key]; owned {
-		delete(v.creationKeys, key)
+	if i, owned := slices.BinarySearch(v.creationKeys, key); owned {
+		v.creationKeys = shrinkSlice(slices.Delete(v.creationKeys, i, i+1))
 		p.accountCreation(v)
 		p.decref(tip)
 	}
@@ -496,17 +480,11 @@ func (p *VertexPool) Bytes() int64 {
 	return p.owned.residentBytes() + p.vertexBytes.Load() + int64(unsafe.Sizeof(*p))
 }
 
-// Call with creationMu held, or before publishing a new vertex. Map capacity
-// survives deletions, while removed ownership strings no longer belong to it.
+// Call with creationMu held, or before publishing a new vertex.
 func (p *VertexPool) accountCreation(v *vertex) {
-	v.creationHighWater = max(v.creationHighWater, len(v.creationKeys))
-
-	var cost int64
-	if v.creationKeys != nil {
-		cost = memsize.Map(v.creationHighWater, 16)
-		for key := range v.creationKeys {
-			cost += memsize.Alloc(int64(len(key)))
-		}
+	cost := memsize.Alloc(int64(cap(v.creationKeys)) * 16)
+	for _, key := range v.creationKeys {
+		cost += memsize.Alloc(int64(len(key)))
 	}
 
 	p.vertexBytes.Add(cost - v.creationBytes)

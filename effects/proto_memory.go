@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"unsafe"
 
-	"github.com/swytchdb/engine/internal/memsize"
+	"github.com/swytchdb/engine/memsize"
 )
 
 // Protobuf snapshots share immutable submessages and value buffers with older
