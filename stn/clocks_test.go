@@ -1,7 +1,31 @@
+/*
+ * Copyright 2026 Swytch Labs BV
+ *
+ * This file is part of Swytch.
+ *
+ * Swytch is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of
+ * the License, or (at your option) any later version.
+ *
+ * Swytch is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with Swytch. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * Additional permissions under GNU AGPL version 3 section 7 apply to
+ * this file. See the NOTICE.md file distributed with this source code
+ * for the current set of additional permissions.
+ */
+
 package stn
 
 import (
 	"errors"
+	"fmt"
 	"math"
 	"math/big"
 	"math/rand/v2"
@@ -125,5 +149,54 @@ func TestClockConstraintsSoundAgainstElapsedSources(t *testing.T) {
 				t.Fatalf("true difference %d outside [%d,%d]: %v", t2-t1, lo, hi, err)
 			}
 		}
+	}
+}
+
+func TestClockSnapshotsBranchConcurrently(t *testing.T) {
+	c, err := NewClocks(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := range 2 {
+		c, err = c.Before(Sample{Domain: uint64(i)}, Sample{Domain: uint64(i + 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for i := range 8 {
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			t.Parallel()
+
+			// Tightening keeps the anchors; growth adds an anchor and changes
+			// topology. Neither may modify the base or another branch.
+			branch, err := c.Before(Sample{Domain: 0, Tick: 1}, Sample{Domain: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			added := Sample{Domain: uint64(i + 10)}
+
+			branch, err = branch.Before(Sample{Domain: 2}, added)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			lo, hi, err := branch.Difference(added, Sample{Domain: 0})
+			if err != nil || lo != -Infinity || hi != -1 {
+				t.Fatalf("branch bounds = [%d,%d], error = %v", lo, hi, err)
+			}
+
+			lo, hi, err = c.Difference(Sample{Domain: 2}, Sample{Domain: 0})
+			if err != nil || lo != -Infinity || hi != 0 {
+				t.Fatalf("base bounds changed: [%d,%d], error = %v", lo, hi, err)
+			}
+
+			lo, hi, err = c.Difference(added, Sample{Domain: 0})
+			if err != nil || lo != -Infinity || hi != Infinity {
+				t.Fatalf("new domain leaked into base: [%d,%d], error = %v", lo, hi, err)
+			}
+		})
 	}
 }

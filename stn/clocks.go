@@ -1,3 +1,26 @@
+/*
+ * Copyright 2026 Swytch Labs BV
+ *
+ * This file is part of Swytch.
+ *
+ * Swytch is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of
+ * the License, or (at your option) any later version.
+ *
+ * Swytch is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with Swytch. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * Additional permissions under GNU AGPL version 3 section 7 apply to
+ * this file. See the NOTICE.md file distributed with this source code
+ * for the current set of additional permissions.
+ */
+
 package stn
 
 import (
@@ -52,22 +75,6 @@ func NewClocks(rateErrorPPM int64) (*Clocks, error) {
 	}
 
 	return &Clocks{network: n, anchors: make(map[uint64]clockAnchor), ppm: rateErrorPPM}, nil
-}
-
-func (c *Clocks) clone() *Clocks {
-	n := &Network{
-		adj: make([]map[int]int64, len(c.network.adj)), limit: c.network.limit, maxInput: c.network.maxInput,
-		order: append([]int(nil), c.network.order...), rank: append([]int(nil), c.network.rank...),
-	}
-	for i, edges := range c.network.adj {
-		n.adj[i] = make(map[int]int64, len(edges))
-		maps.Copy(n.adj[i], edges)
-	}
-
-	anchors := make(map[uint64]clockAnchor, len(c.anchors))
-	maps.Copy(anchors, c.anchors)
-
-	return &Clocks{network: n, anchors: anchors, ppm: c.ppm}
 }
 
 func (c *Clocks) anchor(s Sample) (clockAnchor, error) {
@@ -134,7 +141,11 @@ func (c *Clocks) Before(p, e Sample) (*Clocks, error) {
 		}
 	}
 
-	next := c.clone()
+	next := &Clocks{network: c.network.clone(), anchors: c.anchors, ppm: c.ppm}
+	// Existing anchors never change. Copy the map only when adding a domain.
+	if !pok || !eok {
+		next.anchors = maps.Clone(c.anchors)
+	}
 
 	pa, err = next.anchor(p)
 	if err != nil {
@@ -181,15 +192,7 @@ func (c *Clocks) Difference(a, b Sample) (lower, upper int64, err error) {
 		return 0, 0, err
 	}
 
-	ab, err := c.network.Upper(aa.vertex, ba.vertex)
-	if err != nil {
-		return 0, 0, err
-	}
-
-	baBound, err := c.network.Upper(ba.vertex, aa.vertex)
-	if err != nil {
-		return 0, 0, err
-	}
+	ab, baBound := c.network.bounds(aa.vertex, ba.vertex)
 
 	upper = Infinity
 	if ab != Infinity {
