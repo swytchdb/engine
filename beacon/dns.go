@@ -26,6 +26,7 @@ package beacon
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"strconv"
 	"strings"
@@ -53,9 +54,16 @@ func ResolveJoinAddr(ctx context.Context, resolver *net.Resolver, joinAddr strin
 	}
 
 	// Fall back to A/AAAA records + defaultPort.
-	addrs, err = resolveHost(ctx, resolver, joinAddr, defaultPort)
+	ips, err := resolver.LookupHost(ctx, joinAddr)
 	if err != nil {
 		return nil, fmt.Errorf("dns resolution failed for %q: %w", joinAddr, err)
+	}
+
+	port := strconv.Itoa(defaultPort)
+
+	addrs = make([]string, len(ips))
+	for i, ip := range ips {
+		addrs[i] = net.JoinHostPort(ip, port)
 	}
 
 	return addrs, nil
@@ -66,8 +74,7 @@ func ResolveJoinAddr(ctx context.Context, resolver *net.Resolver, joinAddr strin
 // Returns ok=true if joinAddr looks like literal addresses (contains a comma
 // or is a single host:port / IP literal), false if it should go through DNS.
 func parseLiteralAddrs(joinAddr string, defaultPort int) ([]string, bool) {
-	parts := strings.Split(joinAddr, ",")
-	if len(parts) == 1 {
+	if !strings.Contains(joinAddr, ",") {
 		// Single value — only treat as literal if it has an explicit port
 		// or is an IP address. Bare hostnames go through DNS.
 		host, _, err := net.SplitHostPort(joinAddr)
@@ -88,8 +95,10 @@ func parseLiteralAddrs(joinAddr string, defaultPort int) ([]string, bool) {
 	}
 
 	// Multiple comma-separated values — always literal.
-	addrs := make([]string, 0, len(parts))
-	for _, p := range parts {
+	port := strconv.Itoa(defaultPort)
+
+	addrs := make([]string, 0, strings.Count(joinAddr, ",")+1)
+	for p := range strings.SplitSeq(joinAddr, ",") {
 		p = strings.TrimSpace(p)
 		if p == "" {
 			continue
@@ -98,7 +107,7 @@ func parseLiteralAddrs(joinAddr string, defaultPort int) ([]string, bool) {
 		_, _, err := net.SplitHostPort(p)
 		if err != nil {
 			// No port — append default.
-			p = net.JoinHostPort(p, strconv.Itoa(defaultPort))
+			p = net.JoinHostPort(p, port)
 		}
 
 		addrs = append(addrs, p)
@@ -134,19 +143,31 @@ func resolveSRV(ctx context.Context, resolver *net.Resolver, name string) ([]str
 	return addrs, nil
 }
 
-// resolveHost queries A/AAAA records and combines with the given port.
-func resolveHost(ctx context.Context, resolver *net.Resolver, name string, port int) ([]string, error) {
-	ips, err := resolver.LookupHost(ctx, name)
+// DetectAdvertiseAddr determines the advertise address by UDP-dialing the
+// first DNS candidate (or a well-known address) and reading the local address.
+// Called early — before PeerManager starts — so the TLS leaf cert gets the
+// correct IP SAN.
+func DetectAdvertiseAddr(joinAddr string, clusterPort int) (string, error) {
+	target := "8.8.8.8:53"
+
+	if joinAddr != "" {
+		addrs, err := ResolveJoinAddr(context.Background(), nil, joinAddr, clusterPort)
+		if err == nil && len(addrs) > 0 {
+			target = addrs[0]
+		}
+	}
+
+	conn, err := net.Dial("udp", target)
 	if err != nil {
-		return nil, err
+		return "", err
+	}
+	// This socket only probes the local address; no data is sent or buffered.
+	defer func() { _ = conn.Close() }()
+
+	host, _, _ := net.SplitHostPort(conn.LocalAddr().String())
+	if host == "0.0.0.0" || host == "::" {
+		slog.Warn("auto-detected address is unspecified, consider using --cluster-advertise")
 	}
 
-	portStr := strconv.Itoa(port)
-
-	addrs := make([]string, len(ips))
-	for i, ip := range ips {
-		addrs[i] = net.JoinHostPort(ip, portStr)
-	}
-
-	return addrs, nil
+	return net.JoinHostPort(host, strconv.Itoa(clusterPort)), nil
 }

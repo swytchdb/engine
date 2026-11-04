@@ -26,8 +26,6 @@ package beacon
 import (
 	"context"
 	"log/slog"
-	"net"
-	"strconv"
 	"sync"
 	"time"
 
@@ -55,7 +53,7 @@ type Beacon struct {
 	engine *effects.Engine
 	pm     *cluster.PeerManager
 
-	members       []Member
+	members       map[uint64]string
 	expectedPeers int // DNS-discovered non-self candidate count, set during bootstrap
 	mu            sync.RWMutex
 
@@ -109,115 +107,6 @@ func New(cfg Config, engine *effects.Engine, pm *cluster.PeerManager) *Beacon {
 	}
 
 	return b
-}
-
-// removeMember queues a cloud-pushed "delete this server" command for
-// memberRemoveLoop. Applying it here would run inside the cloud stream's
-// readLoop, one flush per command — a burst of thousands would serialize
-// against it.
-func (b *Beacon) removeMember(nodeID uint64) {
-	b.removeMu.Lock()
-	b.removeQ = append(b.removeQ, nodeID)
-	b.removeMu.Unlock()
-
-	select {
-	case b.removeSignal <- struct{}{}:
-	default:
-	}
-}
-
-// memberRemoveLoop applies queued cloud-pushed removals in batches.
-func (b *Beacon) memberRemoveLoop() {
-	defer b.wg.Done()
-
-	for {
-		select {
-		case <-b.ctx.Done():
-			return
-		case <-b.removeSignal:
-		}
-
-		b.applyQueuedRemovals()
-	}
-}
-
-// applyQueuedRemovals drains the removal queue: every queued node id emits its
-// REMOVE_OP in one context with one flush, then a fresh-context read lets
-// GetSnapshot's chain compaction collapse the removals into a snapshot (the
-// emitting context cannot — a key with pending effects skips the compaction
-// branch). The compacting read is load-bearing for restart recovery: cloud
-// roster discovery walks the membership chain from the cloud's tips on every
-// boot, so an uncompacted removal burst leaves thousands of effects for each
-// future bootstrap to fetch. Failures are loud: peers keep a non-removed entry
-// and redial the dead node until an operator intervenes.
-func (b *Beacon) applyQueuedRemovals() {
-	b.removeMu.Lock()
-	batch := b.removeQ
-	b.removeQ = nil
-	b.removeMu.Unlock()
-
-	if len(batch) == 0 {
-		return
-	}
-
-	// The cloud re-offers every pending removal on each presence sweep until
-	// its TTL expires — it is zero-knowledge, so it cannot see the roster and
-	// never learns a removal was enacted. A re-pushed removal for an
-	// already-absent id must reduce to a local no-op, not a fresh REMOVE
-	// effect per sweep. On a failed roster read the batch applies unfiltered:
-	// redundant effects are the safe direction, a dropped removal is not.
-	var present map[uint64]bool
-
-	roster, _, err := b.engine.NewReadOnlyContext().GetSnapshot(MembershipKey)
-	if err != nil {
-		slog.Warn("beacon: roster read before removals failed, applying unfiltered", "error", err)
-	} else {
-		present = make(map[uint64]bool)
-		for _, m := range parseMembership(roster) {
-			present[m.NodeID] = true
-		}
-	}
-
-	toApply := batch
-	if present != nil {
-		toApply = make([]uint64, 0, len(batch))
-		for _, nodeID := range batch {
-			if present[nodeID] {
-				toApply = append(toApply, nodeID)
-			}
-		}
-
-		if len(toApply) == 0 {
-			slog.Debug("beacon: member removals already absent", "offered", len(batch))
-
-			return
-		}
-	}
-
-	ctx := b.engine.NewContext()
-	for _, nodeID := range toApply {
-		if err := ctx.Emit(buildMemberRemove(nodeID)); err != nil {
-			slog.Error("beacon: member remove emit failed", "node_id", nodeID, "error", err)
-		}
-	}
-
-	if err := ctx.Flush(); err != nil {
-		slog.Error("beacon: member remove flush failed", "batch", len(toApply), "error", err)
-
-		return
-	}
-
-	slog.Info("beacon: applied member removals",
-		"batch", len(toApply), "skipped_absent", len(batch)-len(toApply))
-
-	cctx := b.engine.NewContext()
-	if _, _, err := cctx.GetSnapshot(MembershipKey); err != nil {
-		slog.Error("beacon: post-removal compaction read failed", "error", err)
-	}
-
-	if err := cctx.Flush(); err != nil {
-		slog.Error("beacon: post-removal compaction flush failed", "error", err)
-	}
 }
 
 // Start discovers peers, subscribes to membership, registers this
@@ -321,17 +210,6 @@ func (b *Beacon) Stop() {
 	})
 }
 
-// Members returns the current known membership.
-func (b *Beacon) Members() []Member {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-
-	out := make([]Member, len(b.members))
-	copy(out, b.members)
-
-	return out
-}
-
 // waitForSymmetricPeers blocks until at least one peer is alive+symmetric
 // in the health table, or ctx is cancelled.
 func (b *Beacon) waitForSymmetricPeers(ctx context.Context) error {
@@ -339,6 +217,9 @@ func (b *Beacon) waitForSymmetricPeers(ctx context.Context) error {
 	if ht == nil {
 		return nil
 	}
+
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
 
 	for {
 		if len(ht.AlivePeerIDs()) > 0 {
@@ -348,7 +229,7 @@ func (b *Beacon) waitForSymmetricPeers(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(50 * time.Millisecond):
+		case <-ticker.C:
 		}
 	}
 }
@@ -385,7 +266,10 @@ func (b *Beacon) registerSelf() error {
 		return err
 	}
 
-	if err := ctx.Emit(buildMemberTypeTag()); err != nil {
+	if err := ctx.Emit(&pb.Effect{
+		Key:  []byte(MembershipKey),
+		Kind: &pb.Effect_Meta{Meta: &pb.MetaEffect{TypeTag: pb.ValueType_TYPE_HASH}},
+	}); err != nil {
 		return err
 	}
 
@@ -422,186 +306,4 @@ func (b *Beacon) unregisterSelf() {
 	}
 
 	b.selfRegistered = false
-}
-
-// topologyLoop keeps the PeerManager's connection table as a reactive
-// projection of the __swytch:members key. It reads once at startup, then
-// rebuilds topology each time the key changes — driven by
-// NotifyMembershipChanged (wired to the index-change observer, including
-// snapshots and backfill). No poll.
-//
-// It runs in its own goroutine because the observer fires synchronously
-// inside index updates: doing the read there would
-// deadlock the write that triggered it (GetSnapshot → ensureSubscribed can
-// block on peer ACKs). So the callback only signals; the read happens here.
-//
-// There is deliberately no re-register. Membership entries live until an
-// explicit REMOVE_OP (graceful departure or the one-time address-collision
-// sweep in registerSelf). If our own entry ever reads back missing, that is a
-// DAG coherence problem to fix in the engine — re-writing membership to
-// compensate is exactly what produced the re-register storm.
-func (b *Beacon) topologyLoop() {
-	defer b.wg.Done()
-
-	// Initial projection: don't wait for the first signal, or the topology
-	// stays pinned to the DNS-synthetic view until something writes the key.
-	b.refreshTopology()
-
-	for {
-		select {
-		case <-b.ctx.Done():
-			return
-		case <-b.topoRefresh:
-			b.refreshTopology()
-		}
-	}
-}
-
-// NotifyMembershipChanged signals that the membership key changed. Non-blocking
-// and coalescing: a pending signal already means "re-read on the next
-// iteration", so extras collapse into it. Safe to call from inside an engine
-// callback — it never reenters the engine.
-func (b *Beacon) NotifyMembershipChanged() {
-	select {
-	case b.topoRefresh <- struct{}{}:
-	default:
-	}
-}
-
-// refreshTopology reads the current membership and projects it onto the
-// PeerManager. Its only membership write is the collision sweep: an entry at
-// our advertise address under another node id. Two processes cannot bind the
-// same host:port, so that entry is a dead predecessor (e.g. our own previous
-// incarnation before a restart minted a fresh ephemeral id) — waiting on it
-// would hold every write open forever, and dialing it loops back to
-// ourselves. Emit its REMOVE_OP here rather than one-shot at registration:
-// this runs on every membership change, so the sweep fires whenever the
-// stale entry becomes visible (bootstrap, NACK backfill, anti-entropy,
-// partition heal) with no ordering assumptions. Idempotent — once the REMOVE
-// commits the entry leaves the projection and the predicate goes false. Only
-// the live owner of the address ever evaluates it true, so this cannot
-// ping-pong the way compensating re-inserts did.
-func (b *Beacon) refreshTopology() {
-	// Observation must not emit compaction snapshots: their arrival triggers
-	// the same observer on every peer and can create a refresh feedback loop.
-	snapshot, _, err := b.engine.NewReadOnlyContext().GetSnapshot(MembershipKey)
-	if err != nil {
-		slog.Debug("beacon: membership snapshot read failed", "error", err)
-
-		return
-	}
-
-	ctx := b.engine.NewContext()
-
-	selfID := uint64(b.cfg.NodeID)
-	for _, m := range parseMembership(snapshot) {
-		if m.Addr == b.cfg.AdvertiseAddr && m.NodeID != selfID {
-			slog.Info("beacon: evicting dead predecessor at our address",
-				"old_node_id", m.NodeID, "addr", m.Addr)
-
-			if err := ctx.Emit(buildMemberRemove(m.NodeID)); err != nil {
-				slog.Error("beacon: predecessor eviction emit failed",
-					"old_node_id", m.NodeID, "error", err)
-			}
-		}
-	}
-
-	if err := ctx.Flush(); err != nil {
-		slog.Error("beacon: topology refresh flush failed", "error", err)
-	}
-
-	b.syncMembership(snapshot)
-}
-
-// syncMembership updates the PeerManager topology from the given snapshot
-// if the member set has changed.
-func (b *Beacon) syncMembership(snapshot *pb.ReducedEffect) {
-	members := parseMembership(snapshot)
-
-	b.mu.Lock()
-
-	changed := !membersEqual(b.members, members)
-	if changed {
-		b.members = members
-	}
-	b.mu.Unlock()
-
-	if changed {
-		b.updateTopology(members)
-	}
-}
-
-// updateTopology builds a ClusterConfig from the member list and applies it.
-func (b *Beacon) updateTopology(members []Member) {
-	nodes := make([]cluster.NodeConfig, 0, len(members))
-	for _, m := range members {
-		nodes = append(nodes, cluster.NodeConfig{
-			ID:      cluster.NodeId(m.NodeID),
-			Address: m.Addr,
-		})
-	}
-
-	cfg := &cluster.ClusterConfig{
-		NodeID:        b.cfg.NodeID,
-		Nodes:         nodes,
-		TLSPassphrase: b.cfg.Passphrase,
-	}
-
-	b.pm.UpdateTopology(cfg)
-
-	slog.Info("beacon: topology updated", "members", len(members))
-}
-
-// DetectAdvertiseAddr determines the advertise address by UDP-dialing the
-// first DNS candidate (or a well-known address) and reading the local address.
-// Called early — before PeerManager starts — so the TLS leaf cert gets the
-// correct IP SAN.
-func DetectAdvertiseAddr(joinAddr string, clusterPort int) (string, error) {
-	target := "8.8.8.8:53"
-
-	if joinAddr != "" {
-		addrs, err := ResolveJoinAddr(context.Background(), nil, joinAddr, clusterPort)
-		if err == nil && len(addrs) > 0 {
-			target = addrs[0]
-		}
-	}
-
-	conn, err := net.Dial("udp", target)
-	if err != nil {
-		return "", err
-	}
-	// This socket only probes the local address; no data is sent or buffered.
-	defer func() { _ = conn.Close() }()
-
-	host, _, _ := net.SplitHostPort(conn.LocalAddr().String())
-	if host == "0.0.0.0" || host == "::" {
-		slog.Warn("auto-detected address is unspecified, consider using --cluster-advertise")
-	}
-
-	return net.JoinHostPort(host, portStr(clusterPort)), nil
-}
-
-// membersEqual returns true if two member slices contain the same set
-// (order-independent).
-func membersEqual(a, b []Member) bool {
-	if len(a) != len(b) {
-		return false
-	}
-
-	set := make(map[uint64]string, len(a))
-	for _, m := range a {
-		set[m.NodeID] = m.Addr
-	}
-
-	for _, m := range b {
-		if addr, ok := set[m.NodeID]; !ok || addr != m.Addr {
-			return false
-		}
-	}
-
-	return true
-}
-
-func portStr(port int) string {
-	return strconv.Itoa(port)
 }

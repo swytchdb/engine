@@ -115,10 +115,8 @@ func TestStartCancellationAfterRegistrationRollsBackMembership(t *testing.T) {
 		t.Fatalf("read membership after failed Start: %v", err)
 	}
 
-	for _, member := range parseMembership(snapshot) {
-		if member.NodeID == uint64(nodeID) {
-			t.Fatalf("failed Start left self registered: %+v", member)
-		}
+	if addr, present := parseMembership(snapshot)[uint64(nodeID)]; present {
+		t.Fatalf("failed Start left self registered at %s", addr)
 	}
 
 	// Runtime assigns the beacon before an asynchronous Start completes. A

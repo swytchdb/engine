@@ -71,14 +71,6 @@ func buildMemberInsert(nodeID uint64, addr string) *pb.Effect {
 	}
 }
 
-// buildMemberTypeTag creates a MetaEffect that tags the key as a hash type.
-func buildMemberTypeTag() *pb.Effect {
-	return &pb.Effect{
-		Key:  []byte(MembershipKey),
-		Kind: &pb.Effect_Meta{Meta: &pb.MetaEffect{TypeTag: pb.ValueType_TYPE_HASH}},
-	}
-}
-
 // buildMemberRemove creates a REMOVE_OP DataEffect for graceful departure.
 func buildMemberRemove(nodeID uint64) *pb.Effect {
 	return &pb.Effect{
@@ -91,13 +83,14 @@ func buildMemberRemove(nodeID uint64) *pb.Effect {
 	}
 }
 
-// parseMembership extracts the member list from a reduced snapshot of __swytch:members.
-func parseMembership(reduced *pb.ReducedEffect) []Member {
-	if reduced == nil || reduced.NetAdds == nil {
+// parseMembership extracts valid member addresses keyed by NodeID, matching the
+// membership collection. Map equality is independent of snapshot iteration order.
+func parseMembership(reduced *pb.ReducedEffect) map[uint64]string {
+	if len(reduced.GetNetAdds()) == 0 {
 		return nil
 	}
 
-	members := make([]Member, 0, len(reduced.GetNetAdds()))
+	members := make(map[uint64]string, len(reduced.GetNetAdds()))
 	for idStr, elem := range reduced.GetNetAdds() {
 		nodeID := nodeIDFromBytes([]byte(idStr))
 		if nodeID == 0 {
@@ -109,10 +102,7 @@ func parseMembership(reduced *pb.ReducedEffect) []Member {
 			continue
 		}
 
-		members = append(members, Member{
-			NodeID: nodeID,
-			Addr:   addr,
-		})
+		members[nodeID] = addr
 	}
 
 	return members
