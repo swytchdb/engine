@@ -265,21 +265,12 @@ func findCritBit(a, b string) (bytePos uint32, otherbits uint8) {
 	}
 
 	if len(a) != len(b) {
-		bytePos = uint32(minLen)
-
-		var diffByte byte
-		if len(a) > minLen {
-			diffByte = a[minLen]
-		} else {
-			diffByte = b[minLen]
+		if len(a) < len(b) {
+			a = b
 		}
 
-		hb := highestBit(diffByte)
-		if hb == 0 {
-			return bytePos, 0xFF // length-discrimination sentinel
-		}
-
-		return bytePos, hb ^ 0xFF
+		// A zero byte produces 0xFF, the length-discrimination sentinel.
+		return uint32(minLen), highestBit(a[minLen]) ^ 0xFF
 	}
 
 	return 0, 0

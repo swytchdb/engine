@@ -24,7 +24,6 @@
 package keytrie
 
 import (
-	"cmp"
 	"math"
 	"slices"
 	"unsafe"
@@ -134,7 +133,7 @@ func (c *Critbit[T]) SetEvictHooks(decider func(key string) bool, notify func(ke
 	c.evictDecider = decider
 	c.evictNotify = notify
 	c.underPressure = pressure
-	// Hooks are only ever consumed by EvictBounded, so their presence marks
+	// Hooks are consumed by eviction, so their presence marks
 	// eviction as active: bumpAccess then maintains the freq/LRU/adaptive-k
 	// bookkeeping. Without them, reads skip that bookkeeping entirely.
 	c.evictActive.Store(true)
@@ -208,11 +207,9 @@ func (c *Critbit[T]) EvictStats() EvictStats {
 	}
 }
 
-// EvictBounded evicts a single leaf (or reclaims one ghost). It is a thin
-// wrapper over EvictBatch for one-at-a-time callers and tests; maxScan is
-// ignored (EvictBatch sizes its own window). Returns true if it reclaimed
-// anything.
-func (c *Critbit[T]) EvictBounded(maxScan int) bool {
+// EvictBounded evicts a single leaf or reclaims one ghost using EvictBatch's
+// bounded sampling window. It reports whether anything was reclaimed.
+func (c *Critbit[T]) EvictBounded() bool {
 	return c.EvictBatch(1) > 0
 }
 
@@ -232,8 +229,6 @@ func (c *Critbit[T]) EvictBatch(want int) int {
 
 	c.evictMu.Lock()
 
-	k := c.evictK.Load()
-	epoch := c.decayEpoch()
 	// Window: wide enough to choose the want oldest cold leaves with some
 	// selectivity (so recent writes are spared), but bounded to a small multiple
 	// of want rather than a fraction of the whole keyspace. The persistent clock
@@ -243,25 +238,23 @@ func (c *Critbit[T]) EvictBatch(want int) int {
 	// rather than paying an O(keyspace) sweep per batch.
 	window := max(want*2, minSweep)
 
-	type cand struct {
-		leaf   *critNode[T]
-		access uint64
-	}
-
 	// The usual 128-leaf window needs no heap scratch. Larger requests grow
 	// local slices as needed; nothing is retained on the trie between calls.
-	var candidates, ghostStorage [minSweep]cand
+	var storage [minSweep]evictionCandidate[T]
 
-	cands := candidates[:0]
-	if window > len(candidates) {
-		cands = make([]cand, 0, window)
+	candidates := storage[:]
+	if window > len(storage) {
+		candidates = make([]evictionCandidate[T], window)
 	}
 
-	var (
-		ghosts   = ghostStorage[:0] // sorted oldest-first below
-		fbVictim *critNode[T]
-		fbAccess = uint64(math.MaxUint64)
-	)
+	// Keep the fallback separate from scratch storage so escape analysis does
+	// not move the buffer to the heap when the fallback enters the reap queue.
+	oldest := evictionCandidate[T]{access: math.MaxUint64}
+	sample := evictionSample[T]{
+		candidates: candidates, ghostStart: len(candidates),
+		oldest:    &oldest,
+		threshold: c.evictK.Load(), epoch: c.decayEpoch(),
+	}
 
 	// Hold the reap read-lock across the sweep and the claims. It excludes the
 	// reap write lock — the only thing that frees/reclaims a leaf slot — so a
@@ -269,92 +262,37 @@ func (c *Critbit[T]) EvictBatch(want int) int {
 	// mid-read.
 	c.reapMu.RLock()
 
-	c.sweepLeaves(window, func(leaf *critNode[T]) {
-		access := leaf.lastAccess.Load()
-		if leaf.deleted.Load() {
-			// The sweep only forwards deleted leaves that are ghosts (freq < 0).
-			ghosts = append(ghosts, cand{leaf, access})
-
-			return
-		}
-		// Absorb pending eviction-driven decay before judging protection: −1
-		// per elapsed epoch, floor 1, so a leaf that saturated freq while hot
-		// steps back below k after the workload drifts instead of squatting on
-		// its slot forever. Ghosts are exempt (their forgetting is turnover);
-		// pinned leaves still decay so freq stays honest if they unpin.
-		if epoch > 0 {
-			decayLeaf(leaf, epoch)
-		}
-
-		if leaf.pinned || leaf.pins.Load() != 0 {
-			return // static system-key pin or a dynamic hold
-		}
-
-		if access < fbAccess {
-			fbVictim, fbAccess = leaf, access
-		}
-		// k == 0 is explicit "protection off": every live leaf is a candidate
-		// and the batch is pure LRU. Without the special case, freq <= 0
-		// matches nobody and eviction would fall through to the single-victim
-		// fallback — LRU selection, but one reclaim per sweep instead of
-		// `want`, and no ghosting (which is the recurrence memory k needs to
-		// climb back out of 0).
-		if k == 0 || leaf.freq.Load() <= k {
-			cands = append(cands, cand{leaf, access})
-		}
-	})
+	c.sweepLeaves(window, sample.consider)
+	cold, ghosts := candidates[:sample.coldEnd], candidates[sample.ghostStart:]
 
 	// Keep the want oldest cold candidates (LRU); recent writes have higher
 	// lastAccess and are left alone.
-	oldestFirst := func(a, b cand) int { return cmp.Compare(a.access, b.access) }
-	if len(cands) > want {
-		slices.SortFunc(cands, oldestFirst)
-		cands = cands[:want]
+	if len(cold) > want {
+		slices.SortFunc(cold, oldestCandidateFirst[T])
+		cold = cold[:want]
 	}
 	// Oldest-first, so the trim below and the reclaim fallback always take the
 	// least-recent ghost.
-	slices.SortFunc(ghosts, oldestFirst)
-
-	// trimOldestGhost reclaims the least-recent ghost seen this sweep, skipping
-	// any that were concurrently promoted back to live.
-	trimOldestGhost := func() bool {
-		for len(ghosts) > 0 {
-			g := ghosts[0].leaf
-			ghosts = ghosts[1:]
-
-			if c.reclaimGhost(g) {
-				return true
-			}
-		}
-
-		return false
-	}
+	slices.SortFunc(ghosts, oldestCandidateFirst[T])
 
 	var notifications [minSweep / 2]evictedLeaf[T]
 
 	victims := notifications[:0]
-	if len(cands) > cap(victims) {
-		victims = make([]evictedLeaf[T], 0, len(cands))
+	if len(cold) > cap(victims) {
+		victims = make([]evictedLeaf[T], 0, len(cold))
 	}
 
-	for _, cd := range cands {
+	for _, cd := range cold {
 		leaf := cd.leaf
 		if !c.claimForEviction(leaf) {
 			continue
 		}
 
 		victim := c.detachEvictedLeaf(leaf)
-		// At ghost capacity, trim the oldest existing ghost to make room BEFORE
-		// ghosting the fresh victim. The order is load-bearing: the victim was
-		// chosen as LRU, so its recency is near-oldest — ghost-first followed by
-		// "trim the LRU ghost" would almost always trim the ghost just created.
-		// Ghost memory then freezes on a stale early cohort and every returning
-		// key re-admits at freq 1 like a stranger; nothing crashes, the policy
-		// just quietly becomes LRU-with-overhead (the colibri C port inverted
-		// this exact order). Fresh ghosts from earlier victims in this batch are
-		// not in the ghosts slice, so they can never be the trimmed one.
+		// Make room before ghosting the victim. Newly evicted leaves are not
+		// in the sample, so trimming cannot discard their warm-restart hint.
 		if c.ghostCount.Load() >= c.ghostCap() {
-			trimOldestGhost()
+			c.reclaimOldestGhost(&sample)
 		}
 
 		if c.ghostCount.Load() < c.ghostCap() {
@@ -382,17 +320,17 @@ func (c *Critbit[T]) EvictBatch(want int) int {
 	reclaimedGhost := false
 
 	if len(victims) == 0 {
-		if trimOldestGhost() {
+		if c.reclaimOldestGhost(&sample) {
 			reclaimedGhost = true
 			// Count the reclaim as an unprotected eviction (a ghost is a
 			// previously-cold key) so the adaptive-k clock keeps advancing — without
 			// this, k freezes exactly when ghost reclaims dominate (cold-scarce).
 			c.evictedUnprot.Add(1)
 			c.advanceDecay()
-		} else if fbVictim != nil && c.claimForEviction(fbVictim) {
-			victim := c.detachEvictedLeaf(fbVictim)
+		} else if leaf := oldest.leaf; leaf != nil && c.claimForEviction(leaf) {
+			victim := c.detachEvictedLeaf(leaf)
 			c.deletedCount.Add(1)
-			c.enqueueReap(fbVictim)
+			c.enqueueReap(leaf)
 
 			victims = append(victims, victim)
 
@@ -591,7 +529,7 @@ func (c *Critbit[T]) promoteIfGhost(leaf *critNode[T]) {
 
 // maybeAdaptK re-tunes the protected-freq threshold k every
 // adaptiveCheckInterval evictions, ported from CloxCache's adaptThreshold.
-// It runs under evictMu (the only caller is EvictBounded).
+// It runs under evictMu (the only caller is EvictBatch).
 //
 // Two feedback loops: (1) the graduation rate — the fraction of evicted
 // candidates that had crossed k into protected status — drives k up when

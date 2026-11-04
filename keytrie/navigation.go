@@ -65,11 +65,6 @@ func (c *Critbit[T]) extremeLeaf(node *critNode[T], prefix string, direction int
 	return c.extremeLeaf(node.child[1-direction].Load(), prefix, direction)
 }
 
-type critbitPathEntry[T any] struct {
-	node *critNode[T]
-	dir  int
-}
-
 // seekPrefix shares the lock and traversal for all four ordered lookups.
 // A missing boundary is located at its hypothetical insertion point; following
 // only its search path can skip neighbours when it differs at an earlier bit.
@@ -88,12 +83,17 @@ func (c *Critbit[T]) seekPrefix(prefix, boundary string, bounded bool, direction
 	if !bounded {
 		leaf = c.extremeLeaf(subtree, prefix, direction)
 	} else {
-		path := make([]critbitPathEntry[T], 0, 64)
+		type pathEntry struct {
+			node *critNode[T]
+			dir  int
+		}
+
+		path := make([]pathEntry, 0, 64)
 		current := subtree
 
 		for current != nil && !current.isLeaf {
 			dir := getDirection(boundary, current.bytePos, current.otherbits)
-			path = append(path, critbitPathEntry[T]{node: current, dir: dir})
+			path = append(path, pathEntry{node: current, dir: dir})
 			current = current.child[dir].Load()
 		}
 

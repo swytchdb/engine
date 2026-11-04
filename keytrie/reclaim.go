@@ -134,26 +134,29 @@ func (c *Critbit[T]) unlinkLeaf(leaf *critNode[T]) bool {
 	}
 
 	if parent == nil {
-		c.root.Store(nil)
-		c.readRevision++
-		c.deletedCount.Add(-1)
-		c.retireLeaf(leaf)
-	} else {
-		c.pruneLeaf(parentLink, parent, dir)
+		parentLink = &c.root
 	}
+
+	c.pruneLeaf(parentLink, parent, dir)
 
 	return true
 }
 
 // pruneLeaf replaces parent with the dead leaf's sibling. Both reclamation
 // paths use this operation under reapMu's write lock, so retirement and path
-// invalidation have one owner. link points to parent, dir to the dead leaf.
+// invalidation have one owner. A nil parent means the root itself is a leaf.
 func (c *Critbit[T]) pruneLeaf(link *atomic.Pointer[critNode[T]], parent *critNode[T], dir int) {
-	leaf := parent.child[dir].Load()
-	link.Store(parent.child[1-dir].Load())
+	leaf := link.Load()
+	if parent == nil {
+		link.Store(nil)
+	} else {
+		leaf = parent.child[dir].Load()
+		link.Store(parent.child[1-dir].Load())
+		c.retireInternal(parent)
+	}
+
 	c.deletedCount.Add(-1)
 	c.readRevision++
-	c.retireInternal(parent)
 	c.retireLeaf(leaf)
 }
 

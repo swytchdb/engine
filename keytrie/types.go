@@ -47,22 +47,24 @@ func NewTipSet(refs ...EffectRef) *TipSet {
 	}
 
 	deduped := make([]EffectRef, 0, len(refs))
-	if len(refs) <= smallTipSetDedup {
-		for _, r := range refs {
-			if !slices.Contains(deduped, r) {
-				deduped = append(deduped, r)
-			}
-		}
 
-		return &TipSet{tips: deduped}
+	var seen map[EffectRef]struct{}
+	if len(refs) > smallTipSetDedup {
+		seen = make(map[EffectRef]struct{}, len(refs))
 	}
 
-	seen := make(map[EffectRef]struct{}, len(refs))
 	for _, r := range refs {
-		if _, ok := seen[r]; !ok {
+		if seen != nil {
+			if _, ok := seen[r]; ok {
+				continue
+			}
+
 			seen[r] = struct{}{}
-			deduped = append(deduped, r)
+		} else if slices.Contains(deduped, r) {
+			continue
 		}
+
+		deduped = append(deduped, r)
 	}
 
 	return &TipSet{tips: deduped}

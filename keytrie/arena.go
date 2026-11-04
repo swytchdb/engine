@@ -59,6 +59,8 @@ type critbitArena[T any] struct {
 	chunkSize uint64
 	growMu    sync.Mutex // serializes directory growth and chunk recycling
 	list      atomic.Pointer[arenaChunkList[T]]
+	// Reuse this immutable empty directory for initialization and Close.
+	empty arenaChunkList[T]
 	// freeList recycles the slots of fully-reaped chunks so the arena's footprint
 	// tracks the live working set instead of the all-time high-water mark — without
 	// it, monotonic next climbs forever under key churn and the eviction sweep
@@ -87,7 +89,7 @@ func (a *critbitArena[T]) init(chunkSize int, initNode func(*T)) {
 	a.chunkSize = uint64(chunkSize)
 	a.initNode = initNode
 	a.freeCap = freeSlotCapacity
-	a.list.Store(&arenaChunkList[T]{})
+	a.list.Store(&a.empty)
 }
 
 func (a *critbitArena[T]) alloc() (*T, uint32) {
@@ -236,7 +238,7 @@ func (a *critbitArena[T]) grow(needed uint64) {
 // clear runs under the trie's exclusive reap lock, which already excludes all
 // arena writers. Taking growMu here would protect the same ownership twice.
 func (a *critbitArena[T]) clear() {
-	a.list.Store(&arenaChunkList[T]{})
+	a.list.Store(&a.empty)
 	a.next.Store(0)
 	// No allocator can still use the old queue. Release its backing storage as
 	// well as the stale indices instead of retaining an empty queue after Close.

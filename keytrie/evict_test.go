@@ -56,7 +56,7 @@ func TestEvictBounded_EvictsColdNotProtected(t *testing.T) {
 		c.LoadOrStoreData("hot-b", &struct{}{})
 	}
 
-	if !c.EvictBounded(64) {
+	if !c.EvictBounded() {
 		t.Fatal("EvictBounded reported no eviction; expected the cold key to go")
 	}
 
@@ -82,7 +82,7 @@ func TestEvictBounded_GhostPromoteOnReinsert(t *testing.T) {
 
 	c.Insert("x", nil, NewTipSet(tip(1)))
 
-	if !c.EvictBounded(64) {
+	if !c.EvictBounded() {
 		t.Fatal("expected x to be evicted")
 	}
 
@@ -202,8 +202,8 @@ func TestEvictBounded_ReclaimsGhostBeforeHotKey(t *testing.T) {
 		c.LoadOrStoreData("hot-2", &struct{}{})
 	}
 	// Evict the two cold keys — each is the LRU unprotected leaf, so it becomes a ghost.
-	c.EvictBounded(64)
-	c.EvictBounded(64)
+	c.EvictBounded()
+	c.EvictBounded()
 
 	ghostsBefore := c.ghostCount.Load()
 	if ghostsBefore < 1 {
@@ -211,7 +211,7 @@ func TestEvictBounded_ReclaimsGhostBeforeHotKey(t *testing.T) {
 	}
 
 	// Now only protected keys are live. The next eviction must reclaim a ghost.
-	if !c.EvictBounded(64) {
+	if !c.EvictBounded() {
 		t.Fatal("EvictBounded returned false; expected a ghost reclaim")
 	}
 
@@ -346,7 +346,7 @@ func TestChunkReclaim_DropsFullyDeadChunk(t *testing.T) {
 	}
 
 	c.SetEvictHooks(func(string) bool { return true }, func(string, []EffectRef, *struct{}) {}, func() bool { return true })
-	c.EvictBounded(64) // must not panic on the recycled chunk
+	c.EvictBounded() // must not panic on the recycled chunk
 }
 
 // TestEvictBounded_GhostNotReaped verifies the reaper leaves ghost leaves in
@@ -359,7 +359,7 @@ func TestEvictBounded_GhostNotReaped(t *testing.T) {
 	c.Insert("ghost", nil, NewTipSet(tip(1)))
 	c.Insert("normal", nil, NewTipSet(tip(2)))
 
-	if !c.EvictBounded(64) {
+	if !c.EvictBounded() {
 		t.Fatal("expected an eviction")
 	}
 	// Force a reap pass; the ghost must survive it.
@@ -460,7 +460,7 @@ func TestEvictBatch_GhostTrimOrder(t *testing.T) {
 	}
 
 	for range ghostCap {
-		if !c.EvictBounded(64) {
+		if !c.EvictBounded() {
 			t.Fatal("fodder eviction failed")
 		}
 	}
@@ -476,7 +476,7 @@ func TestEvictBatch_GhostTrimOrder(t *testing.T) {
 		t.Fatal("Unpin on a live key must succeed")
 	}
 
-	if !c.EvictBounded(64) {
+	if !c.EvictBounded() {
 		t.Fatal("expected the victim to be evicted")
 	}
 
@@ -523,7 +523,7 @@ func TestDecayStepsLeafFreqDown(t *testing.T) {
 	for i := range 150 {
 		c.Insert(fmt.Sprintf("fodder-%04d", i), nil, NewTipSet(tip(uint64(i+2))))
 
-		if !c.EvictBounded(64) {
+		if !c.EvictBounded() {
 			t.Fatalf("eviction %d failed", i)
 		}
 	}
