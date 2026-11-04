@@ -25,6 +25,7 @@ package beacon
 
 import (
 	"encoding/binary"
+	"iter"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
 )
@@ -83,26 +84,49 @@ func buildMemberRemove(nodeID uint64) *pb.Effect {
 	}
 }
 
-// parseMembership extracts valid member addresses keyed by NodeID, matching the
-// membership collection. Map equality is independent of snapshot iteration order.
-func parseMembership(reduced *pb.ReducedEffect) map[uint64]string {
-	if len(reduced.GetNetAdds()) == 0 {
+// membershipEntries decodes valid members without copying their addresses.
+// Address bytes belong to the snapshot and must be treated as read-only.
+func membershipEntries(snapshot *pb.ReducedEffect) iter.Seq2[uint64, []byte] {
+	return func(yield func(uint64, []byte) bool) {
+		for id, elem := range snapshot.GetNetAdds() {
+			nodeID := nodeIDFromBytes([]byte(id))
+			if nodeID == 0 {
+				continue
+			}
+
+			addr := elem.GetData().Decompress()
+			if len(addr) > 0 && !yield(nodeID, addr) {
+				return
+			}
+		}
+	}
+}
+
+// matchesMembership compares decoded entries without allocating a second map.
+// Count only valid entries so malformed data cannot force repeated updates.
+func matchesMembership(snapshot *pb.ReducedEffect, members map[uint64]string) bool {
+	count := 0
+
+	for id, addr := range membershipEntries(snapshot) {
+		if members[id] != string(addr) {
+			return false
+		}
+
+		count++
+	}
+
+	return count == len(members)
+}
+
+// parseMembership copies valid members into an owned map.
+func parseMembership(snapshot *pb.ReducedEffect) map[uint64]string {
+	if len(snapshot.GetNetAdds()) == 0 {
 		return nil
 	}
 
-	members := make(map[uint64]string, len(reduced.GetNetAdds()))
-	for idStr, elem := range reduced.GetNetAdds() {
-		nodeID := nodeIDFromBytes([]byte(idStr))
-		if nodeID == 0 {
-			continue
-		}
-
-		addr := string(elem.GetData().Decompress())
-		if addr == "" {
-			continue
-		}
-
-		members[nodeID] = addr
+	members := make(map[uint64]string, len(snapshot.GetNetAdds()))
+	for id, addr := range membershipEntries(snapshot) {
+		members[id] = string(addr)
 	}
 
 	return members

@@ -25,9 +25,9 @@ package beacon
 
 import (
 	"log/slog"
-	"maps"
 
 	"github.com/swytchdb/engine/cluster"
+	pb "github.com/swytchdb/engine/cluster/proto"
 	"github.com/swytchdb/engine/effects"
 )
 
@@ -49,8 +49,6 @@ func (b *Beacon) Members() []Member {
 // index. Missing self-membership must not cause re-registration: writing back
 // to compensate for a stale read can create a re-registration storm.
 func (b *Beacon) topologyLoop() {
-	defer b.wg.Done()
-
 	// Initial projection: don't wait for the first signal, or the topology
 	// stays pinned to the DNS-synthetic view until something writes the key.
 	b.refreshTopology()
@@ -70,8 +68,13 @@ func (b *Beacon) topologyLoop() {
 // iteration", so extras collapse into it. Safe to call from inside an engine
 // callback — it never reenters the engine.
 func (b *Beacon) NotifyMembershipChanged() {
+	signal(b.topoRefresh)
+}
+
+// signal coalesces work without blocking synchronous engine or cloud callbacks.
+func signal(ch chan<- struct{}) {
 	select {
-	case b.topoRefresh <- struct{}{}:
+	case ch <- struct{}{}:
 	default:
 	}
 }
@@ -90,17 +93,15 @@ func (b *Beacon) refreshTopology() {
 		return
 	}
 
-	members := parseMembership(snapshot)
-
 	var ctx *effects.Context
 
 	selfID := uint64(b.cfg.NodeID)
-	for id, addr := range members {
-		if addr != b.cfg.AdvertiseAddr || id == selfID {
+	for id, addr := range membershipEntries(snapshot) {
+		if string(addr) != b.cfg.AdvertiseAddr || id == selfID {
 			continue
 		}
 
-		slog.Info("beacon: evicting dead predecessor at our address", "old_node_id", id, "addr", addr)
+		slog.Info("beacon: evicting dead predecessor at our address", "old_node_id", id, "addr", b.cfg.AdvertiseAddr)
 
 		if ctx == nil {
 			ctx = b.engine.NewContext()
@@ -117,23 +118,22 @@ func (b *Beacon) refreshTopology() {
 		}
 	}
 
-	b.syncMembership(members)
+	b.syncMembership(snapshot)
 }
 
-// syncMembership takes ownership of a parsed member map and
-// updates the PeerManager only when membership changes.
-func (b *Beacon) syncMembership(members map[uint64]string) {
+// syncMembership copies the roster and updates the PeerManager only when
+// membership changes. Unchanged observations need no map or address copies.
+func (b *Beacon) syncMembership(snapshot *pb.ReducedEffect) {
 	b.mu.Lock()
+	if matchesMembership(snapshot, b.members) {
+		b.mu.Unlock()
 
-	changed := !maps.Equal(b.members, members)
-	if changed {
-		b.members = members
-	}
-	b.mu.Unlock()
-
-	if !changed {
 		return
 	}
+
+	members := parseMembership(snapshot)
+	b.members = members
+	b.mu.Unlock()
 
 	nodes := make([]cluster.NodeConfig, 0, len(members))
 	for id, addr := range members {

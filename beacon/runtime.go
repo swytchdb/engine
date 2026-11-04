@@ -185,11 +185,7 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (_ *Runtime, err error) 
 	// The connection secret is derive-and-drop: everything needed later comes
 	// from these two derivations, and no config copy retains the master.
 	passphrase := cfg.ClusterPassphrase
-	cloudEnabled := cfg.ConnectionSecret != ""
-
-	var cloudSync *cluster.CloudSync
-
-	if cloudEnabled {
+	if cfg.ConnectionSecret != "" {
 		if cfg.ClusterPassphrase != "" {
 			return nil, fmt.Errorf("ConnectionSecret is exclusive with ClusterPassphrase: the mTLS passphrase derives from the secret")
 		}
@@ -200,12 +196,11 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (_ *Runtime, err error) 
 
 		passphrase = cluster.DeriveClusterPassphrase(cfg.ConnectionSecret)
 
-		cloudSync, err = cluster.NewCloudSync(engine, cfg.ConnectionSecret)
+		rt.CloudSync, err = cluster.NewCloudSync(engine, cfg.ConnectionSecret)
 		if err != nil {
 			return nil, err
 		}
 
-		rt.CloudSync = cloudSync
 		cfg.ConnectionSecret = ""
 	}
 
@@ -284,17 +279,17 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (_ *Runtime, err error) 
 	// Engine replicates outbound via the PeerManager.
 	engine.SetBroadcaster(pm)
 
-	if cloudSync != nil {
-		if err := cloudSync.Start(); err != nil {
+	if rt.CloudSync != nil {
+		if err := rt.CloudSync.Start(); err != nil {
 			return nil, err
 		}
 		// Recursive dep fetches now race the CDN against peers, so effects no
 		// live peer holds are recoverable from cloud durability.
-		pm.SetCDNFetcher(cloudSync)
+		pm.SetCDNFetcher(rt.CloudSync)
 		// Read-miss backstop: a key evicted from every live peer may still live
 		// in Cloud. The engine asks Cloud for its frontier and rehydrates before
 		// treating the read as a miss (tiered storage).
-		engine.SetCloudReader(cloudSync)
+		engine.SetCloudReader(rt.CloudSync)
 	}
 
 	if cfg.CDNFetcher != nil {
@@ -320,7 +315,7 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (_ *Runtime, err error) 
 		AdvertiseAddr: advertise,
 		NodeID:        engine.NodeID(),
 		Passphrase:    passphrase,
-		Cloud:         cloudSync,
+		Cloud:         rt.CloudSync,
 	}, engine, pm)
 	rt.Beacon = b
 

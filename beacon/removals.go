@@ -34,16 +34,11 @@ func (b *Beacon) removeMember(nodeID uint64) {
 	b.removeQ = append(b.removeQ, nodeID)
 	b.removeMu.Unlock()
 
-	select {
-	case b.removeSignal <- struct{}{}:
-	default:
-	}
+	signal(b.removeSignal)
 }
 
 // memberRemoveLoop applies queued cloud-pushed removals in batches.
 func (b *Beacon) memberRemoveLoop() {
-	defer b.wg.Done()
-
 	for {
 		select {
 		case <-b.ctx.Done():

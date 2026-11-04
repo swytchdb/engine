@@ -29,6 +29,7 @@ import (
 	"testing"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
+	"github.com/swytchdb/engine/effects"
 )
 
 func TestNodeIDBytes_Roundtrip(t *testing.T) {
@@ -190,5 +191,64 @@ func TestParseMembershipIgnoresInvalidEntries(t *testing.T) {
 		if got := parseMembership(snapshot); !maps.Equal(got, want) {
 			t.Fatalf("membership = %v, want %v", got, want)
 		}
+	}
+}
+
+func TestMatchesMembership(t *testing.T) {
+	for _, compressed := range []bool{false, true} {
+		data := buildMemberInsert(1, "peer:7380").GetData()
+		if compressed {
+			data.Value = &pb.DataEffect_Compressed{Compressed: &pb.CompressedValue{
+				Codec: pb.Compression_COMPRESSION_ZSTD,
+				Data:  effects.Compress(data.GetRaw()),
+			}}
+		}
+
+		snapshot := &pb.ReducedEffect{NetAdds: map[string]*pb.ReducedElement{
+			string(nodeIDBytes(1)): {Data: data},
+			string(nodeIDBytes(0)): {Data: buildMemberInsert(0, "zero").GetData()},
+			string(nodeIDBytes(2)): nil,
+			string(nodeIDBytes(3)): {Data: buildMemberInsert(3, "").GetData()},
+			"invalid":              {Data: data},
+		}}
+
+		for _, tc := range []struct {
+			name    string
+			members map[uint64]string
+			match   bool
+		}{
+			{name: "unchanged", members: map[uint64]string{1: "peer:7380"}, match: true},
+			{name: "added", members: nil},
+			{name: "removed", members: map[uint64]string{1: "peer:7380", 2: "removed:7380"}},
+			{name: "changed address", members: map[uint64]string{1: "other:7380"}},
+			{name: "replaced id", members: map[uint64]string{4: "peer:7380"}},
+		} {
+			if got := matchesMembership(snapshot, tc.members); got != tc.match {
+				t.Errorf("%s (compressed=%v): got %v, want %v", tc.name, compressed, got, tc.match)
+			}
+		}
+
+		if got := parseMembership(snapshot); !maps.Equal(got, map[uint64]string{1: "peer:7380"}) {
+			t.Errorf("parsed compressed=%v: %v", compressed, got)
+		}
+	}
+
+	if !matchesMembership(nil, nil) || matchesMembership(nil, map[uint64]string{1: "gone"}) {
+		t.Fatal("empty snapshot did not match empty membership only")
+	}
+}
+
+func TestUnchangedMembershipDoesNotCopy(t *testing.T) {
+	snapshot := &pb.ReducedEffect{NetAdds: make(map[string]*pb.ReducedElement, 256)}
+
+	for id := range 256 {
+		data := buildMemberInsert(uint64(id+1), "peer:7380").GetData()
+		snapshot.NetAdds[string(data.GetId())] = &pb.ReducedElement{Data: data}
+	}
+
+	b := &Beacon{members: parseMembership(snapshot)}
+	// No peer manager: unchanged membership must not rebuild its connections.
+	if allocs := testing.AllocsPerRun(100, func() { b.syncMembership(snapshot) }); allocs != 0 {
+		t.Fatalf("unchanged membership allocated %g times", allocs)
 	}
 }

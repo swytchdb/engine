@@ -25,17 +25,12 @@ package beacon
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"log/slog"
 	"net"
 	"slices"
-	"sync"
 	"time"
 
 	"github.com/swytchdb/engine/cluster"
-	pb "github.com/swytchdb/engine/cluster/proto"
-	"github.com/swytchdb/engine/effects"
 )
 
 // bootstrap performs peer discovery (DNS, or the cloud membership roster when
@@ -115,35 +110,12 @@ func (b *Beacon) bootstrap(ctx context.Context) error {
 	return nil
 }
 
-// cloudCandidates reads peer addresses from the cloud roster, excluding self.
-// Only a successful empty read permits solo startup. Discovery errors, including
-// missing durable blobs, must be retried to avoid silently forking the cluster.
-func (b *Beacon) cloudCandidates(ctx context.Context) ([]string, error) {
-	reduced, err := b.discoverMembersWithRetry(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	members := parseMembership(reduced)
-	selfID := uint64(b.cfg.NodeID)
-
-	addrs := make([]string, 0, len(members))
-	for id, addr := range members {
-		if id == selfID {
-			continue
-		}
-
-		addrs = append(addrs, addr)
-	}
-
-	return addrs, nil
-}
-
-// discoverMembersWithRetry retries cloud discovery until success or cancellation.
+// cloudCandidates reads peer addresses, excluding self, retrying until success
+// or cancellation. Only a successful empty read permits solo startup.
 // Unlike DNS discovery, it has no deadline: work grows with membership history,
 // and a slow walk does not establish that the cluster is empty. Warn periodically
 // so a stalled startup stays visible while cloud reconciliation repairs it.
-func (b *Beacon) discoverMembersWithRetry(ctx context.Context) (*pb.ReducedEffect, error) {
+func (b *Beacon) cloudCandidates(ctx context.Context) ([]string, error) {
 	const (
 		backoffStart  = 250 * time.Millisecond
 		backoffMax    = 3 * time.Second
@@ -164,7 +136,14 @@ func (b *Beacon) discoverMembersWithRetry(ctx context.Context) (*pb.ReducedEffec
 					"attempts", attempt, "elapsed", time.Since(started))
 			}
 
-			return reduced, nil
+			addrs := make([]string, 0, len(reduced.GetNetAdds()))
+			for id, addr := range membershipEntries(reduced) {
+				if id != uint64(b.cfg.NodeID) {
+					addrs = append(addrs, string(addr))
+				}
+			}
+
+			return addrs, nil
 		}
 
 		if ctx.Err() != nil {
@@ -232,137 +211,6 @@ func (b *Beacon) resolveJoinAddrWithRetry(ctx context.Context) ([]string, error)
 
 		backoff = min(backoff*2, backoffMax)
 	}
-}
-
-// joinMembership attempts a membership exchange with every known peer before
-// serving traffic. A seed's address count is not the cluster's membership count:
-// project the exchanged roster and also attempt peers learned through it.
-// Failed peers do not hold join open waiting for full convergence; normal
-// reconnection and membership observation continue after this initial attempt.
-// Self-registration precedes this so simultaneous joiners can discover each other.
-func (b *Beacon) joinMembership(ctx context.Context) error {
-	attempted := make(map[cluster.NodeId]bool)
-
-	for {
-		if err := b.pm.WaitForInitialConnections(ctx); err != nil {
-			return err
-		}
-
-		peers := slices.DeleteFunc(b.pm.PeerIDs(), func(peer cluster.NodeId) bool {
-			return attempted[peer]
-		})
-
-		if len(peers) > 0 {
-			if err := b.exchangeMembership(ctx, peers); err != nil {
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-
-				slog.Warn("beacon: membership exchange incomplete; continuing after attempt", "error", err)
-			}
-
-			for _, peer := range peers {
-				attempted[peer] = true
-			}
-		}
-
-		snapshot, _, err := b.engine.NewReadOnlyContext().GetSnapshot(MembershipKey)
-		if err != nil {
-			return err
-		}
-
-		b.syncMembership(parseMembership(snapshot))
-
-		if len(peers) == 0 {
-			// Projection can discover peers even without an exchange (e.g.
-			// an inbound arrival during bootstrap). Attempt those as well.
-			pending := false
-			for _, peer := range b.pm.PeerIDs() {
-				pending = pending || !attempted[peer]
-			}
-
-			if !pending {
-				return ctx.Err()
-			}
-		}
-	}
-}
-
-// exchangeMembership reannounces the existing membership tips, including our
-// registration, and ingests the peers' NACK frontiers before returning. A cached
-// read alone does neither. Reuse normal effect replication; no new membership
-// records or compaction snapshots are minted by the exchange.
-func (b *Beacon) exchangeMembership(ctx context.Context, peers []cluster.NodeId) error {
-	_, tips, err := b.engine.NewReadOnlyContext().GetSnapshot(MembershipKey)
-	if err != nil {
-		return err
-	}
-
-	notifies := make([]*pb.OffsetNotify, 0, len(tips))
-
-	for _, tip := range tips {
-		eff, ok := b.engine.EffectCache().Get(tip)
-		if !ok {
-			return fmt.Errorf("membership tip %v unavailable", tip)
-		}
-
-		wire, err := effects.MarshalEffect(eff)
-		if err != nil {
-			return err
-		}
-
-		notifies = append(notifies, effects.BuildOffsetNotify(pb.NodeID(tip[0]), tip, eff, wire, ctx))
-	}
-
-	type response struct {
-		nacks []*pb.NackNotify
-		err   error
-	}
-
-	// Each worker owns one result; Wait publishes all results before ingestion.
-	responses := make([]response, len(peers))
-
-	var wg sync.WaitGroup
-	for i, peer := range peers {
-		wg.Go(func() {
-			res := &responses[i]
-
-			for _, notify := range notifies {
-				if ctx.Err() != nil {
-					res.err = ctx.Err()
-
-					break
-				}
-
-				nacks, err := b.pm.ReplicateTo(notify, notify.GetEffectData(), peer)
-
-				res.nacks = append(res.nacks, nacks...)
-				if err != nil {
-					res.err = fmt.Errorf("peer %d: %w", peer, err)
-
-					break
-				}
-			}
-		})
-	}
-
-	wg.Wait()
-
-	var errs []error
-
-	for _, res := range responses {
-		if res.err != nil {
-			errs = append(errs, res.err)
-		}
-
-		for _, nack := range res.nacks {
-			if err := b.engine.HandleNack(nack); err != nil {
-				errs = append(errs, err)
-			}
-		}
-	}
-
-	return errors.Join(errs...)
 }
 
 // setTemporaryTopology builds a ClusterConfig with the given addresses as

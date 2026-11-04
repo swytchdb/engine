@@ -152,7 +152,14 @@ func (b *Beacon) Start(ctx context.Context) (err error) {
 			// Phase 1.75: Subscribe to the membership key before registering
 			// self. NACKs from peers carry their existing membership tips so
 			// the local engine has peer data before registerSelf runs.
-			b.primeSubscription()
+			ctx := b.engine.NewContext()
+			if _, _, err := ctx.GetSnapshot(MembershipKey); err != nil {
+				slog.Debug("beacon: prime subscription incomplete (will retry)", "error", err)
+			}
+
+			if err := ctx.Flush(); err != nil {
+				slog.Warn("beacon: prime subscription flush failed", "error", err)
+			}
 		}
 	}
 
@@ -173,15 +180,13 @@ func (b *Beacon) Start(ctx context.Context) (err error) {
 	// No polling, and crucially no write-back: we never re-register to "fix" a
 	// stale read — a stale read is a coherence problem to solve in the engine,
 	// not paper over here.
-	b.wg.Add(1)
-	go b.topologyLoop()
+	b.wg.Go(b.topologyLoop)
 
 	// Draining only after convergence leaves bootstrap the sole membership
 	// writer, so a removal burst can't branch alongside registerSelf. Nothing
 	// is missed meanwhile: New wires the handler, and removeQ holds the burst.
 	if b.cfg.Cloud != nil {
-		b.wg.Add(1)
-		go b.memberRemoveLoop()
+		b.wg.Go(b.memberRemoveLoop)
 	}
 
 	slog.Info("beacon started",
@@ -231,23 +236,6 @@ func (b *Beacon) waitForSymmetricPeers(ctx context.Context) error {
 			return ctx.Err()
 		case <-ticker.C:
 		}
-	}
-}
-
-// primeSubscription triggers an early subscription to the membership key
-// by calling GetSnapshot. NACKs from peers carry their existing membership
-// tips into the local engine. Errors are non-fatal since the subscription
-// will be followed by the explicit join membership exchange.
-func (b *Beacon) primeSubscription() {
-	ctx := b.engine.NewContext()
-
-	_, _, err := ctx.GetSnapshot(MembershipKey)
-	if err != nil {
-		slog.Debug("beacon: prime subscription incomplete (will retry)", "error", err)
-	}
-
-	if err := ctx.Flush(); err != nil {
-		slog.Warn("beacon: prime subscription flush failed", "error", err)
 	}
 }
 
