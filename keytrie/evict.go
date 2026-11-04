@@ -223,9 +223,9 @@ func (c *Critbit[T]) EvictBounded(maxScan int) bool {
 	return c.EvictBatch(1) > 0
 }
 
-// EvictBatch sweeps the leaf arena once and reclaims up to want leaves, so the
-// scan cost is amortized across many evictions — this is what lets the memory
-// governor drain under heavy write load instead of paying a full sweep per key.
+// EvictBatch reclaims up to want leaves from a bounded sample of the leaf arena.
+// Live leaves and ghosts share the sample budget, amortizing scan cost across
+// evictions without scanning the whole ghost population for each batch.
 //
 // It evicts the LRU `want` of the cold (freq <= k) leaves in the window: keeping
 // the *oldest* cold leaves means a just-written key (high lastAccess) is spared,
@@ -743,10 +743,10 @@ func (c *Critbit[T]) maybeAdaptK() {
 // sweepLeaves forwards leaves to fn by advancing a persistent CLOCK hand over the
 // leaf arena's slots — the trie analogue of CloxCache's slot scan, with
 // sequential array reads instead of per-sample tree descent. It forwards live
-// leaves (counted toward the base budget) and ghosts (freq < 0, not counted, so
-// the caller can pick the oldest as an eviction fallback). It skips uninitialized
+// leaves and ghosts (freq < 0), both counted toward the base budget. The caller
+// can pick the oldest sampled ghost as an eviction fallback. It skips uninitialized
 // slots, reclaimed-chunk holes, and unlink-pending leaves. It stops after base
-// live leaves or one full pass — there is no escalation: when the window has no
+// occupied leaves or one full pass — there is no escalation: when the window has no
 // cold leaf the caller reclaims a ghost rather than hunting further. The hand
 // persists across calls. Runs under evictMu (sole mutator of evictHand) and the
 // reap read-lock.
@@ -788,10 +788,10 @@ func (c *Critbit[T]) sweepLeaves(base int, fn func(*critNode[T])) {
 		}
 
 		origin := hand + uint64(s)*segGap
-		live := 0
+		occupied := 0
 
 		var j uint64
-		for ; live < want && j < segGap; j++ {
+		for ; occupied < want && j < segGap; j++ {
 			idx := (origin + j) % total
 
 			chunk := chunks[idx/chunkSize]
@@ -810,15 +810,17 @@ func (c *Critbit[T]) sweepLeaves(base int, fn func(*critNode[T])) {
 			n := &chunk[idx%chunkSize]
 			if n.deleted.Load() {
 				if n.freq.Load() < 0 {
-					fn(n) // ghost — forwarded for the reclaim fallback, not counted
+					fn(n)
+
+					occupied++
 				}
 
-				continue // ghosts/uninitialized/unlink-pending don't count as live
+				continue // uninitialized and unlink-pending slots consume no budget
 			}
 
 			fn(n)
 
-			live++
+			occupied++
 		}
 
 		if s == 0 {
