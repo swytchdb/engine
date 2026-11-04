@@ -2,12 +2,54 @@ package effects
 
 import (
 	"slices"
+	"sync"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
 	"github.com/swytchdb/engine/memsize"
 )
 
 func subscriberSliceBytes(ids []pb.NodeID) int64 { return memsize.Alloc(int64(cap(ids)) * 8) }
+
+// collectPeerTips announces a subscription concurrently, then folds the replies
+// on the caller. Each worker owns one slot; Wait publishes those slots without
+// a result mutex or atomic counter. Both bootstrap rounds use this same path.
+func (e *Engine) collectPeerTips(key string, notify *pb.OffsetNotify, peers []pb.NodeID, tips []Tip) ([]Tip, int) {
+	replies := make([]struct {
+		nacks []*pb.NackNotify
+		err   error
+	}, len(peers))
+
+	var wg sync.WaitGroup
+	for i, peer := range peers {
+		wg.Go(func() {
+			replies[i].nacks, replies[i].err = e.broadcaster.ReplicateTo(notify, notify.GetEffectData(), peer)
+		})
+	}
+
+	wg.Wait()
+
+	acknowledged := 0
+
+	for i, reply := range replies {
+		if reply.err != nil {
+			continue
+		}
+
+		acknowledged++
+		// A NACK means this peer holds authoritative state for the key.
+		if len(reply.nacks) > 0 {
+			e.addPeerSubscriber(key, peers[i])
+		}
+
+		for _, nack := range reply.nacks {
+			for _, ref := range nack.GetTips() {
+				tips = append(tips, r(ref))
+			}
+		}
+	}
+
+	return tips, acknowledged
+}
 
 // addPeerSubscriber records that peer is subscribed to key. Idempotent.
 // Called from ensureSubscribed (peers that NACK back during bootstrap)

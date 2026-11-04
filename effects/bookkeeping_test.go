@@ -26,8 +26,7 @@ func TestHorizonDuplicatePreservesWaiters(t *testing.T) {
 	done := make(chan struct{})
 
 	go func() {
-		token := original.waiters.RLock()
-		original.waiters.RUnlock(token)
+		<-original.ready
 		close(done)
 	}()
 
@@ -37,6 +36,60 @@ func TestHorizonDuplicatePreservesWaiters(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("reader remained blocked after promotion")
+	}
+}
+
+func TestHorizonResolutionWakesAllWaiters(t *testing.T) {
+	for _, abort := range []bool{false, true} {
+		t.Run(fmt.Sprintf("abort=%t", abort), func(t *testing.T) {
+			e := newHorizonTestEngine()
+			bind := testBind([]*pb.EffectRef{{NodeId: 1, Offset: 10}}, &pb.EffectRef{NodeId: 1, Offset: 20})
+			e.horizon.Add("txn", Tip{1, 30}, bind)
+			entry, _ := e.horizon.entries.Load("txn")
+			done := make(chan struct{}, 16)
+
+			for range cap(done) {
+				go func() {
+					<-entry.ready
+
+					done <- struct{}{}
+				}()
+			}
+
+			select {
+			case <-done:
+				t.Fatal("reader passed an unresolved horizon")
+			default:
+			}
+
+			if abort {
+				e.horizon.Abort("txn")
+			} else {
+				e.horizon.MakeVisible("txn")
+			}
+
+			deadline := time.After(time.Second)
+
+			for range cap(done) {
+				select {
+				case <-done:
+				case <-deadline:
+					t.Fatal("resolution did not wake every reader")
+				}
+			}
+
+			// A redelivery gets a new wait, independent of the resolved entry.
+			e.horizon.Add("txn", Tip{1, 30}, bind)
+
+			next, _ := e.horizon.entries.Load("txn")
+			select {
+			case <-next.ready:
+				t.Fatal("new entry reused a resolved notification")
+			default:
+			}
+
+			e.horizon.Abort("txn")
+		})
 	}
 }
 

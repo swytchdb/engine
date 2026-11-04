@@ -30,7 +30,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -100,8 +99,8 @@ type bootstrapCollector struct {
 }
 
 // Engine is the central coordinator for the causal effect log.
-// Lock-free: the log uses CAS, the index manages its own concurrency,
-// and safety config is swapped atomically.
+// The index and vertex pool synchronize their own state. Engine locks protect
+// lifecycle transitions and shared bookkeeping; Context owns command-local state.
 type Engine struct {
 	recovery atomic.Pointer[recoveryRun]
 	// index is the per-key tip frontier. Its leaf payload is *leafState,
@@ -1507,17 +1506,10 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 			// doesn't know about? The bind knows about its ConsumedTips
 			// and its own effects (NewTip + the bind offset itself).
 			// Any other tip means a concurrent write happened — NACK.
-			known := make(map[Tip]bool, len(kb.GetConsumedTips())+2)
-			for _, ct := range kb.GetConsumedTips() {
-				known[r(ct)] = true
-			}
-
-			known[r(kb.GetNewTip())] = true
-			known[r(notify.GetOrigin())] = true // the bind itself
 			diverged := false
 
 			for _, tip := range kbTips.Tips() {
-				if !known[tip] {
+				if tip != r(kb.GetNewTip()) && tip != r(notify.GetOrigin()) && !refsContain(kb.GetConsumedTips(), tip) {
 					diverged = true
 
 					break
@@ -1533,10 +1525,13 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 			}
 		}
 	} else if initialTips != nil && len(eff.GetDeps()) > 0 {
-		preTips := initialTips.Tips()
-		if !depsMatchTips(fromPbRefs(eff.GetDeps()), preTips) {
+		for _, dep := range eff.GetDeps() {
+			if initialTips.Contains(r(dep)) {
+				continue
+			}
+
 			slog.Debug("HandleRemote: deps diverged, NACK",
-				"key", key, "deps", eff.GetDeps(), "tips", preTips)
+				"key", key, "deps", eff.GetDeps(), "tips", initialTips.Tips())
 			postTips := e.index.Contains(key)
 
 			var postTipOffsets []Tip
@@ -1545,6 +1540,8 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 			}
 
 			nacks = append(nacks, e.buildEnrichedNack(key, notify.GetOrigin(), postTipOffsets))
+
+			break
 		}
 	}
 
@@ -1967,19 +1964,6 @@ func (e *Engine) checkCompetingBinds(bind *pb.TransactionalBindEffect, txnID str
 // gating) or against a concurrent non-tx data effect (SSI). flushTx
 // uses this to abort before emitting.
 func (e *Engine) evaluateBindForkChoice(bind *pb.TransactionalBindEffect, bindOffset Tip, bindHash []byte, txnID string) bool {
-	newEntry := &forkChoiceBindEntry{
-		offset: bindOffset,
-		hash:   bindHash,
-		txnID:  txnID,
-		keys:   make(map[string][]Tip, len(bind.GetKeys())),
-		tips:   make(map[string]Tip, len(bind.GetKeys())),
-	}
-	for _, kb := range bind.GetKeys() {
-		k := string(kb.GetKey())
-		newEntry.keys[k] = fromPbRefs(kb.GetConsumedTips())
-		newEntry.tips[k] = r(kb.GetNewTip())
-	}
-
 	for _, kb := range bind.GetKeys() {
 		k := string(kb.GetKey())
 
@@ -2008,20 +1992,14 @@ func (e *Engine) evaluateBindForkChoice(bind *pb.TransactionalBindEffect, bindOf
 					continue
 				}
 
-				otherEntry := &forkChoiceBindEntry{
-					offset: tipOff,
-					hash:   eff.GetForkChoiceHash(),
-					txnID:  eff.GetTxnId(),
-					keys:   make(map[string][]Tip, len(otherBind.GetKeys())),
-				}
+				if bindsShareBase(bind, otherBind) {
+					var theirTip Tip
 
-				theirNewTips := make(map[string]Tip, len(otherBind.GetKeys()))
-				for _, okb := range otherBind.GetKeys() {
-					otherEntry.keys[string(okb.GetKey())] = fromPbRefs(okb.GetConsumedTips())
-					theirNewTips[string(okb.GetKey())] = r(okb.GetNewTip())
-				}
-
-				if bindsShareBase(newEntry, otherEntry) {
+					for _, otherKey := range otherBind.GetKeys() {
+						if bytes.Equal(kb.GetKey(), otherKey.GetKey()) {
+							theirTip = r(otherKey.GetNewTip())
+						}
+					}
 					// Predicate refinement: suppress the fork-choice
 					// when both txs carry obs/row-write evidence on
 					// this key and their predicates don't intersect
@@ -2030,13 +2008,13 @@ func (e *Engine) evaluateBindForkChoice(bind *pb.TransactionalBindEffect, bindOf
 					// (schema-only mutations, non-SQL binds, etc.).
 					conflict, bothHadEvidence := e.hasPredicateConflict(
 						txnID, eff.GetTxnId(), k,
-						[]Tip{newEntry.tips[k], bindOffset},
-						[]Tip{theirNewTips[k], tipOff})
+						[]Tip{r(kb.GetNewTip()), bindOffset},
+						[]Tip{theirTip, tipOff})
 					if bothHadEvidence && !conflict {
 						continue
 					}
 
-					if !ForkChoiceLess(newEntry.hash, otherEntry.hash) {
+					if !ForkChoiceLess(bindHash, eff.GetForkChoiceHash()) {
 						return true
 					}
 				}
@@ -2046,10 +2024,7 @@ func (e *Engine) evaluateBindForkChoice(bind *pb.TransactionalBindEffect, bindOf
 			if eff.GetTxnId() == "" && eff.GetData() != nil {
 				// Check if this effect is concurrent with our bind on this key:
 				// not in the ancestor set of our consumed tips for this key.
-				consumed := fromPbRefs(kb.GetConsumedTips())
-
-				isAncestor := slices.Contains(consumed, tipOff)
-				if !isAncestor {
+				if !refsContain(kb.GetConsumedTips(), tipOff) {
 					// Not a consumed tip — could be concurrent.
 					// Check if it's a descendant of our bind (depends on us).
 					// If it depends on our NewTip or bindOffset, it's sequential.
@@ -2915,16 +2890,7 @@ func (e *Engine) probeAndFetchKey(key string) {
 		return
 	}
 
-	// Deduplicate
-	seen := make(map[Tip]struct{}, len(allTipOffsets))
-
-	unique := make([]Tip, 0, len(allTipOffsets))
-	for _, off := range allTipOffsets {
-		if _, ok := seen[off]; !ok {
-			seen[off] = struct{}{}
-			unique = append(unique, off)
-		}
-	}
+	unique := compactTips(allTipOffsets)
 
 	// Filter out tips we already have locally
 	localTips := e.index.Contains(key)
@@ -3022,29 +2988,13 @@ func (e *Engine) storeWireData(offset Tip, wireData []byte) error {
 	return e.putIngested(offset, eff, len(protoData))
 }
 
-// depsMatchTips checks if the effect's deps are a subset of current tips.
-func depsMatchTips(deps []Tip, tips []Tip) bool {
-	if len(tips) == 0 {
-		return len(deps) == 0
-	}
-
-	tipSet := make(map[Tip]struct{}, len(tips))
-	for _, t := range tips {
-		tipSet[t] = struct{}{}
-	}
-
-	for _, d := range deps {
-		if _, ok := tipSet[d]; !ok {
-			return false
-		}
-	}
-
-	return true
-}
-
 // incrementAbortCount increments the abort counter for a key and returns
 // true if the serialization threshold has been exceeded.
 func (e *Engine) incrementAbortCount(key string) bool {
+	if !adaptiveSerializationEnabled {
+		return false
+	}
+
 	counter, _ := e.txAbortCounts.LoadOrStore(key, &atomic.Int32{})
 	count := counter.Add(1)
 

@@ -35,10 +35,10 @@ import (
 
 // horizonEntry tracks a single Bind that is in its horizon wait period.
 type horizonEntry struct {
-	group   *horizonGroup
-	txnID   string
-	bind    *pb.TransactionalBindEffect // immutable; owns keys and new tips
-	waiters xsync.RBMutex
+	group *horizonGroup
+	txnID string
+	bind  *pb.TransactionalBindEffect // immutable; owns keys and new tips
+	ready chan struct{}               // closed once, by resolve under HorizonSet.mu
 }
 
 // horizonGroup tracks a group of competing Binds that share at least one
@@ -47,9 +47,11 @@ type horizonEntry struct {
 // schedules MakeVisible via ScheduleMakeVisible on the remote-arrival side
 // (crash-fallback timer).
 type horizonGroup struct {
-	entries  []*horizonEntry
-	bindKeys map[string][]Tip // key → consumed tips (for overlap detection)
-	timer    *time.Timer      // scheduled MakeVisible (remote-arrival path)
+	entries []*horizonEntry
+	// Keep immutable bases until the whole group resolves, including aborted
+	// members: later arrivals must still join the same overlapping group.
+	bases []*pb.TransactionalBindEffect
+	timer *time.Timer // scheduled MakeVisible (remote-arrival path)
 }
 
 // HorizonSet tracks Binds in their horizon wait period. Effects from
@@ -96,7 +98,17 @@ func (h *HorizonSet) Add(txnID string, bindOffset Tip, bind *pb.TransactionalBin
 	var target *horizonGroup
 
 	for _, group := range h.groups {
-		if !group.overlaps(bind) {
+		overlaps := false
+
+		for _, base := range group.bases {
+			if bindsShareBase(base, bind) {
+				overlaps = true
+
+				break
+			}
+		}
+
+		if !overlaps {
 			continue
 		}
 
@@ -111,28 +123,22 @@ func (h *HorizonSet) Add(txnID string, bindOffset Tip, bind *pb.TransactionalBin
 		}
 
 		target.entries = append(target.entries, group.entries...)
-		for key, tips := range group.bindKeys {
-			target.bindKeys[key] = append(target.bindKeys[key], tips...)
-		}
+		target.bases = append(target.bases, group.bases...)
 
 		group.entries = nil
 	}
 
 	if target == nil {
-		target = &horizonGroup{bindKeys: make(map[string][]Tip, len(bind.GetKeys()))}
+		target = &horizonGroup{}
 		h.groups = append(h.groups, target)
 	} else {
 		h.pruneGroups()
 	}
 
-	entry := &horizonEntry{group: target, txnID: txnID, bind: bind}
-	entry.waiters.Lock()
+	entry := &horizonEntry{group: target, txnID: txnID, bind: bind, ready: make(chan struct{})}
 	target.entries = append(target.entries, entry)
 
-	for _, kb := range bind.GetKeys() {
-		key := string(kb.GetKey())
-		target.bindKeys[key] = append(target.bindKeys[key], fromPbRefs(kb.GetConsumedTips())...)
-	}
+	target.bases = append(target.bases, bind)
 
 	h.entries.Store(txnID, entry)
 
@@ -140,35 +146,27 @@ func (h *HorizonSet) Add(txnID string, bindOffset Tip, bind *pb.TransactionalBin
 		"group_size", len(target.entries))
 }
 
-// HorizonWait is a handle returned by WaitForClear. It carries the
-// horizonEntry pointer and the RToken so Release can RUnlock the same
-// mutex even after the entry has been removed from h.entries by
-// MakeVisible or Abort.
-type HorizonWait struct {
-	entry *horizonEntry
-	tok   *xsync.RToken
-}
+// HorizonWait records that WaitForClear observed a pending bind. Resolution is
+// permanent for that entry, so a waiter needs no lock or resource after waking.
+type HorizonWait struct{}
 
 // WaitForClear blocks until the bind for txnID has been resolved
-// (MakeVisible or Abort releases the entry's waiter lock). Returns nil if
+// (MakeVisible or Abort closes the entry's ready channel). Returns nil if
 // the bind is not in the invisible set — the caller may proceed without
-// waiting. Returns a *HorizonWait the caller must Release when done.
+// waiting. The returned handle is retained for API compatibility.
 func (h *HorizonSet) WaitForClear(txnID string) *HorizonWait {
 	if entry, ok := h.entries.Load(txnID); ok {
-		return &HorizonWait{entry: entry, tok: entry.waiters.RLock()}
+		<-entry.ready
+
+		return &HorizonWait{}
 	}
 
 	return nil
 }
 
-// Release returns the read-lock token to the horizonEntry. Safe on nil.
-func (w *HorizonWait) Release() {
-	if w == nil {
-		return
-	}
-
-	w.entry.waiters.RUnlock(w.tok)
-}
+// Release is a no-op, including on nil. Kept for callers of the former lock API.
+// Deprecated: WaitForClear no longer holds a lock after returning.
+func (w *HorizonWait) Release() {}
 
 // ScheduleMakeVisible schedules MakeVisible(txnID) to fire after `wait`.
 // Used by handleRemoteBind as a crash-fallback for the remote-arrival
@@ -288,20 +286,6 @@ func (h *HorizonSet) Empty() bool {
 	return h.entries.Size() == 0
 }
 
-// overlaps checks shared consumed tips without building a temporary set.
-// The owning HorizonSet's mutex protects the group.
-func (g *horizonGroup) overlaps(bind *pb.TransactionalBindEffect) bool {
-	for _, kb := range bind.GetKeys() {
-		for _, ref := range kb.GetConsumedTips() {
-			if slices.Contains(g.bindKeys[string(kb.GetKey())], r(ref)) {
-				return true
-			}
-		}
-	}
-
-	return false
-}
-
 // resolve releases one bind's bookkeeping before waking readers. Caller holds h.mu.
 func (h *HorizonSet) resolve(entry *horizonEntry) {
 	for _, kb := range entry.bind.GetKeys() {
@@ -309,7 +293,7 @@ func (h *HorizonSet) resolve(entry *horizonEntry) {
 	}
 
 	h.entries.Delete(entry.txnID)
-	entry.waiters.Unlock()
+	close(entry.ready)
 }
 
 // pruneGroups releases completed/merged groups and their timer and key storage.
@@ -325,7 +309,7 @@ func (h *HorizonSet) pruneGroups() {
 			group.timer = nil
 		}
 
-		group.bindKeys = nil
+		group.bases = nil
 
 		return true
 	})

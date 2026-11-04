@@ -31,6 +31,7 @@ import (
 	"log/slog"
 	"maps"
 	rand "math/rand/v2"
+	"slices"
 	"sort"
 	"sync"
 
@@ -54,6 +55,7 @@ type watchedKeyState struct {
 
 // Context tracks per-key state for dep chaining (Emit) and deferred
 // index update + broadcast (Flush). One Context per command invocation.
+// A context may be reused after Flush or Abort, but is not safe for concurrent use.
 type Context struct {
 	engine      *Engine
 	traceCtx    context.Context // carries the active OTel span for this command
@@ -117,31 +119,13 @@ type ContextSavepoint struct {
 // TakeSavepoint captures a deep-enough copy of the Context's pending
 // key state that RestoreSavepoint can revert every Emit issued
 // between Take and Restore. Cheap: each contextKey is a small struct
-// with slice fields that we clone by reference (the underlying
-// values — notifies, elementIDs — are immutable once added).
+// with slice storage that we copy; the underlying values (notifies and
+// elementIDs) are immutable once added and can be shared.
 func (c *Context) TakeSavepoint() *ContextSavepoint {
-	snap := &ContextSavepoint{
-		keys:    make(map[string]*contextKey, len(c.keys)),
+	return &ContextSavepoint{
+		keys:    cloneContextKeys(c.keys),
 		readErr: c.readErr,
 	}
-	for k, ck := range c.keys {
-		cloned := *ck
-		// Clone mutable slices so later Emits on the Context don't
-		// extend the saved slices in place.
-		if len(ck.notifies) > 0 {
-			cloned.notifies = make([]*pb.OffsetNotify, len(ck.notifies))
-			copy(cloned.notifies, ck.notifies)
-		}
-
-		if len(ck.elementIDs) > 0 {
-			cloned.elementIDs = make([][]byte, len(ck.elementIDs))
-			copy(cloned.elementIDs, ck.elementIDs)
-		}
-
-		snap.keys[k] = &cloned
-	}
-
-	return snap
 }
 
 // RestoreSavepoint replaces the Context's pending-key state with the
@@ -156,34 +140,36 @@ func (c *Context) RestoreSavepoint(sp *ContextSavepoint) {
 	// Clone the snapshot's keys map so subsequent Emits don't mutate
 	// it (in case the caller retains the snapshot for nested
 	// rollbacks).
-	restored := make(map[string]*contextKey, len(sp.keys))
-	for k, ck := range sp.keys {
-		cloned := *ck
-		if len(ck.notifies) > 0 {
-			cloned.notifies = make([]*pb.OffsetNotify, len(ck.notifies))
-			copy(cloned.notifies, ck.notifies)
-		}
-
-		if len(ck.elementIDs) > 0 {
-			cloned.elementIDs = make([][]byte, len(ck.elementIDs))
-			copy(cloned.elementIDs, ck.elementIDs)
-		}
-
-		restored[k] = &cloned
-	}
-
-	c.keys = restored
+	c.keys = cloneContextKeys(sp.keys)
 	// Explicit command rollback discards its partial writes and handles its
 	// read failure. Unhandled failures still prevent Flush from committing.
 	// Snapshot membership stays fixed: rollback cannot undo exposed values.
 	c.readErr = sp.readErr
 }
 
+// Savepoints own the mutable slice storage. Elements and tip sets are immutable
+// once emitted, so their contents can be shared across repeated restores.
+func cloneContextKeys(keys map[string]*contextKey) map[string]*contextKey {
+	if len(keys) == 0 {
+		return nil
+	}
+
+	cloned := make(map[string]*contextKey, len(keys))
+	for key, state := range keys {
+		clonedState := *state
+		clonedState.notifies = slices.Clone(state.notifies)
+		clonedState.elementIDs = slices.Clone(state.elementIDs)
+		clonedState.subOps = slices.Clone(state.subOps)
+		cloned[key] = &clonedState
+	}
+
+	return cloned
+}
+
 // NewContext creates a new write context bound to the engine.
 func (e *Engine) NewContext() *Context {
 	return &Context{
 		engine: e,
-		keys:   make(map[string]*contextKey),
 	}
 }
 
@@ -194,7 +180,6 @@ func (e *Engine) NewContext() *Context {
 func (e *Engine) NewReadOnlyContext() *Context {
 	return &Context{
 		engine:   e,
-		keys:     make(map[string]*contextKey),
 		readOnly: true,
 	}
 }
@@ -589,7 +574,7 @@ func (c *Context) Watch(key string) error {
 // MULTI/EXEC (c.inTx) the id is load-bearing for in-flight effects
 // and must be preserved.
 func (c *Context) ClearWatches() {
-	clear(c.watchedKeys)
+	c.watchedKeys = nil
 
 	if !c.inTx {
 		c.txnID = ""
@@ -649,7 +634,7 @@ func (c *Context) CheckWatches() bool {
 			continue // key didn't exist at WATCH time, still doesn't after flush
 		}
 		// Key was modified — abort
-		clear(c.watchedKeys)
+		c.watchedKeys = nil
 		c.inTx = false
 		c.txnID = ""
 		c.txSnapshot = nil
@@ -666,7 +651,8 @@ func (c *Context) CheckWatches() bool {
 			Kind: &pb.Effect_Noop{Noop: &pb.NoopEffect{}},
 		}, []Tip{ws.noopOffset}); err != nil {
 			slog.Error("CheckWatches: transactional NOOP emit failed", "key", key, "error", err)
-			clear(c.watchedKeys)
+
+			c.watchedKeys = nil
 			c.inTx = false
 			c.txnID = ""
 			c.txSnapshot = nil
@@ -679,7 +665,7 @@ func (c *Context) CheckWatches() bool {
 		}
 	}
 
-	clear(c.watchedKeys)
+	c.watchedKeys = nil
 
 	return true
 }
@@ -687,12 +673,8 @@ func (c *Context) CheckWatches() bool {
 // Abort discards pending index updates and broadcasts. Effects already
 // written to the log remain durable but invisible (index not updated).
 func (c *Context) Abort() {
-	clear(c.keys)
-	clear(c.watchedKeys)
-	c.inTx = false
-	c.txnID = ""
-	c.txSnapshot = nil
-	c.readErr = nil
+	c.reset()
+	c.watchedKeys = nil
 }
 
 // Emit writes a single effect to the log. The context tracks per-key
@@ -788,6 +770,10 @@ func (c *Context) Emit(eff *pb.Effect, snapshotTips ...[]Tip) error {
 		}
 
 		ck = &contextKey{initialTips: tips, readOnly: c.inTx}
+		if c.keys == nil {
+			c.keys = make(map[string]*contextKey)
+		}
+
 		c.keys[key] = ck
 
 		if tips != nil {
@@ -1209,22 +1195,10 @@ func (c *Context) flushTx() error {
 			continue
 		}
 
-		initialSet := make(map[Tip]bool, len(initial))
-		for _, t := range initial {
-			initialSet[t] = true
-		}
-
 		current := c.engine.index.Contains(key)
-		currentSet := make(map[Tip]bool)
-
-		if current != nil {
-			for _, t := range current.Tips() {
-				currentSet[t] = true
-			}
-		}
 
 		for _, t := range initial {
-			if !currentSet[t] {
+			if !current.Contains(t) {
 				slog.Debug("flushTx: stale consumed tip, aborting before emission",
 					"key", key, "stale_tip", t, "current_tips", current)
 
@@ -1245,8 +1219,8 @@ func (c *Context) flushTx() error {
 			}
 		}
 
-		for t := range currentSet {
-			if initialSet[t] {
+		for _, t := range current.Tips() {
+			if ck.initialTips.Contains(t) {
 				continue
 			}
 			// Subscription tips are commutative metadata, not bind writes
@@ -1873,7 +1847,14 @@ func (c *Context) emitSerializationEffect(key string) {
 
 // reset clears the context for reuse.
 func (c *Context) reset() {
-	clear(c.keys)
+	// Reuse small command maps, but let an unusually large transaction's map
+	// go: clear alone retains its buckets for the lifetime of the context.
+	if len(c.keys) > 16 {
+		c.keys = nil
+	} else {
+		clear(c.keys)
+	}
+
 	c.inTx = false
 	c.txnID = ""
 	c.txSnapshot = nil

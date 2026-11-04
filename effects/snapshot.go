@@ -961,46 +961,9 @@ func (e *Engine) ensureSubscribedMode(key string, allowAsync bool) error {
 	bootstrapDeadline := time.After(30 * time.Second)
 
 	for attempt := 0; ; attempt++ {
-		var (
-			mu           sync.Mutex
-			successCount sync.WaitGroup
-			ackCount     atomic.Int32
-		)
+		var expected int
 
-		for _, pid := range peerIDs {
-			successCount.Add(1)
-			go func(pid pb.NodeID) {
-				defer successCount.Done()
-
-				nacks, err := e.broadcaster.ReplicateTo(notify, notify.GetEffectData(), pid)
-				if err != nil {
-					return
-				}
-
-				ackCount.Add(1)
-				// A non-empty NACK list means the peer was authoritative on
-				// this key — i.e., the peer is subscribed. Record it so
-				// flushTx can address bind broadcast directly without
-				// re-deriving from the DAG.
-				if len(nacks) > 0 {
-					e.addPeerSubscriber(ownedKey, pid)
-				}
-				// Collect NACKs returned synchronously from ReplicateTo.
-				// HandleRemote on the peer generates these inline and
-				// returns them as the ReplicateTo response.
-				mu.Lock()
-				for _, nack := range nacks {
-					for _, tp := range nack.GetTips() {
-						allTipOffsets = append(allTipOffsets, r(tp))
-					}
-				}
-				mu.Unlock()
-			}(pid)
-		}
-
-		successCount.Wait()
-
-		expected := int(ackCount.Load())
+		allTipOffsets, expected = e.collectPeerTips(ownedKey, notify, peerIDs, allTipOffsets)
 		if expected == 0 {
 			// UnsafeMode: unreachable peers never block. Proceed with local
 			// state; the subscription announce reaches recovering peers via
@@ -1051,37 +1014,7 @@ done:
 	// A second probe collects those updated tips so all nodes converge on
 	// the same tip set — critical for fork-choice conflict detection
 	// (bindsShareBase requires shared consumed tips).
-	{
-		var (
-			mu sync.Mutex
-			wg sync.WaitGroup
-		)
-		for _, pid := range peerIDs {
-			wg.Add(1)
-			go func(pid pb.NodeID) {
-				defer wg.Done()
-
-				nacks, err := e.broadcaster.ReplicateTo(notify, notify.GetEffectData(), pid)
-				if err != nil {
-					return
-				}
-
-				if len(nacks) > 0 {
-					e.addPeerSubscriber(ownedKey, pid)
-				}
-
-				mu.Lock()
-				for _, nack := range nacks {
-					for _, tp := range nack.GetTips() {
-						allTipOffsets = append(allTipOffsets, r(tp))
-					}
-				}
-				mu.Unlock()
-			}(pid)
-		}
-
-		wg.Wait()
-	}
+	allTipOffsets, _ = e.collectPeerTips(ownedKey, notify, peerIDs, allTipOffsets)
 
 	if len(allTipOffsets) == 0 {
 		succeeded = true
@@ -1089,16 +1022,7 @@ done:
 		return nil
 	}
 
-	// Deduplicate
-	seen := make(map[Tip]struct{}, len(allTipOffsets))
-
-	unique := make([]Tip, 0, len(allTipOffsets))
-	for _, off := range allTipOffsets {
-		if _, ok := seen[off]; !ok {
-			seen[off] = struct{}{}
-			unique = append(unique, off)
-		}
-	}
+	unique := compactTips(allTipOffsets)
 
 	installed, skipped := e.walkAndInstall(ownedKey, unique)
 
@@ -1317,8 +1241,8 @@ func (e *Engine) reconstructWithView(key string, tips []Tip, txID string, waitFo
 
 	// Retry loop: every time iterate encounters an in-horizon bind on the
 	// ancestry of tips AND waitForHorizon is true, the wait completes
-	// inline (entry.waiters.RLock blocks until MakeVisible or Abort
-	// releases the write lock) and the callback returns errHorizonRetryNeeded.
+	// inline (WaitForClear waits for MakeVisible or Abort to close ready)
+	// and the callback returns errHorizonRetryNeeded.
 	// We restart with fresh bindKeyClosure / losersOnKey / dependsOnInvisible
 	// state — the resolved bind's verdict is now visible to fork-choice,
 	// and its descendants in the walk no longer trigger the "descends from
@@ -1664,40 +1588,6 @@ func (e *Engine) reconstructWithView(key string, tips []Tip, txID string, waitFo
 		"result_nil", result == nil)
 
 	return result, count + crossKeyWalked, nil
-}
-
-// forkChoiceBindEntry holds bind metadata for fork-choice resolution.
-// Used by the commit path (evaluateBindForkChoice).
-type forkChoiceBindEntry struct {
-	offset Tip
-	hash   []byte
-	txnID  string
-	keys   map[string][]Tip // key → ConsumedTips
-	tips   map[string]Tip   // key → NewTip
-}
-
-// bindsShareBase returns true if two binds have overlapping keys with at
-// least one shared ConsumedTip on those keys.
-func bindsShareBase(a, b *forkChoiceBindEntry) bool {
-	for key, aBase := range a.keys {
-		bBase, ok := b.keys[key]
-		if !ok {
-			continue
-		}
-
-		aSet := make(map[Tip]bool, len(aBase))
-		for _, off := range aBase {
-			aSet[off] = true
-		}
-
-		for _, off := range bBase {
-			if aSet[off] {
-				return true
-			}
-		}
-	}
-
-	return false
 }
 
 // bindKeyClosure widens outward from startKey along bind cross-key links
