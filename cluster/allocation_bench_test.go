@@ -24,9 +24,53 @@
 package cluster
 
 import (
+	"bytes"
 	"testing"
 	"time"
+
+	pb "github.com/swytchdb/engine/cluster/proto"
 )
+
+func BenchmarkNotifyPacket(b *testing.B) {
+	notify := &pb.OffsetNotify{Key: []byte("key"), EffectData: bytes.Repeat([]byte("x"), 4096)}
+
+	b.ReportAllocs()
+
+	for b.Loop() {
+		if _, err := MarshalNotifyPacket(42, notify); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkNotifyNACKPacket(b *testing.B) {
+	nacks := make([]*pb.NackNotify, 16)
+	for i := range nacks {
+		nacks[i] = &pb.NackNotify{Key: bytes.Repeat([]byte("k"), 128), NotSubscribed: true}
+	}
+
+	b.ReportAllocs()
+
+	for b.Loop() {
+		MarshalNotifyNACKPacket(1, 42, nacks, 0)
+	}
+}
+
+func BenchmarkDiffTopology(b *testing.B) {
+	old := &ClusterConfig{NodeID: 1}
+	updated := &ClusterConfig{NodeID: 1}
+
+	for id := NodeId(1); id <= 64; id++ {
+		old.Nodes = append(old.Nodes, NodeConfig{ID: id, Region: "local"})
+		updated.Nodes = append(updated.Nodes, NodeConfig{ID: id, Region: "remote"})
+	}
+
+	b.ReportAllocs()
+
+	for b.Loop() {
+		DiffTopology(old, updated)
+	}
+}
 
 func BenchmarkReplicationReachability(b *testing.B) {
 	health := NewPeerHealthTable(ClockConfig{})

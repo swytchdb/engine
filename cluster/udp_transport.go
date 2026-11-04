@@ -45,7 +45,8 @@ type PacketHandler interface {
 // Notify plaintext layout:
 // [1:type][8:requestID LE][proto-marshaled OffsetNotify]
 const (
-	notifyHeaderSize = 1 + 8 // 9 bytes before protobuf payload
+	notifyHeaderSize    = 1 + 8 // 9 bytes before protobuf payload
+	notifyACKHeaderSize = 1 + 8 + 8 + 1 + 4
 )
 
 // --- Packet marshaling/parsing helpers ---
@@ -53,12 +54,16 @@ const (
 // MarshalNotifyPacket builds a notify plaintext body:
 // [1:type][8:requestID LE][proto-marshaled OffsetNotify]
 func MarshalNotifyPacket(requestID uint64, notify *pb.OffsetNotify) ([]byte, error) {
-	protoBytes, err := proto.Marshal(notify)
+	buf := make([]byte, notifyHeaderSize, notifyHeaderSize+proto.Size(notify))
+	buf[0] = PacketTypeNotify
+	binary.LittleEndian.PutUint64(buf[1:9], requestID)
+
+	buf, err := proto.MarshalOptions{}.MarshalAppend(buf, notify)
 	if err != nil {
 		return nil, fmt.Errorf("marshal OffsetNotify: %w", err)
 	}
 
-	return AssembleNotifyPacket(requestID, protoBytes), nil
+	return buf, nil
 }
 
 // AssembleNotifyPacket frames a pre-marshalled OffsetNotify body into a notify
@@ -94,21 +99,23 @@ func parseNotifyPacket(data []byte) (requestID uint64, notify *pb.OffsetNotify, 
 // MarshalNotifyACKPacket builds a notify ACK plaintext body:
 // [1:type][8:nodeID LE][8:requestID LE][1:status][4:credits LE]
 func MarshalNotifyACKPacket(nodeID NodeId, requestID uint64, status byte, credits uint32) []byte {
-	bodyLen := 1 + 8 + 8 + 1 + 4 // 22 bytes
-	buf := make([]byte, bodyLen)
+	buf := make([]byte, notifyACKHeaderSize)
+	writeNotifyACKHeader(buf, nodeID, requestID, status, credits)
 
+	return buf
+}
+
+func writeNotifyACKHeader(buf []byte, nodeID NodeId, requestID uint64, status byte, credits uint32) {
 	buf[0] = PacketTypeNotifyACK
 	binary.LittleEndian.PutUint64(buf[1:9], uint64(nodeID))
 	binary.LittleEndian.PutUint64(buf[9:17], requestID)
 	buf[17] = status
 	binary.LittleEndian.PutUint32(buf[18:22], credits)
-
-	return buf
 }
 
 // parseNotifyACKPacket parses the plaintext body of a NotifyACK packet.
 func parseNotifyACKPacket(data []byte) (peerID NodeId, requestID uint64, status byte, credits uint32, err error) {
-	if len(data) < 22 { // type(1) + nodeID(8) + requestID(8) + status(1) + credits(4)
+	if len(data) < notifyACKHeaderSize {
 		return 0, 0, 0, 0, fmt.Errorf("notify ACK packet too short: %d", len(data))
 	}
 
@@ -123,28 +130,36 @@ func parseNotifyACKPacket(data []byte) (peerID NodeId, requestID uint64, status 
 // MarshalNotifyNACKPacket builds a NotifyACK with status=0x01 and embedded NACKs:
 // [1:0x04][8:nodeID LE][8:requestID LE][1:0x01][4:credits LE][4:nack_count LE][for each: [4:len LE][proto NackNotify]]
 func MarshalNotifyNACKPacket(nodeID NodeId, requestID uint64, nacks []*pb.NackNotify, credits uint32) []byte {
-	header := MarshalNotifyACKPacket(nodeID, requestID, 0x01, credits)
+	size := notifyACKHeaderSize + 4
+	for _, nack := range nacks {
+		size += 4 + proto.Size(nack)
+	}
 
-	countBuf := make([]byte, 4)
-	binary.LittleEndian.PutUint32(countBuf, uint32(len(nacks)))
+	buf := make([]byte, notifyACKHeaderSize+4, size)
+	writeNotifyACKHeader(buf, nodeID, requestID, 0x01, credits)
 
-	buf := make([]byte, 0, len(header)+4+len(nacks)*64)
-	buf = append(buf, header...)
-	buf = append(buf, countBuf...)
+	var count uint32
 
 	for _, nack := range nacks {
-		protoBytes, err := proto.Marshal(nack)
+		start := len(buf)
+		buf = binary.LittleEndian.AppendUint32(buf, 0)
+
+		encoded, err := proto.MarshalOptions{}.MarshalAppend(buf, nack)
 		if err != nil {
 			slog.Error("failed to marshal NackNotify in NACK response", "error", err)
+
+			buf = buf[:start]
 
 			continue
 		}
 
-		lenBuf := make([]byte, 4)
-		binary.LittleEndian.PutUint32(lenBuf, uint32(len(protoBytes)))
-		buf = append(buf, lenBuf...)
-		buf = append(buf, protoBytes...)
+		buf = encoded
+		binary.LittleEndian.PutUint32(buf[start:start+4], uint32(len(buf)-start-4))
+
+		count++
 	}
+
+	binary.LittleEndian.PutUint32(buf[notifyACKHeaderSize:], count)
 
 	return buf
 }
@@ -209,14 +224,13 @@ func parseKeyFilterPacket(data []byte) (version uint64, filter []byte, err error
 // MarshalNackPacket builds a NACK plaintext body:
 // [1:type][proto-marshaled NackNotify]
 func MarshalNackPacket(nack *pb.NackNotify) ([]byte, error) {
-	protoBytes, err := proto.Marshal(nack)
+	buf := make([]byte, 1, 1+proto.Size(nack))
+	buf[0] = PacketTypeNack
+
+	buf, err := proto.MarshalOptions{}.MarshalAppend(buf, nack)
 	if err != nil {
 		return nil, fmt.Errorf("marshal NackNotify: %w", err)
 	}
-
-	buf := make([]byte, 1+len(protoBytes))
-	buf[0] = PacketTypeNack
-	copy(buf[1:], protoBytes)
 
 	return buf, nil
 }

@@ -26,7 +26,10 @@
 // PeerManager owns topology and connection lifecycle. PeerConn maintains one
 // outbound connection and shares fetch/forward framing through requestOverConn.
 // QUICNotifyTransport carries notifications and dispatches incoming packets;
-// Replicator owns acknowledgement, retry, and completion policy.
+// Replicator owns acknowledgement, retry, and completion policy, depending only
+// on NotificationTransport for delivery. replication_request.go owns request
+// registration and future completion; requests are fully initialized before
+// ACK handlers or the timeout sweep can see them.
 // HeartbeatManager measures peers; PeerHealthTable exposes their health.
 // PubSubRouter routes ephemeral subscriptions and messages through RouterTransport.
 // CloudSync separately owns the durable cloud upload outbox and cloud reads.

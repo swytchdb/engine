@@ -88,7 +88,7 @@ func (cs *CloudSync) DiscoverMembers(ctx context.Context, membershipKey string) 
 	var initialTips []effects.Tip
 
 	for _, kt := range resp.GetKeys() {
-		for _, ce := range cs.peelSidecar(kt) {
+		for _, ce := range cs.appendSidecar(nil, kt) {
 			sidecar[ce.Tip] = ce.Eff
 		}
 

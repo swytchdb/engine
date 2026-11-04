@@ -664,6 +664,16 @@ func (pm *PeerManager) fetchFromConns(ctx context.Context, offset *pb.EffectRef,
 		return nil, ErrPeerUnavailable
 	}
 
+	// The usual two-node cluster needs no fan-out goroutine or result channel.
+	if len(conns) == 1 {
+		data, err := fetchOverConn(ctx, conns[0], offset)
+		if err == nil && len(data) == 0 {
+			err = errFetchNotFound
+		}
+
+		return data, err
+	}
+
 	type result struct {
 		data []byte
 		err  error
@@ -676,19 +686,11 @@ func (pm *PeerManager) fetchFromConns(ctx context.Context, offset *pb.EffectRef,
 	for _, c := range conns {
 		go func(c *quic.Conn) {
 			data, err := fetchOverConn(ctx, c, offset)
-			if err != nil {
-				ch <- result{nil, err}
-
-				return
+			if err == nil && len(data) == 0 {
+				err = errFetchNotFound
 			}
 
-			if len(data) == 0 {
-				ch <- result{nil, errFetchNotFound}
-
-				return
-			}
-
-			ch <- result{data, nil}
+			ch <- result{data, err}
 		}(c)
 	}
 

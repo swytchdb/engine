@@ -29,6 +29,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"time"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
@@ -114,7 +115,7 @@ func (cs *CloudSync) CloudTips(ctx context.Context, key string) ([]effects.Tip, 
 			}
 		}
 
-		sidecar = append(sidecar, cs.peelSidecar(kt)...)
+		sidecar = cs.appendSidecar(sidecar, kt)
 		for _, ref := range kt.GetMissing() {
 			missing = append(missing, effects.Tip{ref.GetNodeId(), ref.GetOffset()})
 		}
@@ -226,10 +227,7 @@ func (cs *CloudSync) reconcileBatch(keys []string) {
 			continue
 		}
 
-		var tips, missing []effects.Tip
-		for _, ref := range kt.GetTips() {
-			tips = append(tips, effects.Tip{ref.GetNodeId(), ref.GetOffset()})
-		}
+		tips := cloudTips(kt.GetTips())
 
 		if len(tips) == 0 {
 			cs.clearReconcile(key) // the cloud holds nothing we haven't already served
@@ -237,11 +235,7 @@ func (cs *CloudSync) reconcileBatch(keys []string) {
 			continue
 		}
 
-		for _, ref := range kt.GetMissing() {
-			missing = append(missing, effects.Tip{ref.GetNodeId(), ref.GetOffset()})
-		}
-
-		pending, err := cs.engine.InstallCloudTips(key, tips, cs.peelSidecar(kt), missing)
+		pending, err := cs.engine.InstallCloudTips(key, tips, cs.appendSidecar(nil, kt), cloudTips(kt.GetMissing()))
 		if err != nil {
 			slog.Warn("cloud reconcile: install failed; will retry", "key", key, "error", err)
 
@@ -337,16 +331,28 @@ func (cs *CloudSync) peelEnvelope(env *dp.Effect) (*pb.Effect, int, error) {
 	return eff, len(raw), nil
 }
 
-// peelSidecar decodes a KeyTips' inline closure into engine-installable
-// effects. An envelope that fails to peel is skipped with a warning — the
-// install walk fetches it like any other straggler.
-func (cs *CloudSync) peelSidecar(kt *dp.KeyTips) []effects.CloudEffect {
-	closure := kt.GetClosure()
-	if len(closure) == 0 {
+// cloudTips converts cloud wire references without growing an intermediate slice.
+func cloudTips(refs []*dp.EffectRef) []effects.Tip {
+	if len(refs) == 0 {
 		return nil
 	}
 
-	sidecar := make([]effects.CloudEffect, 0, len(closure))
+	tips := make([]effects.Tip, len(refs))
+	for i, ref := range refs {
+		tips[i] = effects.Tip{ref.GetNodeId(), ref.GetOffset()}
+	}
+
+	return tips
+}
+
+// appendSidecar decodes a KeyTips' inline closure into engine-installable
+// effects. An envelope that fails to peel is skipped with a warning — the
+// install walk fetches it like any other straggler.
+func (cs *CloudSync) appendSidecar(sidecar []effects.CloudEffect, kt *dp.KeyTips) []effects.CloudEffect {
+	closure := kt.GetClosure()
+	start := len(sidecar)
+
+	sidecar = slices.Grow(sidecar, len(closure))
 	for _, env := range closure {
 		eff, protoLen, err := cs.peelEnvelope(env)
 		if err != nil {
@@ -368,7 +374,7 @@ func (cs *CloudSync) peelSidecar(kt *dp.KeyTips) []effects.CloudEffect {
 		})
 	}
 
-	cloudSidecarEffectsTotal.Add(float64(len(sidecar)))
+	cloudSidecarEffectsTotal.Add(float64(len(sidecar) - start))
 
 	return sidecar
 }

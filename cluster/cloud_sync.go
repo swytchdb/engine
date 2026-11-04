@@ -560,14 +560,7 @@ func (cs *CloudSync) nextEnvelope() (*dp.Effect, bool) {
 			// drop cloud durability for an effect the cluster still owes it.
 			slog.Error("cloud sync: envelope build failed, will retry",
 				"tip", tip, "error", err)
-			time.AfterFunc(cloudNackRetry, func() {
-				cs.mu.Lock()
-				if _, ok := cs.pending[tip]; ok {
-					cs.sendQ = append(cs.sendQ, tip)
-				}
-				cs.mu.Unlock()
-				cs.wakeSender()
-			})
+			cs.retryUpload(tip)
 
 			continue
 		}
@@ -630,6 +623,12 @@ func (cs *CloudSync) handleAck(ack *dp.WriteAck) {
 	cloudEffectsNackedTotal.Inc()
 	slog.Warn("cloud sync: cloud failed to store effect, will retry",
 		"tip", tip, "error", ack.GetError())
+	cs.retryUpload(tip)
+}
+
+// retryUpload schedules another attempt only if the outbox still owns the tip.
+// A successful ACK can retire it while the retry timer is pending.
+func (cs *CloudSync) retryUpload(tip effects.Tip) {
 	time.AfterFunc(cloudNackRetry, func() {
 		cs.mu.Lock()
 		if _, ok := cs.pending[tip]; ok {
