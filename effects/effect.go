@@ -157,24 +157,31 @@ type Engine struct {
 	// memory governor (see startMemoryGovernor), not the pool itself.
 	effectCache *VertexPool
 
-	// Memory governor lifecycle (RSS-driven below-LCA sweeps).
+	// Memory governor lifecycle (owned-capacity eviction).
 	memGovStop chan struct{}
 	memGovWg   sync.WaitGroup
 
 	// memTarget is the resolved byte budget the governor holds the pool under
 	// (0 = unbounded). Exposed via MemoryTarget for heartbeat telemetry.
-	memTarget int64
+	memTarget       int64
+	cacheTarget     int64
+	goMemoryLimit   int64
+	cachedDagBytes  atomic.Int64
+	subscriberBytes atomic.Int64
+	memWake         chan struct{}
+	reclaimMu       sync.Mutex
+	keyMemoryMu     sync.Mutex
+	keyOwners       map[string]keyOwner
+	keyHighWater    int
+	keyBytes        int64
 
 	// compressValues makes Emit store data values zstd-compressed inside the
 	// effect (--compress). Write-side only: reading inflates unconditionally,
 	// driven by the per-effect flag, never by this setting.
 	compressValues bool
 
-	// evictBudget is the number of keys the governor wants evicted, computed each
-	// tick from the live-heap overage. The write path drains it inline (see
-	// drainEvictBudget) so insertion is back-pressured by eviction — you cannot
-	// add faster than you make room. The governor drains any leftover for the
-	// idle/low-write case. Zero means at/under target: writes evict nothing.
+	// evictBudget is the current background batch's remaining key count.
+	// The governor drains references and remeasures ownership between batches.
 	evictBudget atomic.Int64
 
 	// releaseItems defers cold-evicted keys' creation-ref chain walk
@@ -182,9 +189,8 @@ type Engine struct {
 	// tip synchronously (the act that bounds memory) and enqueues the key here;
 	// the expensive resident-chain walk that releases its refs is bookkeeping the
 	// governor drains at the top of each reclaimUnreferenced, then frees the
-	// now-refs-0 vertices in the same pass — so memory frees on the same tick it
-	// would have, with the walk off the write/read latency path. Many write-path
-	// drains enqueue, the single governor consumes.
+	// now-refs-0 vertices in the same pass. The governor then remeasures owned
+	// bytes before choosing another batch. The walk stays off the command path.
 	//
 	// This is deliberately a mutex+slice pair and NOT xsync's UMPSCQueue: that
 	// queue never zeroes a dequeued slot and pools consumed segments fully
@@ -257,6 +263,7 @@ type Engine struct {
 // subscriptionState tracks a subscription's readiness.
 // The ready channel is closed once bootstrapping completes.
 type subscriptionState struct {
+	ownedKey   bool
 	ready      chan struct{}
 	incomplete atomic.Bool // true if bootstrap saw unreachable effects
 	closeOnce  sync.Once   // guards close(ready)
@@ -407,6 +414,7 @@ func newEngine(cfg EngineConfig) *Engine {
 		spokenBinds:        clox.NewCloxCache[Tip, *spokenBindHistory](clox.ConfigFromCapacity(8192)),
 		compressValues:     cfg.CompressValues,
 	}
+	e.configureIndexKeyOwnership()
 
 	// Creation refs are seeded at PutSized (one per tipset a vertex occupies) and
 	// released by the key-removal walk (releaseChainRefs) on eviction/flush; read
@@ -414,11 +422,8 @@ func newEngine(cfg EngineConfig) *Engine {
 	// is needed — a superseded tip stays reachable and must keep its ref, so the
 	// only refcount signals are creation, adoption, and whole-key removal.
 
-	// Memory governor: keep process RSS near the target. Under pressure it
-	// first reclaims refs-0 vertices (below-LCA / orphans), then evicts cold
-	// keys whose active state still exceeds the budget. Percent-based uses a
-	// fraction of available memory; absolute uses the exact byte budget from
-	// --maxmemory. The governor also sets GOMEMLIMIT so the GC cooperates.
+	// Resolve the owned-cache budget. Go's collector limit and runtime heap
+	// observations are independent of the cache eviction threshold.
 	var memTarget int64
 	if cfg.MemoryLimitPercent > 0 && cfg.MemoryLimitPercent <= 1.0 {
 		memTarget = int64(float64(clox.GetAvailableMemory()) * cfg.MemoryLimitPercent)
@@ -527,11 +532,23 @@ func (e *Engine) addPeerSubscriber(key string, peer pb.NodeID) {
 	}
 
 	ls.subMu.Lock()
+	if ls.subdag.Load() == evictedSubdag {
+		ls.subMu.Unlock()
+
+		return
+	}
+
 	if ls.subscribers == nil {
 		ls.subscribers = make(map[pb.NodeID]struct{})
 	}
 
 	ls.subscribers[peer] = struct{}{}
+	if len(ls.subscribers) > ls.subscriberHighWater {
+		ls.subscriberHighWater = len(ls.subscribers)
+		cost := subscriberMapBytes(ls.subscriberHighWater)
+		e.subscriberBytes.Add(cost - ls.subscriberBytes)
+		ls.subscriberBytes = cost
+	}
 	ls.subMu.Unlock()
 }
 
@@ -2613,9 +2630,10 @@ func (e *Engine) prefetchEffects(refs []Tip) {
 // evictedKey is a cold-evicted key queued for deferred creation-ref release; see
 // Engine.releaseItems.
 type evictedKey struct {
-	key  string
-	tips []Tip
-	ls   *leafState
+	key      string
+	tips     []Tip
+	ls       *leafState
+	ownedKey bool
 }
 
 func (e *Engine) onLeafEvicted(key string, tips []Tip, ls *leafState) {
@@ -2628,8 +2646,9 @@ func (e *Engine) onLeafEvicted(key string, tips []Tip, ls *leafState) {
 	// must not sit on the write/read latency path that triggered this eviction.
 	// The governor drains releaseItems at the top of reclaimUnreferenced, so the
 	// vertices still free on the same tick.
+	key = e.retainKey(key)
 	e.releaseMu.Lock()
-	e.releaseItems = append(e.releaseItems, evictedKey{key: key, tips: tips, ls: ls})
+	e.releaseItems = append(e.releaseItems, evictedKey{key: key, tips: tips, ls: ls, ownedKey: true})
 	e.releaseMu.Unlock()
 
 	// Count the real cold-key eviction here (once per victim) — the bounded
@@ -2664,10 +2683,18 @@ func (e *Engine) releaseChainRefs(key string, tips []Tip, ls *leafState) {
 	// flush) a no-op.
 	if ls != nil {
 		if cs := ls.subdag.Swap(evictedSubdag); cs != nil && cs != evictedSubdag {
+			e.cachedDagBytes.Add(-cs.bytes)
+
 			for _, tip := range cs.topoOrder {
 				e.effectCache.decref(tip)
 			}
 		}
+
+		ls.subMu.Lock()
+		e.subscriberBytes.Add(-ls.subscriberBytes)
+		ls.subscriberBytes = 0
+		ls.subscribers = nil
+		ls.subMu.Unlock()
 	}
 
 	visited := make(map[Tip]struct{}, len(tips)*8)
@@ -2759,7 +2786,7 @@ func (e *Engine) broadcastUnsubscribe(key string, tips []Tip) {
 		}
 	}
 
-	e.subscriptions.Delete(key)
+	e.dropSubscription(key)
 	slog.Debug("onLeafEvicted: evicted cold key", "key", key)
 }
 

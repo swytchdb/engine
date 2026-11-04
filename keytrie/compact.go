@@ -238,11 +238,19 @@ func (c *Critbit[T]) relocateLeaf(old *critNode[T]) bool {
 
 	n2, ci := c.leafArena.alloc() // born deleted=true via the arena init hook
 	n2.chunkIdx = ci
+
 	n2.key = old.key
+	if c.retainKey != nil {
+		n2.key = c.retainKey(n2.key)
+	}
+
 	n2.pinned = old.pinned
 	n2.pins.Store(old.pins.Load())
 	n2.tips.Store(old.tips.Load())
 	n2.data.Store(old.data.Load())
+	// Transfer the shared tips/payload charge; the husk remains read-safe.
+	c.leafArena.addExtra(ci, c.keyBytes(n2.key)+tipSetBytes(n2.tips.Load())+payloadBytes(n2.data.Load()))
+	c.releaseLeafMemory(old, old.tips.Load(), old.data.Load())
 	n2.freq.Store(old.freq.Load())
 	n2.lastAccess.Store(old.lastAccess.Load())
 	// Publish before splicing: unreachable until the splice, and the write lock

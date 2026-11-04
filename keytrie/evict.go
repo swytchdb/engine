@@ -361,6 +361,7 @@ func (c *Critbit[T]) EvictBatch(want int) int {
 		data := leaf.data.Load()
 		leaf.tips.Store(nil)
 		leaf.data.Store(nil)
+		c.releaseLeafMemory(leaf, tips, data)
 		c.size.Add(-1)
 		// At ghost capacity, trim the oldest existing ghost to make room BEFORE
 		// ghosting the fresh victim. The order is load-bearing: the victim was
@@ -418,6 +419,7 @@ func (c *Critbit[T]) EvictBatch(want int) int {
 			data := fbVictim.data.Load()
 			fbVictim.tips.Store(nil)
 			fbVictim.data.Store(nil)
+			c.releaseLeafMemory(fbVictim, tips, data)
 			c.size.Add(-1)
 			c.deletedCount.Add(1)
 			c.enqueueReap(fbVictim)

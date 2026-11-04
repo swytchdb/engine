@@ -1011,11 +1011,8 @@ func (c *Context) Flush() error {
 		defer flushSpan.End()
 	}
 
-	// Back-pressure once per command, not once per effect: the effects were
-	// already pooled during Emit, so a command that wrote N effects (e.g. value +
-	// type-tag, or a read that also compacted) pays a single bounded eviction
-	// slice here instead of N. The drain itself is cheap — it drops victim tips and
-	// defers their ref-release walk to the governor (see Engine.releaseItems).
+	// Wake the governor once per command. Eviction, deferred reference release,
+	// and remeasurement run together in the background, independently of GC.
 	var err error
 	if !c.inTx {
 		err = c.flushNonTx()

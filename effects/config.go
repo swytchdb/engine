@@ -51,11 +51,10 @@ type EngineConfig struct {
 	RTTProvider   PeerRTTProvider // nil disables RTT-based leader selection
 	DefaultMode   SafetyMode
 	KeyRangeRules []KeyRangeRule
-	MemoryLimit   int64 // memory budget for effect cache (0 = 10MB default)
+	MemoryLimit   int64 // owned resident cache budget (0 = unbounded)
 	// MemoryLimitPercent, when non-zero, expresses the cache budget as a
 	// fraction (0,1] of the memory available to this process. Takes
-	// precedence over MemoryLimit. The cache enforces this via a live
-	// re-evaluating tick so cgroup/system changes propagate.
+	// precedence over MemoryLimit. Available memory is resolved at startup.
 	MemoryLimitPercent float64
 	// CompressValues makes this node store data values zstd-compressed inside
 	// the effects it emits, trading decompression on read for more resident

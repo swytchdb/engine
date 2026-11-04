@@ -169,7 +169,8 @@ type Critbit[T any] struct {
 	// consumer could re-enter.
 	refDelta func(added, removed []EffectRef, droppedData *T)
 
-	initOnce sync.Once
+	initOnce  sync.Once
+	retainKey func(string) string
 	// Two arenas of the same node type — leaves and internal nodes never migrate
 	// between roles (isLeaf is set at alloc and never flipped), so a node born in
 	// one arena dies there. Splitting them lets the eviction sweep scan only the
@@ -216,6 +217,7 @@ type arenaChunkList[T any] struct {
 	chunks      [][]T
 	reaped      []*atomic.Int64
 	outstanding []*atomic.Int64
+	extra       []*atomic.Int64
 }
 
 type critbitArena[T any] struct {
@@ -241,6 +243,7 @@ type critbitArena[T any] struct {
 	// every slot, so the eviction sweep (which scans the arena directly) skips a
 	// slot until allocLeafNode + Insert have written and published a real leaf.
 	initNode func(*T)
+	dropNode func(*T)
 }
 
 func (a *critbitArena[T]) init(chunkSize int, initNode func(*T)) {
@@ -346,6 +349,14 @@ func (a *critbitArena[T]) dropChunk(chunkIdx uint32) {
 	newChunks := make([][]T, len(list.chunks))
 	copy(newChunks, list.chunks)
 
+	if a.dropNode != nil {
+		for i := range list.chunks[chunkIdx] {
+			a.dropNode(&list.chunks[chunkIdx][i])
+		}
+	}
+
+	list.extra[chunkIdx].Store(0)
+
 	if a.freeCount.Load()+int64(a.chunkSize) <= int64(a.freeCap) {
 		fresh := make([]T, a.chunkSize)
 		if a.initNode != nil {
@@ -359,7 +370,7 @@ func (a *critbitArena[T]) dropChunk(chunkIdx uint32) {
 		list.outstanding[chunkIdx].Store(int64(a.chunkSize))
 		// Publish the fresh chunk before its slots become reachable via the free
 		// list, so a concurrent alloc that dequeues an index sees the new array.
-		a.list.Store(&arenaChunkList[T]{chunks: newChunks, reaped: list.reaped, outstanding: list.outstanding})
+		a.list.Store(&arenaChunkList[T]{chunks: newChunks, reaped: list.reaped, outstanding: list.outstanding, extra: list.extra})
 
 		base := uint64(chunkIdx) * a.chunkSize
 		for i := uint64(0); i < a.chunkSize; i++ {
@@ -372,7 +383,7 @@ func (a *critbitArena[T]) dropChunk(chunkIdx uint32) {
 	}
 
 	newChunks[chunkIdx] = nil
-	a.list.Store(&arenaChunkList[T]{chunks: newChunks, reaped: list.reaped, outstanding: list.outstanding})
+	a.list.Store(&arenaChunkList[T]{chunks: newChunks, reaped: list.reaped, outstanding: list.outstanding, extra: list.extra})
 }
 
 func (a *critbitArena[T]) grow(needed uint64) {
@@ -397,13 +408,24 @@ func (a *critbitArena[T]) grow(needed uint64) {
 		newOutstanding := make([]*atomic.Int64, len(list.outstanding)+1)
 		copy(newOutstanding, list.outstanding)
 		newOutstanding[len(list.outstanding)] = &atomic.Int64{}
-		list = &arenaChunkList[T]{chunks: newChunks, reaped: newReaped, outstanding: newOutstanding}
+		newExtra := make([]*atomic.Int64, len(list.extra)+1)
+		copy(newExtra, list.extra)
+		newExtra[len(list.extra)] = &atomic.Int64{}
+		list = &arenaChunkList[T]{chunks: newChunks, reaped: newReaped, outstanding: newOutstanding, extra: newExtra}
 		a.list.Store(list)
 	}
 }
 
 func (a *critbitArena[T]) clear() {
 	a.growMu.Lock()
+	if a.dropNode != nil {
+		for _, chunk := range a.list.Load().chunks {
+			for i := range chunk {
+				a.dropNode(&chunk[i])
+			}
+		}
+	}
+
 	a.list.Store(&arenaChunkList[T]{})
 	a.next.Store(0)
 	// Drain stale recycled indices: they point into chunks the reset just dropped,
@@ -455,7 +477,13 @@ func (c *Critbit[T]) enqueueReap(leaf *critNode[T]) {
 func (c *Critbit[T]) allocLeafNode(key string, ts *TipSet) *critNode[T] {
 	n, ci := c.leafArena.alloc() // born deleted=true via the arena init hook
 	n.chunkIdx = ci
+
+	if c.retainKey != nil {
+		key = c.retainKey(key)
+	}
+
 	n.key = key
+	c.leafArena.addExtra(ci, c.keyBytes(key)+tipSetBytes(ts))
 	// A decider returning false means "do not evict" → pinned. When no decider is
 	// installed, no sweep ever runs, so the default false is inert.
 	n.pinned = c.evictDecider != nil && !c.evictDecider(key)
@@ -602,6 +630,8 @@ func (c *Critbit[T]) Insert(key string, old *TipSet, newTips *TipSet) (*TipSet, 
 			}
 
 			if bestLeaf.tips.CompareAndSwap(old, newTips) {
+				c.leafArena.addExtra(bestLeaf.chunkIdx, tipSetBytes(newTips)-tipSetBytes(old))
+
 				if bestLeaf.deleted.CompareAndSwap(true, false) {
 					c.size.Add(1)
 					// A ghost (freq < 0) was never counted as a deleted leaf;
@@ -634,6 +664,8 @@ func (c *Critbit[T]) Insert(key string, old *TipSet, newTips *TipSet) (*TipSet, 
 			}
 
 			if bestLeaf.tips.CompareAndSwap(old, newTips) {
+				c.leafArena.addExtra(bestLeaf.chunkIdx, tipSetBytes(newTips)-tipSetBytes(old))
+
 				if bestLeaf.deleted.CompareAndSwap(true, false) {
 					c.size.Add(1)
 					// A ghost (freq < 0) was never counted as a deleted leaf;
@@ -978,6 +1010,8 @@ func (c *Critbit[T]) LoadOrStoreData(key string, def *T) (*T, bool) {
 	}
 
 	if leaf.data.CompareAndSwap(nil, def) {
+		c.leafArena.addExtra(leaf.chunkIdx, payloadBytes(def))
+
 		return def, false
 	}
 
@@ -1073,6 +1107,7 @@ func (c *Critbit[T]) RemoveTips(key string, refs []EffectRef) {
 
 		newTips := NewTipSet(kept...)
 		if leaf.tips.CompareAndSwap(current, newTips) {
+			c.leafArena.addExtra(leaf.chunkIdx, tipSetBytes(newTips)-tipSetBytes(current))
 			c.reapMu.RUnlock(rt)
 			c.fireTipDelta(current, newTips, nil)
 
@@ -1124,6 +1159,7 @@ func (c *Critbit[T]) DeleteAndSnapshot(key string, old *TipSet) *TipSet {
 	// Drop the leaf payload too — a deleted key's cached state is stale.
 	droppedData := leaf.data.Load()
 	leaf.data.Store(nil)
+	c.releaseLeafMemory(leaf, old, droppedData)
 	c.size.Add(-1)
 
 	c.reapMu.RUnlock(rt)

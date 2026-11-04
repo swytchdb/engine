@@ -28,39 +28,25 @@ import (
 	"log/slog"
 	"math"
 	"runtime/debug"
-	"runtime/metrics"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/puzpuzpuz/xsync/v4"
-	"google.golang.org/protobuf/proto"
 
-	clox "github.com/swytchdb/engine/cache"
 	pb "github.com/swytchdb/engine/cluster/proto"
 	"github.com/swytchdb/engine/durability"
+	"github.com/swytchdb/engine/internal/memsize"
 )
 
-// vertexOverhead approximates the per-entry bookkeeping cost added to the
-// marshalled effect size for byte accounting. The bare structs alone are ~48B
-// (vertex ~24 + Tip key 16 + map value pointer 8), but that ignores heap
-// size-class rounding on the vertex allocation, the xsync.Map bucket/hash
-// overhead per entry, and the in-memory *pb.Effect struct cost (Hlc, Deps/
-// ForkChoiceHash slice headers, the Kind interface) that proto.Size does not
-// capture — dominant for small effects. 96 is a conservative estimate of the
-// total; over-counting makes the governor evict slightly early, which is the
-// safe direction (under-counting lets RSS overshoot the target).
-const vertexOverhead = 96
+// vertexOverhead accounts for the wrapper and conservative concurrent-map slack.
+var vertexOverhead = memsize.Alloc(int64(unsafe.Sizeof(vertex{}))) + 96
 
-// vertex wraps an immutable effect resident in the VertexPool. size is a
-// per-vertex byte estimate (protoLen + vertexOverhead) kept only for reclaim
-// telemetry — it is no longer summed into a pool footprint (Bytes() reads the
-// runtime's live heap instead). refs counts how many DAGs reference this vertex:
-// the tipsets that reach it (one per occupying key, set at PutSized) plus the
-// cached read-subdags that adopted it (publishSubdag). Each tipset ref is
-// released by its key's eviction walk; each subdag ref by the subdag's
-// drop/replace or its leaf's eviction. reclaimUnreferenced frees a vertex only
-// once refs hits zero.
+// vertex wraps an immutable protobuf effect. Shared message allocations are
+// tracked separately; size accounts for this wrapper and its map entry.
+// refs counts creation ownership and cached read-DAG pins. Whole-key eviction
+// releases creation ownership; displacing a read DAG releases its pins.
 type vertex struct {
 	eff  *pb.Effect
 	size int64
@@ -70,8 +56,10 @@ type vertex struct {
 	temporal atomic.Uint32
 	// Creation references belong to individual keys. A positive refs count
 	// alone cannot distinguish ownership from another subdag's adoption pin.
-	creationMu   sync.Mutex
-	creationKeys map[string]struct{}
+	creationMu        sync.Mutex
+	creationKeys      map[string]struct{}
+	creationHighWater int
+	creationBytes     int64
 }
 
 // VertexPool is the engine's deserialized effect store: a map from Tip to
@@ -81,15 +69,15 @@ type vertex struct {
 // Eviction is driven by the engine memory governor, which is the only component
 // that knows a key's active DAG path and can therefore choose safe victims.
 //
-// The pool does NOT meter its own footprint: a protoLen-based sum undercounted
-// each decoded effect graph ~3x and was blind to the off-pool per-key state
-// (subdags, reduced memos, subscriptions) that grows alongside it. Bytes()
-// reports the runtime's exact live heap instead — see Bytes.
+// Bytes reports owned protobuf graphs and pool bookkeeping. The governor also
+// accounts for the trie, cached DAGs and subscription metadata.
 //
 // DAG-reference counting lets eviction drop whole keys and reclaim only the
 // vertices no other key or read still needs; a vertex is referenced by every
 // tipset that reaches it and every cached subdag that adopted it.
 type VertexPool struct {
+	owned       protoMemory
+	vertexBytes atomic.Int64
 	// Set before serving; nil during recovery so restored records are not rewritten.
 	mirror      *durability.Store
 	mirrorLocks [256]sync.Mutex
@@ -149,9 +137,7 @@ func (p *VertexPool) Get(tip Tip) (*pb.Effect, bool) {
 	return v.eff, true
 }
 
-// Put stores eff at tip, computing its accounted size from the proto. Callers
-// that already hold the serialized length — a marshalled buffer on emit, the
-// wire protoData on ingest — should use PutSized to skip the proto.Size walk.
+// Put stores eff at tip and accounts for its resident protobuf allocations.
 //
 // A re-Put of an already-resident tip keeps the existing vertex so its
 // accumulated refcount survives: effects are immutable (a Tip is written once),
@@ -161,17 +147,11 @@ func (p *VertexPool) Get(tip Tip) (*pb.Effect, bool) {
 // resident fast-path reuses the known size on a re-delivery while still taking
 // any missing creation ownership.
 func (p *VertexPool) Put(tip Tip, eff *pb.Effect) error {
-	if v, ok := p.m.Load(tip); ok {
-		return p.PutSized(tip, eff, int(v.size-vertexOverhead))
-	}
-
-	return p.PutSized(tip, eff, proto.Size(eff))
+	return p.PutSized(tip, eff, 0)
 }
 
-// PutSized stores eff at tip using a caller-supplied serialized length, avoiding
-// the proto.Size walk Put would do. protoLen is the marshalled effect size (the
-// length of MarshalEffect's output, or the wire protoData); vertexOverhead is
-// added on top. Re-Put semantics match Put: an already-resident tip is kept.
+// PutSized preserves the serialized-length ingestion API. Owned allocations,
+// rather than wire length, determine the memory charge.
 //
 // A new vertex is born with its creation refcount equal to the number of tipsets
 // it occupies — its "walkable from a tipset" references, one per reaching tip.
@@ -222,10 +202,22 @@ func (p *VertexPool) putSized(tip Tip, eff *pb.Effect, protoLen int, owns func([
 		}
 	}
 
-	nv := &vertex{eff: eff, size: int64(protoLen) + vertexOverhead, creationKeys: keys}
-	nv.refs.Store(int32(len(keys)))
+	v, loaded := p.m.Load(tip)
+	if !loaded {
+		nv := &vertex{eff: eff, size: vertexOverhead, creationKeys: keys}
+		nv.refs.Store(int32(len(keys)))
+		p.owned.change(eff, 1)
+		p.vertexBytes.Add(nv.size)
+		p.accountCreation(nv)
 
-	if v, loaded := p.m.LoadOrStore(tip, nv); loaded {
+		v, loaded = p.m.LoadOrStore(tip, nv)
+		if loaded {
+			p.owned.change(eff, -1)
+			p.vertexBytes.Add(-nv.size - nv.creationBytes)
+		}
+	}
+
+	if loaded {
 		v.creationMu.Lock()
 		defer v.creationMu.Unlock()
 
@@ -255,6 +247,8 @@ func (p *VertexPool) putSized(tip Tip, eff *pb.Effect, protoLen int, owns func([
 				v.creationKeys[key] = struct{}{}
 			}
 		}
+
+		p.accountCreation(v)
 	}
 
 	return nil
@@ -273,7 +267,7 @@ func (p *VertexPool) putSized(tip Tip, eff *pb.Effect, protoLen int, owns func([
 // transition unless first adopted (publishSubdag) and then dropped, so it is
 // enqueued as a reclaim candidate at birth — without this an un-adopted cache
 // fetch would never be reclaimed (there is no full-map scan to catch it).
-func (p *VertexPool) PutSizedCache(tip Tip, eff *pb.Effect, protoLen int) error {
+func (p *VertexPool) PutSizedCache(tip Tip, eff *pb.Effect, _ int) error {
 	if p.mirror != nil {
 		lock := &p.mirrorLocks[(tip[0]^tip[1])%256]
 		lock.Lock()
@@ -284,9 +278,19 @@ func (p *VertexPool) PutSizedCache(tip Tip, eff *pb.Effect, protoLen int) error 
 		}
 	}
 
-	nv := &vertex{eff: eff, size: int64(protoLen) + vertexOverhead}
+	if _, loaded := p.m.Load(tip); loaded {
+		return nil
+	}
+
+	nv := &vertex{eff: eff, size: vertexOverhead}
+	p.owned.change(eff, 1)
+	p.vertexBytes.Add(nv.size)
+
 	if _, loaded := p.m.LoadOrStore(tip, nv); !loaded {
 		p.enqueueReclaim(tip)
+	} else {
+		p.owned.change(eff, -1)
+		p.vertexBytes.Add(-nv.size)
 	}
 
 	return nil
@@ -328,6 +332,10 @@ func (p *VertexPool) delete(tip Tip) int64 {
 	}
 
 	p.reclaimed.Add(1)
+	prev.creationMu.Lock()
+	p.vertexBytes.Add(-prev.size - prev.creationBytes)
+	prev.creationMu.Unlock()
+	p.owned.change(prev.eff, -1)
 
 	return prev.size
 }
@@ -346,6 +354,7 @@ func (p *VertexPool) decrefChainNode(key string, tip Tip) (*pb.Effect, bool) {
 	v.creationMu.Lock()
 	if _, owned := v.creationKeys[key]; owned {
 		delete(v.creationKeys, key)
+		p.accountCreation(v)
 		p.decref(tip)
 	}
 	v.creationMu.Unlock()
@@ -481,26 +490,27 @@ func (p *VertexPool) decref(tip Tip) {
 	}
 }
 
-// Bytes returns the process's live heap as marked by the last GC
-// (/gc/heap/live:bytes). This is the exact, total memory signal the governor
-// triggers and sizes eviction on, and it counts everything that grows per key —
-// decoded effect graphs in the pool, off-pool subdags/reduced memos/subscription
-// state, the trie — not just the pool's slice. A protoLen-based pool sum
-// undercounted each decoded graph ~3x and was blind to the off-pool half, so
-// triggering on it let the heap reach 10GB while the pool read 3GB.
-//
-// It deliberately uses /gc/heap/live (live objects only) rather than HeapAlloc
-// (/memory/classes/heap/objects), which is live + not-yet-collected garbage and
-// sawtooths up to the GC goal (~2x live at GOGC=100). Triggering on HeapAlloc
-// fired eviction on the garbage peaks while the true working set was under
-// target. /gc/heap/live updates once per GC cycle — stable between cycles and,
-// under a churning workload, fresh well within the governor's 1s tick. metrics.Read
-// is cheap and non-STW.
+// Bytes estimates the pool's owned capacity, including shared protobuf memory
+// charged once. It changes on ownership transitions without waiting for GC.
 func (p *VertexPool) Bytes() int64 {
-	s := []metrics.Sample{{Name: "/gc/heap/live:bytes"}}
-	metrics.Read(s)
+	return p.owned.residentBytes() + p.vertexBytes.Load() + int64(unsafe.Sizeof(*p))
+}
 
-	return int64(s[0].Value.Uint64())
+// Call with creationMu held, or before publishing a new vertex. Map capacity
+// survives deletions, while removed ownership strings no longer belong to it.
+func (p *VertexPool) accountCreation(v *vertex) {
+	v.creationHighWater = max(v.creationHighWater, len(v.creationKeys))
+
+	var cost int64
+	if v.creationKeys != nil {
+		cost = memsize.Map(v.creationHighWater, 16)
+		for key := range v.creationKeys {
+			cost += memsize.Alloc(int64(len(key)))
+		}
+	}
+
+	p.vertexBytes.Add(cost - v.creationBytes)
+	v.creationBytes = cost
 }
 
 // EntryCount returns the number of resident effects.
@@ -521,42 +531,42 @@ func (p *VertexPool) ColdEvictions() uint64 { return p.coldEvictions.Load() }
 // (below-LCA history and orphans) — storage churn, not cache eviction.
 func (p *VertexPool) Reclaimed() uint64 { return p.reclaimed.Load() }
 
-// startMemoryGovernor launches the background loop that keeps process RSS near
-// targetBytes by sweeping below-LCA effects out of the vertex pool. It also
-// sets GOMEMLIMIT (if unset) so the GC cooperates with the budget, mirroring
-// the prior CloxCache enforcement. targetBytes <= 0 disables enforcement.
-//
-// This is the interim memory-pressure mechanism. It is looser than the old
-// per-Put CloxCache eviction (it reacts on a 1s tick rather than inline),
-// because choosing a safe victim now requires the active-path walk, which is
-// too expensive for the ingest hot path. The tight, per-key bound returns
-// with the sharded eviction policy in a later stage.
+// startMemoryGovernor evicts owned capacity above the configured budget.
+// Go handles collection/scavenging independently of cache policy.
+// targetBytes <= 0 leaves the existing unbounded-cache mode unchanged.
 func (e *Engine) startMemoryGovernor(targetBytes int64) {
 	if targetBytes <= 0 {
 		return
 	}
-	// Eviction is only ever driven by this governor, so install the hooks here
-	// rather than unconditionally: the bounded sweep pins system keys (never a
-	// victim) and hands each evicted cold key's tips + leaf payload to
-	// onLeafEvicted (which releases refs and unsubscribes). Installing the hooks
-	// also activates the trie's per-read eviction bookkeeping, so a node without
-	// a memory target pays none of that read-path cost.
-	e.index.SetEvictHooks(
-		func(key string) bool { return !isSystemKey([]byte(key)) },
-		e.onLeafEvicted,
-		// Live over-target signal: the governor sets evictBudget > 0 each tick it
-		// measures live heap above target, and writers drain it back to 0. This is
-		// the keytrie analogue of CloxCache's instantaneous
-		// entryCount >= capacity check, so a graduation is counted only while
-		// there is genuinely pressure to adapt against.
-		func() bool { return e.evictBudget.Load() > 0 },
-	)
 
-	if cur := debug.SetMemoryLimit(-1); cur == math.MaxInt64 {
-		// Reserve 5% of the target for non-heap memory (stacks, mmap, etc.).
-		debug.SetMemoryLimit(targetBytes * 95 / 100)
-		slog.Debug("vertex pool: set GOMEMLIMIT", "limit", clox.FormatMemory(uint64(targetBytes*95/100)))
+	if targetBytes > 0 {
+		// Eviction is only ever driven by this governor, so install the hooks here
+		// rather than unconditionally: the bounded sweep pins system keys (never a
+		// victim) and hands each evicted cold key's tips + leaf payload to
+		// onLeafEvicted (which releases refs and unsubscribes). Installing the hooks
+		// also activates the trie's per-read eviction bookkeeping, so a node without
+		// a memory target pays none of that read-path cost.
+		e.index.SetEvictHooks(
+			func(key string) bool { return !isSystemKey([]byte(key)) },
+			e.onLeafEvicted,
+			// Graduations count only during an active capacity-eviction batch.
+			func() bool { return e.evictBudget.Load() > 0 },
+		)
+
+		// Preserve the existing default collector setting when GOMEMLIMIT is unset.
+		// Collector pacing must not change the configured eviction threshold.
+		defaultGoLimit := targetBytes / 100 * 95
+
+		e.goMemoryLimit = debug.SetMemoryLimit(-1)
+		if e.goMemoryLimit == math.MaxInt64 {
+			e.goMemoryLimit = defaultGoLimit
+			debug.SetMemoryLimit(e.goMemoryLimit)
+		}
+
+		e.cacheTarget = targetBytes
 	}
+
+	e.memWake = make(chan struct{}, 1)
 
 	e.memGovStop = make(chan struct{})
 
@@ -569,93 +579,102 @@ func (e *Engine) memoryGovernorLoop(targetBytes int64) {
 
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+	// Coalesce write notifications; never scan accounting or walk references
+	// once per write. All reference draining has one background consumer.
+	wakeTimer := time.NewTimer(time.Hour)
+
+	wakeTimer.Stop()
+	defer wakeTimer.Stop()
+
+	var wake <-chan time.Time
 
 	for {
 		select {
 		case <-e.memGovStop:
 			return
+		case <-e.memWake:
+			if wake == nil {
+				wakeTimer.Reset(50 * time.Millisecond)
+				wake = wakeTimer.C
+			}
+
+			continue
+		case <-wake:
+			wake = nil
 		case <-ticker.C:
-			if r := e.recovery.Load(); r != nil {
-				r.checkMemory(targetBytes)
+		}
 
-				continue
-			}
-			// 1. Drain any budget the write path didn't (idle / low write rate), so
-			//    a quiet node still converges to target. Each eviction only drops the
-			//    victim's tip and queues its ref-release walk (releaseItems) — the
-			//    walk runs in step 2, off the latency path.
-			e.drainEvictBudget(maxDrainPerTick)
-			// 2. Reclaim, entirely off the candidate queue — no full-map scan, at
-			//    any pressure level. Run the deferred ref-release walks for every key
-			//    evicted since the last tick (inline back-pressure evictions plus the
-			//    drain above), then free the vertices those walks and concurrent
-			//    reads drove to refs==0. Every path to refs==0 enqueues, so the queue
-			//    is the complete set of reclaimable vertices. Reclaiming before
-			//    measuring keeps Bytes() on the true working set (below-LCA history /
-			//    orphans the GC still marks live are freed here first).
+		if r := e.recovery.Load(); r != nil {
+			r.checkMemory(targetBytes)
+
+			continue
+		}
+
+		if targetBytes > 0 {
+			e.evictToTarget(e.cacheTarget)
+		} else {
 			e.reclaimUnreferenced()
-			// 3. Re-measure and set the deficit for the write path to drain over the
-			//    next second as back-pressure. If we are still over target after
-			//    draining every reclaimable vertex, the live working set genuinely
-			//    exceeds the budget: evict cold keys. Their chain release re-enqueues
-			//    their vertices, which the next tick's drain frees — sustained
-			//    pressure converges through the queue, never through a full scan.
-			//    Sized as overage / true per-key footprint (live heap / live keys).
-			live := e.effectCache.Bytes()
-
-			over := live - targetBytes
-			if over <= 0 {
-				e.evictBudget.Store(0)
-
-				continue
-			}
-
-			keys := e.index.Size()
-			if keys == 0 {
-				e.evictBudget.Store(0)
-
-				continue
-			}
-
-			avgPerKey := max(live/keys, 64)
-			// Round a positive deficit up to at least one key: an overage
-			// smaller than avgPerKey would otherwise divide to a zero budget
-			// and park the node permanently over target.
-			e.evictBudget.Store(min(max(over/avgPerKey, 1), maxDrainPerTick))
 		}
 	}
 }
 
-// evictBatchSize is how many keys one EvictBatch call harvests per sweep when the
-// governor drains in bulk. Inline write-path drains use a much smaller cap.
-const evictBatchSize = 4096
+// evictToTarget uses ownership/capacity accounting only. Each bounded batch
+// drains deferred releases before measuring again; GC timing cannot repeat a
+// deficit that logical reclamation has already satisfied.
+func (e *Engine) evictToTarget(target int64) MemoryStats {
+	e.reclaimUnreferenced()
 
-// inlineEvictCap bounds how many keys a single write may evict while draining the
-// budget, so back-pressure stays a steady per-insert tax rather than an
-// occasional multi-thousand-key latency spike on one unlucky write.
-const inlineEvictCap = 8
+	s := e.residentMemory()
+	defer e.evictBudget.Store(0)
+
+	if s.ResidentBytes <= target {
+		return s
+	}
+
+	for remaining := maxDrainPerTick; remaining > 0 && s.ResidentBytes > target; {
+		keys := e.index.Size()
+		if keys == 0 {
+			break
+		}
+
+		avg := max(s.ResidentBytes/keys, 64)
+		want := min(max((s.ResidentBytes-target)/avg, 1), int64(evictBatchSize), int64(remaining))
+		e.evictBudget.Store(want)
+		e.drainEvictBudget(int(want))
+
+		drained := want - e.evictBudget.Load()
+		if drained <= 0 {
+			break // pinned state or the bounded CLOCK window needs another pass
+		}
+
+		remaining -= int(drained)
+
+		e.reclaimUnreferenced()
+		s = e.residentMemory()
+	}
+
+	return s
+}
+
+// evictBatchSize bounds one sweep before the governor releases references and
+// remeasures. It is deliberately independent of the GC cycle.
+const evictBatchSize = 4096
 
 // maxDrainPerTick caps the deficit the governor sets (and bulk-drains) per tick so
 // a runaway overage can't try to evict the whole cache at once; the remainder is
 // re-measured and drained on following ticks.
 const maxDrainPerTick = 1 << 18 // 262144
 
-// backpressure is the write-path hook: an insert over the memory target pays for
-// a small bounded slice of eviction before returning, so insertion throughput is
-// clamped to eviction throughput — you cannot add faster than you make room. A
-// cheap atomic-load no-op in the common under-target case (budget == 0).
+// backpressure coalesces a governor wake after ingest/flush. Eviction and its
+// deferred walks run together in the background. Writes do not wait for GC or
+// for the operating system to reclaim pages.
 func (e *Engine) backpressure() {
-	if e.evictBudget.Load() > 0 {
-		e.drainEvictBudget(inlineEvictCap)
-	}
+	e.wakeMemoryGovernor()
 }
 
 // drainEvictBudget evicts up to maxKeys keys, decrementing the shared evictBudget
-// the governor set from the live-heap overage. It is the single drain path for
-// both the governor (idle case, large maxKeys) and the write path (back-pressure,
-// inlineEvictCap). Concurrent writers share the budget via the atomic, so a burst
-// spreads the eviction work across the inserts causing it — insertion cannot
-// outrun eviction because every insert over budget does the evicting itself.
+// the governor sets from resident capacity. Only the governor drains in serving
+// code, alternating bounded batches with reference release and remeasurement.
 //
 // Stops early when the budget is exhausted (at/under target) or when a sweep finds
 // nothing evictable (all pinned / empty window this pass); the persistent clock
@@ -685,11 +704,8 @@ func (e *Engine) drainEvictBudget(maxKeys int) {
 		e.evictBudget.Add(-int64(n))
 		maxKeys -= n
 	}
-	// Note: no reclaim here. EvictBatch already released each dropped leaf's
-	// tips, subdag, reduced memo, and subscription synchronously (via the
-	// refDelta hook + onLeafEvicted); the now-refs-0 pool vertices are enqueued
-	// as reclaim candidates and freed by the governor's per-tick drain. Reclaim
-	// must never run on the inline write-path drain.
+	// The caller drains deferred chain walks and reclaim candidates before
+	// deciding whether another batch is needed.
 }
 
 // ReleaseQueueDepth returns the number of cold-evicted keys whose deferred
@@ -727,6 +743,10 @@ func (e *Engine) drainPendingReleases() {
 
 	for _, ek := range batch {
 		e.releaseChainRefs(ek.key, ek.tips, ek.ls)
+
+		if ek.ownedKey {
+			e.releaseKey(ek.key)
+		}
 	}
 
 	clear(batch)
@@ -746,6 +766,9 @@ func (e *Engine) drainPendingReleases() {
 // tests, which never start a governor — it requires a memory target) may call
 // it.
 func (e *Engine) reclaimUnreferenced() {
+	e.reclaimMu.Lock()
+	defer e.reclaimMu.Unlock()
+
 	if e.effectCache == nil {
 		return
 	}
@@ -755,6 +778,6 @@ func (e *Engine) reclaimUnreferenced() {
 	total := e.effectCache.drainReclaim()
 	if total > 0 {
 		slog.Debug("vertex pool: reclaimed unreferenced effects",
-			"est_bytes_freed", total, "live_heap", e.effectCache.Bytes())
+			"vertex_overhead_bytes", total, "pool_resident_bytes", e.effectCache.Bytes())
 	}
 }

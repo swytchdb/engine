@@ -138,6 +138,7 @@ func (e *Engine) openDurability(ctx context.Context, dir string, grace time.Dura
 
 		e.index = keytrie.NewCritbit[leafState]()
 		e.effectCache = newVertexPool()
+		e.configureIndexKeyOwnership()
 		e.evictBudget.Store(0)
 		e.ownKeyFilter = CuckooChain{}
 		e.ownFilterVer = 0

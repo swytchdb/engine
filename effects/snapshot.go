@@ -35,8 +35,10 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
+	"github.com/swytchdb/engine/internal/memsize"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -104,8 +106,10 @@ type leafState struct {
 	// is evicted; a departed peer's stale id is filtered against current
 	// membership at broadcast time (collectSubscribers), so no eager scrub on
 	// peer removal is needed. Guarded by subMu; lazily allocated.
-	subMu       sync.Mutex
-	subscribers map[pb.NodeID]struct{}
+	subMu               sync.Mutex
+	subscribers         map[pb.NodeID]struct{}
+	subscriberHighWater int
+	subscriberBytes     int64
 }
 
 // reducedResult is a cached materialized read keyed on the exact tip set it was
@@ -137,6 +141,7 @@ type reducedResult struct {
 // that raced reclaim silently no-op'd), accumulating gigabytes of heap-live
 // effects invisible to vertex_count and unreachable by eviction.
 type cachedDag struct {
+	bytes     int64
 	tips      []Tip
 	topoOrder []Tip
 	lcaTip    Tip
@@ -350,9 +355,12 @@ func (e *Engine) publishSubdag(ls *leafState, d *dag, tips []Tip) {
 		topoOrder: d.topoOrder,
 		lcaTip:    d.lcaTip,
 	}
+	cs.bytes = memsize.Alloc(int64(unsafe.Sizeof(*cs))) + memsize.Alloc(int64(cap(cs.tips))*16) + memsize.Alloc(int64(cap(cs.topoOrder))*16)
+	e.cachedDagBytes.Add(cs.bytes)
 
 	old := ls.subdag.Load()
 	if old == evictedSubdag || !ls.subdag.CompareAndSwap(old, cs) {
+		e.cachedDagBytes.Add(-cs.bytes)
 		// Leaf evicted, or another builder won: roll back our pin. In the
 		// eviction case releaseChainRefs already swept this leafState — a
 		// publish here would pin vertices no release walk will ever visit.
@@ -369,6 +377,10 @@ func (e *Engine) publishSubdag(ls *leafState, d *dag, tips []Tip) {
 		for _, tip := range old.topoOrder {
 			e.effectCache.decref(tip)
 		}
+	}
+
+	if old != nil {
+		e.cachedDagBytes.Add(-old.bytes)
 	}
 }
 
@@ -843,10 +855,12 @@ func (e *Engine) ensureSubscribedMode(key string, allowAsync bool) error {
 	// buffer. A new subscription outlives that command, so own the map/trie key
 	// before publishing any state. The already-subscribed path above remains
 	// allocation-free.
-	ownedKey := strings.Clone(key)
+	ownedKey := e.retainKey(key)
 
-	state := &subscriptionState{ready: make(chan struct{})}
+	state := &subscriptionState{ready: make(chan struct{}), ownedKey: true}
 	if existing, loaded := e.subscriptions.LoadOrStore(ownedKey, state); loaded {
+		e.releaseKey(ownedKey)
+
 		return e.awaitSubscription(existing, unsafe)
 	}
 
@@ -876,7 +890,7 @@ func (e *Engine) ensureSubscribedMode(key string, allowAsync bool) error {
 	if err != nil {
 		// Marshal failure is a code bug; remove state so a fresh call
 		// retries from scratch and concurrent waiters re-bootstrap.
-		e.subscriptions.Delete(ownedKey)
+		e.dropSubscription(ownedKey)
 		state.markFailed()
 
 		return err
@@ -886,7 +900,7 @@ func (e *Engine) ensureSubscribedMode(key string, allowAsync bool) error {
 
 	if e.effectCache != nil {
 		if err := e.effectCache.PutSized(offset, eff, len(data)); err != nil {
-			e.subscriptions.Delete(ownedKey)
+			e.dropSubscription(ownedKey)
 			state.markFailed()
 
 			return err
@@ -1025,7 +1039,7 @@ done:
 	// also surface ErrBootstrapIncomplete. UnsafeMode skips the gate:
 	// there is no majority to protect, only branches to merge.
 	if !unsafe && !e.broadcaster.InMajorityPartition() {
-		e.subscriptions.Delete(ownedKey)
+		e.dropSubscription(ownedKey)
 		state.markFailed()
 
 		return ErrRegionPartitioned
@@ -1258,7 +1272,7 @@ func (e *Engine) retryBootstrap(key string, state *subscriptionState, nackTips [
 
 	slog.Warn("retryBootstrap: giving up, clearing subscription for re-bootstrap",
 		"key", key, "tips", len(nackTips))
-	e.subscriptions.Delete(key)
+	e.dropSubscription(key)
 	state.markFailed()
 }
 
