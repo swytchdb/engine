@@ -467,7 +467,7 @@ func (c *Context) getSnapshotFromTx(key string) (*pb.ReducedEffect, []Tip, error
 
 	tipOffsets := c.engine.resolveTipDeps(snapshotTips)
 
-	tipOffsets = append(append([]Tip(nil), tipOffsets...), c.txSnapshot.views[key].anchors[key]...)
+	tipOffsets = slices.Concat(tipOffsets, c.txSnapshot.views[key].anchors[key])
 
 	var result *pb.ReducedEffect
 	if len(tipOffsets) != 0 {
@@ -1537,7 +1537,7 @@ func (c *Context) flushTx() error {
 			// chance to commit it.
 			slog.Debug("flushTx: no subscribers, committing immediately",
 				"bind_offset", bindOffset)
-			commitPendingTxn(ptxn)
+			ptxn.finish(txnStateCommitted)
 		} else {
 			// Peers exist — bind stays invisible until we finish processing
 			// peer responses and explicitly call MakeVisible (commit) or
@@ -1636,7 +1636,7 @@ func (c *Context) flushTx() error {
 								"detail_is_bind", detail.GetIsBind(),
 								"detail_is_data", detail.GetIsData(),
 								"detail_is_tx", detail.GetIsTransactional())
-							abortPendingTxn(ptxn)
+							ptxn.finish(txnStateAborted)
 
 							break
 						}
@@ -1660,8 +1660,8 @@ func (c *Context) flushTx() error {
 						"bind_offset", bindOffset,
 						"responses", responseCount,
 						"subscribers", len(subscribers))
-					markPendingTxnAmbiguous(ptxn)
-				} else if commitPendingTxn(ptxn) {
+					ptxn.finish(txnStateAmbiguous)
+				} else if ptxn.finish(txnStateCommitted) {
 					slog.Debug("flushTx: all subscribers responded, committed",
 						"bind_offset", bindOffset,
 						"subscribers", len(subscribers))
@@ -1740,7 +1740,7 @@ func (c *Context) flushTx() error {
 		}
 	} else {
 		// Standalone: commit immediately
-		commitPendingTxn(ptxn)
+		ptxn.finish(txnStateCommitted)
 	}
 
 	// Step 6: Process result

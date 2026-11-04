@@ -137,8 +137,7 @@ func tipsEqual(a, b []Tip) bool {
 	}
 
 	for _, x := range a {
-		found := slices.Contains(b, x)
-		if !found {
+		if !slices.Contains(b, x) {
 			return false
 		}
 	}
@@ -1148,7 +1147,6 @@ func (e *Engine) reconstructWithView(key string, tips []Tip, txID string, waitFo
 		crossKeyWalked   int
 		d                *dag
 		err              error
-		expandKeys       map[string]struct{}
 		bindsByKey       map[string][]Tip
 		snapshotVerdicts verdictMap
 		atomicallyLost   map[string]struct{}
@@ -1187,10 +1185,10 @@ func (e *Engine) reconstructWithView(key string, tips []Tip, txID string, waitFo
 		resultFromSnapshot = false
 
 		if view != nil {
-			expandKeys, snapshotVerdicts = view.keys, view.verdicts
+			bindsByKey, snapshotVerdicts = view.anchors, view.verdicts
 			atomicallyLost, crossKeyWalked = view.lost, view.walked
 		} else {
-			expandKeys, bindsByKey, snapshotVerdicts, err = e.bindKeyClosure(key)
+			bindsByKey, snapshotVerdicts, err = e.bindKeyClosure(key)
 			if err != nil {
 				return nil, 0, err
 			}
@@ -1203,7 +1201,7 @@ func (e *Engine) reconstructWithView(key string, tips []Tip, txID string, waitFo
 				}
 			}
 
-			for k := range expandKeys {
+			for k := range bindsByKey {
 				losers, walked := e.losersOnKey(k, bindsByKey[k], snapshotVerdicts)
 				if k != key {
 					crossKeyWalked += walked
@@ -1216,9 +1214,9 @@ func (e *Engine) reconstructWithView(key string, tips []Tip, txID string, waitFo
 		}
 
 		if slog.Default().Enabled(context.Background(), slog.LevelDebug) &&
-			(len(expandKeys) > 1 || len(atomicallyLost) > 0 || len(snapshotVerdicts) > 0) {
-			closure := make([]string, 0, len(expandKeys))
-			for k := range expandKeys {
+			(len(bindsByKey) > 1 || len(atomicallyLost) > 0 || len(snapshotVerdicts) > 0) {
+			closure := make([]string, 0, len(bindsByKey))
+			for k := range bindsByKey {
 				closure = append(closure, k)
 			}
 
@@ -1478,12 +1476,13 @@ func (e *Engine) reconstructWithView(key string, tips []Tip, txID string, waitFo
 // surface as a winner. Failing the read on bootstrap error is correct:
 // we can't reconstruct K without authoritative state on K'.
 //
-// bindsByKey[K'] is the set of bind envelope offsets discovered during
+// The returned map contains every closure key, with nil anchors when none
+// were discovered. bindsByKey[K'] is the set of bind envelope offsets found during
 // the closure walk. Callers pass these as extra starting tips to
 // losersOnKey(K') so the per-key walk reaches those binds even when an
 // intervening snapshot on K' would otherwise truncate the walk before
 // them.
-func (e *Engine) bindKeyClosure(startKey string) (map[string]struct{}, map[string][]Tip, verdictMap, error) {
+func (e *Engine) bindKeyClosure(startKey string) (map[string][]Tip, verdictMap, error) {
 	return e.bindKeyClosureFrom([]string{startKey}, func(key string) ([]Tip, error) {
 		if err := e.ensureSubscribed(key); err != nil {
 			return nil, err
@@ -1496,8 +1495,7 @@ func (e *Engine) bindKeyClosure(startKey string) (map[string]struct{}, map[strin
 // bindKeyClosureFrom shares the same traversal between live single-key reads
 // and batch reads with a captured frontier. Batch reads require every branch
 // to be available before deciding which transactions survive.
-func (e *Engine) bindKeyClosureFrom(startKeys []string, tipsFor func(string) ([]Tip, error), strict bool) (map[string]struct{}, map[string][]Tip, verdictMap, error) {
-	keys := make(map[string]struct{})
+func (e *Engine) bindKeyClosureFrom(startKeys []string, tipsFor func(string) ([]Tip, error), strict bool) (map[string][]Tip, verdictMap, error) {
 	bindsByKey := make(map[string][]Tip)
 
 	var queue []string
@@ -1505,7 +1503,7 @@ func (e *Engine) bindKeyClosureFrom(startKeys []string, tipsFor func(string) ([]
 	queued := make(map[string]bool)
 	for _, key := range startKeys {
 		if !queued[key] {
-			keys[key] = struct{}{}
+			bindsByKey[key] = nil
 			queue = append(queue, key)
 			queued[key] = true
 		}
@@ -1530,11 +1528,10 @@ func (e *Engine) bindKeyClosureFrom(startKeys []string, tipsFor func(string) ([]
 
 		frontier, err := tipsFor(k)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, err
 		}
 
-		stack := append([]Tip(nil), frontier...)
-		stack = append(stack, bindsByKey[k]...)
+		stack := slices.Concat(frontier, bindsByKey[k])
 		// Tolerant traversal: dag.walk errors on the first unfetchable
 		// dep, which would truncate closure expansion. For closure
 		// discovery we only need to find binds reachable from tips,
@@ -1556,7 +1553,7 @@ func (e *Engine) bindKeyClosureFrom(startKeys []string, tipsFor func(string) ([]
 			eff, err := e.getEffect(k, t)
 			if err != nil {
 				if strict {
-					return nil, nil, nil, err
+					return nil, nil, err
 				}
 
 				continue
@@ -1582,8 +1579,6 @@ func (e *Engine) bindKeyClosureFrom(startKeys []string, tipsFor func(string) ([]
 							queued[other] = true
 						}
 					}
-
-					keys[other] = struct{}{}
 				}
 				// Bind dep: same-key NewTip.
 				for ref := range keyDeps(k, eff) {
@@ -1615,7 +1610,7 @@ func (e *Engine) bindKeyClosureFrom(startKeys []string, tipsFor func(string) ([]
 		}
 	}
 
-	return keys, bindsByKey, verdicts, nil
+	return bindsByKey, verdicts, nil
 }
 
 // losersOnKey returns the txnIDs of binds on `key` that lost fork choice,
@@ -1783,45 +1778,41 @@ func (e *Engine) losersOnKeyAt(key string, tips, extraTips []Tip, snapshotVerdic
 	// Fetches via e.getEffect (CloxCache-backed) instead of holding a
 	// separate nodes map during discovery.
 	ancestorsOf := make(map[Tip]map[Tip]struct{})
-	buildAncestors := func(start Tip) map[Tip]struct{} {
-		if cached, ok := ancestorsOf[start]; ok {
-			return cached
-		}
-
-		seen := make(map[Tip]struct{})
-		seen[start] = struct{}{}
-
-		stack := []Tip{start}
-		for len(stack) > 0 {
-			cur := stack[len(stack)-1]
-			stack = stack[:len(stack)-1]
-
-			eff, err := e.getEffect(key, cur)
-			if err != nil {
-				continue
-			}
-
-			for _, dep := range eff.GetDeps() {
-				dt := r(dep)
-				if _, dup := seen[dt]; dup {
-					continue
-				}
-
-				seen[dt] = struct{}{}
-				stack = append(stack, dt)
-			}
-		}
-
-		ancestorsOf[start] = seen
-
-		return seen
-	}
 	reaches := func(from, target Tip) bool {
 		if from == target {
 			return true
 		}
 
-		_, found := buildAncestors(from)[target]
+		seen, cached := ancestorsOf[from]
+		if !cached {
+			seen = make(map[Tip]struct{})
+			seen[from] = struct{}{}
+
+			stack := []Tip{from}
+			for len(stack) > 0 {
+				cur := stack[len(stack)-1]
+				stack = stack[:len(stack)-1]
+
+				eff, err := e.getEffect(key, cur)
+				if err != nil {
+					continue
+				}
+
+				for _, dep := range eff.GetDeps() {
+					dt := r(dep)
+					if _, dup := seen[dt]; dup {
+						continue
+					}
+
+					seen[dt] = struct{}{}
+					stack = append(stack, dt)
+				}
+			}
+
+			ancestorsOf[from] = seen
+		}
+
+		_, found := seen[target]
 
 		return found
 	}

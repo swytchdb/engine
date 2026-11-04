@@ -1017,7 +1017,7 @@ func TestFlushTx_VerdictSnapshotEmittedOnLoserOnlyKeys(t *testing.T) {
 	loserDataLoserOnly := Tip{uint64(loserNodeID), 99}
 
 	// Loser's hash maxed so any HLC-derived hash from our engine wins
-	// the ForkChoiceLess(ours, theirs) check inside defeatedCompetitor.
+	// the ForkChoiceLess(ours, theirs) check inside classifyNackTip.
 	loserHash := make([]byte, 32)
 	for i := range loserHash {
 		loserHash[i] = 0xff

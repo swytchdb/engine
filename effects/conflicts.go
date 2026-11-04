@@ -1,3 +1,26 @@
+/*
+ * Copyright 2026 Swytch Labs BV
+ *
+ * This file is part of Swytch.
+ *
+ * Swytch is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of
+ * the License, or (at your option) any later version.
+ *
+ * Swytch is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with Swytch. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * Additional permissions under GNU AGPL version 3 section 7 apply to
+ * this file. See the NOTICE.md file distributed with this source code
+ * for the current set of additional permissions.
+ */
+
 package effects
 
 import (
@@ -305,9 +328,9 @@ func (e *Engine) describeConflictKey(bind *pb.Effect, kb *pb.TransactionalBindEf
 // installed, no reports are generated, and the recorded expiry metadata stays
 // in the returned state.
 func (e *Engine) conflictHistoricalState(key string, tips []Tip) (*pb.ReducedEffect, error) {
-	view := &snapshotReadView{engine: e, historical: true, resolved: map[string][]Tip{key: tips}, lost: make(map[string]struct{})}
+	view := &snapshotReadView{engine: e, historical: true, frontiers: map[string]snapshotFrontier{key: {resolved: tips}}}
 
-	if err := view.discover([]string{key}, func(k string) ([]Tip, error) { return view.resolved[k], nil }); err != nil {
+	if err := view.discover([]string{key}, func(k string) ([]Tip, error) { return view.frontiers[k].resolved, nil }); err != nil {
 		return nil, err
 	}
 

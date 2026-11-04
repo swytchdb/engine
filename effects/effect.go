@@ -1090,7 +1090,7 @@ func (e *Engine) emitSnapshot(key string, verdicts map[string]pb.Verdict) error 
 
 // applySnapshotVerdicts promotes every txn named in a SnapshotEffect's
 // verdict map out of horizon. The verdict snapshot is emitted by the
-// originator only after commitPendingTxn returns (every subscriber
+// originator only after finishing the pending transaction (every subscriber
 // responded, isRealConflict cleared), so its arrival is strictly stronger
 // evidence than the 1×RTT timer that any concurrent competitor has had
 // its chance. MakeVisible is idempotent — txns not in horizon are a
@@ -1762,7 +1762,7 @@ func (e *Engine) handleRemoteBind(bind *pb.TransactionalBindEffect, bindOffset T
 		e.pendingTxns.Range(func(_ Tip, ptxn *pendingTxn) bool {
 			for _, pk := range ptxn.keys {
 				if pk.newTip == aborted {
-					abortPendingTxn(ptxn)
+					ptxn.finish(txnStateAborted)
 
 					return false // stop ranging
 				}
@@ -2087,7 +2087,7 @@ func (e *Engine) HandleNack(nack *pb.NackNotify) error {
 	// Transactional NACK: smart conflict detection across all keys in the tx
 	for _, detail := range nack.GetTipDetails() {
 		if e.isRealConflict(matchedTxn, string(nack.GetKey()), detail) {
-			abortPendingTxn(matchedTxn)
+			matchedTxn.finish(txnStateAborted)
 
 			return nil
 		}

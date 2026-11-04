@@ -1,8 +1,33 @@
+/*
+ * Copyright 2026 Swytch Labs BV
+ *
+ * This file is part of Swytch.
+ *
+ * Swytch is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of
+ * the License, or (at your option) any later version.
+ *
+ * Swytch is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with Swytch. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * Additional permissions under GNU AGPL version 3 section 7 apply to
+ * this file. See the NOTICE.md file distributed with this source code
+ * for the current set of additional permissions.
+ */
+
 package effects
 
 import (
 	"context"
 	"errors"
+	"maps"
+	"slices"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
 	"github.com/swytchdb/engine/keytrie"
@@ -14,22 +39,26 @@ import (
 type snapshotReadView struct {
 	engine     *Engine
 	ctx        context.Context
-	frontier   map[string]*keytrie.TipSet
-	resolved   map[string][]Tip
+	frontiers  map[string]snapshotFrontier
 	invisible  map[string]bool
-	keys       map[string]struct{}
-	anchors    map[string][]Tip
+	anchors    map[string][]Tip // every key in the closure, including keys without anchors
 	verdicts   verdictMap
 	lost       map[string]struct{}
 	walked     int
 	historical bool // report reconstruction uses recorded ancestry only
 }
 
+// Keep the captured index identity and its resolved tips together. Historical
+// views populate only resolved; they never validate against the live index.
+type snapshotFrontier struct {
+	index    *keytrie.TipSet
+	resolved []Tip
+}
+
 func newSnapshotReadView(e *Engine, ctx context.Context) *snapshotReadView {
 	return &snapshotReadView{
 		engine: e, ctx: ctx,
-		resolved: make(map[string][]Tip),
-		lost:     make(map[string]struct{}),
+		frontiers: make(map[string]snapshotFrontier),
 	}
 }
 
@@ -38,7 +67,8 @@ func (v *snapshotReadView) capture(key string) ([]Tip, error) {
 		return nil, err
 	}
 
-	if _, ok := v.frontier[key]; !ok {
+	frontier, ok := v.frontiers[key]
+	if !ok {
 		if !v.engine.freeMissEligible(key) {
 			if err := v.engine.ensureSubscribed(key); err != nil {
 				return nil, err
@@ -46,15 +76,11 @@ func (v *snapshotReadView) capture(key string) ([]Tip, error) {
 		}
 
 		tips := v.engine.index.Contains(key)
-		if v.frontier == nil {
-			v.frontier = make(map[string]*keytrie.TipSet)
-		}
-
-		v.frontier[key] = tips
-		v.resolved[key] = v.engine.resolveTipDeps(tips.Tips())
+		frontier = snapshotFrontier{index: tips, resolved: v.engine.resolveTipDeps(tips.Tips())}
+		v.frontiers[key] = frontier
 	}
 
-	return v.resolved[key], nil
+	return frontier.resolved, nil
 }
 
 // Freeze visibility decisions too: horizon completion need not change a key's
@@ -78,9 +104,13 @@ func (v *snapshotReadView) isInvisible(txn string) bool {
 }
 
 func (v *snapshotReadView) valid() bool {
-	for key, tips := range v.frontier {
-		if v.engine.index.Contains(key) != tips ||
-			!tipsEqual(v.resolved[key], v.engine.resolveTipDeps(tips.Tips())) {
+	if v.historical {
+		return true
+	}
+
+	for key, frontier := range v.frontiers {
+		if v.engine.index.Contains(key) != frontier.index ||
+			!tipsEqual(frontier.resolved, v.engine.resolveTipDeps(frontier.index.Tips())) {
 			return false
 		}
 	}
@@ -99,23 +129,29 @@ func (v *snapshotReadView) valid() bool {
 func (v *snapshotReadView) discover(keys []string, frontier func(string) ([]Tip, error)) error {
 	var err error
 
-	v.keys, v.anchors, v.verdicts, err = v.engine.bindKeyClosureFrom(keys, frontier, true)
+	v.anchors, v.verdicts, err = v.engine.bindKeyClosureFrom(keys, frontier, true)
 	if err != nil {
 		return err
 	}
 
 	for txn, entry := range v.verdicts {
 		if entry.verdict == pb.Verdict_LOST {
+			if v.lost == nil {
+				v.lost = make(map[string]struct{})
+			}
+
 			v.lost[txn] = struct{}{}
 		}
 	}
 
-	for key := range v.keys {
-		losers, walked := v.engine.losersOnKeyAt(key, v.resolved[key], v.anchors[key], v.verdicts, v.isInvisible, !v.historical)
+	for key := range v.anchors {
+		losers, walked := v.engine.losersOnKeyAt(key, v.frontiers[key].resolved, v.anchors[key], v.verdicts, v.isInvisible, !v.historical)
 
 		v.walked += walked
-		for txn := range losers {
-			v.lost[txn] = struct{}{}
+		if v.lost == nil {
+			v.lost = losers
+		} else {
+			maps.Copy(v.lost, losers)
 		}
 	}
 
@@ -127,6 +163,10 @@ func (v *snapshotReadView) discover(keys []string, frontier func(string) ([]Tip,
 // or concurrent writes that change any captured input restart the whole batch;
 // no values from a discarded attempt are returned.
 func (e *Engine) GetSnapshots(ctx context.Context, keys []string) ([]*pb.ReducedEffect, error) {
+	unique := slices.Clone(keys)
+	slices.Sort(unique)
+	unique = slices.Compact(unique)
+
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -134,17 +174,10 @@ func (e *Engine) GetSnapshots(ctx context.Context, keys []string) ([]*pb.Reduced
 		// Keep the existing subscription, free-miss, and Cloud hydration rules.
 		// These preliminary values are discarded: later keys can reveal
 		// competitors that change an earlier key's reconstruction.
-		ready := make(map[string]bool)
-		for _, key := range keys {
-			if ready[key] {
-				continue
-			}
-
+		for _, key := range unique {
 			if _, _, _, err := e.GetSnapshot(key); err != nil {
 				return nil, err
 			}
-
-			ready[key] = true
 		}
 
 		view := newSnapshotReadView(e, ctx)
@@ -163,8 +196,7 @@ func (e *Engine) GetSnapshots(ctx context.Context, keys []string) ([]*pb.Reduced
 		for i, key := range keys {
 			// Include histories learned through other keys even when their
 			// bind has not yet been installed in this key's live frontier.
-			tips := append([]Tip(nil), view.resolved[key]...)
-			tips = append(tips, view.anchors[key]...)
+			tips := slices.Concat(view.frontiers[key].resolved, view.anchors[key])
 
 			results[i], _, readErr = e.reconstructWithView(key, tips, "", true, view)
 			if readErr != nil {

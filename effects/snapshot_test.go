@@ -3324,7 +3324,7 @@ func TestBindKeyClosure_ExpandsViaBindKeysField(t *testing.T) {
 	})
 	e.index.Insert("el-3", nil, keytrie.NewTipSet(bind))
 
-	closure, _, _, err := e.bindKeyClosure("el-3")
+	closure, _, err := e.bindKeyClosure("el-3")
 	if err != nil {
 		t.Fatalf("bindKeyClosure: %v", err)
 	}

@@ -1,8 +1,32 @@
+/*
+ * Copyright 2026 Swytch Labs BV
+ *
+ * This file is part of Swytch.
+ *
+ * Swytch is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of
+ * the License, or (at your option) any later version.
+ *
+ * Swytch is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with Swytch. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * Additional permissions under GNU AGPL version 3 section 7 apply to
+ * this file. See the NOTICE.md file distributed with this source code
+ * for the current set of additional permissions.
+ */
+
 package effects
 
 import (
 	"context"
 	"fmt"
+	"slices"
 	"time"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
@@ -41,7 +65,7 @@ func (s *transactionSnapshot) tips(ctx context.Context, key string) (*keytrie.Ti
 
 	v := s.views[key]
 
-	tips := v.resolved[key]
+	tips := v.frontiers[key].resolved
 	if len(tips) == 0 {
 		return nil, nil
 	}
@@ -58,8 +82,7 @@ func (s *transactionSnapshot) contains(ctx context.Context, key string, target T
 		return false, nil
 	}
 
-	frontier := append([]Tip(nil), v.resolved[key]...)
-	frontier = append(frontier, v.anchors[key]...)
+	frontier := slices.Concat(v.frontiers[key].resolved, v.anchors[key])
 	seen := make(map[Tip]bool)
 
 	for len(frontier) != 0 {
@@ -228,9 +251,8 @@ func (s *transactionSnapshot) prepare(ctx context.Context, requested []string) e
 		return err
 	}
 
-	for key := range live.keys {
-		tips := append([]Tip(nil), live.resolved[key]...)
-		tips = append(tips, live.anchors[key]...)
+	for key := range live.anchors {
+		tips := slices.Concat(live.frontiers[key].resolved, live.anchors[key])
 
 		d := newDag(s.engine, key, "")
 		if err := d.prepare(tips); err != nil {
@@ -254,9 +276,13 @@ func (s *transactionSnapshot) prepare(ctx context.Context, requested []string) e
 	// over subsequent numerical tightening.
 	s.clocks = s.engine.clockEvidence()
 
+	// member removes each active visit on return; reuse the cycle detector
+	// across frontier candidates instead of allocating one map per candidate.
+	visiting := make(map[Tip]bool)
+
 	view, err := s.engine.historicalReadView(ctx, keys, func(key string) ([]Tip, error) {
 		if old := s.views[key]; old != nil {
-			return old.resolved[key], nil
+			return old.frontiers[key].resolved, nil
 		}
 
 		_, err := live.capture(key)
@@ -267,17 +293,17 @@ func (s *transactionSnapshot) prepare(ctx context.Context, requested []string) e
 		// tips. resolveTipDeps is a reconstruction operation: substituting
 		// pending WATCH/transaction tips here would turn valid consumed
 		// tips into stale ancestors before the existing commit protocol.
-		tips := live.frontier[key].Tips()
+		tips := live.frontiers[key].index.Tips()
 
 		return s.engine.historicalFrontier(ctx, key, tips, func(t Tip, eff *pb.Effect) (bool, error) {
-			return s.member(ctx, t, eff, make(map[Tip]bool))
+			return s.member(ctx, t, eff, visiting)
 		})
 	})
 	if err != nil {
 		return err
 	}
 
-	for key := range view.keys {
+	for key := range view.anchors {
 		if s.views[key] == nil {
 			s.views[key] = view
 		}
