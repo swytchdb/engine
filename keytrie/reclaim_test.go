@@ -67,6 +67,7 @@ func TestReclaimRelocationReleasesOldChunkAndPreservesEscapedValues(t *testing.T
 	value := 42
 	c.LoadOrStoreData("a", &value)
 	escapedTips, escapedData := c.Contains("a"), c.LoadData("a")
+	c.findBestMatch(c.root.Load(), "a").lastDecayEpoch.Store(7)
 
 	old := weak.Make(c.findBestMatch(c.root.Load(), "a"))
 	for _, key := range []string{"b", "c", "d"} {
@@ -92,6 +93,10 @@ func TestReclaimRelocationReleasesOldChunkAndPreservesEscapedValues(t *testing.T
 
 	if c.LoadData("a") != escapedData || c.Contains("a") != escapedTips {
 		t.Fatal("relocated leaf did not preserve value identity")
+	}
+
+	if c.findBestMatch(c.root.Load(), "a").lastDecayEpoch.Load() != 7 {
+		t.Fatal("relocation lost the leaf's decay history")
 	}
 
 	runtime.KeepAlive(c)

@@ -25,7 +25,7 @@ func payloadBytes[T any](data *T) int64 {
 // Callers hold reapMu until the pointer mutation and its accounting complete.
 // This prevents a chunk from being dropped/recycled between those operations.
 func (a *critbitArena[T]) addExtra(chunk uint32, delta int64) {
-	a.list.Load().extra[chunk].Add(delta)
+	a.list.Load().chunks[chunk].extra.Add(delta)
 }
 
 func (c *Critbit[T]) releaseLeafMemory(leaf *critNode[T], tips *TipSet, data *T) {
@@ -73,11 +73,11 @@ func (a *critbitArena[T]) residentBytes() int64 {
 
 	var node T
 
-	n := int64(unsafe.Sizeof(*list)) + memsize.Alloc(int64(cap(list.chunks))*24) + 3*memsize.Alloc(int64(len(list.chunks))*8)
-	for i, chunk := range list.chunks {
-		n += 3 * 8 // reaped, outstanding, extra counters survive a nil chunk
+	n := memsize.Alloc(int64(unsafe.Sizeof(*list))) + memsize.Alloc(int64(cap(list.chunks))*int64(unsafe.Sizeof((*arenaChunk[T])(nil))))
+	for _, chunk := range list.chunks {
 		if chunk != nil {
-			n += memsize.Alloc(int64(cap(chunk))*int64(unsafe.Sizeof(node))) + max(list.extra[i].Load(), 0)
+			n += memsize.Alloc(int64(unsafe.Sizeof(*chunk)))
+			n += memsize.Alloc(int64(cap(chunk.nodes))*int64(unsafe.Sizeof(node))) + max(chunk.extra.Load(), 0)
 		}
 	}
 

@@ -316,7 +316,7 @@ func TestChunkReclaim_DropsFullyDeadChunk(t *testing.T) {
 		t.Fatal("leaf chunk 0 was nil-dropped; the free list had room, so it should have been recycled")
 	}
 
-	if got := list.outstanding[0].Load(); got != int64(defaultCritbitArenaChunkSize) {
+	if got := list.chunks[0].outstanding.Load(); got != int64(defaultCritbitArenaChunkSize) {
 		t.Fatalf("chunk 0 outstanding = %d; want %d (all recycled slots unallocated)",
 			got, defaultCritbitArenaChunkSize)
 	}
@@ -420,8 +420,12 @@ func findLeaf[T any](c *Critbit[T], key string) *critNode[T] {
 	defer c.reapMu.RUnlock()
 
 	for _, chunk := range c.leafArena.list.Load().chunks {
-		for i := range chunk {
-			if n := &chunk[i]; n.key == key {
+		if chunk == nil {
+			continue
+		}
+
+		for i := range chunk.nodes {
+			if n := &chunk.nodes[i]; n.key == key {
 				return n
 			}
 		}

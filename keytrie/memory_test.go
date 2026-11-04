@@ -30,7 +30,7 @@ func TestMemoryFrontiersPayloadsAndDeadKeys(t *testing.T) {
 	}
 
 	leaf := c.findBestMatch(c.root.Load(), key)
-	charge := func() int64 { return c.leafArena.list.Load().extra[leaf.chunkIdx].Load() }
+	charge := func() int64 { return c.leafArena.list.Load().chunks[leaf.chunkIdx].extra.Load() }
 
 	initial := memsize.Alloc(int64(len(key))) + tipSetBytes(first)
 	if charge() != initial {
@@ -100,7 +100,7 @@ func TestMemoryGhostRetainsKeyCapacity(t *testing.T) {
 		t.Fatal("no victim")
 	}
 
-	got := c.leafArena.list.Load().extra[leaf.chunkIdx].Load()
+	got := c.leafArena.list.Load().chunks[leaf.chunkIdx].extra.Load()
 	if got != memsize.Alloc(int64(len(key))) {
 		t.Fatalf("ghost retained %d bytes, want key capacity", got)
 	}
@@ -135,7 +135,7 @@ func TestMemoryRecycledChunkDropsOldKeyCharges(t *testing.T) {
 	for c.drainReap() > 0 {
 	}
 
-	if got := c.leafArena.list.Load().extra[0].Load(); got != 0 {
+	if got := c.leafArena.list.Load().chunks[0].extra.Load(); got != 0 {
 		t.Fatalf("recycled chunk retained %d bytes of old keys", got)
 	}
 
@@ -145,7 +145,7 @@ func TestMemoryRecycledChunkDropsOldKeyCharges(t *testing.T) {
 
 	c.Insert("fresh", nil, NewTipSet(tip(2)))
 
-	if got := c.leafArena.list.Load().extra[0].Load(); got != memsize.Alloc(5)+tipSetBytes(NewTipSet(tip(2))) {
+	if got := c.leafArena.list.Load().chunks[0].extra.Load(); got != memsize.Alloc(5)+tipSetBytes(NewTipSet(tip(2))) {
 		t.Fatalf("fresh recycled slot charge=%d", got)
 	}
 }

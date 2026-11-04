@@ -21,8 +21,12 @@ func TestSweepBudgetIncludesGhosts(t *testing.T) {
 	liveKey := fmt.Sprintf("ghost-budget:%d", count-1)
 
 	for _, chunk := range c.leafArena.list.Load().chunks {
-		for i := range chunk {
-			n := &chunk[i]
+		if chunk == nil {
+			continue
+		}
+
+		for i := range chunk.nodes {
+			n := &chunk.nodes[i]
 			if n.key != "" && n.key != liveKey {
 				n.deleted.Store(true)
 				n.freq.Store(-1)

@@ -127,14 +127,14 @@ func (c *Critbit[T]) compactLeafChunks(maxChunks int) int {
 		// allocations — evacuating it would relocate its few residents for
 		// nothing, and its counter can't fill until every recycled slot has been
 		// handed out anyway.
-		if list.outstanding[ci].Load() > 0 {
+		if chunk.outstanding.Load() > 0 {
 			continue
 		}
 
 		live := 0
 
-		for i := range chunk {
-			if !chunk[i].deleted.Load() {
+		for i := range chunk.nodes {
+			if !chunk.nodes[i].deleted.Load() {
 				live++
 			}
 		}
@@ -143,7 +143,7 @@ func (c *Critbit[T]) compactLeafChunks(maxChunks int) int {
 			continue
 		}
 
-		if c.evacuateLeafChunk(chunk) {
+		if c.evacuateLeafChunk(chunk.nodes) {
 			evacuated++
 		}
 	}
@@ -248,6 +248,7 @@ func (c *Critbit[T]) relocateLeaf(old *critNode[T]) bool {
 	c.leafArena.addExtra(ci, c.keyBytes(n2.key)+tipSetBytes(n2.tips.Load())+payloadBytes(n2.data.Load()))
 	n2.freq.Store(old.freq.Load())
 	n2.lastAccess.Store(old.lastAccess.Load())
+	n2.lastDecayEpoch.Store(old.lastDecayEpoch.Load())
 	// Publish before splicing: unreachable until the splice, and the write lock
 	// excludes scanners until the relocated leaf is ready.
 	n2.deleted.Store(false)
@@ -267,9 +268,8 @@ func (c *Critbit[T]) relocateLeaf(old *critNode[T]) bool {
 // compactInternalChunks evacuates up to maxChunks sparse internal chunks.
 // Internal nodes carry no key, so victims are found by walking the tree:
 // one shared-lock DFS counts linked internals per chunk (advisory), then one
-// write-lock DFS collects the victims' members with their parents and
-// relocates them. Splice order is handled by a replacement map, so a victim
-// child spliced after its victim parent lands on the parent's clone. Each
+// write-lock DFS relocates selected nodes before visiting their children.
+// Children therefore always splice through their current parent. Each
 // relocated husk is accounted through recordReaped, which fires the drop when
 // the victim's last slot dies — compaction never drops a chunk directly.
 func (c *Critbit[T]) compactInternalChunks(maxChunks int) int {
@@ -320,27 +320,29 @@ func (c *Critbit[T]) compactInternalChunks(maxChunks int) int {
 
 	threshold := int(chunkSize) * compactOccupancyPct / 100
 
-	victims := make(map[uint32]bool)
-	for ci := 0; ci < len(chunks) && ci < tail && len(victims) < maxChunks; ci++ {
+	// Reuse counts as a selection mask; chunk indices are dense.
+	victims := 0
+	for ci := 0; ci < len(chunks) && ci < tail && victims < maxChunks; ci++ {
 		if chunks[ci] == nil {
 			continue
 		}
 		// Recycled chunks awaiting re-allocation look sparse but are refilling;
 		// see the same skip in compactLeafChunks.
-		if list.outstanding[ci].Load() > 0 {
+		if chunks[ci].outstanding.Load() > 0 {
 			continue
 		}
 
 		if counts[ci] <= threshold {
-			victims[uint32(ci)] = true
+			counts[ci] = -1
+			victims++
 		}
 	}
 
-	if len(victims) == 0 {
+	if victims == 0 {
 		return 0
 	}
 
-	// Pass 2 (write lock): collect victim members with parents, relocate, drop.
+	// Pass 2 (write lock): relocate parents before descending into their children.
 	c.reapMu.Lock()
 	defer c.reapMu.Unlock()
 
@@ -359,8 +361,6 @@ func (c *Critbit[T]) compactInternalChunks(maxChunks int) int {
 		dir    int
 	}
 
-	var moves []frame
-
 	fstack := make([]frame, 0, 64)
 
 	fstack = append(fstack, frame{node: root})
@@ -372,11 +372,20 @@ func (c *Critbit[T]) compactInternalChunks(maxChunks int) int {
 			continue
 		}
 
-		if victims[f.node.chunkIdx] {
-			// DFS is pre-order, so an ancestor always precedes its descendants
-			// in moves — the replacement map below can therefore always resolve
-			// a relocated parent before its child splices through it.
-			moves = append(moves, f)
+		if int(f.node.chunkIdx) < len(counts) && counts[f.node.chunkIdx] == -1 {
+			n2 := c.allocInternalNode(f.node.bytePos, f.node.otherbits)
+			n2.child[0].Store(f.node.child[0].Load())
+			n2.child[1].Store(f.node.child[1].Load())
+
+			if f.parent == nil {
+				c.root.Store(n2)
+			} else {
+				f.parent.child[f.dir].Store(n2)
+			}
+
+			c.readRevision++
+			c.retireInternal(f.node)
+			f.node = n2
 		}
 
 		for dir := range 2 {
@@ -386,30 +395,5 @@ func (c *Critbit[T]) compactInternalChunks(maxChunks int) int {
 		}
 	}
 
-	replaced := make(map[*critNode[T]]*critNode[T], len(moves))
-	for _, m := range moves {
-		n2, ci := c.internalArena.alloc()
-		n2.chunkIdx = ci
-		n2.bytePos = m.node.bytePos
-		n2.otherbits = m.node.otherbits
-		n2.child[0].Store(m.node.child[0].Load())
-		n2.child[1].Store(m.node.child[1].Load())
-
-		if m.parent == nil {
-			c.root.Store(n2)
-		} else {
-			p := m.parent
-			if rp, ok := replaced[p]; ok {
-				p = rp
-			}
-
-			p.child[m.dir].Store(n2)
-		}
-
-		replaced[m.node] = n2
-		c.readRevision++
-		c.retireInternal(m.node)
-	}
-
-	return len(victims)
+	return victims
 }

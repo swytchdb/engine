@@ -24,8 +24,9 @@
 package keytrie
 
 import (
+	"cmp"
 	"math"
-	"sort"
+	"slices"
 	"unsafe"
 )
 
@@ -119,8 +120,10 @@ const (
 // consumer the dropped key's tips and leaf payload so it can release refs and
 // tear down (e.g. unsubscribe). pressure reports whether the consumer is
 // currently over its eviction target — the instantaneous condition that gates
-// graduation counting in bumpAccess (see underPressure). All three run without
-// any trie lock the consumer could re-enter; keep them prompt.
+// graduation counting in bumpAccess (see underPressure). Keep all hooks prompt.
+// notify runs outside trie locks and may re-enter the trie; concurrent eviction
+// calls may deliver notifications concurrently. decider and pressure run under
+// the lifetime read lock and must not re-enter operations that acquire trie locks.
 //
 // decider must be installed before any Insert: the sweep reads each leaf's pin
 // verdict (critNode.pinned) cached at creation, so a leaf written before the
@@ -238,7 +241,6 @@ func (c *Critbit[T]) EvictBatch(want int) int {
 	}
 
 	c.evictMu.Lock()
-	defer c.evictMu.Unlock()
 
 	k := c.evictK.Load()
 	epoch := c.decayEpoch()
@@ -311,13 +313,14 @@ func (c *Critbit[T]) EvictBatch(want int) int {
 
 	// Keep the want oldest cold candidates (LRU); recent writes have higher
 	// lastAccess and are left alone.
+	oldestFirst := func(a, b cand) int { return cmp.Compare(a.access, b.access) }
 	if len(cands) > want {
-		sort.Slice(cands, func(i, j int) bool { return cands[i].access < cands[j].access })
+		slices.SortFunc(cands, oldestFirst)
 		cands = cands[:want]
 	}
 	// Oldest-first, so the trim below and the reclaim fallback always take the
 	// least-recent ghost.
-	sort.Slice(ghosts, func(i, j int) bool { return ghosts[i].access < ghosts[j].access })
+	slices.SortFunc(ghosts, oldestFirst)
 
 	// tick advances the decay clock one reclaim: forgetting is
 	// eviction-clocked, never wall-clocked, so an idle trie forgets nothing.
@@ -433,9 +436,11 @@ func (c *Critbit[T]) EvictBatch(want int) int {
 	}
 
 	c.reapMu.RUnlock()
+	c.maybeAdaptK()
+	c.evictMu.Unlock()
 
-	// Release tip/payload references and notify, outside the lock (the consumer
-	// callbacks may re-enter the trie).
+	// Notifications need neither the arena lifetime lock nor the policy lock.
+	// Consumer callbacks may re-enter any trie operation, including eviction.
 	for _, v := range victims {
 		c.fireTipDelta(v.tips, nil, v.data)
 
@@ -449,7 +454,6 @@ func (c *Critbit[T]) EvictBatch(want int) int {
 		}
 	}
 
-	c.maybeAdaptK()
 	c.maybeReap()
 
 	if reclaimedGhost {
@@ -751,7 +755,7 @@ func (c *Critbit[T]) maybeAdaptK() {
 // persists across calls. Runs under evictMu (sole mutator of evictHand) and the
 // reap read-lock.
 func (c *Critbit[T]) sweepLeaves(base int, fn func(*critNode[T])) {
-	chunks, chunkSize := c.leafArena.chunkSnapshot()
+	chunks, chunkSize := c.leafArena.list.Load().chunks, c.leafArena.chunkSize
 
 	total := uint64(len(chunks)) * chunkSize
 	if total == 0 {
@@ -807,7 +811,7 @@ func (c *Critbit[T]) sweepLeaves(base int, fn func(*critNode[T])) {
 				continue
 			}
 
-			n := &chunk[idx%chunkSize]
+			n := &chunk.nodes[idx%chunkSize]
 			if n.deleted.Load() {
 				if n.freq.Load() < 0 {
 					fn(n)
