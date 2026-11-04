@@ -174,10 +174,10 @@ type Replicator struct {
 	transport   *QUICNotifyTransport
 	tracker     requestTracker
 
-	mu xsync.RBMutex
+	mu sync.Mutex // serializes membership writers only
 	// Published maps are immutable. Membership changes replace the map so
 	// replication can keep a snapshot without copying it or holding a lock.
-	peerRegions map[NodeId]string
+	peerRegions atomic.Pointer[map[NodeId]string]
 
 	handler EffectHandler // for handling inbound notifications
 
@@ -206,7 +206,6 @@ func NewReplicator(
 		transport:          transport,
 		handler:            handler,
 		tracker:            requestTracker{pending: xsync.NewMap[uint64, *trackedRequest]()},
-		peerRegions:        make(map[NodeId]string),
 		stopCh:             make(chan struct{}),
 	}
 }
@@ -228,13 +227,15 @@ func (r *Replicator) AddPeer(nodeID NodeId, region string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if existing, ok := r.peerRegions[nodeID]; ok && existing == region {
+	current := r.regionsSnapshot()
+	if existing, ok := current[nodeID]; ok && existing == region {
 		return
 	}
 
-	regions := maps.Clone(r.peerRegions)
+	regions := make(map[NodeId]string, len(current)+1)
+	maps.Copy(regions, current)
 	regions[nodeID] = region
-	r.peerRegions = regions
+	r.peerRegions.Store(&regions)
 }
 
 // RemovePeer unregisters a peer.
@@ -242,27 +243,29 @@ func (r *Replicator) RemovePeer(nodeID NodeId) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if _, ok := r.peerRegions[nodeID]; !ok {
+	current := r.regionsSnapshot()
+	if _, ok := current[nodeID]; !ok {
 		return
 	}
 
 	// Rebuild at the remaining size; deleting from a long-lived map retains
 	// its peak allocation after membership shrinks.
-	regions := make(map[NodeId]string, len(r.peerRegions)-1)
-	for id, region := range r.peerRegions {
+	regions := make(map[NodeId]string, len(current)-1)
+	for id, region := range current {
 		if id != nodeID {
 			regions[id] = region
 		}
 	}
 
-	r.peerRegions = regions
+	r.peerRegions.Store(&regions)
 }
 
 func (r *Replicator) regionsSnapshot() map[NodeId]string {
-	token := r.mu.RLock()
-	defer r.mu.RUnlock(token)
+	if regions := r.peerRegions.Load(); regions != nil {
+		return *regions
+	}
 
-	return r.peerRegions
+	return nil
 }
 
 // AllRegionPeersReachable returns true if every same-region peer is alive

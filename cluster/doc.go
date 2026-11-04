@@ -39,9 +39,15 @@
 // PeerConn publishes its connection atomically; it never holds a mutex during
 // network I/O. Replication and heartbeat membership snapshots are immutable:
 // membership writers replace them, while sends retain the old snapshot.
+// Replication readers load their snapshot atomically; only writers take a lock.
+// PubSubRouter keeps sorted subscription slices under one lock, releasing peak
+// capacity after churn. Heartbeat observations reuse a sorted slice; encoding
+// finishes under its lock before the independent packet is sent.
 //
 // CloudSync.mu protects outbox membership, queue ordering, and key pin ownership
 // together. Its filter and known-cloud caches have separate locks so reads do
 // not wait on outbox work. An upload keeps its effect and ancestry policy in
 // one entry; draining the outbox releases its map and queue storage.
+// cloud_outbox.go owns that lifecycle, cloud_read.go owns reads and reconciliation,
+// and cloud_discovery.go reconstructs membership without mutating the engine.
 package cluster

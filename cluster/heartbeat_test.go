@@ -24,9 +24,126 @@
 package cluster
 
 import (
+	"slices"
+	"sync"
 	"testing"
 	"time"
 )
+
+func TestHeartbeatObservationsSurviveBufferReuse(t *testing.T) {
+	hm := NewHeartbeatManager(1, NewPeerHealthTable(ClockConfig{}), ClockConfig{})
+	hm.AddPeer(2, "local")
+	hm.AddPeer(3, "local")
+
+	var packets [][]byte
+
+	hm.sendFunc = func(_ NodeId, packet []byte) error {
+		packets = append(packets, packet)
+
+		return nil
+	}
+
+	for _, id := range []NodeId{3, 2, 3} {
+		hm.ProcessInboundTick(id, &ClockTick{NodeID: id, Seq: uint64(id), WallClock: time.Now().UnixNano()})
+	}
+
+	hm.ProcessInboundTick(3, &ClockTick{NodeID: 3, Seq: 10, WallClock: time.Now().UnixNano()})
+	hm.sendTick()
+
+	first, err := ParseClockTick(packets[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(first.Observed) != 2 || first.Observed[1].Seq != 10 {
+		t.Fatalf("expected latest observation per peer: %v", first.Observed)
+	}
+
+	hm.ProcessInboundTick(2, &ClockTick{NodeID: 2, Seq: 20, WallClock: time.Now().UnixNano()})
+	hm.ProcessInboundTick(3, &ClockTick{NodeID: 3, Seq: 30, WallClock: time.Now().UnixNano()})
+	hm.RemovePeer(3)
+	hm.sendTick()
+
+	second, err := ParseClockTick(packets[2])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(second.Observed) != 1 || second.Observed[0].NodeID != 2 || second.Observed[0].Seq != 20 {
+		t.Fatalf("removed peer or stale observation sent: %v", second.Observed)
+	}
+
+	again, err := ParseClockTick(packets[0])
+	if err != nil || !slices.Equal(again.Observed, first.Observed) {
+		t.Fatalf("buffer reuse changed an in-flight packet: %v, %v", again, err)
+	}
+
+	hm.sendTick()
+
+	empty, err := ParseClockTick(packets[3])
+	if err != nil || len(empty.Observed) != 0 {
+		t.Fatalf("observations were not drained: %v, %v", empty, err)
+	}
+}
+
+func TestHeartbeatConcurrentObservationAndSend(t *testing.T) {
+	hm := NewHeartbeatManager(1, NewPeerHealthTable(ClockConfig{}), ClockConfig{})
+	hm.AddPeer(2, "local")
+	hm.sendFunc = func(_ NodeId, packet []byte) error {
+		_, err := ParseClockTick(packet)
+		if err != nil {
+			t.Error(err)
+		}
+
+		return err
+	}
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for seq := uint64(1); seq <= 100; seq++ {
+			hm.ProcessInboundTick(2, &ClockTick{NodeID: 2, Seq: seq, WallClock: time.Now().UnixNano()})
+		}
+	})
+	wg.Go(func() {
+		for range 100 {
+			hm.sendTick()
+		}
+	})
+	wg.Wait()
+}
+
+func TestHealthChecksUseConfiguredMembership(t *testing.T) {
+	table := NewPeerHealthTable(ClockConfig{})
+	unknown := table.GetOrCreate(99)
+	unknown.alive.Store(true)
+	unknown.symmetric.Store(true)
+
+	regions := map[NodeId]string{2: ""}
+
+	if table.AllRegionPeersReachable("", regions) || table.InMajorityPartition("", regions) {
+		t.Fatal("configured peer without health state must count as unreachable")
+	}
+
+	if got := table.AliveSymmetricPeers("", regions); len(got) != 0 {
+		t.Fatalf("unconfigured peer entered replication targets: %v", got)
+	}
+
+	if got := table.AliveSymmetricCount("", regions); got != 0 {
+		t.Fatalf("unconfigured peer entered replication count: %d", got)
+	}
+
+	if got := table.AllSameRegionPeers("", regions); !slices.Equal(got, []NodeId{2}) {
+		t.Fatalf("configured membership lost: %v", got)
+	}
+
+	peer := table.GetOrCreate(2)
+	peer.alive.Store(true)
+	peer.symmetric.Store(true)
+
+	if !table.AllRegionPeersReachable("", regions) || !table.InMajorityPartition("", regions) {
+		t.Fatal("healthy configured peer must restore reachability")
+	}
+}
 
 func TestMarshalParseClockTick(t *testing.T) {
 	tick := &ClockTick{
