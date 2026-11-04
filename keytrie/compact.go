@@ -207,27 +207,12 @@ func (c *Critbit[T]) evacuateLeafChunk(chunk []critNode[T]) bool {
 // the chunk's counter can fire the drop. Returns false when the slot isn't
 // actually linked (an orphan husk, accounted at abandonment).
 func (c *Critbit[T]) relocateLeaf(old *critNode[T]) bool {
-	root := c.root.Load()
-	if root == nil {
-		return false
-	}
+	link := &c.root
 
-	var (
-		p    *critNode[T]
-		pDir int
-	)
-
-	cur := root
-	for !cur.isLeaf {
-		dir := getDirection(old.key, cur.bytePos, cur.otherbits)
-		p, pDir = cur, dir
-
-		next := cur.child[dir].Load()
-		if next == nil {
-			return false
-		}
-
-		cur = next
+	cur := link.Load()
+	for cur != nil && !cur.isLeaf {
+		link = &cur.child[getDirection(old.key, cur.bytePos, cur.otherbits)]
+		cur = link.Load()
 	}
 
 	if cur != old {
@@ -254,11 +239,7 @@ func (c *Critbit[T]) relocateLeaf(old *critNode[T]) bool {
 	// excludes scanners until the relocated leaf is ready.
 	n2.deleted.Store(false)
 
-	if p == nil {
-		c.root.Store(n2)
-	} else {
-		p.child[pDir].Store(n2)
-	}
+	link.Store(n2)
 
 	c.readRevision++
 	c.retireLeaf(old)

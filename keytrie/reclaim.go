@@ -101,53 +101,36 @@ func (c *Critbit[T]) unlinkLeaf(leaf *critNode[T]) bool {
 		return false
 	}
 
-	root := c.root.Load()
-	if root == nil {
-		return false
-	}
-
-	if root == leaf {
-		c.root.Store(nil)
-		c.readRevision++
-		c.deletedCount.Add(-1)
-		c.retireLeaf(leaf)
-
-		return true
-	}
-
-	// Descend to leaf.key, tracking the parent (p) and grandparent (gp) so we can
-	// splice the leaf's sibling up into p's slot, dropping both leaf and p.
-	key := leaf.key
-
+	// Track the link to the parent so pruning needs no special case for an
+	// internal root and no separate grandparent/direction bookkeeping.
 	var (
-		gp, p       *critNode[T]
-		gpDir, pDir int
+		parentLink *atomic.Pointer[critNode[T]]
+		parent     *critNode[T]
+		dir        int
 	)
 
-	cur := root
-	for !cur.isLeaf {
-		dir := getDirection(key, cur.bytePos, cur.otherbits)
-		gp, gpDir = p, pDir
-		p, pDir = cur, dir
+	link := &c.root
 
-		next := cur.child[dir].Load()
-		if next == nil {
-			return false
-		}
-
-		cur = next
+	cur := link.Load()
+	for cur != nil && !cur.isLeaf {
+		parentLink, parent = link, cur
+		dir = getDirection(leaf.key, cur.bytePos, cur.otherbits)
+		link = &cur.child[dir]
+		cur = link.Load()
 	}
 
 	if cur != leaf {
 		return false // a different leaf occupies this key path now
 	}
 
-	link := &c.root
-	if gp != nil {
-		link = &gp.child[gpDir]
+	if parent == nil {
+		c.root.Store(nil)
+		c.readRevision++
+		c.deletedCount.Add(-1)
+		c.retireLeaf(leaf)
+	} else {
+		c.pruneLeaf(parentLink, parent, dir)
 	}
-
-	c.pruneLeaf(link, p, pDir)
 
 	return true
 }

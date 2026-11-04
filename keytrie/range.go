@@ -1,5 +1,7 @@
 package keytrie
 
+import "strings"
+
 // rangeKeys copies small batches under the structural read lock, then invokes
 // callbacks without a lock. Callbacks may re-enter or mutate the trie. A cursor
 // may retain a detached node between batches, but never reads it after a path
@@ -51,7 +53,7 @@ func (c *Critbit[T]) rangeKeys(prefix, after string, hasAfter bool, fn func(stri
 			stack = stack[:last]
 
 			if node.isLeaf {
-				if !node.isDeleted() && (!hasAfter || node.key > after) && len(node.key) >= len(prefix) && node.key[:len(prefix)] == prefix {
+				if !node.isDeleted() && (!hasAfter || node.key > after) && strings.HasPrefix(node.key, prefix) {
 					keys[n] = node.key
 					n++
 				}

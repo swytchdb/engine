@@ -64,6 +64,9 @@ func TestTipDeltaTransitions(t *testing.T) {
 		{name: "insert", next: first, added: first.Tips()},
 		{name: "delete", old: first, removed: first.Tips()},
 		{name: "overlap", old: first, next: second, added: []EffectRef{tip(3)}, removed: []EffectRef{tip(1)}},
+		{name: "disjoint", old: first, next: NewTipSet(tip(3), tip(4)), added: []EffectRef{tip(3), tip(4)}, removed: first.Tips()},
+		{name: "subset", old: first, next: NewTipSet(tip(2)), removed: []EffectRef{tip(1)}},
+		{name: "superset", old: NewTipSet(tip(2)), next: first, added: []EffectRef{tip(1)}},
 		{name: "same", old: first, next: first},
 		{name: "equal", old: first, next: NewTipSet(first.Tips()...)},
 		{name: "payload", old: first, next: first, data: &data},
@@ -95,6 +98,48 @@ func TestTipDeltaTransitions(t *testing.T) {
 	}
 }
 
+func TestTipDeltaStorageSurvivesLaterMutations(t *testing.T) {
+	c := NewCritbit[struct{}]()
+
+	t.Cleanup(func() { closeTestTrie(t, c) })
+
+	type delta struct{ added, removed []EffectRef }
+
+	var deltas []delta
+
+	c.SetRefDelta(func(added, removed []EffectRef, _ *struct{}) {
+		// Consumers may retain these immutable slices without copying them.
+		deltas = append(deltas, delta{added, removed})
+	})
+
+	first := NewTipSet(tip(1), tip(2), tip(3))
+	second := NewTipSet(tip(3), tip(4), tip(5))
+	third := NewTipSet(tip(6), tip(7))
+
+	c.Insert("key", nil, first)
+	c.Insert("key", first, second)
+	c.Insert("key", second, third)
+	c.RemoveTips("key", []EffectRef{tip(6)})
+	c.Delete("key", c.Contains("key"))
+
+	want := []delta{
+		{added: []EffectRef{tip(1), tip(2), tip(3)}},
+		{added: []EffectRef{tip(4), tip(5)}, removed: []EffectRef{tip(1), tip(2)}},
+		{added: []EffectRef{tip(6), tip(7)}, removed: []EffectRef{tip(3), tip(4), tip(5)}},
+		{removed: []EffectRef{tip(6)}},
+		{removed: []EffectRef{tip(7)}},
+	}
+	if len(deltas) != len(want) {
+		t.Fatalf("got %d deltas, want %d", len(deltas), len(want))
+	}
+
+	for i, got := range deltas {
+		if !slices.Equal(got.added, want[i].added) || !slices.Equal(got.removed, want[i].removed) {
+			t.Fatalf("delta %d changed: got %v, want %v", i, got, want[i])
+		}
+	}
+}
+
 func BenchmarkTipDeltaInsertDelete(b *testing.B) {
 	var c Critbit[struct{}]
 
@@ -119,7 +164,7 @@ func BenchmarkTipDeltaInsertDelete(b *testing.B) {
 }
 
 func BenchmarkEvictBatchReinsert(b *testing.B) {
-	for _, want := range []int{1, 16, 128} {
+	for _, want := range []int{1, 16, 128, 512} {
 		b.Run(fmt.Sprint(want), func(b *testing.B) {
 			c := NewCritbit[struct{}]()
 

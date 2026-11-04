@@ -119,5 +119,35 @@ func (ts *TipSet) ContainsAll(refs []EffectRef) bool {
 	return true
 }
 
+// tipDifference returns refs absent from excluded, preserving their order.
+// Both inputs and the result are immutable. An unchanged result shares refs;
+// a partial result owns exactly the retained capacity.
+func tipDifference(refs, excluded []EffectRef) []EffectRef {
+	remaining := 0
+
+	for _, ref := range refs {
+		if !slices.Contains(excluded, ref) {
+			remaining++
+		}
+	}
+
+	switch remaining {
+	case 0:
+		return nil
+	case len(refs):
+		return refs
+	}
+
+	kept := make([]EffectRef, 0, remaining)
+
+	for _, ref := range refs {
+		if !slices.Contains(excluded, ref) {
+			kept = append(kept, ref)
+		}
+	}
+
+	return kept
+}
+
 // ReleaseClaimFunc is a function that releases a claimed key.
 type ReleaseClaimFunc func()

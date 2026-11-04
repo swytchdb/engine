@@ -24,7 +24,6 @@
 package keytrie
 
 import (
-	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -349,35 +348,8 @@ func (c *Critbit[T]) Insert(key string, old *TipSet, newTips *TipSet) (*TipSet, 
 		// CAS on a detached node would link a leaf into an unreachable subtree.
 		rootNode := c.root.Load()
 
-		if rootNode == nil {
-			newNode := c.allocLeafNode(key, newTips) // deleted=true, pop under the read lock
-			if c.root.CompareAndSwap(nil, newNode) {
-				newNode.deleted.Store(false) // publish only after linking
-				c.size.Add(1)
-				c.reapMu.RUnlock()
-				c.fireTipDelta(old, newTips, nil)
-
-				return nil, true
-			}
-
-			// Lost the CAS: newNode is an unlinked orphan, still deleted=true, so
-			// the sweep skips it. Its slot is never reused; account it reaped now,
-			// or its chunk could never reach a full count and would be pinned from
-			// reclamation forever by this one dead slot.
-			c.retireLeaf(newNode)
-			c.reapMu.RUnlock()
-
-			continue
-		}
-
 		bestLeaf := c.findBestMatch(rootNode, key)
-		if bestLeaf == nil {
-			c.reapMu.RUnlock()
-
-			continue
-		}
-
-		if bestLeaf.key == key {
+		if bestLeaf != nil && bestLeaf.key == key {
 			// Existing key — single CAS attempt.
 			// If the leaf is deleted, the caller may pass old=nil (from Contains
 			// returning nil). Accept that by swapping old to the actual current
@@ -414,17 +386,52 @@ func (c *Critbit[T]) Insert(key string, old *TipSet, newTips *TipSet) (*TipSet, 
 			return tips, false
 		}
 
-		bytePos, otherbits := findCritBit(key, bestLeaf.key)
+		// Locate the link to replace before allocating any arena slots. The
+		// root and child links use the same publication and retirement path.
+		link, node := &c.root, rootNode
 
-		newLeafNode := c.allocLeafNode(key, newTips) // deleted=true
-		newInternal := c.allocInternalNode(bytePos, otherbits)
+		var (
+			bytePos   uint32
+			otherbits uint8
+		)
 
-		newDir := getDirection(key, bytePos, otherbits)
-		oldDir := 1 - newDir
+		if bestLeaf != nil {
+			bytePos, otherbits = findCritBit(key, bestLeaf.key)
+			for node != nil && !node.isLeaf && shouldInsertBefore(node.bytePos, node.otherbits, bytePos, otherbits) {
+				link = &node.child[getDirection(key, node.bytePos, node.otherbits)]
+				node = link.Load()
+			}
 
-		ok := c.insertNode(rootNode, newInternal, newLeafNode, newDir, oldDir, bytePos, otherbits)
-		if ok {
-			newLeafNode.deleted.Store(false) // publish after linking, before releasing the read lock
+			// A concurrent insert may have introduced the same critical bit or
+			// changed the matching leaf. Retry before allocating orphan slots.
+			if node == nil || (!node.isLeaf && !shouldInsertBefore(bytePos, otherbits, node.bytePos, node.otherbits)) {
+				c.reapMu.RUnlock()
+
+				continue
+			}
+
+			if node.isLeaf {
+				actualPos, actualBits := findCritBit(key, node.key)
+				if actualPos != bytePos || actualBits != otherbits {
+					c.reapMu.RUnlock()
+
+					continue
+				}
+			}
+		}
+
+		newLeaf := c.allocLeafNode(key, newTips) // deleted until linked
+		replacement := newLeaf
+
+		if node != nil {
+			replacement = c.allocInternalNode(bytePos, otherbits)
+			dir := getDirection(key, bytePos, otherbits)
+			replacement.child[dir].Store(newLeaf)
+			replacement.child[1-dir].Store(node)
+		}
+
+		if link.CompareAndSwap(node, replacement) {
+			newLeaf.deleted.Store(false)
 			c.size.Add(1)
 			c.reapMu.RUnlock()
 			c.fireTipDelta(old, newTips, nil)
@@ -432,82 +439,24 @@ func (c *Critbit[T]) Insert(key string, old *TipSet, newTips *TipSet) (*TipSet, 
 			return nil, true
 		}
 
-		// Lost: newLeafNode/newInternal are unlinked orphans (leaf still
-		// deleted=true, so the sweep skips it). Account both slots reaped so
-		// they don't pin their chunks from reclamation, then retry.
-		c.retireLeaf(newLeafNode)
-		c.retireInternal(newInternal)
+		// Unlinked slots must be retired exactly once so they do not pin
+		// their chunks. The leaf is still deleted, so eviction skips it.
+		c.retireLeaf(newLeaf)
+
+		if replacement != newLeaf {
+			c.retireInternal(replacement)
+		}
+
 		c.reapMu.RUnlock()
 	}
 }
 
 func (c *Critbit[T]) findBestMatch(node *critNode[T], key string) *critNode[T] {
-	if node == nil {
-		return nil
+	for node != nil && !node.isLeaf {
+		node = node.child[getDirection(key, node.bytePos, node.otherbits)].Load()
 	}
 
-	current := node
-	for !current.isLeaf {
-		dir := getDirection(key, current.bytePos, current.otherbits)
-
-		next := current.child[dir].Load()
-		if next == nil {
-			return nil
-		}
-
-		current = next
-	}
-
-	return current
-}
-
-func (c *Critbit[T]) insertNode(rootNode *critNode[T], newInternal *critNode[T], newLeafNode *critNode[T], newDir, oldDir int, bytePos uint32, otherbits uint8) bool {
-	if rootNode.isLeaf || shouldInsertBefore(bytePos, otherbits, rootNode.bytePos, rootNode.otherbits) {
-		newInternal.child[newDir].Store(newLeafNode)
-		newInternal.child[oldDir].Store(rootNode)
-
-		return c.root.CompareAndSwap(rootNode, newInternal)
-	}
-
-	current := rootNode
-
-	for {
-		// The new node's bit must be strictly less significant than the
-		// current parent's bit. A concurrent insert may have spliced a
-		// new internal node with the same (or more-significant) bit into
-		// the path we are walking, which would create a duplicate or
-		// out-of-order bit position if we insert here.
-		if !shouldInsertBefore(current.bytePos, current.otherbits, bytePos, otherbits) {
-			return false
-		}
-
-		dir := getDirection(newLeafNode.key, current.bytePos, current.otherbits)
-		childNode := current.child[dir].Load()
-
-		if childNode == nil {
-			return false
-		}
-
-		if childNode.isLeaf {
-			// Verify the precomputed crit bit is still valid for this leaf.
-			// A concurrent insert may have replaced the original leaf with a
-			// different one, making the crit bit (computed against the old
-			// best-match leaf) incorrect for this pairing.
-			actualBytePos, actualOtherbits := findCritBit(newLeafNode.key, childNode.key)
-			if actualBytePos != bytePos || actualOtherbits != otherbits {
-				return false // tree changed; retry from Insert's outer loop
-			}
-		}
-
-		if childNode.isLeaf || shouldInsertBefore(bytePos, otherbits, childNode.bytePos, childNode.otherbits) {
-			newInternal.child[newDir].Store(newLeafNode)
-			newInternal.child[oldDir].Store(childNode)
-
-			return current.child[dir].CompareAndSwap(childNode, newInternal)
-		}
-
-		current = childNode
-	}
+	return node
 }
 
 func shouldInsertBefore(newBytePos uint32, newOtherbits uint8, curBytePos uint32, curOtherbits uint8) bool {
@@ -532,17 +481,8 @@ func (c *Critbit[T]) fireTipDelta(old, newTips *TipSet, droppedData *T) {
 	case newTips.Len() == 0:
 		removed = old.Tips()
 	default:
-		for _, t := range newTips.tips {
-			if !old.Contains(t) {
-				added = append(added, t)
-			}
-		}
-
-		for _, t := range old.tips {
-			if !newTips.Contains(t) {
-				removed = append(removed, t)
-			}
-		}
+		added = tipDifference(newTips.tips, old.tips)
+		removed = tipDifference(old.tips, newTips.tips)
 	}
 
 	if len(added) > 0 || len(removed) > 0 || droppedData != nil {
@@ -576,28 +516,11 @@ func (c *Critbit[T]) RemoveTips(key string, refs []EffectRef) {
 			return
 		}
 
-		remaining := 0
-
-		for _, tip := range current.tips {
-			if !slices.Contains(refs, tip) {
-				remaining++
-			}
-		}
-
-		if remaining == len(current.tips) {
+		kept := tipDifference(current.tips, refs)
+		if len(kept) == len(current.tips) {
 			c.reapMu.RUnlock()
 
 			return // nothing to remove
-		}
-
-		// Allocate only retained capacity. The source is already deduplicated,
-		// so the owned slice can be published without another NewTipSet copy.
-		kept := make([]EffectRef, 0, remaining)
-
-		for _, tip := range current.tips {
-			if !slices.Contains(refs, tip) {
-				kept = append(kept, tip)
-			}
 		}
 
 		newTips := &TipSet{tips: kept}
@@ -736,7 +659,7 @@ func (c *Critbit[T]) MatchPattern(pattern string) []string {
 	result := make([]string, 0)
 
 	c.Range(func(key string) bool {
-		if matchGlob(key, pattern) {
+		if MatchGlob(key, pattern) {
 			result = append(result, key)
 		}
 

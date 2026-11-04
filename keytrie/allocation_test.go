@@ -93,3 +93,28 @@ func BenchmarkArenaGrow(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkTipDeltaReplace(b *testing.B) {
+	for _, overlap := range []int{0, 8, 16} {
+		b.Run(fmt.Sprintf("overlap=%d", overlap), func(b *testing.B) {
+			var c Critbit[struct{}]
+
+			c.SetRefDelta(func(_, _ []EffectRef, _ *struct{}) {})
+
+			var before, after [16]EffectRef
+
+			for i := range 16 {
+				before[i] = tip(uint64(i))
+				after[i] = tip(uint64(i + 16 - overlap))
+			}
+
+			old, next := NewTipSet(before[:]...), NewTipSet(after[:]...)
+
+			b.ReportAllocs()
+
+			for b.Loop() {
+				c.fireTipDelta(old, next, nil)
+			}
+		})
+	}
+}

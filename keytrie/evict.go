@@ -147,17 +147,6 @@ func (c *Critbit[T]) SetRefDelta(fn func(added, removed []EffectRef, droppedData
 	c.refDelta = fn
 }
 
-// EvictBounded runs one bounded eviction sweep. It samples at most maxScan
-// leaves by random root-to-leaf descent, selects the least-recently-used
-// unprotected (freq <= k) leaf among them — falling back to the overall LRU
-// sample when every candidate is protected — soft-deletes it, and notifies the
-// consumer. Returns true if a leaf was evicted.
-//
-// Latency is bounded by maxScan regardless of keyspace size, and victim quality
-// doesn't depend on key-order locality: the samples are spread across the
-// keyspace the way CloxCache's hash-distributed slot scan was, so the LRU of
-// the sample tracks the global LRU rather than the LRU of a lexicographic
-// neighborhood.
 // EvictK returns the current protected-frequency eviction threshold (the
 // adaptive SLRU promotion bar maybeAdaptK tunes). It is the trie's analogue
 // of CloxCache's per-shard k; telemetry reports it as average_k. Returns the
@@ -330,16 +319,6 @@ func (c *Critbit[T]) EvictBatch(want int) int {
 	// least-recent ghost.
 	slices.SortFunc(ghosts, oldestFirst)
 
-	// tick advances the decay clock one reclaim: forgetting is
-	// eviction-clocked, never wall-clocked, so an idle trie forgets nothing.
-	tick := func() {
-		c.evictClock++
-		if every := c.decayIntervalNow(); every > 0 && c.evictClock >= every {
-			c.evictClock = 0
-			c.decayEpochN.Add(1)
-		}
-	}
-
 	// trimOldestGhost reclaims the least-recent ghost seen this sweep, skipping
 	// any that were concurrently promoted back to live.
 	trimOldestGhost := func() bool {
@@ -355,15 +334,12 @@ func (c *Critbit[T]) EvictBatch(want int) int {
 		return false
 	}
 
-	type evicted struct {
-		key  string
-		tips *TipSet
-		data *T
-	}
-
-	var notifications [minSweep / 2]evicted
+	var notifications [minSweep / 2]evictedLeaf[T]
 
 	victims := notifications[:0]
+	if len(cands) > cap(victims) {
+		victims = make([]evictedLeaf[T], 0, len(cands))
+	}
 
 	for _, cd := range cands {
 		leaf := cd.leaf
@@ -371,12 +347,7 @@ func (c *Critbit[T]) EvictBatch(want int) int {
 			continue
 		}
 
-		tips := leaf.tips.Load()
-		data := leaf.data.Load()
-		leaf.tips.Store(nil)
-		leaf.data.Store(nil)
-		c.releaseLeafMemory(leaf, tips, data)
-		c.size.Add(-1)
+		victim := c.detachEvictedLeaf(leaf)
 		// At ghost capacity, trim the oldest existing ghost to make room BEFORE
 		// ghosting the fresh victim. The order is load-bearing: the victim was
 		// chosen as LRU, so its recency is near-oldest — ghost-first followed by
@@ -411,9 +382,9 @@ func (c *Critbit[T]) EvictBatch(want int) int {
 			c.enqueueReap(leaf)
 		}
 
-		tick()
+		c.advanceDecay()
 
-		victims = append(victims, evicted{leaf.key, tips, data})
+		victims = append(victims, victim)
 	}
 
 	// Fallback when the window held no cold leaf: reclaim the oldest ghost ahead
@@ -427,20 +398,16 @@ func (c *Critbit[T]) EvictBatch(want int) int {
 			// previously-cold key) so the adaptive-k clock keeps advancing — without
 			// this, k freezes exactly when ghost reclaims dominate (cold-scarce).
 			c.evictedUnprot.Add(1)
-			tick()
+			c.advanceDecay()
 		} else if fbVictim != nil && c.claimForEviction(fbVictim) {
-			tips := fbVictim.tips.Load()
-			data := fbVictim.data.Load()
-			fbVictim.tips.Store(nil)
-			fbVictim.data.Store(nil)
-			c.releaseLeafMemory(fbVictim, tips, data)
-			c.size.Add(-1)
+			victim := c.detachEvictedLeaf(fbVictim)
 			c.deletedCount.Add(1)
 			c.enqueueReap(fbVictim)
-			victims = append(victims, evicted{fbVictim.key, tips, data})
+
+			victims = append(victims, victim)
 
 			c.evictedProt.Add(1)
-			tick()
+			c.advanceDecay()
 		}
 	} else {
 		c.evictedUnprot.Add(uint64(len(victims)))
@@ -467,6 +434,36 @@ func (c *Critbit[T]) EvictBatch(want int) int {
 	}
 
 	return len(victims)
+}
+
+// evictedLeaf owns the values needed for notification after releasing the
+// locks. It must not retain an arena node: callbacks may reclaim that node.
+type evictedLeaf[T any] struct {
+	key  string
+	tips *TipSet
+	data *T
+}
+
+// detachEvictedLeaf clears a claimed leaf and accounts its released contents.
+// The caller holds reapMu and decides whether to retain a ghost or queue a reap.
+func (c *Critbit[T]) detachEvictedLeaf(leaf *critNode[T]) evictedLeaf[T] {
+	victim := evictedLeaf[T]{key: leaf.key, tips: leaf.tips.Load(), data: leaf.data.Load()}
+	leaf.tips.Store(nil)
+	leaf.data.Store(nil)
+	c.releaseLeafMemory(leaf, victim.tips, victim.data)
+	c.size.Add(-1)
+
+	return victim
+}
+
+// advanceDecay records one reclaim under evictMu. Forgetting is driven by
+// eviction rather than wall time, so an idle trie retains its frequencies.
+func (c *Critbit[T]) advanceDecay() {
+	c.evictClock++
+	if every := c.decayIntervalNow(); every > 0 && c.evictClock >= every {
+		c.evictClock = 0
+		c.decayEpochN.Add(1)
+	}
 }
 
 // SetDecayInterval overrides the eviction-driven frequency decay cadence:

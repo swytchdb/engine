@@ -49,10 +49,6 @@ func matchCharClass(b byte, class string) bool {
 // MatchGlob matches a string against a Redis-style glob pattern using O(n*m) algorithm.
 // This avoids exponential backtracking on pathological patterns like "a*a*a*...*b".
 func MatchGlob(s, pattern string) bool {
-	return matchGlob(s, pattern)
-}
-
-func matchGlob(s, pattern string) bool {
 	si, pi := 0, 0
 	starIdx, matchIdx := -1, 0
 
@@ -87,15 +83,7 @@ func matchGlob(s, pattern string) bool {
 				}
 
 				if end >= len(pattern) {
-					if starIdx >= 0 {
-						matchIdx++
-						si = matchIdx
-						pi = starIdx + 1
-
-						continue
-					}
-
-					return false
+					break // use the same star backtracking as any other mismatch
 				}
 
 				class := pattern[classStart:end]
