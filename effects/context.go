@@ -814,7 +814,7 @@ func (c *Context) Emit(eff *pb.Effect, snapshotTips ...[]Tip) error {
 
 			ck.collection = data.GetCollection()
 			if len(data.GetId()) > 0 {
-				ck.elementIDs = append(ck.elementIDs, data.GetId())
+				ck.elementIDs = append(ck.elementIDs, bytes.Clone(data.GetId()))
 			}
 		}
 		// A RowWriteEffect is semantic evidence of a row-level write
@@ -1952,7 +1952,7 @@ func BuildOffsetNotify(nodeID pb.NodeID, offset Tip, eff *pb.Effect, data []byte
 	notify := &pb.OffsetNotify{
 		Origin:     toPbRef(offset),
 		Hlc:        eff.GetHlc(),
-		Key:        eff.GetKey(),
+		Key:        bytes.Clone(eff.GetKey()),
 		Deps:       eff.GetDeps(),
 		EffectData: wireData,
 	}
