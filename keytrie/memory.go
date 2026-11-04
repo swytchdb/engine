@@ -28,8 +28,15 @@ func (a *critbitArena[T]) addExtra(chunk uint32, delta int64) {
 	a.list.Load().chunks[chunk].extra.Add(delta)
 }
 
-func (c *Critbit[T]) releaseLeafMemory(leaf *critNode[T], tips *TipSet, data *T) {
+// clearLeaf releases a claimed leaf's payload and accounts its removed tips.
+// The caller has already detached tips and holds reapMu through accounting.
+// Both explicit deletion and eviction use this transition.
+func (c *Critbit[T]) clearLeaf(leaf *critNode[T], tips *TipSet) *T {
+	data := leaf.data.Swap(nil)
 	c.leafArena.addExtra(leaf.chunkIdx, -tipSetBytes(tips)-payloadBytes(data))
+	c.size.Add(-1)
+
+	return data
 }
 
 func (c *Critbit[T]) keyBytes(key string) int64 {

@@ -38,8 +38,9 @@ import (
 // never correctness. 64Ki slots ≈ 32 chunks.
 const freeSlotCapacity = 1 << 16
 
-// arenaChunkList is an immutable directory. Growth and recycling publish a new
-// directory; existing entries share their nodes and counters until retired.
+// arenaChunkList is an immutable directory. Growth may append beyond a published
+// slice's length; recycling copies the directory before replacing an entry.
+// Existing entries share their nodes and counters until retired.
 type arenaChunkList[T any] struct {
 	chunks []*arenaChunk[T]
 }
@@ -222,11 +223,11 @@ func (a *critbitArena[T]) grow(needed uint64) {
 		return
 	}
 
-	chunks := make([]*arenaChunk[T], needed+1)
-	copy(chunks, list.chunks)
-
-	for i := len(list.chunks); i < len(chunks); i++ {
-		chunks[i] = a.newChunk()
+	// Only growMu writes the directory. Appending can reuse spare capacity:
+	// readers of older snapshots cannot see entries beyond their slice length.
+	chunks := slices.Grow(list.chunks, int(needed)+1-len(list.chunks))
+	for len(chunks) <= int(needed) {
+		chunks = append(chunks, a.newChunk())
 	}
 
 	a.list.Store(&arenaChunkList[T]{chunks: chunks})

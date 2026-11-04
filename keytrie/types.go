@@ -106,10 +106,6 @@ func (ts *TipSet) Single() (EffectRef, bool) {
 
 // ContainsAll reports whether the tip set contains all of the given refs.
 func (ts *TipSet) ContainsAll(refs []EffectRef) bool {
-	if ts == nil {
-		return len(refs) == 0
-	}
-
 	for _, r := range refs {
 		if !ts.Contains(r) {
 			return false
@@ -123,6 +119,10 @@ func (ts *TipSet) ContainsAll(refs []EffectRef) bool {
 // Both inputs and the result are immutable. An unchanged result shares refs;
 // a partial result owns exactly the retained capacity.
 func tipDifference(refs, excluded []EffectRef) []EffectRef {
+	if len(excluded) == 0 {
+		return refs
+	}
+
 	remaining := 0
 
 	for _, ref := range refs {

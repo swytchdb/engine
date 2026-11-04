@@ -2,6 +2,36 @@ package keytrie
 
 import "testing"
 
+func TestArenaGrowthPreservesPublishedDirectories(t *testing.T) {
+	var arena critbitArena[int]
+	arena.init(1, nil)
+
+	snapshots := make([]*arenaChunkList[int], 0, 100)
+
+	for i := range 100 {
+		node, _ := arena.alloc()
+		*node = i + 1
+
+		snapshots = append(snapshots, arena.list.Load())
+	}
+
+	// Neither appending into spare capacity nor recycling may change entries
+	// visible to readers of an older directory.
+	arena.recordReaped(0)
+
+	for i, snapshot := range snapshots {
+		if len(snapshot.chunks) != i+1 {
+			t.Fatalf("snapshot %d grew to %d entries", i, len(snapshot.chunks))
+		}
+
+		for j, chunk := range snapshot.chunks {
+			if chunk.nodes[0] != j+1 {
+				t.Fatalf("snapshot %d entry %d changed", i, j)
+			}
+		}
+	}
+}
+
 func TestArenaRecycleKeepsGenerationAccountingSeparate(t *testing.T) {
 	var arena critbitArena[int]
 	arena.init(2, nil)

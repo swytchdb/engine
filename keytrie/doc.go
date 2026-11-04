@@ -15,4 +15,8 @@
 // Tip sets and payload pointers can escape a lookup; arena nodes cannot. TipSet
 // slices are immutable, and payload contents remain the consumer's responsibility.
 // Configure ownership and eviction hooks before publishing a trie to callers.
+//
+// Maintenance storage is demand-driven: the reap queue is allocated on the first
+// pending deletion, and arena directories grow without copying their published
+// prefix on every new chunk. Close releases both arena and queue storage.
 package keytrie

@@ -286,12 +286,8 @@ func (c *Critbit[T]) EvictBatch(want int) int {
 			decayLeaf(leaf, epoch)
 		}
 
-		if leaf.pinned {
-			return // pinned (e.g. a system key) — verdict cached at leaf creation
-		}
-
-		if leaf.pins.Load() != 0 {
-			return // dynamically pinned (e.g. cloud outbox holds un-acked uploads)
+		if leaf.pinned || leaf.pins.Load() != 0 {
+			return // static system-key pin or a dynamic hold
 		}
 
 		if access < fbAccess {
@@ -365,13 +361,7 @@ func (c *Critbit[T]) EvictBatch(want int) int {
 			// Ghost: retain the frequency (negated) for a warm restart.
 			for {
 				f := leaf.freq.Load()
-
-				nf := -f
-				if nf >= 0 {
-					nf = -1
-				}
-
-				if leaf.freq.CompareAndSwap(f, nf) {
+				if leaf.freq.CompareAndSwap(f, -max(f, 1)) {
 					break
 				}
 			}
@@ -447,20 +437,23 @@ type evictedLeaf[T any] struct {
 // detachEvictedLeaf clears a claimed leaf and accounts its released contents.
 // The caller holds reapMu and decides whether to retain a ghost or queue a reap.
 func (c *Critbit[T]) detachEvictedLeaf(leaf *critNode[T]) evictedLeaf[T] {
-	victim := evictedLeaf[T]{key: leaf.key, tips: leaf.tips.Load(), data: leaf.data.Load()}
-	leaf.tips.Store(nil)
-	leaf.data.Store(nil)
-	c.releaseLeafMemory(leaf, victim.tips, victim.data)
-	c.size.Add(-1)
+	tips := leaf.tips.Swap(nil)
 
-	return victim
+	return evictedLeaf[T]{key: leaf.key, tips: tips, data: c.clearLeaf(leaf, tips)}
 }
 
 // advanceDecay records one reclaim under evictMu. Forgetting is driven by
 // eviction rather than wall time, so an idle trie retains its frequencies.
 func (c *Critbit[T]) advanceDecay() {
 	c.evictClock++
-	if every := c.decayIntervalNow(); every > 0 && c.evictClock >= every {
+
+	every := c.decayEvery.Load()
+	if every == 0 {
+		// Scale with the live set so forgetting takes about seven turnovers.
+		every = max(defaultDecayInterval, uint64(c.size.Load())/2)
+	}
+
+	if every != math.MaxUint64 && c.evictClock >= every {
 		c.evictClock = 0
 		c.decayEpochN.Add(1)
 	}
@@ -468,7 +461,7 @@ func (c *Critbit[T]) advanceDecay() {
 
 // SetDecayInterval overrides the eviction-driven frequency decay cadence:
 // n > 0 sets reclaims-per-step, n <= 0 disables decay entirely. Call at setup;
-// the default auto-scales with the live-leaf count (see decayIntervalNow).
+// the default auto-scales with the live-leaf count (see advanceDecay).
 func (c *Critbit[T]) SetDecayInterval(n int) {
 	if n > 0 {
 		c.decayEvery.Store(uint64(n))
@@ -478,23 +471,6 @@ func (c *Critbit[T]) SetDecayInterval(n int) {
 	// MaxUint64 keeps the epoch counter frozen — decay never applies — while
 	// staying distinct from 0, which means "not configured, auto-scale".
 	c.decayEvery.Store(math.MaxUint64)
-}
-
-// decayIntervalNow returns the reclaims-per-decay-step in effect: the
-// configured value when set, otherwise auto-scaled to the current live-leaf
-// count so forget-from-saturation stays ≈7 turnovers of the resident set
-// regardless of domain size — with a fixed small interval, a large domain's
-// epochs elapse so fast that every leaf hits the floor by its next sweep
-// visit and protection degrades to plain LRU. Returns 0 when disabled.
-func (c *Critbit[T]) decayIntervalNow() uint64 {
-	switch every := c.decayEvery.Load(); every {
-	case 0:
-		return max(defaultDecayInterval, uint64(c.size.Load())/2)
-	case math.MaxUint64:
-		return 0
-	default:
-		return every
-	}
 }
 
 // decayEpoch returns the current eviction-decay epoch. Leaves store the epoch
@@ -650,7 +626,8 @@ func (c *Critbit[T]) maybeAdaptK() {
 	// until the window completes; this also paces the post-halving underflow
 	// burst above to one k step per completed window rather than one per
 	// eviction, which is the burst's intended shape.
-	if c.windowOps.load() < hitRateWindowSize {
+	ops := c.windowOps.load()
+	if ops < hitRateWindowSize {
 		return
 	}
 
@@ -665,49 +642,37 @@ func (c *Critbit[T]) maybeAdaptK() {
 		return
 	}
 
-	// Self-tune the rate thresholds from the hit-rate gradient once the
-	// window has enough samples.
-	if ops := c.windowOps.load(); ops >= hitRateWindowSize {
-		// Clamp: the two counters are bumped independently, so hits can briefly
-		// read above ops — never let the gradient see a rate over 1.
-		hits := min(c.windowHits.load(), ops)
-		hitRate := uint64(float64(hits) / float64(ops) * 10000)
-		prev := c.prevHitRate.Load()
+	// Learn from the previous change: a successful increase in k lowers the
+	// high threshold; a successful decrease raises the low threshold. Failed
+	// changes move their threshold the other way. Both use the same bounds rule.
+	hits := min(c.windowHits.load(), ops)
+	hitRate := uint64(float64(hits) / float64(ops) * 10000)
+	prev, lastDir := c.prevHitRate.Load(), c.lastKDir.Load()
 
-		dir := c.lastKDir.Load()
-		if prev > 0 && dir != 0 {
-			improved := hitRate > prev
-			rateLow := c.rateLow.Load()
+	if prev > 0 && lastDir != 0 {
+		threshold := &c.rateHigh
+		lower, upper := uint32(minRateHigh), uint32(maxRateHigh)
+		increase := hitRate <= prev
 
-			rateHigh := c.rateHigh.Load()
-			if dir > 0 { // last change raised k
-				if improved {
-					if rateHigh > minRateHigh+thresholdLearningRate {
-						c.rateHigh.Store(rateHigh - thresholdLearningRate)
-					}
-				} else if rateHigh < maxRateHigh-thresholdLearningRate {
-					c.rateHigh.Store(rateHigh + thresholdLearningRate)
-				}
-			} else { // last change lowered k
-				if improved {
-					if rateLow < maxRateLow-thresholdLearningRate {
-						c.rateLow.Store(rateLow + thresholdLearningRate)
-					}
-				} else if rateLow > minRateLow+thresholdLearningRate {
-					c.rateLow.Store(rateLow - thresholdLearningRate)
-				}
-			}
+		if lastDir < 0 {
+			threshold = &c.rateLow
+			lower, upper = minRateLow, maxRateLow
+			increase = hitRate > prev
 		}
 
-		c.prevHitRate.Store(hitRate)
-		// bumpAccess bumps hits before ops. Resetting in the same order (ops
-		// first, hits last) means a concurrent access straddling the reset has its
-		// hits increment wiped while its ops increment survives, so the residual
-		// is always ops >= hits — never a persisted windowHits > windowOps skew
-		// bleeding into the next window.
-		c.windowOps.reset()
-		c.windowHits.reset()
+		value := threshold.Load()
+		if increase && value < upper-thresholdLearningRate {
+			threshold.Store(value + thresholdLearningRate)
+		} else if !increase && value > lower+thresholdLearningRate {
+			threshold.Store(value - thresholdLearningRate)
+		}
 	}
+
+	c.prevHitRate.Store(hitRate)
+	// Reset ops before hits: an access straddling the reset must not leave
+	// a persisted hits > ops skew in the next window. Telemetry also clamps it.
+	c.windowOps.reset()
+	c.windowHits.reset()
 
 	rate := float64(graduated) / float64(total)
 	rateLow := float64(c.rateLow.Load()) / 10000.0
@@ -815,13 +780,7 @@ func (c *Critbit[T]) sweepLeaves(base int, fn func(*critNode[T])) {
 			}
 
 			n := &chunk.nodes[idx%chunkSize]
-			if n.deleted.Load() {
-				if n.freq.Load() < 0 {
-					fn(n)
-
-					occupied++
-				}
-
+			if n.deleted.Load() && n.freq.Load() >= 0 {
 				continue // uninitialized and unlink-pending slots consume no budget
 			}
 

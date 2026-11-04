@@ -51,52 +51,30 @@ const (
 	reapBatchSize = 64
 )
 
-// critNode is a flattened node that serves as both internal and leaf.
-// Hot-path fields (child, bytePos, otherbits, isLeaf) are in the first 22 bytes.
-// Leaf fields start at offset 24.
-//
-// The type parameter T is the consumer-owned leaf payload. The trie itself
-// never inspects it — it only stores the pointer on each leaf so a consumer
-// (the effects engine) can attach a per-key cached subdag without leaking its
-// types into keytrie. Plain tip indexes use T = struct{} and never touch it.
+// critNode represents an internal branch or a leaf; its role never changes.
+// Structural fields come first for traversal locality. Leaf payloads belong to
+// the consumer; the trie stores their pointers without inspecting their contents.
 type critNode[T any] struct {
-	child     [2]atomic.Pointer[critNode[T]] // 16 bytes, offset 0  (internal)
-	bytePos   uint32                         // 4 bytes,  offset 16 (internal)
-	otherbits uint8                          // 1 byte,   offset 20 (internal)
-	isLeaf    bool                           // 1 byte,   offset 21
-	// pinned caches the eviction decider's verdict (the system-key pin), computed
-	// once when the leaf is created, so the sweep reads a bit instead of calling
-	// the decider — a func-pointer indirect plus a per-key prefix check — on every
-	// leaf it visits. The verdict is a pure function of the immutable key; key
-	// updates reuse the leaf, so it never needs recomputing. Written once before
-	// publish, so no atomic is needed (same discipline as key).
-	pinned  bool                   // 1 byte,   offset 22 (leaf)
-	_       [1]byte                //           offset 23
-	key     string                 // 16 bytes, offset 24 (leaf)
-	tips    atomic.Pointer[TipSet] // 8 bytes,  offset 40 (leaf)
-	deleted atomic.Bool            // 4 bytes,  offset 44 (leaf)
-	// Eviction metadata (leaf). A leaf spans a second cache line now;
-	// these are written on the hot read path (freq bump) so they sit
-	// apart from the structural fields above. freq < 0 marks a ghost:
-	// a soft-deleted leaf retaining |freq| so a returning key warms back.
-	freq       atomic.Int32  // 4 bytes,  offset 48
-	chunkIdx   uint32        // 4 bytes,  offset 52 (arena chunk, for reclamation)
-	lastAccess atomic.Uint64 // 8 bytes,  offset 56 (LRU tiebreak)
-	// pins counts dynamic do-not-evict holds (Pin/Unpin). The cloud outbox
-	// holds one while any of the key's effects await a durability ack:
-	// evicting then would free almost nothing — the outbox already pins the
-	// effect bytes — while making the key invisible cluster-wide (this node
-	// unsubscribes and drops its tips, and the cloud has no tip markers yet),
-	// so every read of the key anywhere misses data the cluster durably
-	// holds. Unlike the static pinned bit this changes at runtime, so the
-	// sweep pays one atomic load per visited leaf.
-	pins atomic.Int32      // 4 bytes,  offset 64
-	data atomic.Pointer[T] // 8 bytes,  offset 72 (leaf payload, 8-aligned)
-	// lastDecayEpoch is the eviction-decay epoch this leaf last absorbed; the
-	// sweep steps freq down by the elapsed epochs on visit (see decayLeaf).
-	// Atomic because ghost promotion and the sweep can share the read lock
-	// while the sweep writes it under evictMu.
-	lastDecayEpoch atomic.Uint64 // 8 bytes,  offset 80
+	child     [2]atomic.Pointer[critNode[T]]
+	bytePos   uint32
+	otherbits uint8
+	isLeaf    bool
+	// pinned is the eviction decider's verdict, fixed before publication.
+	// pins counts dynamic holds taken by Pin/Unpin.
+	pinned  bool
+	_       [1]byte
+	key     string
+	tips    atomic.Pointer[TipSet]
+	deleted atomic.Bool
+	// Negative frequency marks a ghost: a deleted leaf retaining its frequency
+	// for a warm restart. Live accesses update frequency and recency atomically.
+	freq       atomic.Int32
+	chunkIdx   uint32 // owning arena chunk, for reclamation
+	lastAccess atomic.Uint64
+	pins       atomic.Int32
+	data       atomic.Pointer[T]
+	// Sweep decay and ghost promotion can both update this under reapMu.RLock.
+	lastDecayEpoch atomic.Uint64
 }
 
 func noop() {}
@@ -120,8 +98,9 @@ type Critbit[T any] struct {
 	// worker (see drainReap) so the unlink never rides the hot path. reapDropped
 	// counts pushes lost to a full queue; a non-zero value schedules a full-tree
 	// reap as a backstop.
-	reapQueue   *xsync.MPMCQueue[*critNode[T]]
-	reapDropped atomic.Int64
+	reapQueue     atomic.Pointer[xsync.MPMCQueue[*critNode[T]]]
+	reapQueueOnce sync.Once // allocate only when a leaf needs unlinking
+	reapDropped   atomic.Int64
 
 	// Eviction policy (lifted from CloxCache as a single bounded domain;
 	// see evict.go). Sweeps run serialized under evictMu — a cold path —
@@ -220,7 +199,6 @@ func (c *Critbit[T]) ensureInit() {
 			n.deleted.Store(true)
 		})
 		c.internalArena.init(defaultCritbitArenaChunkSize, nil)
-		c.reapQueue = xsync.NewMPMCQueue[*critNode[T]](reapQueueCapacity)
 		c.evictK.Store(defaultProtectedFreqThreshold)
 		c.rateLow.Store(defaultRateLow)
 		c.rateHigh.Store(defaultRateHigh)
@@ -473,16 +451,9 @@ func (c *Critbit[T]) fireTipDelta(old, newTips *TipSet, droppedData *T) {
 
 	var added, removed []EffectRef
 
-	switch {
-	case old == newTips:
-		// No tip change; the payload may still need releasing.
-	case old.Len() == 0:
-		added = newTips.Tips()
-	case newTips.Len() == 0:
-		removed = old.Tips()
-	default:
-		added = tipDifference(newTips.tips, old.tips)
-		removed = tipDifference(old.tips, newTips.tips)
+	if old != newTips {
+		added = tipDifference(newTips.Tips(), old.Tips())
+		removed = tipDifference(old.Tips(), newTips.Tips())
 	}
 
 	if len(added) > 0 || len(removed) > 0 || droppedData != nil {
@@ -563,20 +534,16 @@ func (c *Critbit[T]) DeleteAndSnapshot(key string, old *TipSet) *TipSet {
 
 		return nil
 	}
-	// Drop the leaf payload too — a deleted key's cached state is stale.
-	droppedData := leaf.data.Load()
-	leaf.data.Store(nil)
-	c.releaseLeafMemory(leaf, old, droppedData)
-	c.size.Add(-1)
+	// The tips CAS already detached old; release the payload and account both.
+	droppedData := c.clearLeaf(leaf, old)
+	deleted := c.deletedCount.Add(1)
+	c.enqueueReap(leaf)
 
 	c.reapMu.RUnlock()
 
 	// Release the tips and the payload's references — DeleteAndSnapshot bypasses
 	// the eviction notify, so this is the only refcount signal for FlushIndex.
 	c.fireTipDelta(old, nil, droppedData)
-
-	deleted := c.deletedCount.Add(1)
-	c.enqueueReap(leaf)
 
 	live := c.size.Load()
 	if deleted > 0 && deleted > (live+deleted)/10 {
@@ -754,6 +721,7 @@ func (c *Critbit[T]) Close() error {
 
 	c.leafArena.clear()
 	c.internalArena.clear()
+	c.reapQueue.Store(nil)
 
 	return nil
 }

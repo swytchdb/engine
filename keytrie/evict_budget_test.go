@@ -30,8 +30,7 @@ func TestSweepBudgetIncludesGhosts(t *testing.T) {
 			if n.key != "" && n.key != liveKey {
 				n.deleted.Store(true)
 				n.freq.Store(-1)
-				c.releaseLeafMemory(n, n.tips.Swap(nil), nil)
-				c.size.Add(-1)
+				c.clearLeaf(n, n.tips.Swap(nil))
 				c.ghostCount.Add(1)
 			}
 		}

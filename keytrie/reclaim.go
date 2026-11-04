@@ -23,13 +23,22 @@
 
 package keytrie
 
-import "sync/atomic"
+import (
+	"sync/atomic"
+
+	"github.com/puzpuzpuz/xsync/v4"
+)
 
 // enqueueReap queues a leaf that just went dead for background unlinking. A drop
 // (full queue) bumps reapDropped so maybeReap falls back to a full traversal, which
 // rediscovers stragglers — nothing is leaked, the fast path is just bypassed.
+// The caller holds reapMu, so Close cannot discard the queue during publication.
 func (c *Critbit[T]) enqueueReap(leaf *critNode[T]) {
-	if c.reapQueue == nil || !c.reapQueue.TryEnqueue(leaf) {
+	c.reapQueueOnce.Do(func() {
+		c.reapQueue.Store(xsync.NewMPMCQueue[*critNode[T]](reapQueueCapacity))
+	})
+
+	if !c.reapQueue.Load().TryEnqueue(leaf) {
 		c.reapDropped.Add(1)
 	}
 }
@@ -61,7 +70,8 @@ func (c *Critbit[T]) maybeReap() {
 // leaf is still dead and still the leaf for its key, so a revived or
 // already-unlinked entry is harmlessly skipped.
 func (c *Critbit[T]) drainReap() int {
-	if c.closed.Load() || c.reapQueue == nil {
+	queue := c.reapQueue.Load()
+	if c.closed.Load() || queue == nil {
 		return 0
 	}
 
@@ -69,7 +79,7 @@ func (c *Critbit[T]) drainReap() int {
 
 	n := 0
 	for n < reapBatchSize {
-		leaf, ok := c.reapQueue.TryDequeue()
+		leaf, ok := queue.TryDequeue()
 		if !ok {
 			break
 		}
