@@ -108,11 +108,11 @@ func (s *transactionSnapshot) member(ctx context.Context, tip Tip, eff *pb.Effec
 	visiting[tip] = true
 	defer delete(visiting, tip)
 
-	choose := func(include bool, why string) (bool, error) {
+	choose := func(include bool, why string) bool {
 		s.decided[tip] = include
 		temporalDebug(ctx, s.at, tip, why)
 
-		return include, nil
+		return include
 	}
 
 	// A newly discovered branch cannot extend a key whose history was
@@ -139,14 +139,14 @@ func (s *transactionSnapshot) member(ctx context.Context, tip Tip, eff *pb.Effec
 		}
 
 		if !included {
-			return choose(false, "outside frozen key frontier")
+			return choose(false, "outside frozen key frontier"), nil
 		}
 
 		knownPast = true
 	}
 
 	if knownPast {
-		return choose(true, "ancestor of frozen frontier")
+		return choose(true, "ancestor of frozen frontier"), nil
 	}
 
 	lower, upper, err := s.clocks.Difference(s.at, effectSample(eff))
@@ -155,17 +155,17 @@ func (s *transactionSnapshot) member(ctx context.Context, tip Tip, eff *pb.Effec
 	}
 
 	if lower > 0 {
-		return choose(false, "numerically after boundary")
+		return choose(false, "numerically after boundary"), nil
 	}
 	// A proven-before state snapshot summarizes an entire causal prefix.
 	// Before any keys have been frozen there are no prior cut choices that
 	// could reject part of that prefix. Do not demand discarded ancestry
 	// merely to re-prove what an existing state snapshot already records.
 	if eff.GetSnapshot().GetState() != nil && upper <= 0 && len(s.views) == 0 {
-		return choose(true, "before-boundary state snapshot")
+		return choose(true, "before-boundary state snapshot"), nil
 	}
 
-	for _, ref := range allDeps(eff) {
+	for ref := range allDeps(eff) {
 		parent, err := s.engine.getEffect(string(eff.GetKey()), r(ref))
 		if err != nil {
 			return false, err
@@ -177,17 +177,17 @@ func (s *transactionSnapshot) member(ctx context.Context, tip Tip, eff *pb.Effec
 		}
 
 		if !include {
-			return choose(false, "descendant of excluded history")
+			return choose(false, "descendant of excluded history"), nil
 		}
 	}
 
 	if upper <= 0 {
-		return choose(true, "numerically before boundary")
+		return choose(true, "numerically before boundary"), nil
 	}
 
 	s.ambiguous++
 
-	return choose(true, "ambiguous; fixed causal inclusion")
+	return choose(true, "ambiguous; fixed causal inclusion"), nil
 }
 
 func (s *transactionSnapshot) prepare(ctx context.Context, requested []string) error {
@@ -240,8 +240,7 @@ func (s *transactionSnapshot) prepare(ctx context.Context, requested []string) e
 		for _, tip := range d.topoOrder {
 			eff := d.nodes[tip]
 			if eff.GetTxnBind() != nil && s.engine.horizon != nil && s.engine.horizon.IsInvisible(eff.GetTxnId()) {
-				wait := s.engine.horizon.WaitForClear(eff.GetTxnId())
-				wait.Release()
+				s.engine.horizon.WaitForClear(eff.GetTxnId())
 				// Completion can reveal verdicts and competitors. Recollect
 				// the closure before publishing any value from this read.
 				return s.prepare(ctx, keys)

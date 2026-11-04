@@ -93,7 +93,7 @@ func (e *Engine) collectTxnEffectsOnKey(txnID, key string, startTips ...Tip) (
 		}
 		// Use allDeps so that starting from a bind walks its
 		// per-key NewTips, not just its top-level Deps.
-		for _, dep := range allDeps(eff) {
+		for dep := range allDeps(eff) {
 			d := r(dep)
 			if !visited[d] {
 				stack = append(stack, d)

@@ -314,9 +314,11 @@ func (p *VertexPool) delete(tip Tip) int64 {
 	}
 
 	p.reclaimed.Add(1)
-	prev.creationMu.Lock()
+	// claimAndDelete already changed refs from zero to the tombstone. Every
+	// creation release updates accounting before dropping its reference, and
+	// new owners must acquire a reference before changing it. The successful
+	// CAS therefore publishes the final accounting and prevents further writes.
 	p.vertexBytes.Add(-prev.size - prev.creationBytes)
-	prev.creationMu.Unlock()
 	p.owned.change(prev.eff, -1)
 
 	return prev.size

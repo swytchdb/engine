@@ -1,11 +1,59 @@
 package effects
 
 import (
+	"runtime"
 	"sync"
 	"testing"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
 )
+
+func TestCreationRefs_ConcurrentReleaseAndReclaim(t *testing.T) {
+	p := newVertexPool()
+	eff := &pb.Effect{Key: []byte("key")}
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+
+	go func() {
+		defer close(stopped)
+
+		for {
+			p.drainReclaim()
+
+			select {
+			case <-done:
+				return
+			default:
+				runtime.Gosched()
+			}
+		}
+	}()
+
+	var writers sync.WaitGroup
+	for worker := range 4 {
+		writers.Go(func() {
+			for i := range 1000 {
+				tip := Tip{uint64(worker + 1), uint64(i + 1)}
+				if err := p.Put(tip, eff); err != nil {
+					t.Error(err)
+
+					return
+				}
+
+				p.decrefChainNode("key", tip)
+			}
+		})
+	}
+
+	writers.Wait()
+	close(done)
+	<-stopped
+	p.drainReclaim()
+
+	if p.EntryCount() != 0 || p.vertexBytes.Load() != 0 || p.owned.residentBytes() != 0 {
+		t.Fatal("concurrent release and reclamation retained vertices or accounting")
+	}
+}
 
 func TestReleaseChainRefs_SharedBindPins(t *testing.T) {
 	for _, owned := range []bool{false, true} {

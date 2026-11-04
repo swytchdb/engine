@@ -27,6 +27,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"iter"
 	"log/slog"
 	"slices"
 	"sort"
@@ -35,23 +36,46 @@ import (
 	pb "github.com/swytchdb/engine/cluster/proto"
 )
 
-// allDeps copies the effect's Deps and appends any KeyBind.NewTip offsets
-// for bind effects. The returned slice is always a fresh allocation when
-// bind tips are present to avoid racing with concurrent callers.
-func allDeps(eff *pb.Effect) []*pb.EffectRef {
-	bind := eff.GetTxnBind()
-	if bind == nil || len(bind.GetKeys()) == 0 {
-		return eff.GetDeps()
+// allDeps visits ordinary dependencies followed by a bind's new tips without
+// copying or modifying the immutable effect's slices.
+func allDeps(eff *pb.Effect) iter.Seq[*pb.EffectRef] {
+	return func(yield func(*pb.EffectRef) bool) {
+		for _, ref := range eff.GetDeps() {
+			if !yield(ref) {
+				return
+			}
+		}
+
+		for _, kb := range eff.GetTxnBind().GetKeys() {
+			if !yield(kb.GetNewTip()) {
+				return
+			}
+		}
 	}
+}
 
-	deps := make([]*pb.EffectRef, len(eff.GetDeps()), len(eff.GetDeps())+len(bind.GetKeys()))
-	copy(deps, eff.GetDeps())
+// keyDeps follows a bind through this key's new tip, excluding other keys.
+// Ordinary effects retain all dependencies, including cross-key read evidence.
+func keyDeps(key string, eff *pb.Effect) iter.Seq[*pb.EffectRef] {
+	return func(yield func(*pb.EffectRef) bool) {
+		if bind := eff.GetTxnBind(); bind != nil {
+			for _, kb := range bind.GetKeys() {
+				if string(kb.GetKey()) == key {
+					yield(kb.GetNewTip())
 
-	for _, kb := range bind.GetKeys() {
-		deps = append(deps, kb.GetNewTip())
+					return
+				}
+			}
+
+			return
+		}
+
+		for _, ref := range eff.GetDeps() {
+			if !yield(ref) {
+				return
+			}
+		}
 	}
-
-	return deps
 }
 
 type dag struct {
@@ -112,6 +136,8 @@ func (d *dag) walk(tips []Tip, processor func(*pb.Effect) error) error {
 // prepare runs BFS + LCA trim and builds d.topoOrder. Safe to read
 // d.nodes and d.topoOrder after this returns successfully.
 func (d *dag) prepare(tips []Tip) error {
+	d.lcaTip = Tip{}
+	d.topoOrder = nil
 	d.nodes = make(map[Tip]*pb.Effect, len(tips)*8)
 
 	if err := d.bfs(tips, &d.lcaTip); err != nil {
@@ -254,14 +280,15 @@ func (d *dag) bfs(tips []Tip, lcaTip *Tip) error {
 			return nil
 		}
 
-		refs := d.keyDeps(eff)
-
 		// Roots finish queued work without resolving their dependency path.
-		if len(refs) > 0 {
-			delete(frontier, cur)
-		}
+		first := true
+		for ref := range keyDeps(d.key, eff) {
+			if first {
+				delete(frontier, cur)
 
-		for _, ref := range refs {
+				first = false
+			}
+
 			dt := r(ref)
 			if dep, seen := d.nodes[dt]; seen {
 				if dep.GetSubscription() != nil && len(dep.GetDeps()) == 0 {
@@ -333,26 +360,10 @@ func (d *dag) trimAncestorsOfLCA() {
 		// separate set and are expanded only once.
 		delete(d.nodes, cur)
 
-		for _, dep := range d.keyDeps(eff) {
+		for dep := range keyDeps(d.key, eff) {
 			stack = append(stack, r(dep))
 		}
 	}
-}
-
-// keyDeps follows a bind through this key's new tip, not through other keys.
-// All traversal phases use the same rule for the per-key graph.
-func (d *dag) keyDeps(eff *pb.Effect) []*pb.EffectRef {
-	if bind := eff.GetTxnBind(); bind != nil {
-		for _, kb := range bind.GetKeys() {
-			if string(kb.GetKey()) == d.key {
-				return []*pb.EffectRef{kb.GetNewTip()}
-			}
-		}
-
-		return nil
-	}
-
-	return eff.GetDeps()
 }
 
 // topoCollect does a post-order DFS within the collected nodes, recording
@@ -379,24 +390,30 @@ func (d *dag) topoCollect(t Tip, visited map[Tip]bool) {
 		return
 	}
 
-	// A chain needs no sorting buffer. Only forks collect and order siblings.
-	refs := d.keyDeps(eff)
-	if len(refs) == 1 {
-		d.topoCollect(r(refs[0]), visited)
-	} else if len(refs) > 1 {
-		deps := make([]dagTip, 0, len(refs))
-		for _, ref := range refs {
-			tip := r(ref)
-			if dep, ok := d.nodes[tip]; ok {
-				deps = append(deps, dagTip{tip, dep})
-			}
-		}
+	// Ordinary chains need neither an iterator nor a sorting buffer.
+	if eff.GetTxnBind() == nil && len(eff.GetDeps()) == 1 {
+		d.topoCollect(r(eff.GetDeps()[0]), visited)
+		d.topoOrder = append(d.topoOrder, t)
 
-		slices.SortFunc(deps, compareDagTips)
+		return
+	}
 
-		for _, dep := range deps {
-			d.topoCollect(dep.tip, visited)
+	// Typical forks fit on the stack; unusually wide forks can grow the slice.
+	var local [8]dagTip
+
+	deps := local[:0]
+
+	for ref := range keyDeps(d.key, eff) {
+		tip := r(ref)
+		if dep, ok := d.nodes[tip]; ok {
+			deps = append(deps, dagTip{tip, dep})
 		}
+	}
+
+	slices.SortFunc(deps, compareDagTips)
+
+	for _, dep := range deps {
+		d.topoCollect(dep.tip, visited)
 	}
 
 	d.topoOrder = append(d.topoOrder, t)

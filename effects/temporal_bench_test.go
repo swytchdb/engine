@@ -68,7 +68,7 @@ func BenchmarkTemporalEngine(b *testing.B) {
 			}
 
 			localEffect, err := e.getEffect("witness", local)
-			if err != nil || len(allDeps(localEffect)) == 0 {
+			if err != nil || len(localEffect.GetDeps()) == 0 {
 				b.Fatalf("missing real witness dependency: %v", err)
 			}
 

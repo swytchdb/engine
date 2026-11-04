@@ -110,7 +110,7 @@ func (e *Engine) observeTemporal(tip Tip, eff *pb.Effect, receipt bool) {
 	if observed&temporalDepsObserved == 0 {
 		completed |= temporalDepsObserved
 
-		for _, ref := range allDeps(eff) {
+		for ref := range allDeps(eff) {
 			parent, ok := e.effectCache.Get(r(ref))
 			if !ok {
 				completed &^= temporalDepsObserved

@@ -129,7 +129,7 @@ func TestSTNRealHistoryNumericalInference(t *testing.T) {
 	)
 
 	for i, rec := range history {
-		for _, dep := range allDeps(rec.effect) {
+		for dep := range allDeps(rec.effect) {
 			j, ok := ids[r(dep)]
 			if !ok {
 				t.Fatalf("unrecorded dependency %v", dep)
@@ -280,7 +280,7 @@ func TestSTNRealHistoryNumericalInference(t *testing.T) {
 
 	sample := func(i int) stn.Sample { return stn.Sample{Domain: domain(i), Tick: stamp(i)} }
 	for i, rec := range history {
-		for _, dep := range allDeps(rec.effect) {
+		for dep := range allDeps(rec.effect) {
 			anchors, err = anchors.Before(sample(ids[r(dep)]), sample(i))
 			if err != nil {
 				t.Fatal(err)

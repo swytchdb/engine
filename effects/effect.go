@@ -633,21 +633,7 @@ func NormalizeCloudTipCandidates(key string, candidates, localRoots []Tip, load 
 			return nil, nil, loadErr
 		}
 
-		var refs []*pb.EffectRef
-
-		if bind := eff.GetTxnBind(); bind != nil {
-			for _, kb := range bind.GetKeys() {
-				if string(kb.GetKey()) == key {
-					refs = []*pb.EffectRef{kb.GetNewTip()}
-
-					break
-				}
-			}
-		} else {
-			refs = eff.GetDeps()
-		}
-
-		for _, ref := range refs {
+		for ref := range keyDeps(key, eff) {
 			dep := r(ref)
 			if _, candidate := candidateSet[dep]; candidate && dep != cur {
 				supersededSet[dep] = struct{}{}
@@ -1167,19 +1153,7 @@ func (e *Engine) lookupSnapshotVerdict(key, txnID string) (pb.Verdict, bool) {
 			continue
 		}
 
-		if bind := eff.GetTxnBind(); bind != nil {
-			for _, kb := range bind.GetKeys() {
-				if string(kb.GetKey()) == key {
-					stack = append(stack, r(kb.GetNewTip()))
-
-					break
-				}
-			}
-
-			continue
-		}
-
-		for _, dep := range eff.GetDeps() {
+		for dep := range keyDeps(key, eff) {
 			stack = append(stack, r(dep))
 		}
 	}
@@ -2262,25 +2236,14 @@ func (e *Engine) collectCausalChain(key string, tips []keytrie.EffectRef) []*pb.
 			break
 		}
 
-		var refs []*pb.EffectRef
+		first := true
+		for ref := range keyDeps(key, eff) {
+			if first {
+				delete(frontier, cur)
 
-		if bind := eff.GetTxnBind(); bind != nil {
-			for _, kb := range bind.GetKeys() {
-				if string(kb.GetKey()) == key {
-					refs = []*pb.EffectRef{kb.GetNewTip()}
-
-					break
-				}
+				first = false
 			}
-		} else {
-			refs = eff.GetDeps()
-		}
 
-		if len(refs) > 0 {
-			delete(frontier, cur)
-		}
-
-		for _, ref := range refs {
 			enqueue(r(ref), false)
 		}
 	}
@@ -2376,25 +2339,14 @@ func (e *Engine) ingestNackTips(nack *pb.NackNotify) {
 			break
 		}
 
-		var refs []*pb.EffectRef
+		first := true
+		for ref := range keyDeps(string(nack.GetKey()), eff) {
+			if first {
+				delete(frontier, cur)
 
-		if bind := eff.GetTxnBind(); bind != nil {
-			for _, kb := range bind.GetKeys() {
-				if string(kb.GetKey()) == string(nack.GetKey()) {
-					refs = []*pb.EffectRef{kb.GetNewTip()}
-
-					break
-				}
+				first = false
 			}
-		} else {
-			refs = eff.GetDeps()
-		}
 
-		if len(refs) > 0 {
-			delete(frontier, cur)
-		}
-
-		for _, ref := range refs {
 			enqueue(r(ref), false)
 		}
 	}
@@ -2587,19 +2539,7 @@ func (e *Engine) releaseChainRefs(key string, tips []Tip, ls *leafState) {
 			continue // not resident — nothing below to release
 		}
 
-		if bind := eff.GetTxnBind(); bind != nil {
-			for _, kb := range bind.GetKeys() {
-				if string(kb.GetKey()) == key {
-					stack = append(stack, r(kb.GetNewTip()))
-
-					break
-				}
-			}
-
-			continue
-		}
-
-		for _, dep := range eff.GetDeps() {
+		for dep := range keyDeps(key, eff) {
 			stack = append(stack, r(dep))
 		}
 	}

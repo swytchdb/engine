@@ -356,22 +356,14 @@ func (e *Engine) reachesFromTxOnKey(ptxn *pendingTxn, key *string, targets ...Ti
 
 		refs := allDeps(eff)
 		if key != nil {
-			if bind := eff.GetTxnBind(); bind != nil {
-				refs = nil
-
-				for _, kb := range bind.GetKeys() {
-					if string(kb.GetKey()) == *key {
-						refs = []*pb.EffectRef{kb.GetNewTip()}
-
-						break
-					}
-				}
-			} else if string(eff.GetKey()) != *key {
+			if eff.GetTxnBind() == nil && string(eff.GetKey()) != *key {
 				continue
 			}
+
+			refs = keyDeps(*key, eff)
 		}
 
-		for _, dep := range refs {
+		for dep := range refs {
 			push(r(dep))
 		}
 	}

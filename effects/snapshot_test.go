@@ -157,39 +157,6 @@ func TestGetSnapshot_SingleEffect(t *testing.T) {
 	}
 }
 
-func TestGetSnapshot_ReusesImmutableReducedMemo(t *testing.T) {
-	if !reducedReadCacheEnabled {
-		t.Skip("materialized read cache disabled pending cross-key invalidation")
-	}
-
-	log := newSnapshotLog()
-	e := newSnapshotEngine(log)
-
-	off := log.putEffect(&pb.Effect{
-		Key: []byte("k"), Hlc: sTs(10), NodeId: 1,
-		Kind: &pb.Effect_Data{Data: scalarInsertRaw([]byte("hello"))},
-	})
-	e.index.Insert("k", nil, keytrie.NewTipSet(off))
-
-	first, _, _, err := e.GetSnapshot("k")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	second, _, _, err := e.GetSnapshot("k")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if first != second {
-		t.Fatal("stable reads should reuse the immutable reduced memo")
-	}
-
-	if string(second.GetScalar().GetRaw()) != "hello" {
-		t.Fatalf("expected hello, got %q", second.GetScalar().GetRaw())
-	}
-}
-
 func TestEnsureSubscribed_OwnsBorrowedKey(t *testing.T) {
 	e := newSnapshotEngine(nil)
 	buf := []byte("borrowed-key")

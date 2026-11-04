@@ -59,7 +59,7 @@ func TestTemporalFetchedHistoryObservedOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(allDeps(eff)) == 0 {
+	if len(eff.GetDeps()) == 0 {
 		t.Fatal("emitted history has no dependencies")
 	}
 

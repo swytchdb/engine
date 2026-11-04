@@ -50,9 +50,6 @@ import (
 // post-resolution state.
 var errHorizonRetryNeeded = errors.New("reconstruct: horizon ancestor resolved, retry")
 
-// Disabled until invalidation accounts for adjudication on associated keys.
-const reducedReadCacheEnabled = false
-
 // leafState is the per-key payload attached to each critbit leaf (the trie's
 // T). It carries the cached subdag for the key so reads reuse the prepared
 // structure instead of rebuilding it. It is created once per key and mutated
@@ -60,14 +57,6 @@ const reducedReadCacheEnabled = false
 // the subdag, which is why this is a struct rather than a bare subdag pointer.
 type leafState struct {
 	subdag atomic.Pointer[cachedDag]
-	// reduced memoizes the fully-materialized read result for a specific tip
-	// set, so a repeated client read of an unchanged key skips fork-choice
-	// adjudication and ReduceChain entirely (only the subdag structure cache
-	// existed before). reconstruct(key, tips) is a pure function of the tip set
-	// — the reachable DAG is immutable — so a tip change yields a different key
-	// and misses; see GetSnapshot for the store/serve invariant.
-	reduced atomic.Pointer[reducedResult]
-
 	// cloudConsulted marks that the Cloud read-miss backstop has received one
 	// complete answer for this key during this leaf's residency. It turns a
 	// nil reduction from "not known — ask Cloud" into "authoritatively
@@ -109,20 +98,6 @@ type leafState struct {
 	subMu           sync.Mutex
 	subscribers     []pb.NodeID
 	subscriberBytes int64
-}
-
-// reducedResult is a cached materialized read keyed on the exact tip set it was
-// derived from. The result is immutable once published. Read paths must use
-// copy-on-write before changing it (filterSnapshot and compaction do this).
-//
-// result aliases the value byte slices of the effects it was reduced from
-// (cloneData/cloneReduced share Raw slices rather than copying). Those effects
-// are in the active window and kept resident by dep-refcounting, so the memo
-// needs no refcount of its own.
-type reducedResult struct {
-	tips     []Tip
-	result   *pb.ReducedEffect
-	chainLen int
 }
 
 // cachedDag is the reusable output of dag.prepare for a specific tip set: the
@@ -724,65 +699,17 @@ func (e *Engine) reconstructLocal(key string) (*pb.ReducedEffect, []Tip, int) {
 		return nil, nil, 0
 	}
 
-	// Reduced-result memo: a client read (waitForHorizon=true) always waits out
-	// any in-horizon ancestor before completing, so a completed result is the
-	// committed answer for these exact tips, and reconstruct(key, tips) is a
-	// pure function of the tip set (the reachable DAG is immutable). Cache it in
-	// the leaf keyed on the tip set — a later write/arrival changes the tips,
-	// yielding a different key that misses. The cached result is immutable;
-	// filtering and compaction use copy-on-write before changing it. The memo is
-	// bypassed while any txn is mid-horizon: a conservative guard that keeps the
-	// cache out of the in-flight-visibility window entirely.
-	horizonClear := reducedReadCacheEnabled && (e.horizon == nil || e.horizon.Empty())
-
-	ls := e.index.LoadData(key)
-	if ls == nil {
-		ls, _ = e.index.LoadOrStoreData(key, &leafState{})
+	// Client reads wait for in-flight binds. Recompute adjudication even when
+	// this key's tips are unchanged: associated keys can reveal competitors.
+	if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
+		slog.Debug("GetSnapshot: reconstructing", "key", key, "tips", tipOffsets)
 	}
 
-	var (
-		result   *pb.ReducedEffect
-		chainLen int
-	)
+	result, chainLen, err := e.reconstruct(key, tipOffsets, "", true)
+	if err != nil {
+		slog.Debug("GetSnapshot: reconstruction incomplete, returning empty", "key", key, "error", err)
 
-	served := false
-
-	if horizonClear && ls != nil {
-		if rr := ls.reduced.Load(); rr != nil && tipsEqual(rr.tips, tipOffsets) {
-			result, chainLen, served = rr.result, rr.chainLen, true
-		}
-	}
-
-	if !served {
-		// Walk DAG and reconstruct. waitForHorizon=true: this is a client-facing
-		// read, so the walk must block on any in-ancestry HorizonSet bind to
-		// avoid returning a value that excludes a bind which will be present
-		// in the next reconstruct from the same tips (the Elle :incompatible-order
-		// shape from Jepsen run 26373595271).
-		if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
-			slog.Debug("GetSnapshot: reconstructing", "key", key, "tips", tipOffsets)
-		}
-
-		var err error
-
-		result, chainLen, err = e.reconstruct(key, tipOffsets, "", true)
-		if err != nil {
-			slog.Debug("GetSnapshot: reconstruction incomplete, returning empty", "key", key, "error", err)
-
-			return nil, nil, 0
-		}
-
-		if horizonClear && ls != nil {
-			// The reduced memo is a pure read cache. Its result aliases the value
-			// bytes of effects in the active window, but those are kept resident by
-			// dep-refcounting (the chain from the live tip down stays pinned), so
-			// the memo needs no refcount of its own.
-			ls.reduced.Store(&reducedResult{
-				tips:     append([]Tip(nil), tipOffsets...),
-				result:   result,
-				chainLen: chainLen,
-			})
-		}
+		return nil, nil, 0
 	}
 
 	// Sync serialization state from reconstruction result before filtering
@@ -1355,43 +1282,23 @@ func (e *Engine) reconstructWithView(key string, tips []Tip, txID string, waitFo
 		var dependsOnInvisible map[Tip]struct{}
 
 		if isInvisible != nil {
-			invisibleBindTips := make(map[Tip]struct{})
 			dependsOnInvisible = make(map[Tip]struct{})
 
 			for _, t := range d.topoOrder {
 				eff := d.nodes[t]
 
-				var refs []*pb.EffectRef
+				if eff.GetTxnBind() != nil && isInvisible(eff.GetTxnId()) {
+					dependsOnInvisible[t] = struct{}{}
 
-				if bind := eff.GetTxnBind(); bind != nil {
-					for _, kb := range bind.GetKeys() {
-						if string(kb.GetKey()) == key {
-							refs = []*pb.EffectRef{kb.GetNewTip()}
-
-							break
-						}
-					}
-				} else {
-					refs = eff.GetDeps()
+					continue
 				}
 
-				for _, ref := range refs {
-					dt := r(ref)
-					if _, ok := invisibleBindTips[dt]; ok {
+				for ref := range keyDeps(key, eff) {
+					if _, ok := dependsOnInvisible[r(ref)]; ok {
 						dependsOnInvisible[t] = struct{}{}
 
 						break
 					}
-
-					if _, ok := dependsOnInvisible[dt]; ok {
-						dependsOnInvisible[t] = struct{}{}
-
-						break
-					}
-				}
-
-				if bind := eff.GetTxnBind(); bind != nil && isInvisible(eff.GetTxnId()) {
-					invisibleBindTips[t] = struct{}{}
 				}
 			}
 		}
@@ -1415,17 +1322,12 @@ func (e *Engine) reconstructWithView(key string, tips []Tip, txID string, waitFo
 			if bind := eff.GetTxnBind(); bind != nil {
 				if isInvisible != nil && isInvisible(eff.GetTxnId()) {
 					if waitForHorizon && e.horizon != nil {
-						// Block on the entry's waiter mutex. RLock returns
-						// once MakeVisible or Abort releases the write lock
-						// taken at horizon.Add. Release the read token,
-						// then signal the outer loop to restart with fresh
-						// fork-choice + dependsOnInvisible state.
+						// Wait for resolution, then rebuild fork choice and
+						// visibility from the newly available history.
 						slog.Debug("reconstruct: waiting on in-horizon ancestor",
 							"key", key, "txn", eff.GetTxnId())
 
-						if w := e.horizon.WaitForClear(eff.GetTxnId()); w != nil {
-							w.Release()
-						}
+						e.horizon.WaitForClear(eff.GetTxnId())
 
 						return errHorizonRetryNeeded
 					}
@@ -1609,27 +1511,16 @@ func (e *Engine) bindKeyClosureFrom(startKeys []string, tipsFor func(string) ([]
 		}
 	}
 
-	visitedByKey := make(map[string]map[Tip]bool)
-	seenBindTip := make(map[string]map[Tip]struct{})
-	addBindTip := func(k string, t Tip) {
-		s, ok := seenBindTip[k]
-		if !ok {
-			s = make(map[Tip]struct{})
-			seenBindTip[k] = s
-		}
-
-		if _, dup := s[t]; dup {
-			return
-		}
-
-		s[t] = struct{}{}
-
-		bindsByKey[k] = append(bindsByKey[k], t)
-		if !queued[k] {
-			queue = append(queue, k)
-			queued[k] = true
-		}
+	// A tip can be discovered as another key's anchor before being visited.
+	// Keep both facts together, with one ledger for the entire closure.
+	type location struct {
+		key string
+		tip Tip
 	}
+
+	type progress struct{ visited, anchored bool }
+
+	seen := make(map[location]progress)
 	verdicts := make(verdictMap)
 
 	for len(queue) > 0 {
@@ -1642,32 +1533,25 @@ func (e *Engine) bindKeyClosureFrom(startKeys []string, tipsFor func(string) ([]
 			return nil, nil, nil, err
 		}
 
-		startTips := append([]Tip(nil), frontier...)
-
-		startTips = append(startTips, bindsByKey[k]...)
-		if len(startTips) == 0 {
-			continue
-		}
+		stack := append([]Tip(nil), frontier...)
+		stack = append(stack, bindsByKey[k]...)
 		// Tolerant traversal: dag.walk errors on the first unfetchable
 		// dep, which would truncate closure expansion. For closure
 		// discovery we only need to find binds reachable from tips,
 		// not a complete DAG — skip missing refs and keep going.
-		visited := visitedByKey[k]
-		if visited == nil {
-			visited = make(map[Tip]bool)
-			visitedByKey[k] = visited
-		}
-
-		stack := append([]Tip(nil), startTips...)
 		for len(stack) > 0 {
 			t := stack[len(stack)-1]
 			stack = stack[:len(stack)-1]
 
-			if visited[t] {
+			at := location{k, t}
+
+			state := seen[at]
+			if state.visited {
 				continue
 			}
 
-			visited[t] = true
+			state.visited = true
+			seen[at] = state
 
 			eff, err := e.getEffect(k, t)
 			if err != nil {
@@ -1682,22 +1566,28 @@ func (e *Engine) bindKeyClosureFrom(startKeys []string, tipsFor func(string) ([]
 			if bind != nil {
 				for _, kb := range bind.GetKeys() {
 					other := string(kb.GetKey())
-					if other != k {
+					anchor := location{other, t}
+
+					state := seen[anchor]
+					if other != k && !state.anchored {
 						// Start at the envelope: NewTip is its ancestor
 						// and cannot lead a backwards walk to this bind.
 						// A new anchor also requeues an already visited key.
-						addBindTip(other, t)
+						state.anchored = true
+						seen[anchor] = state
+
+						bindsByKey[other] = append(bindsByKey[other], t)
+						if !queued[other] {
+							queue = append(queue, other)
+							queued[other] = true
+						}
 					}
 
 					keys[other] = struct{}{}
 				}
 				// Bind dep: same-key NewTip.
-				for _, kb := range bind.GetKeys() {
-					if string(kb.GetKey()) == k {
-						stack = append(stack, r(kb.GetNewTip()))
-
-						break
-					}
+				for ref := range keyDeps(k, eff) {
+					stack = append(stack, r(ref))
 				}
 
 				continue
