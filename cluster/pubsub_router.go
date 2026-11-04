@@ -216,12 +216,12 @@ func (r *PubSubRouter) OnPeerRemoved(peerID NodeId) {
 // connected peer. Fire-and-forget; receivers register us in their
 // per-peer tables and return immediately without log storage.
 func (r *PubSubRouter) AnnounceSub(channel string, isPattern bool) {
-	r.broadcastAnnounce(routingKeyFor(channel, isPattern), false)
+	r.sendAnnounce(routingKeyFor(channel, isPattern), false, r.transport.PeerIDs()...)
 }
 
 // AnnounceUnsub broadcasts an unsubscribe ephemeral SubscriptionEffect.
 func (r *PubSubRouter) AnnounceUnsub(channel string, isPattern bool) {
-	r.broadcastAnnounce(routingKeyFor(channel, isPattern), true)
+	r.sendAnnounce(routingKeyFor(channel, isPattern), true, r.transport.PeerIDs()...)
 }
 
 func routingKeyFor(name string, isPattern bool) []byte {
@@ -338,49 +338,37 @@ func (r *PubSubRouter) targetsFor(channel string) []NodeId {
 	token := r.mu.RLock()
 	defer r.mu.RUnlock(token)
 
-	matched := make(map[NodeId]struct{})
+	var targets []NodeId
 
 	for peerID, set := range r.channels {
 		if _, ok := set[channel]; ok {
-			matched[peerID] = struct{}{}
+			targets = append(targets, peerID)
 		}
 	}
 
 	for peerID, set := range r.patterns {
-		if _, ok := matched[peerID]; ok {
+		if _, ok := r.channels[peerID][channel]; ok {
 			continue
 		}
 
 		for pat := range set {
 			if keytrie.MatchGlob(channel, pat) {
-				matched[peerID] = struct{}{}
+				targets = append(targets, peerID)
 
 				break
 			}
 		}
 	}
 
-	if len(matched) == 0 {
-		return nil
-	}
-
-	out := make([]NodeId, 0, len(matched))
-	for id := range matched {
-		out = append(out, id)
-	}
-
-	return out
+	return targets
 }
 
-// broadcastAnnounce sends an ephemeral SubscriptionEffect to every
-// connected peer via the replicator's broadcast path.
-func (r *PubSubRouter) broadcastAnnounce(routingKey []byte, unsubscribe bool) {
-	for _, peerID := range r.transport.PeerIDs() {
-		r.sendAnnounce(routingKey, unsubscribe, peerID)
+// sendAnnounce builds one subscription announcement for the entire fan-out.
+func (r *PubSubRouter) sendAnnounce(routingKey []byte, unsubscribe bool, peers ...NodeId) {
+	if len(peers) == 0 {
+		return
 	}
-}
 
-func (r *PubSubRouter) sendAnnounce(routingKey []byte, unsubscribe bool, peerID NodeId) {
 	hlc := timestamppb.Now()
 	eff := &pb.Effect{
 		Key:            routingKey,
@@ -402,9 +390,11 @@ func (r *PubSubRouter) sendAnnounce(routingKey []byte, unsubscribe bool, peerID 
 	}
 
 	notify := buildEphemeralNotify(r.self, eff, data)
-	if err := r.transport.SendOneWayTo(notify, notify.GetEffectData(), peerID); err != nil {
-		slog.Debug("pubsub router: announce send failed",
-			"peer", peerID, "unsubscribe", unsubscribe, "error", err)
+	for _, peerID := range peers {
+		if err := r.transport.SendOneWayTo(notify, notify.GetEffectData(), peerID); err != nil {
+			slog.Debug("pubsub router: announce send failed",
+				"peer", peerID, "unsubscribe", unsubscribe, "error", err)
+		}
 	}
 }
 

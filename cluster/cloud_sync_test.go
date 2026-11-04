@@ -70,7 +70,7 @@ func TestStopWaitsForInflightEnqueue(t *testing.T) {
 	cs := &CloudSync{
 		engine:      engine,
 		keyNameKey:  DeriveKeyNameKey("shutdown-test-secret"),
-		pending:     make(map[effects.Tip]*pb.Effect),
+		pending:     make(map[effects.Tip]pendingUpload),
 		pendingKeys: make(map[string]*pendingKeyEntry),
 		wake:        make(chan struct{}, 1),
 	}
@@ -278,7 +278,7 @@ func TestPendingTipsIndex(t *testing.T) {
 	cs := &CloudSync{
 		engine:      engine,
 		keyNameKey:  DeriveKeyNameKey("outbox-test-secret"),
-		pending:     make(map[effects.Tip]*pb.Effect),
+		pending:     make(map[effects.Tip]pendingUpload),
 		pendingKeys: make(map[string]*pendingKeyEntry),
 		wake:        make(chan struct{}, 1),
 	}
@@ -318,6 +318,20 @@ func TestPendingTipsIndex(t *testing.T) {
 	if len(cs.pendingKeys) != 0 {
 		t.Fatal("pendingKeys entry should be removed with its last tip")
 	}
+
+	if cs.pending != nil || cs.pendingKeys != nil || cs.sendQ != nil {
+		t.Fatal("drained outbox retained its backlog storage")
+	}
+
+	// A drained outbox must accept new work, including the key frontier,
+	// after releasing its maps and any stale queued retries.
+	cs.handleLocalEffect(tipA, effA)
+
+	if got := cs.pendingTipsFor("k"); len(got) != 1 || got[0] != tipA {
+		t.Fatalf("expected re-enqueued tip after drain, got %v", got)
+	}
+
+	cs.retire(tipA)
 }
 
 // TestOutboxPinsKeyUntilDrained: the outbox holds a do-not-evict pin on a key
@@ -335,7 +349,7 @@ func TestOutboxPinsKeyUntilDrained(t *testing.T) {
 	cs := &CloudSync{
 		engine:      engine,
 		keyNameKey:  DeriveKeyNameKey("pin-test-secret"),
-		pending:     make(map[effects.Tip]*pb.Effect),
+		pending:     make(map[effects.Tip]pendingUpload),
 		pendingKeys: make(map[string]*pendingKeyEntry),
 		wake:        make(chan struct{}, 1),
 	}
@@ -433,7 +447,7 @@ func TestSubscriptionMintDoesNotOpenGate(t *testing.T) {
 	cs := &CloudSync{
 		engine:      engine,
 		keyNameKey:  keyNameKey,
-		pending:     make(map[effects.Tip]*pb.Effect),
+		pending:     make(map[effects.Tip]pendingUpload),
 		pendingKeys: make(map[string]*pendingKeyEntry),
 		wake:        make(chan struct{}, 1),
 	}
@@ -762,7 +776,7 @@ func TestFetchEffectServesOutbox(t *testing.T) {
 	tip := effects.Tip{7, 42}
 	want := &pb.Effect{Key: []byte("k")}
 	cs := &CloudSync{
-		pending: map[effects.Tip]*pb.Effect{tip: want},
+		pending: map[effects.Tip]pendingUpload{tip: {effect: want}},
 		// No httpClient: reaching for the CDN would nil-panic, which is the
 		// test's proof that the outbox short-circuits the fetch.
 	}
@@ -830,7 +844,7 @@ func ancestrySync(t *testing.T, engine *effects.Engine) (*CloudSync, effects.Tip
 		engine:      engine,
 		enc:         enc,
 		keyNameKey:  DeriveKeyNameKey("ancestry-secret"),
-		pending:     make(map[effects.Tip]*pb.Effect),
+		pending:     make(map[effects.Tip]pendingUpload),
 		pendingKeys: make(map[string]*pendingKeyEntry),
 		wake:        make(chan struct{}, 1),
 	}

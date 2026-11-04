@@ -122,6 +122,13 @@ type pendingKeyEntry struct {
 	pinned bool
 }
 
+type pendingUpload struct {
+	effect *pb.Effect // keeps the effect reachable while its pool reference is held
+	// Only locally-authored uploads expand ancestry. Fetch replies upload
+	// exactly the requested effect; Cloud must ask for any deeper holes.
+	expand bool
+}
+
 // CloudSync uploads this node's locally-authored effects to Swytch Cloud over
 // the dataplane WriteEffects stream.
 //
@@ -157,11 +164,7 @@ type CloudSync struct {
 	httpClient   *http.Client
 
 	mu      sync.Mutex
-	pending map[effects.Tip]*pb.Effect // un-acked uploads; the held pointer keeps the effect reachable even if its pool ref is consumed
-	// expandable marks locally-authored uploads whose locally-authored ancestry
-	// may be added to the outbox. Fetch replies are deliberately absent: Cloud
-	// asked for exactly that ref and must explicitly ask for each deeper hole.
-	expandable map[effects.Tip]struct{}
+	pending map[effects.Tip]pendingUpload
 	// pendingKeys indexes pending by plaintext key, so CloudTips can answer a
 	// read-miss from the outbox: an evicted-before-ack key has no index tips
 	// and no cloud tips, but its effects sit refcount-pinned in the pool — the
@@ -237,7 +240,7 @@ func NewCloudSync(engine *effects.Engine, connectionSecret string) (*CloudSync, 
 		target:      CloudEndpoint,
 		folder:      CloudFolder(authKey),
 		httpClient:  &http.Client{Timeout: cloudBackstopTimeout},
-		pending:     make(map[effects.Tip]*pb.Effect),
+		pending:     make(map[effects.Tip]pendingUpload),
 		pendingKeys: make(map[string]*pendingKeyEntry),
 		reconcile:   make(map[string]struct{}),
 		wake:        make(chan struct{}, 1),
@@ -455,20 +458,21 @@ func (cs *CloudSync) enqueueUpload(tip effects.Tip, eff *pb.Effect, frontier, ex
 		return false
 	}
 
-	cs.pending[tip] = eff
-	if expand {
-		if cs.expandable == nil {
-			cs.expandable = make(map[effects.Tip]struct{})
-		}
-
-		cs.expandable[tip] = struct{}{}
+	if cs.pending == nil {
+		cs.pending = make(map[effects.Tip]pendingUpload)
 	}
+
+	cs.pending[tip] = pendingUpload{effect: eff, expand: expand}
 
 	if frontier {
 		k := string(eff.GetKey())
 
 		entry := cs.pendingKeys[k]
 		if entry == nil {
+			if cs.pendingKeys == nil {
+				cs.pendingKeys = make(map[string]*pendingKeyEntry)
+			}
+
 			// First un-acked upload on this key: hold it in the index until the
 			// cloud acks everything. Evicting it early frees almost nothing (the
 			// outbox pins the bytes) but unsubscribes and drops the tips, making
@@ -643,12 +647,11 @@ func (cs *CloudSync) wakeSender() {
 // the outbox entry was already retired.
 func (cs *CloudSync) retire(tip effects.Tip) bool {
 	cs.mu.Lock()
-	eff, held := cs.pending[tip]
+	upload, held := cs.pending[tip]
 	delete(cs.pending, tip)
-	delete(cs.expandable, tip)
 
 	if held {
-		k := string(eff.GetKey())
+		k := string(upload.effect.GetKey())
 		if entry := cs.pendingKeys[k]; entry != nil {
 			delete(entry.tips, tip)
 
@@ -664,6 +667,14 @@ func (cs *CloudSync) retire(tip effects.Tip) bool {
 	}
 
 	backlog := len(cs.pending)
+	if backlog == 0 {
+		// Release peak backlog storage once the outbox drains. clear/delete
+		// alone would leave the maps and queued retry storage allocated.
+		cs.pending = nil
+		cs.pendingKeys = nil
+		cs.sendQ = nil
+	}
+
 	cs.mu.Unlock()
 
 	if held {
@@ -839,19 +850,19 @@ func (cs *CloudSync) nextEnvelope() (*dp.Effect, bool) {
 
 		tip := cs.sendQ[0]
 		cs.sendQ = cs.sendQ[1:]
-		eff := cs.pending[tip]
-		_, expand := cs.expandable[tip]
+		upload := cs.pending[tip]
 		cs.mu.Unlock()
 
 		remaining--
 
+		eff := upload.effect
 		if eff == nil {
 			continue // acked while queued
 		}
 		// Continue the unsent-history walk off the emit path. The outbox
 		// reference on this effect keeps its deps resolvable here even if the
 		// key was evicted since the mint.
-		if expand {
+		if upload.expand {
 			if deps := cs.expandAncestry(eff); len(deps) > 0 {
 				cs.deferUploadBehind(tip, deps)
 				// These deps were not in the queue when the pass was bounded. Count
@@ -1678,7 +1689,7 @@ func (cs *CloudSync) fetchEffect(ctx context.Context, tip effects.Tip) (*pb.Effe
 	// still waiting in the upload queue — CloudTips names the outbox tip as
 	// frontier, and this is where its bytes come from.
 	cs.mu.Lock()
-	eff := cs.pending[tip]
+	eff := cs.pending[tip].effect
 	cs.mu.Unlock()
 
 	if eff != nil {

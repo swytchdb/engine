@@ -110,8 +110,10 @@ func (f *ReplicationFuture) resolve() {
 
 // reject stores an error then closes the future. First call wins.
 func (f *ReplicationFuture) reject(err error) {
-	f.err.CompareAndSwap(nil, &err)
-	f.resolve()
+	f.once.Do(func() {
+		f.err.Store(&err)
+		close(f.done)
+	})
 }
 
 // rejectedFuture returns a pre-rejected future with the given error.
@@ -133,7 +135,6 @@ type trackedRequest struct {
 	createdAt  int64        // UnixNano
 	lastSentAt atomic.Int64 // UnixNano of most recent send attempt (original or retransmit)
 	deadline   int64        // UnixNano — absolute deadline (deadline-mode requests only)
-	packetSize int          // bytes sent (for metrics)
 	peerID     NodeId
 	packetData []byte // serialized plaintext for retransmission
 
@@ -162,26 +163,6 @@ func (rt *requestTracker) Resolve(requestID uint64) *trackedRequest {
 	return nil
 }
 
-// rejectDeadlineExpired rejects deadline-mode requests (cross-region
-// fire-and-forget, bind ReplicateTo) that have exceeded their deadline.
-// Same-region first-ACK requests (retransmit=true) are swept by
-// Replicator.sweep, which retransmits instead of expiring on a clock.
-func (rt *requestTracker) rejectDeadlineExpired() {
-	nowNano := time.Now().UnixNano()
-
-	rt.pending.Range(func(key uint64, tr *trackedRequest) bool {
-		if tr.retransmit || nowNano <= tr.deadline {
-			return true
-		}
-
-		rt.pending.Delete(key)
-		tr.future.reject(ErrReplicationTimeout)
-		RecordRetransmissionGiveUp(tr.peerID)
-
-		return true
-	})
-}
-
 // Replicator manages replication with first-ACK semantics for same-region
 // and fire-and-forget for cross-region peers. Uses QUIC stream-per-message transport.
 type Replicator struct {
@@ -193,7 +174,9 @@ type Replicator struct {
 	transport   *QUICNotifyTransport
 	tracker     requestTracker
 
-	mu          xsync.RBMutex
+	mu xsync.RBMutex
+	// Published maps are immutable. Membership changes replace the map so
+	// replication can keep a snapshot without copying it or holding a lock.
 	peerRegions map[NodeId]string
 
 	handler EffectHandler // for handling inbound notifications
@@ -245,7 +228,13 @@ func (r *Replicator) AddPeer(nodeID NodeId, region string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.peerRegions[nodeID] = region
+	if existing, ok := r.peerRegions[nodeID]; ok && existing == region {
+		return
+	}
+
+	regions := maps.Clone(r.peerRegions)
+	regions[nodeID] = region
+	r.peerRegions = regions
 }
 
 // RemovePeer unregisters a peer.
@@ -253,29 +242,39 @@ func (r *Replicator) RemovePeer(nodeID NodeId) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	delete(r.peerRegions, nodeID)
+	if _, ok := r.peerRegions[nodeID]; !ok {
+		return
+	}
+
+	// Rebuild at the remaining size; deleting from a long-lived map retains
+	// its peak allocation after membership shrinks.
+	regions := make(map[NodeId]string, len(r.peerRegions)-1)
+	for id, region := range r.peerRegions {
+		if id != nodeID {
+			regions[id] = region
+		}
+	}
+
+	r.peerRegions = regions
+}
+
+func (r *Replicator) regionsSnapshot() map[NodeId]string {
+	token := r.mu.RLock()
+	defer r.mu.RUnlock(token)
+
+	return r.peerRegions
 }
 
 // AllRegionPeersReachable returns true if every same-region peer is alive
 // and has a verified symmetric path.
 func (r *Replicator) AllRegionPeersReachable() bool {
-	token := r.mu.RLock()
-	regions := make(map[NodeId]string, len(r.peerRegions))
-	maps.Copy(regions, r.peerRegions)
-	r.mu.RUnlock(token)
-
-	return r.healthTable.AllRegionPeersReachable(r.localRegion, regions)
+	return r.healthTable.AllRegionPeersReachable(r.localRegion, r.regionsSnapshot())
 }
 
 // InMajorityPartition returns true if this node can reach a strict majority
 // of same-region nodes (including itself).
 func (r *Replicator) InMajorityPartition() bool {
-	token := r.mu.RLock()
-	regions := make(map[NodeId]string, len(r.peerRegions))
-	maps.Copy(regions, r.peerRegions)
-	r.mu.RUnlock(token)
-
-	return r.healthTable.InMajorityPartition(r.localRegion, regions)
+	return r.healthTable.InMajorityPartition(r.localRegion, r.regionsSnapshot())
 }
 
 // Replicate sends a notification to all peers with first-ACK semantics for same-region.
@@ -293,10 +292,7 @@ func (r *Replicator) Replicate(notify *pb.OffsetNotify, wireData []byte) *Replic
 		defer sendSpan.End()
 	}
 
-	token := r.mu.RLock()
-	regions := make(map[NodeId]string, len(r.peerRegions))
-	maps.Copy(regions, r.peerRegions)
-	r.mu.RUnlock(token)
+	regions := r.regionsSnapshot()
 
 	// Attach effect data inline. Safe to mutate: callers pass a
 	// per-effect notify that isn't read after this call.
@@ -305,11 +301,17 @@ func (r *Replicator) Replicate(notify *pb.OffsetNotify, wireData []byte) *Replic
 	// Find alive+symmetric same-region peers for tracked replication
 	targets := r.healthTable.AliveSymmetricPeers(r.localRegion, regions)
 
-	// Send to cross-region peers (fire-and-forget, off critical path)
-	go r.sendCrossRegion(notify, regions)
+	crossRegion := false
 
-	// No alive same-region targets — fail immediately
-	if len(targets) == 0 {
+	for _, region := range regions {
+		if region != r.localRegion {
+			crossRegion = true
+
+			break
+		}
+	}
+
+	if len(targets) == 0 && !crossRegion {
 		return rejectedFuture(ErrNoPeers)
 	}
 
@@ -320,6 +322,16 @@ func (r *Replicator) Replicate(notify *pb.OffsetNotify, wireData []byte) *Replic
 	body, err := proto.Marshal(notify)
 	if err != nil {
 		return rejectedFuture(fmt.Errorf("marshal notify packet: %w", err))
+	}
+
+	// Share the serialized body across both regions. Avoid starting a
+	// goroutine at all when there are no cross-region recipients.
+	if crossRegion {
+		go r.sendCrossRegion(body, regions)
+	}
+
+	if len(targets) == 0 {
+		return rejectedFuture(ErrNoPeers)
 	}
 
 	// One tracked request per peer; future resolves on FIRST ACK (first-ACK semantics).
@@ -362,15 +374,13 @@ func (r *Replicator) Replicate(notify *pb.OffsetNotify, wireData []byte) *Replic
 			// available and only gives up if the peer leaves the
 			// alive+symmetric set. We must NOT drop it: an un-replicated tip
 			// that a later effect depends on becomes an unrecoverable orphan.
-			wireSize, err := r.transport.Send(targetID, notifyPkt)
+			_, err := r.transport.Send(targetID, notifyPkt)
 			if err != nil {
 				slog.Debug("same-region send failed, holding for retransmit",
 					"peer", targetID, "error", err)
 
 				return
 			}
-
-			tr.packetSize = wireSize
 
 			RecordNotificationSent()
 		}(targetID)
@@ -392,31 +402,14 @@ func (r *Replicator) Replicate(notify *pb.OffsetNotify, wireData []byte) *Replic
 
 // sendCrossRegion sends the notification to all cross-region peers.
 // Fire-and-forget — callers don't block on cross-region ACKs.
-func (r *Replicator) sendCrossRegion(notify *pb.OffsetNotify, regions map[NodeId]string) {
+func (r *Replicator) sendCrossRegion(body []byte, regions map[NodeId]string) {
 	deadlineNano := time.Now().Add(r.replicationTimeout).UnixNano()
-
-	// Marshal the notify body once and reuse it across peers (see Replicate).
-	var (
-		body       []byte
-		nullFuture *ReplicationFuture
-	)
+	nullFuture := &ReplicationFuture{done: make(chan struct{})}
+	nullFuture.resolve()
 
 	for peerID, region := range regions {
 		if region == r.localRegion {
 			continue
-		}
-
-		if nullFuture == nil {
-			marshalled, err := proto.Marshal(notify)
-			if err != nil {
-				slog.Error("failed to marshal cross-region notify packet", "error", err)
-
-				return
-			}
-
-			body = marshalled
-			nullFuture = &ReplicationFuture{done: make(chan struct{})}
-			nullFuture.resolve()
 		}
 
 		requestID := r.tracker.nextID.Add(1)
@@ -433,7 +426,7 @@ func (r *Replicator) sendCrossRegion(notify *pb.OffsetNotify, regions map[NodeId
 		tr.lastSentAt.Store(now)
 		r.tracker.pending.Store(requestID, tr)
 
-		wireSize, err := r.transport.Send(peerID, notifyPkt)
+		_, err := r.transport.Send(peerID, notifyPkt)
 		if err != nil {
 			r.tracker.pending.Delete(requestID)
 			slog.Error("cross-region send failed, notification dropped",
@@ -441,8 +434,6 @@ func (r *Replicator) sendCrossRegion(notify *pb.OffsetNotify, regions map[NodeId
 
 			continue
 		}
-
-		tr.packetSize = wireSize
 
 		RecordNotificationSent()
 	}
@@ -656,14 +647,12 @@ func (r *Replicator) replicateBody(notifyBody []byte, targetPeerID NodeId) ([]*p
 	tr.lastSentAt.Store(now)
 	r.tracker.pending.Store(requestID, tr)
 
-	wireSize, err := r.transport.Send(targetPeerID, notifyPkt)
+	_, err := r.transport.Send(targetPeerID, notifyPkt)
 	if err != nil {
 		r.tracker.pending.Delete(requestID)
 
 		return nil, fmt.Errorf("send to peer %d: %w", targetPeerID, err)
 	}
-
-	tr.packetSize = wireSize
 
 	RecordNotificationSent()
 
@@ -745,12 +734,17 @@ func (r *Replicator) sweepLoop() {
 // removed from pending by the ACK handler, so only sends that never landed —
 // the peer's connection wasn't up at first attempt — keep reaching here.
 func (r *Replicator) sweep() {
-	r.tracker.rejectDeadlineExpired()
-
 	now := time.Now().UnixNano()
 
 	r.tracker.pending.Range(func(key uint64, tr *trackedRequest) bool {
 		if !tr.retransmit {
+			if now > tr.deadline {
+				if _, removed := r.tracker.pending.LoadAndDelete(key); removed {
+					tr.future.reject(ErrReplicationTimeout)
+					RecordRetransmissionGiveUp(tr.peerID)
+				}
+			}
+
 			return true
 		}
 
@@ -759,7 +753,10 @@ func (r *Replicator) sweep() {
 		// always resolves a live connection (outbound, or inbound fallback) we
 		// can send over, so retransmission will land — no wall-clock needed.
 		if ph := r.healthTable.Get(tr.peerID); ph == nil || !ph.IsReplicationTarget() {
-			r.tracker.pending.Delete(key)
+			if _, removed := r.tracker.pending.LoadAndDelete(key); !removed {
+				return true
+			}
+
 			RecordRetransmissionGiveUp(tr.peerID)
 			// Mirror the NotSubscribed accounting: this peer can no longer
 			// positively resolve the future. When the last live target drops,
@@ -779,12 +776,10 @@ func (r *Replicator) sweep() {
 
 		tr.lastSentAt.Store(now)
 
-		if wireSize, err := r.transport.Send(tr.peerID, tr.packetData); err != nil {
+		if _, err := r.transport.Send(tr.peerID, tr.packetData); err != nil {
 			slog.Debug("retransmit failed (peer connection not up yet)",
 				"peer", tr.peerID, "error", err)
 		} else {
-			tr.packetSize = wireSize
-
 			RecordNotificationSent()
 		}
 

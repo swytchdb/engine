@@ -27,6 +27,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -110,8 +111,9 @@ type HeartbeatManager struct {
 	healthTable *PeerHealthTable
 	cfg         ClockConfig
 
-	mu          sync.Mutex
-	peerRegions map[NodeId]string
+	mu sync.Mutex
+	// Membership is replaced on change; senders retain an immutable snapshot.
+	peers []NodeId
 
 	// Tick emission state, guarded by mu.
 	seq           uint64
@@ -137,7 +139,6 @@ func NewHeartbeatManager(nodeID NodeId, healthTable *PeerHealthTable, cfg ClockC
 		nodeID:      nodeID,
 		healthTable: healthTable,
 		cfg:         cfg,
-		peerRegions: make(map[NodeId]string),
 		ownTicks:    newTickRing(cfg.WindowSize),
 		pendingObs:  make(map[NodeId]ObservedTick),
 		interval:    cfg.Interval,
@@ -146,11 +147,14 @@ func NewHeartbeatManager(nodeID NodeId, healthTable *PeerHealthTable, cfg ClockC
 }
 
 // AddPeer registers a peer for clock tick exchange and liveness monitoring.
-func (hm *HeartbeatManager) AddPeer(nodeID NodeId, region string) {
+func (hm *HeartbeatManager) AddPeer(nodeID NodeId, _ string) {
 	hm.mu.Lock()
 	defer hm.mu.Unlock()
 
-	hm.peerRegions[nodeID] = region
+	if !slices.Contains(hm.peers, nodeID) {
+		hm.peers = append(slices.Clone(hm.peers), nodeID)
+	}
+
 	hm.healthTable.GetOrCreate(nodeID)
 }
 
@@ -159,7 +163,13 @@ func (hm *HeartbeatManager) RemovePeer(nodeID NodeId) {
 	hm.mu.Lock()
 	defer hm.mu.Unlock()
 
-	delete(hm.peerRegions, nodeID)
+	if i := slices.Index(hm.peers, nodeID); i >= 0 {
+		peers := make([]NodeId, len(hm.peers)-1)
+		copy(peers, hm.peers[:i])
+		copy(peers[i:], hm.peers[i+1:])
+		hm.peers = peers
+	}
+
 	delete(hm.pendingObs, nodeID)
 	hm.healthTable.Remove(nodeID)
 }
@@ -352,10 +362,7 @@ func (hm *HeartbeatManager) sendTick() {
 
 	hm.mu.Lock()
 
-	peerIDs := make([]NodeId, 0, len(hm.peerRegions))
-	for peerID := range hm.peerRegions {
-		peerIDs = append(peerIDs, peerID)
-	}
+	peerIDs := hm.peers
 
 	// Wall-vs-monotonic divergence since the previous tick reveals clock
 	// steps (NTP step, VM resume, manual set). Monotonic is ground truth
@@ -425,10 +432,7 @@ func (hm *HeartbeatManager) adjustInterval() (time.Duration, bool) {
 
 	hm.ticksToAdjust = 0
 
-	peerIDs := make([]NodeId, 0, len(hm.peerRegions))
-	for peerID := range hm.peerRegions {
-		peerIDs = append(peerIDs, peerID)
-	}
+	peerIDs := hm.peers
 
 	current := hm.interval
 	hm.mu.Unlock()
