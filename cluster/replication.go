@@ -533,8 +533,10 @@ func (r *Replicator) replicateBody(notifyBody []byte, targetPeerID NodeId) ([]*p
 	// waiter must not depend on the stopped sweep to expire its deadline.
 	select {
 	case <-r.stopCh:
-		r.tracker.pending.Delete(requestID)
-		future.reject(ErrReplicationTimeout)
+		// A response that already claimed the request owns its completion.
+		if _, removed := r.tracker.pending.LoadAndDelete(requestID); removed {
+			future.reject(ErrReplicationTimeout)
+		}
 	case <-future.Done():
 	}
 
@@ -593,8 +595,9 @@ func (r *Replicator) sweepLoop() {
 		select {
 		case <-r.stopCh:
 			r.tracker.pending.Range(func(key uint64, tr *trackedRequest) bool {
-				r.tracker.pending.Delete(key)
-				tr.future.reject(ErrReplicationTimeout)
+				if _, removed := r.tracker.pending.LoadAndDelete(key); removed {
+					tr.future.reject(ErrReplicationTimeout)
+				}
 
 				return true
 			})

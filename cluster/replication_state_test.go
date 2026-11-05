@@ -26,6 +26,7 @@ package cluster
 import (
 	"errors"
 	"maps"
+	"slices"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -194,6 +195,85 @@ func TestReplicateToAfterStop(t *testing.T) {
 			t.Error("shutdown left the request tracked")
 		}
 	})
+}
+
+func TestReplicateToShutdownPreservesClaimedResponse(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		nacks []*pb.NackNotify
+		want  error
+	}{
+		{name: "ACK"},
+		{name: "NACK", nacks: []*pb.NackNotify{{Key: []byte("key")}}},
+		{name: "not subscribed", nacks: []*pb.NackNotify{{NotSubscribed: true}}, want: ErrAllPeersNotSubscribed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				r := NewReplicator(1, "local", NewPeerHealthTable(ClockConfig{}), nil, nil, time.Second)
+				claimed := make(chan *trackedRequest, 1)
+				r.transport = notificationTransportFunc(func(_ NodeId, packet []byte) (int, error) {
+					requestID, _, err := parseNotifyPacket(packet)
+					if err != nil {
+						return 0, err
+					}
+
+					// Pause a response after the handler's LoadAndDelete, before
+					// it publishes NACK data and completes the future.
+					tr, ok := r.tracker.pending.LoadAndDelete(requestID)
+					if !ok {
+						t.Error("response could not claim pending request")
+					}
+
+					claimed <- tr
+
+					return len(packet), nil
+				})
+				r.Start()
+
+				type result struct {
+					nacks []*pb.NackNotify
+					err   error
+				}
+
+				done := make(chan result, 1)
+
+				go func() {
+					nacks, err := r.ReplicateTo(&pb.OffsetNotify{Key: []byte("key")}, nil, 2)
+					done <- result{nacks: nacks, err: err}
+				}()
+
+				tr := <-claimed
+
+				r.Stop()
+				synctest.Wait()
+
+				select {
+				case <-tr.future.Done():
+					t.Error("shutdown completed a request already claimed by a response")
+				default:
+				}
+
+				// Resume the handler's publication and completion steps.
+				tr.future.nacks.Store(&tc.nacks)
+
+				if tc.want != nil {
+					tr.future.drop(tc.want)
+				} else {
+					tr.future.resolve()
+				}
+
+				got := <-done
+				if !errors.Is(got.err, tc.want) {
+					t.Fatalf("response error = %v, want %v", got.err, tc.want)
+				}
+
+				// ReplicateTo returns NACK data only for successful responses.
+				if tc.want == nil && !slices.Equal(got.nacks, tc.nacks) {
+					t.Fatalf("response NACKs = %v, want %v", got.nacks, tc.nacks)
+				}
+			})
+		})
+	}
 }
 
 func TestReplicationMembershipSnapshot(t *testing.T) {
