@@ -24,6 +24,7 @@
 package beacon
 
 import (
+	"errors"
 	"log/slog"
 	"time"
 
@@ -115,7 +116,10 @@ func (b *Beacon) refreshTopology() error {
 		return err
 	}
 
-	var ctx *effects.Context
+	var (
+		ctx  *effects.Context
+		errs []error
+	)
 
 	selfID := uint64(b.cfg.NodeID)
 	for id, addr := range membershipEntries(snapshot) {
@@ -131,18 +135,20 @@ func (b *Beacon) refreshTopology() error {
 
 		if err := ctx.Emit(buildMemberRemove(id)); err != nil {
 			slog.Error("beacon: predecessor eviction emit failed", "old_node_id", id, "error", err)
+			errs = append(errs, err)
 		}
 	}
 
 	if ctx != nil {
 		if err := ctx.Flush(); err != nil {
 			slog.Error("beacon: topology refresh flush failed", "error", err)
+			errs = append(errs, err)
 		}
 	}
 
 	b.syncMembership(snapshot)
 
-	return nil
+	return errors.Join(errs...)
 }
 
 // syncMembership copies the roster and updates the PeerManager only when

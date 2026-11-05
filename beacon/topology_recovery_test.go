@@ -4,17 +4,78 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"maps"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/swytchdb/engine/cluster"
 	pb "github.com/swytchdb/engine/cluster/proto"
+	"github.com/swytchdb/engine/durability"
 	"github.com/swytchdb/engine/effects"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 var errMembershipFetch = errors.New("temporary membership fetch failure")
+
+func TestPredecessorEvictionFailureReturnsErrorAfterProjection(t *testing.T) {
+	e, err := effects.OpenEngine(t.Context(), effects.EngineConfig{DataDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		if err := e.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	const address = "127.0.0.1:7380"
+
+	nodes := []cluster.NodeConfig{{ID: e.NodeID(), Address: address}, {ID: 2, Address: address}, {ID: 3, Address: address}}
+
+	write := e.NewContext()
+	for _, node := range nodes {
+		if err := write.Emit(buildMemberInsert(uint64(node.ID), node.Address)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := write.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Match the existing roster so projection needs no live peer connections.
+	pm, err := cluster.NewPeerManager(&cluster.ClusterConfig{NodeID: e.NodeID(), Nodes: nodes}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	b := New(Config{NodeID: e.NodeID(), AdvertiseAddr: address}, e, pm)
+
+	// Cached membership remains readable, but writes fail at the closed mirror.
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := b.refreshTopology(); !errors.Is(err, durability.ErrClosed) {
+		t.Fatalf("predecessor eviction error was swallowed: %v", err)
+	}
+
+	want := map[uint64]string{uint64(e.NodeID()): address, 2: address, 3: address}
+	if !maps.Equal(b.members, want) {
+		t.Fatalf("failed eviction did not project readable membership: %v", b.members)
+	}
+
+	snapshot, _, err := e.NewReadOnlyContext().GetSnapshot(MembershipKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := parseMembership(snapshot); !maps.Equal(got, want) {
+		t.Fatalf("failed removals changed membership: %v", got)
+	}
+}
 
 type membershipFetchFault struct {
 	effects.Broadcaster
