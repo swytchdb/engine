@@ -30,6 +30,7 @@ import (
 	"log/slog"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/swytchdb/engine/cluster"
 	pb "github.com/swytchdb/engine/cluster/proto"
@@ -68,12 +69,9 @@ func (b *Beacon) joinMembership(ctx context.Context) error {
 			}
 		}
 
-		snapshot, _, err := b.engine.NewReadOnlyContext().GetSnapshot(MembershipKey)
-		if err != nil {
+		if err := b.projectJoinMembership(ctx); err != nil {
 			return err
 		}
-
-		b.syncMembership(snapshot)
 
 		if len(peers) == 0 {
 			// Projection can discover peers even without an exchange (e.g.
@@ -87,6 +85,51 @@ func (b *Beacon) joinMembership(ctx context.Context) error {
 				return ctx.Err()
 			}
 		}
+	}
+}
+
+// projectJoinMembership keeps the startup gate closed while ancestry is
+// temporarily unavailable. Match topologyLoop's backoff, but give startup a
+// finite retry budget. Snapshot reads are synchronous: an in-flight fetch still
+// uses its transport timeout, and must finish before startup can clean up.
+func (b *Beacon) projectJoinMembership(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	backoff := 100 * time.Millisecond
+
+	var lastErr error
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("initial membership projection: %w", errors.Join(err, lastErr))
+		}
+
+		snapshot, _, err := b.engine.NewReadOnlyContext().GetSnapshot(MembershipKey)
+		// A read that completes after the deadline must not open the gate.
+		if ctx.Err() != nil {
+			return fmt.Errorf("initial membership projection: %w", errors.Join(ctx.Err(), err, lastErr))
+		}
+
+		if err == nil {
+			b.syncMembership(snapshot)
+
+			return nil
+		}
+
+		lastErr = err
+		slog.Debug("beacon: initial membership projection failed; retrying", "error", err, "backoff", backoff)
+		timer := time.NewTimer(backoff)
+
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+		case <-b.topoRefresh:
+			timer.Stop()
+		case <-timer.C:
+		}
+
+		backoff = min(2*backoff, 3*time.Second)
 	}
 }
 
