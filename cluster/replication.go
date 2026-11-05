@@ -528,6 +528,16 @@ func (r *Replicator) replicateBody(notifyBody []byte, targetPeerID NodeId) ([]*p
 
 	RecordNotificationSent()
 
+	// Shutdown may finish its final sweep before this request is registered
+	// (e.g. an engine anti-entropy probe racing PeerManager.Stop). Such a
+	// waiter must not depend on the stopped sweep to expire its deadline.
+	select {
+	case <-r.stopCh:
+		r.tracker.pending.Delete(requestID)
+		future.reject(ErrReplicationTimeout)
+	case <-future.Done():
+	}
+
 	if err := future.Wait(); err != nil {
 		return nil, err
 	}

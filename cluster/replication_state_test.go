@@ -28,6 +28,7 @@ import (
 	"maps"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
@@ -150,6 +151,49 @@ func TestReplicateToImmediateNACK(t *testing.T) {
 	if string(notify.GetEffectData()) != "original" {
 		t.Fatal("shared caller notification was mutated")
 	}
+}
+
+func TestReplicateToAfterStop(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := NewReplicator(1, "local", NewPeerHealthTable(ClockConfig{}), nil, nil, time.Second)
+		r.transport = notificationTransportFunc(func(_ NodeId, packet []byte) (int, error) {
+			return len(packet), nil
+		})
+		r.Start()
+		r.Stop()
+
+		done := make(chan error, 1)
+
+		go func() {
+			_, err := r.ReplicateTo(&pb.OffsetNotify{Key: []byte("key")}, nil, 2)
+			done <- err
+		}()
+
+		synctest.Wait()
+
+		select {
+		case err := <-done:
+			if !errors.Is(err, ErrReplicationTimeout) {
+				t.Fatalf("expected shutdown rejection, got %v", err)
+			}
+		default:
+			t.Error("request registered after shutdown waits forever without the sweep")
+			// Release the broken waiter so the test reports the failure cleanly.
+			r.tracker.pending.Range(func(_ uint64, tr *trackedRequest) bool {
+				tr.future.reject(ErrReplicationTimeout)
+
+				return true
+			})
+
+			if err := <-done; !errors.Is(err, ErrReplicationTimeout) {
+				t.Errorf("cleanup returned %v", err)
+			}
+		}
+
+		if r.tracker.pending.Size() != 0 {
+			t.Error("shutdown left the request tracked")
+		}
+	})
 }
 
 func TestReplicationMembershipSnapshot(t *testing.T) {
