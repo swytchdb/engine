@@ -36,12 +36,22 @@ var allocationClasses = [...]int64{
 	27264, 28672, 32768,
 }
 
-// Alloc rounds an allocation to Go's size classes, or whole heap pages for large
-// objects. Keep estimates separate from ownership: readers can retain an
+// Alloc conservatively rounds an allocation to Go's size classes, or whole
+// heap pages for large objects. Since callers supply no pointer metadata, small
+// objects above Go's header threshold include the 8-byte malloc header even if
+// pointer-free. Keep estimates separate from ownership: readers can retain an
 // allocation after its cache owner releases it.
 func Alloc(n int64) int64 {
 	if n <= 0 {
 		return 0
+	}
+
+	// Go's internal/runtime/gc uses PtrSize*PtrBits as the exclusive header
+	// threshold (512 on 64-bit, 128 on 32-bit). Larger objects use heap pages
+	// without an inline header; see runtime.mallocgc and runtime.roundupsize.
+	const headerSize = 8
+	if n > bits.UintSize*bits.UintSize/8 && n <= 32768-headerSize {
+		n += headerSize
 	}
 
 	for _, size := range allocationClasses[:] {

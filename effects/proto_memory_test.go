@@ -26,13 +26,35 @@ package effects
 import (
 	"bytes"
 	"fmt"
+	"reflect"
 	"runtime"
 	"sync"
 	"testing"
+	"unsafe"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
 	"google.golang.org/protobuf/proto"
 )
+
+func TestCollectAllocationsConservativeHeaders(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value any
+	}{
+		{"pointers", make([]*pb.Effect, 0, 1024/int(unsafe.Sizeof((*pb.Effect)(nil))))},
+		{"bytes", make([]byte, 0, 1024)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := reflect.ValueOf(tc.value)
+			allocations := make(map[uintptr]int64)
+			collectAllocations(v, allocations)
+
+			if got := allocations[v.Pointer()]; got != 1152 {
+				t.Fatalf("allocation charge = %d, want 1152", got)
+			}
+		})
+	}
+}
 
 func BenchmarkProtoMemoryChurn(b *testing.B) {
 	for _, resident := range []int{1024, 65536, 262144} {
