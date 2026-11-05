@@ -51,7 +51,15 @@ type horizonGroup struct {
 	// Keep immutable bases until the whole group resolves, including aborted
 	// members: later arrivals must still join the same overlapping group.
 	bases []*pb.TransactionalBindEffect
-	timer *time.Timer // scheduled MakeVisible (remote-arrival path)
+	timer *horizonTimer // scheduled MakeVisible (remote-arrival path)
+}
+
+// horizonTimer follows its group's entries when they merge into another group.
+// Its group and timer ownership are protected by HorizonSet.mu.
+type horizonTimer struct {
+	*time.Timer
+
+	group *horizonGroup
 }
 
 // HorizonSet tracks Binds in their horizon wait period. Effects from
@@ -125,6 +133,12 @@ func (h *HorizonSet) Add(txnID string, bindOffset Tip, bind *pb.TransactionalBin
 		target.entries = append(target.entries, group.entries...)
 		target.bases = append(target.bases, group.bases...)
 
+		if target.timer == nil && group.timer != nil {
+			target.timer = group.timer
+			target.timer.group = target
+			group.timer = nil
+		}
+
 		group.entries = nil
 	}
 
@@ -168,7 +182,7 @@ func (h *HorizonSet) WaitForClear(txnID string) *HorizonWait {
 // Deprecated: WaitForClear no longer holds a lock after returning.
 func (w *HorizonWait) Release() {}
 
-// ScheduleMakeVisible schedules MakeVisible(txnID) to fire after `wait`.
+// ScheduleMakeVisible schedules visibility for txnID's group after `wait`.
 // Used by handleRemoteBind as a crash-fallback for the remote-arrival
 // wait — the primary signal is the originator's verdict-snapshot
 // arriving via applySnapshotVerdicts, which short-circuits this timer.
@@ -190,11 +204,25 @@ func (h *HorizonSet) ScheduleMakeVisible(txnID string, wait time.Duration) {
 		group.timer.Stop()
 	}
 
-	fn := func() { h.MakeVisible(txnID) }
+	timer := &horizonTimer{group: group}
+	group.timer = timer
+
+	fn := func() {
+		h.mu.Lock()
+
+		// Stop may race with a callback already waiting for the lock.
+		if timer.group.timer != timer {
+			h.mu.Unlock()
+
+			return
+		}
+
+		h.makeGroupVisible(timer.group, txnID)
+	}
 	if h.afterFunc != nil {
-		group.timer = h.afterFunc(wait, fn)
+		timer.Timer = h.afterFunc(wait, fn)
 	} else {
-		group.timer = time.AfterFunc(wait, fn)
+		timer.Timer = time.AfterFunc(wait, fn)
 	}
 }
 
@@ -210,7 +238,11 @@ func (h *HorizonSet) MakeVisible(txnID string) {
 		return
 	}
 
-	group := entry.group
+	h.makeGroupVisible(entry.group, txnID)
+}
+
+// makeGroupVisible promotes group with h.mu held, then unlocks before callbacks.
+func (h *HorizonSet) makeGroupVisible(group *horizonGroup, txnID string) {
 	count := len(group.entries)
 
 	var keys []string

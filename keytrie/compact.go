@@ -43,8 +43,8 @@ import (
 //
 // Relocation safety rests on the existing lock discipline:
 //   - Every leaf-field mutator (Insert, RemoveTips, LoadOrStoreData,
-//     DeleteAndSnapshot, the eviction sweep) holds the reap read-lock for its
-//     whole critical section, so the write lock excludes all of them.
+//     DeleteAndSnapshot, the eviction sweep) holds the reap lock, shared or
+//     exclusive, for its whole critical section, so relocation excludes all of them.
 //   - Splices are identity-checked by descent, exactly like unlinkLeaf: a slot
 //     whose key path resolves to a different node is an orphan husk and is
 //     skipped, and stale reapQueue entries no-op the same way.

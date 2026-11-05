@@ -162,8 +162,9 @@ type Critbit[T any] struct {
 	leafArena     critbitArena[critNode[T]]
 	internalArena critbitArena[critNode[T]]
 
-	// reapMu protects node lifetimes. Readers and inserts share the read lock;
-	// the reaper takes the write lock to detach nodes and clear their fields.
+	// reapMu protects node lifetimes and deletion transitions. Readers and
+	// inserts share the read lock; deletion, eviction, and the reaper take the
+	// write lock so revival cannot race with clearing a leaf or its accounting.
 	reapMu sync.RWMutex
 	// Incremented under the write lock when existing paths are detached. Range
 	// cursors restart after their last key instead of following retired nodes.
@@ -504,33 +505,28 @@ func (c *Critbit[T]) Delete(key string, old *TipSet) bool {
 // DeleteAndSnapshot removes a key only if its current tips match old
 // (CAS). Returns the previous tip set on success, nil on failure.
 func (c *Critbit[T]) DeleteAndSnapshot(key string, old *TipSet) *TipSet {
-	c.reapMu.RLock()
+	c.reapMu.Lock()
 
 	leaf := c.liveLeaf(key)
 	if leaf == nil {
-		c.reapMu.RUnlock()
-
-		return nil
-	}
-
-	if !leaf.deleted.CompareAndSwap(false, true) {
-		c.reapMu.RUnlock()
+		c.reapMu.Unlock()
 
 		return nil
 	}
 
 	if !leaf.tips.CompareAndSwap(old, nil) {
-		leaf.deleted.Store(false)
-		c.reapMu.RUnlock()
+		c.reapMu.Unlock()
 
 		return nil
 	}
+
+	leaf.deleted.Store(true)
 	// The tips CAS already detached old; release the payload and account both.
 	droppedData := c.clearLeaf(leaf, old)
 	deleted := c.deletedCount.Add(1)
 	c.enqueueReap(leaf)
 
-	c.reapMu.RUnlock()
+	c.reapMu.Unlock()
 
 	// Release the tips and the payload's references — DeleteAndSnapshot bypasses
 	// the eviction notify, so this is the only refcount signal for FlushIndex.

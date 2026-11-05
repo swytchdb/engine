@@ -256,11 +256,10 @@ func (c *Critbit[T]) EvictBatch(want int) int {
 		threshold: c.evictK.Load(), epoch: c.decayEpoch(),
 	}
 
-	// Hold the reap read-lock across the sweep and the claims. It excludes the
-	// reap write lock — the only thing that frees/reclaims a leaf slot — so a
-	// published leaf's fields (including the non-atomic key) cannot be mutated
-	// mid-read.
-	c.reapMu.RLock()
+	// Keep claims, detached contents, and ghost/deletion accounting atomic with
+	// respect to Insert. A shared lock would let Insert revive a claimed leaf
+	// before eviction finishes clearing it and choosing its completed state.
+	c.reapMu.Lock()
 
 	c.sweepLeaves(window, sample.consider)
 	cold, ghosts := candidates[:sample.coldEnd], candidates[sample.ghostStart:]
@@ -341,7 +340,7 @@ func (c *Critbit[T]) EvictBatch(want int) int {
 		c.evictedUnprot.Add(uint64(len(victims)))
 	}
 
-	c.reapMu.RUnlock()
+	c.reapMu.Unlock()
 	c.maybeAdaptK()
 	c.evictMu.Unlock()
 
@@ -373,7 +372,7 @@ type evictedLeaf[T any] struct {
 }
 
 // detachEvictedLeaf clears a claimed leaf and accounts its released contents.
-// The caller holds reapMu and decides whether to retain a ghost or queue a reap.
+// The caller holds reapMu's write lock through ghost/deletion accounting.
 func (c *Critbit[T]) detachEvictedLeaf(leaf *critNode[T]) evictedLeaf[T] {
 	tips := leaf.tips.Swap(nil)
 
@@ -445,14 +444,9 @@ func decayLeaf[T any](leaf *critNode[T], epoch uint64) {
 	}
 }
 
-// claimForEviction atomically claims a live leaf as an eviction victim and
-// revalidates its dynamic pins. Claim: deleted=false means a live, linked
-// leaf, so a successful CAS false→true is an atomic claim (a lost CAS means a
-// concurrent delete won). The pin/claim race is resolved Dekker-style: Pin
-// increments then re-reads deleted (undoing if set); the claimer claims then
-// re-reads pins. With seq-cst atomics exactly one side observes the other, so
-// a pin can never be stranded on an evicted leaf and a pinned leaf can never
-// be evicted — whichever write lands second detects the first.
+// claimForEviction claims a live, unpinned leaf with reapMu's write lock held.
+// The caller retains that lock until clearing and accounting are complete,
+// preventing Insert from reviving an unfinished eviction.
 func (c *Critbit[T]) claimForEviction(leaf *critNode[T]) bool {
 	if !leaf.deleted.CompareAndSwap(false, true) {
 		return false
@@ -482,7 +476,7 @@ func (c *Critbit[T]) ghostCap() int64 {
 // unlinked and its chunk can be reclaimed. It is the eviction fallback used
 // ahead of evicting a live protected key: a ghost carries no tips/data (cleared
 // when it was first evicted), so there is nothing to release — it is pure dead
-// weight. Returns false if the ghost was concurrently promoted back to live.
+// weight. The caller holds reapMu's write lock, excluding ghost promotion.
 func (c *Critbit[T]) reclaimGhost(g *critNode[T]) bool {
 	for {
 		f := g.freq.Load()
@@ -659,7 +653,7 @@ func (c *Critbit[T]) maybeAdaptK() {
 // occupied leaves or one full pass — there is no escalation: when the window has no
 // cold leaf the caller reclaims a ghost rather than hunting further. The hand
 // persists across calls. Runs under evictMu (sole mutator of evictHand) and the
-// reap read-lock.
+// reap lock (exclusive during eviction).
 func (c *Critbit[T]) sweepLeaves(base int, fn func(*critNode[T])) {
 	chunks, chunkSize := c.leafArena.list.Load().chunks, c.leafArena.chunkSize
 

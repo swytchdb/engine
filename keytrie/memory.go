@@ -52,7 +52,7 @@ func (a *critbitArena[T]) addExtra(chunk uint32, delta int64) {
 }
 
 // clearLeaf releases a claimed leaf's payload and accounts its removed tips.
-// The caller has already detached tips and holds reapMu through accounting.
+// The caller has already detached tips and holds reapMu's write lock through accounting.
 // Both explicit deletion and eviction use this transition.
 func (c *Critbit[T]) clearLeaf(leaf *critNode[T], tips *TipSet) *T {
 	data := leaf.data.Swap(nil)
