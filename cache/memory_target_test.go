@@ -24,6 +24,8 @@
 package cache
 
 import (
+	"fmt"
+	"math"
 	"runtime/debug"
 	"testing"
 )
@@ -46,39 +48,29 @@ func TestGetAvailableMemory(t *testing.T) {
 	}
 }
 
-func TestEnforceMemoryTarget_SetsGOMEMLIMIT(t *testing.T) {
-	// Save and restore GOMEMLIMIT
-	origLimit := debug.SetMemoryLimit(-1) // read current
-	defer debug.SetMemoryLimit(origLimit)
+func TestMemoryEnforcementPreservesGoLimit(t *testing.T) {
+	for _, absolute := range []bool{false, true} {
+		for _, limit := range []int64{math.MaxInt64, 256 << 20} {
+			t.Run(fmt.Sprintf("absolute=%t/limit=%d", absolute, limit), func(t *testing.T) {
+				previous := debug.SetMemoryLimit(limit)
 
-	// Reset to "unset" (math.MaxInt64 means no limit)
-	debug.SetMemoryLimit(-1)
+				t.Cleanup(func() { debug.SetMemoryLimit(previous) })
 
-	cfg := ConfigFromCapacity(10000)
-	cfg.CollectStats = true
+				c := NewCloxCache[string, []byte](ConfigFromCapacity(1000))
+				t.Cleanup(c.Close)
 
-	c := NewCloxCache[string, []byte](cfg)
-	defer c.Close()
+				if absolute {
+					c.EnforceAbsoluteMemoryLimit(512<<20, 256)
+				} else {
+					c.EnforceMemoryTarget(0.5, 256)
+				}
 
-	c.EnforceMemoryTarget(0.5, 256) // 50% target
-
-	// GOMEMLIMIT should now be set
-	newLimit := debug.SetMemoryLimit(-1)
-	if newLimit <= 0 {
-		t.Errorf("GOMEMLIMIT was not set, got %d", newLimit)
+				if got := debug.SetMemoryLimit(-1); got != limit {
+					t.Fatalf("overrode process Go limit: %d -> %d", limit, got)
+				}
+			})
+		}
 	}
-
-	availMem := GetAvailableMemory()
-	expectedLimit := int64(float64(availMem) * 0.5)
-
-	// Should be within 10% of expected
-	if newLimit < expectedLimit*85/100 || newLimit > expectedLimit*115/100 {
-		t.Errorf("GOMEMLIMIT %d not close to expected %d (50%% of %d)",
-			newLimit, expectedLimit, availMem)
-	}
-
-	t.Logf("GOMEMLIMIT set to %s (target 50%% of %s = %s)",
-		FormatMemory(uint64(newLimit)), FormatMemory(availMem), FormatMemory(uint64(expectedLimit)))
 }
 
 func TestEnforceMemoryTarget_DoesNotOverrideExistingGOMEMLIMIT(t *testing.T) {

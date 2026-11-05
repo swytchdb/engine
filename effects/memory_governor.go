@@ -46,11 +46,12 @@ func (e *Engine) startMemoryGovernor(targetBytes int64) {
 		func() bool { return e.evictBudget.Load() > 0 },
 	)
 
-	// Collector pacing does not change the configured eviction threshold.
+	// The Go limit belongs to the operator and covers more than owned cache
+	// memory. A negative argument only reads it; never tune it for the caller.
 	e.goMemoryLimit = debug.SetMemoryLimit(-1)
-	if e.goMemoryLimit == math.MaxInt64 {
-		e.goMemoryLimit = targetBytes / 100 * 95
-		debug.SetMemoryLimit(e.goMemoryLimit)
+	if e.goMemoryLimit != math.MaxInt64 && e.goMemoryLimit <= targetBytes {
+		slog.Warn("Go memory limit leaves no headroom above the cache budget; allow room for runtime and transient allocations",
+			"go_memory_limit_bytes", e.goMemoryLimit, "cache_target_bytes", targetBytes)
 	}
 
 	e.cacheTarget = targetBytes

@@ -24,8 +24,10 @@
 package effects
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"math"
 	"runtime"
 	"runtime/debug"
@@ -409,14 +411,21 @@ func TestMemorySubscribersReleasedOnce(t *testing.T) {
 	}
 }
 
-func TestMemoryTargetsRespectExplicitGoLimit(t *testing.T) {
+func TestMemoryTargetsRespectGoLimit(t *testing.T) {
 	const budget = int64(8 << 30)
 
-	for _, limit := range []int64{math.MaxInt64, 256 << 20, 2 << 30, 14 << 30} {
+	for _, limit := range []int64{math.MaxInt64, 256 << 20, 2 << 30, budget, 14 << 30} {
 		t.Run(fmt.Sprint(limit), func(t *testing.T) {
 			previous := debug.SetMemoryLimit(limit)
 
 			t.Cleanup(func() { debug.SetMemoryLimit(previous) })
+
+			var logs bytes.Buffer
+
+			previousLogger := slog.Default()
+
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+			t.Cleanup(func() { slog.SetDefault(previousLogger) })
 
 			e := NewEngine(EngineConfig{MemoryLimit: budget})
 
@@ -427,13 +436,27 @@ func TestMemoryTargetsRespectExplicitGoLimit(t *testing.T) {
 			})
 
 			actual := debug.SetMemoryLimit(-1)
-			if limit != math.MaxInt64 && actual != limit {
-				t.Fatalf("overrode explicit Go limit: %d -> %d", limit, actual)
+			if actual != limit {
+				t.Fatalf("overrode process Go limit: %d -> %d", limit, actual)
 			}
 
 			stats := e.MemoryStats()
 			if stats.GoMemoryLimitBytes != actual || stats.CacheTargetBytes != budget || e.MemoryTarget() != budget {
 				t.Fatalf("collector settings changed the configured eviction threshold: %+v", stats)
+			}
+
+			if err := e.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			wantWarning := limit != math.MaxInt64 && limit <= budget
+			if got := strings.Contains(logs.String(), "level=WARN"); got != wantWarning {
+				t.Fatalf("memory-limit warning = %v, want %v; logs: %s", got, wantWarning, logs.String())
+			}
+
+			if wantWarning && (!strings.Contains(logs.String(), fmt.Sprintf("go_memory_limit_bytes=%d", limit)) ||
+				!strings.Contains(logs.String(), fmt.Sprintf("cache_target_bytes=%d", budget))) {
+				t.Fatalf("warning omitted the conflicting memory budgets: %s", logs.String())
 			}
 		})
 	}

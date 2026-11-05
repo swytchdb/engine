@@ -51,7 +51,10 @@ type EngineConfig struct {
 	RTTProvider   PeerRTTProvider // nil disables RTT-based leader selection
 	DefaultMode   SafetyMode
 	KeyRangeRules []KeyRangeRule
-	MemoryLimit   int64 // owned resident cache budget (0 = unbounded)
+	// MemoryLimit is the owned resident cache budget (0 = unbounded). It does
+	// not change GOMEMLIMIT; configure that separately with headroom for runtime
+	// memory and transient allocations outside the owned cache.
+	MemoryLimit int64
 	// MemoryLimitPercent, when non-zero, expresses the cache budget as a
 	// fraction (0,1] of the memory available to this process. Takes
 	// precedence over MemoryLimit. Available memory is resolved at startup.
