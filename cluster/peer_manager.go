@@ -81,6 +81,10 @@ type PeerManager struct {
 	serverTLS *tls.Config
 	clientTLS *tls.Config
 
+	// Own the QUIC transport and its socket so Stop can release the port
+	// synchronously; closing a ListenAddr listener alone does not wait for it.
+	serverTransport *quic.Transport
+
 	// QUIC notification transport (replaces UDP + Noise + chunking + pacing)
 	healthTable   *PeerHealthTable
 	heartbeat     *HeartbeatManager
@@ -425,9 +429,13 @@ func (pm *PeerManager) Stop() {
 		}
 	}
 
-	if pm.listener != nil {
-		if err := pm.listener.Close(); err != nil {
-			slog.Error("failed to close QUIC listener", "error", err)
+	if pm.serverTransport != nil {
+		if err := pm.serverTransport.Close(); err != nil {
+			slog.Error("failed to close QUIC server transport", "error", err)
+		}
+
+		if err := pm.serverTransport.Conn.Close(); err != nil {
+			slog.Error("failed to close QUIC server socket", "error", err)
 		}
 	}
 
@@ -966,11 +974,19 @@ func (pm *PeerManager) startServer() error {
 	tlsCfg = tlsCfg.Clone()
 	tlsCfg.NextProtos = []string{"swytch-cluster"}
 
-	listener, err := quic.ListenAddr(self.Address, tlsCfg, clusterQUICConfig())
+	conn, err := net.ListenPacket("udp", self.Address)
 	if err != nil {
 		return err
 	}
 
+	transport := &quic.Transport{Conn: conn}
+
+	listener, err := transport.Listen(tlsCfg, clusterQUICConfig())
+	if err != nil {
+		return errors.Join(err, transport.Close(), conn.Close())
+	}
+
+	pm.serverTransport = transport
 	pm.listener = listener
 	pm.lisAddr = listener.Addr()
 

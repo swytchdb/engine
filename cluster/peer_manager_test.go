@@ -24,6 +24,7 @@
 package cluster
 
 import (
+	"net"
 	"testing"
 	"time"
 
@@ -55,6 +56,17 @@ func TestPeerManagerStartStop(t *testing.T) {
 	}
 
 	pm.Stop()
+
+	// Stop must release the UDP socket before returning, including when
+	// startup fails and the caller immediately retries on the same address.
+	listener, err := net.ListenPacket("udp", pm.ListenAddr())
+	if err != nil {
+		t.Fatalf("stopped peer manager retained listener: %v", err)
+	}
+
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestPeerManagerBroadcastAndReceive(t *testing.T) {
