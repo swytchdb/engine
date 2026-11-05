@@ -223,6 +223,7 @@ func TestRangeCallbacksCanReclaimPaths(t *testing.T) {
 
 func TestReclaimConcurrentReadersKeepStableKeys(t *testing.T) {
 	c := NewCritbit[int]()
+	c.reapRunning.Store(true) // the writer below owns draining and compaction
 
 	t.Cleanup(func() { closeTestTrie(t, c) })
 

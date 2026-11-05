@@ -41,6 +41,8 @@ func TestCompact_InternalArenaOrderAndStaleSlots(t *testing.T) {
 			c.internalArena.init(8, nil)
 			c.reapRunning.Store(true)
 
+			t.Cleanup(func() { closeTestTrie(t, c) })
+
 			keys := make([]string, 0, 264)
 			keys = append(keys, "", "a", "aa", "ab", "b", "ba", "z", "za")
 
@@ -112,8 +114,9 @@ func TestCompact_InternalArenaOrderAndStaleSlots(t *testing.T) {
 	}
 }
 
-// drainAllReaps runs the reap machinery to quiescence synchronously (the
-// production path is the async maybeReap goroutine).
+// drainAllReaps runs maintenance synchronously. Callers must set reapRunning
+// before mutations to suppress the async worker: TryDequeue can fail under
+// consumer contention, and an empty queue can still have a batch in flight.
 func drainAllReaps[T any](c *Critbit[T]) {
 	for c.drainReap() > 0 {
 	}
@@ -130,6 +133,10 @@ func drainAllReaps[T any](c *Critbit[T]) {
 // lands on the free list for reuse).
 func TestCompact_EvacuatesSparseLeafChunk(t *testing.T) {
 	c := NewCritbit[int]()
+	c.reapRunning.Store(true) // this test owns draining and compaction
+
+	t.Cleanup(func() { closeTestTrie(t, c) })
+
 	n := defaultCritbitArenaChunkSize + 100 // fill chunk 0, spill into chunk 1
 
 	keys := make([]string, n)
@@ -211,6 +218,10 @@ func TestCompact_EvacuatesSparseLeafChunk(t *testing.T) {
 // tree stays fully readable.
 func TestCompact_InternalChunksFollowLeaves(t *testing.T) {
 	c := NewCritbit[struct{}]()
+	c.reapRunning.Store(true) // this test owns draining and compaction
+
+	t.Cleanup(func() { closeTestTrie(t, c) })
+
 	n := defaultCritbitArenaChunkSize + 100
 
 	keys := make([]string, n)
@@ -260,6 +271,10 @@ func TestCompact_InternalChunksFollowLeaves(t *testing.T) {
 // deleted accounting staying balanced.
 func TestCompact_GhostsForfeited(t *testing.T) {
 	c := NewCritbit[struct{}]()
+	c.reapRunning.Store(true) // this test owns draining and compaction
+
+	t.Cleanup(func() { closeTestTrie(t, c) })
+
 	c.SetEvictHooks(func(string) bool { return true }, func(string, []EffectRef, *struct{}) {}, func() bool { return true })
 
 	n := defaultCritbitArenaChunkSize + 100
@@ -314,6 +329,9 @@ func TestCompact_GhostsForfeited(t *testing.T) {
 // unlink path — no compaction involved.
 func TestOrphanSlots_DontPinChunks(t *testing.T) {
 	c := NewCritbit[struct{}]()
+	c.reapRunning.Store(true) // this test owns draining and compaction
+
+	t.Cleanup(func() { closeTestTrie(t, c) })
 
 	const (
 		workers   = 8
@@ -376,6 +394,9 @@ func TestOrphanSlots_DontPinChunks(t *testing.T) {
 // keyspace exactly. Run with -race to exercise the locking contract.
 func TestCompact_UnderConcurrentTraffic(t *testing.T) {
 	c := NewCritbit[int]()
+	c.reapRunning.Store(true) // the compactor goroutine below owns maintenance
+
+	t.Cleanup(func() { closeTestTrie(t, c) })
 
 	const (
 		workers   = 4
