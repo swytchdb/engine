@@ -1,3 +1,26 @@
+/*
+ * Copyright 2026 Swytch Labs BV
+ *
+ * This file is part of Swytch.
+ *
+ * Swytch is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of
+ * the License, or (at your option) any later version.
+ *
+ * Swytch is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with Swytch. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * Additional permissions under GNU AGPL version 3 section 7 apply to
+ * this file. See the NOTICE.md file distributed with this source code
+ * for the current set of additional permissions.
+ */
+
 // Package stn implements incremental partial path consistency (IPPC),
 // Algorithm 1 and Tag in Planken, de Weerdt and Yorke-Smith, ICAPS 2010:
 // https://doi.org/10.1609/icaps.v20i1.13417.
@@ -6,7 +29,9 @@ package stn
 
 import (
 	"errors"
+	"maps"
 	"math"
+	"slices"
 )
 
 const Infinity int64 = math.MaxInt64
@@ -61,6 +86,21 @@ func New(n int, topology []Pair) (*Network, error) {
 }
 
 func (s *Network) vertex(v int) bool { return v >= 0 && v < len(s.adj) }
+
+// clone copies mutable edge weights. Elimination orders are replaced, never
+// edited; clipping their capacity also makes AddPoint's appends independent.
+func (s *Network) clone() *Network {
+	n := &Network{
+		adj: make([]map[int]int64, len(s.adj)), limit: s.limit, maxInput: s.maxInput,
+		order: slices.Clip(s.order), rank: slices.Clip(s.rank),
+	}
+	for v, edges := range s.adj {
+		n.adj[v] = maps.Clone(edges)
+	}
+
+	return n
+}
+
 func (s *Network) link(a, b int) {
 	if _, ok := s.adj[a][b]; !ok {
 		s.adj[a][b], s.adj[b][a] = Infinity, Infinity
@@ -103,20 +143,13 @@ func (s *Network) Connect(a, b int) error {
 		return nil
 	}
 
-	add := func(u, v int) {
-		if _, ok := s.adj[u][v]; ok {
-			return
-		}
-
-		uv, _ := s.Upper(u, v)
-		vu, _ := s.Upper(v, u)
-		s.adj[u][v], s.adj[v][u] = uv, vu
-	}
-
 	if _, ok := s.adj[a][b]; ok {
 		return nil
 	}
 
+	add := func(u, v int) {
+		s.adj[u][v], s.adj[v][u] = s.bounds(u, v)
+	}
 	add(a, b)
 
 	// Added edges carry already-implied bounds. Until the new PEO is installed,
@@ -158,7 +191,7 @@ func (s *Network) Constrain(from, to int, upper int64) error {
 	}
 	// In a PPC graph the reverse edge is already a tight shortest-path
 	// bound. Algorithm 1 checks it before touching any weights.
-	if plus(upper, s.adj[to][from]) < 0 {
+	if pathSum(upper, s.adj[to][from]) < 0 {
 		return ErrInconsistent
 	}
 
@@ -167,37 +200,33 @@ func (s *Network) Constrain(from, to int, upper int64) error {
 	}
 
 	s.maxInput = max(s.maxInput, upper, -upper)
-	n := len(s.adj)
-	toA, fromB := make([]int64, n), make([]int64, n)
-	tagged := make([]bool, n)
+	distance := make([]distances, len(s.adj))
+	resetDistances(distance)
+	distance[from].forward, distance[to].backward = 0, 0
+	q := newCardinality(len(s.adj))
 
-	for i := range toA {
-		toA[i], fromB[i] = Infinity, Infinity
-	}
-
-	toA[from], fromB[to] = 0, 0
-	q := newCardinality(n)
-	tag := func(v int) {
-		tagged[v] = true
+	// Tag the constrained endpoints first, then visit by maximum cardinality.
+	// forward tracks u -> from; backward tracks to -> u (Algorithm 1).
+	for v := from; v >= 0; {
 		q.remove(v)
 
 		for u, vu := range s.adj[v] {
 			uv := s.adj[u][v]
-			if !tagged[u] {
-				toA[u] = min(toA[u], plus(uv, toA[v]))
-				fromB[u] = min(fromB[u], plus(fromB[v], vu))
+			if q.contains(u) {
+				distance[u].forward = min(distance[u].forward, pathSum(uv, distance[v].forward))
+				distance[u].backward = min(distance[u].backward, pathSum(distance[v].backward, vu))
 				q.increment(u)
 			} else {
-				s.adj[u][v] = min(uv, plus(plus(toA[u], upper), fromB[v]))
-				s.adj[v][u] = min(vu, plus(plus(toA[v], upper), fromB[u]))
+				s.adj[u][v] = min(uv, pathSum(pathSum(distance[u].forward, upper), distance[v].backward))
+				s.adj[v][u] = min(vu, pathSum(pathSum(distance[v].forward, upper), distance[u].backward))
 			}
 		}
-	}
-	tag(from)
-	tag(to)
 
-	for v := q.maximum(); v >= 0; v = q.maximum() {
-		tag(v)
+		if v == from {
+			v = to
+		} else {
+			v = q.maximum()
+		}
 	}
 
 	return nil
@@ -222,17 +251,31 @@ func (s *Network) Upper(from, to int) (int64, error) {
 		return w, nil
 	}
 
-	forward, backward := make([]int64, len(s.adj)), make([]int64, len(s.adj))
-	for i := range forward {
-		forward[i], backward[i] = Infinity, Infinity
+	return s.upper(from, to, make([]distances, len(s.adj))), nil
+}
+
+// bounds queries both directions between distinct, valid vertices. The two
+// searches reuse one buffer; adjacent vertices need no scratch allocation.
+func (s *Network) bounds(from, to int) (forward, backward int64) {
+	if w, ok := s.adj[from][to]; ok {
+		return w, s.adj[to][from]
 	}
 
-	forward[from], backward[to] = 0, 0
+	distance := make([]distances, len(s.adj))
+
+	return s.upper(from, to, distance), s.upper(to, from, distance)
+}
+
+// upper queries validated, nonadjacent vertices using caller-owned scratch.
+// Keeping scratch out of Network allows concurrent immutable clock reads.
+func (s *Network) upper(from, to int, distance []distances) int64 {
+	resetDistances(distance)
+	distance[from].forward, distance[to].backward = 0, 0
 
 	bound := Infinity
 	for _, v := range s.order {
-		bound = min(bound, pathSum(forward[v], backward[v]))
-		if forward[v] == Infinity && backward[v] == Infinity {
+		bound = min(bound, pathSum(distance[v].forward, distance[v].backward))
+		if distance[v].forward == Infinity && distance[v].backward == Infinity {
 			continue
 		}
 
@@ -241,12 +284,20 @@ func (s *Network) Upper(from, to int) (int64, error) {
 				continue
 			}
 
-			forward[u] = min(forward[u], pathSum(forward[v], vu))
-			backward[u] = min(backward[u], pathSum(backward[v], s.adj[u][v]))
+			distance[u].forward = min(distance[u].forward, pathSum(distance[v].forward, vu))
+			distance[u].backward = min(distance[u].backward, pathSum(distance[v].backward, s.adj[u][v]))
 		}
 	}
 
-	return bound, nil
+	return bound
+}
+
+type distances struct{ forward, backward int64 }
+
+func resetDistances(distance []distances) {
+	for i := range distance {
+		distance[i] = distances{Infinity, Infinity}
+	}
 }
 
 // A nonoptimal upward path may sum many already-derived edge bounds. Ignore
@@ -254,82 +305,11 @@ func (s *Network) Upper(from, to int) (int64, error) {
 // cannot discard the optimum: some shortest path is upward/downward, every
 // prefix/suffix of that path is shortest, and every finite shortest-path bound
 // is within V*maxInput (< 1<<60). Consistency likewise prevents negative
-// underflow on any path. IPPC's separate three-term arithmetic is unchanged.
+// underflow on any path. IPPC's three-term sums fit within the input budget.
 func pathSum(a, b int64) int64 {
 	if a == Infinity || b == Infinity || b > 0 && a > math.MaxInt64-b {
 		return Infinity
 	}
 
 	return a + b
-}
-
-func plus(a, b int64) int64 {
-	if a == Infinity || b == Infinity {
-		return Infinity
-	}
-
-	return a + b
-}
-
-// Intrusive buckets implement maximum-cardinality search in O(V+E), avoiding
-// an O(V) scan to choose each next vertex in Algorithm 1.
-type cardinality struct {
-	first, next, prev, count []int
-	max                      int
-}
-
-func newCardinality(n int) *cardinality {
-	q := &cardinality{first: make([]int, n), next: make([]int, n), prev: make([]int, n), count: make([]int, n)}
-	for i := range n {
-		q.first[i], q.next[i], q.prev[i] = -1, -1, -1
-	}
-
-	for i := range n {
-		q.insert(i)
-	}
-
-	return q
-}
-
-func (q *cardinality) insert(v int) {
-	c := q.count[v]
-	u := q.first[c]
-
-	q.first[c], q.next[v], q.prev[v] = v, u, -1
-	if u >= 0 {
-		q.prev[u] = v
-	}
-
-	q.max = max(q.max, c)
-}
-
-func (q *cardinality) remove(v int) {
-	u, w := q.prev[v], q.next[v]
-	if u < 0 {
-		q.first[q.count[v]] = w
-	} else {
-		q.next[u] = w
-	}
-
-	if w >= 0 {
-		q.prev[w] = u
-	}
-}
-
-func (q *cardinality) increment(v int) {
-	q.remove(v)
-	q.count[v]++
-	q.insert(v)
-}
-
-func (q *cardinality) maximum() int {
-	for q.max >= 0 && q.first[q.max] < 0 {
-		q.max--
-	}
-
-	if q.max < 0 {
-		return -1
-	}
-
-	return q.first[q.max]
 }

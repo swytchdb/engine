@@ -25,11 +25,12 @@ package cluster
 
 import (
 	"bytes"
+	"cmp"
 	"log/slog"
-	"sort"
+	"slices"
+	"sync"
 	"time"
 
-	"github.com/puzpuzpuz/xsync/v4"
 	pb "github.com/swytchdb/engine/cluster/proto"
 	"github.com/swytchdb/engine/effects"
 	"github.com/swytchdb/engine/keytrie"
@@ -106,9 +107,20 @@ type PubSubRouter struct {
 	transport RouterTransport
 	broker    LocalPubSubBroker
 
-	mu       xsync.RBMutex
-	channels map[NodeId]map[string]struct{} // peerID -> set of exact channels
-	patterns map[NodeId]map[string]struct{} // peerID -> set of patterns
+	mu    sync.RWMutex
+	peers []peerSubscriptions // sorted by peer ID; guarded by mu
+}
+
+type peerSubscriptions struct {
+	id       NodeId
+	channels []string // sorted and unique
+	patterns []string // sorted and unique
+}
+
+func (r *PubSubRouter) peerIndex(id NodeId) (int, bool) {
+	return slices.BinarySearchFunc(r.peers, id, func(peer peerSubscriptions, id NodeId) int {
+		return cmp.Compare(peer.id, id)
+	})
 }
 
 // NewPubSubRouter constructs a router. The broker is the in-process
@@ -121,8 +133,6 @@ func NewPubSubRouter(self NodeId, transport RouterTransport, broker LocalPubSubB
 		self:      self,
 		transport: transport,
 		broker:    broker,
-		channels:  make(map[NodeId]map[string]struct{}),
-		patterns:  make(map[NodeId]map[string]struct{}),
 	}
 }
 
@@ -149,30 +159,32 @@ func (r *PubSubRouter) HandleEphemeralSubscribe(subscriberNodeID uint64, routing
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	table := r.channels
-	if isPattern {
-		table = r.patterns
-	}
-
-	if unsubscribe {
-		if set := table[peerID]; set != nil {
-			delete(set, name)
-
-			if len(set) == 0 {
-				delete(table, peerID)
-			}
+	i, found := r.peerIndex(peerID)
+	if !found {
+		if unsubscribe {
+			return
 		}
 
-		return
+		r.peers = slices.Insert(r.peers, i, peerSubscriptions{id: peerID})
 	}
 
-	set := table[peerID]
-	if set == nil {
-		set = make(map[string]struct{})
-		table[peerID] = set
+	peer := &r.peers[i]
+
+	names := &peer.channels
+	if isPattern {
+		names = &peer.patterns
 	}
 
-	set[name] = struct{}{}
+	j, subscribed := slices.BinarySearch(*names, name)
+	if unsubscribe && subscribed {
+		*names = shrink(slices.Delete(*names, j, j+1))
+	} else if !unsubscribe && !subscribed {
+		*names = slices.Insert(*names, j, name)
+	}
+
+	if len(peer.channels)+len(peer.patterns) == 0 {
+		r.peers = shrink(slices.Delete(r.peers, i, i+1))
+	}
 }
 
 // HandleInboundMessage is wired to effects.Engine.OnPubSubMessage. It
@@ -206,8 +218,9 @@ func (r *PubSubRouter) OnPeerRemoved(peerID NodeId) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	delete(r.channels, peerID)
-	delete(r.patterns, peerID)
+	if i, found := r.peerIndex(peerID); found {
+		r.peers = shrink(slices.Delete(r.peers, i, i+1))
+	}
 }
 
 // --- shared.PubSubClusterRouter implementation --------------------------
@@ -216,12 +229,12 @@ func (r *PubSubRouter) OnPeerRemoved(peerID NodeId) {
 // connected peer. Fire-and-forget; receivers register us in their
 // per-peer tables and return immediately without log storage.
 func (r *PubSubRouter) AnnounceSub(channel string, isPattern bool) {
-	r.broadcastAnnounce(routingKeyFor(channel, isPattern), false)
+	r.sendAnnounce(routingKeyFor(channel, isPattern), false, r.transport.PeerIDs()...)
 }
 
 // AnnounceUnsub broadcasts an unsubscribe ephemeral SubscriptionEffect.
 func (r *PubSubRouter) AnnounceUnsub(channel string, isPattern bool) {
-	r.broadcastAnnounce(routingKeyFor(channel, isPattern), true)
+	r.sendAnnounce(routingKeyFor(channel, isPattern), true, r.transport.PeerIDs()...)
 }
 
 func routingKeyFor(name string, isPattern bool) []byte {
@@ -241,11 +254,29 @@ func (r *PubSubRouter) RouteMessage(channel string, payload []byte) int {
 		return 0
 	}
 
-	notify, wireData := r.buildPubSubMessage(channel, payload)
+	hlc := timestamppb.Now()
+	eff := &pb.Effect{
+		Key:            encodeRoutingKey(chKeyPrefix, channel),
+		Hlc:            hlc,
+		NodeId:         uint64(r.self),
+		ForkChoiceHash: effects.ComputeForkChoiceHash(r.self, hlc),
+		Kind: &pb.Effect_PubsubMessage{PubsubMessage: &pb.PubSubMessage{
+			Channel: []byte(channel),
+			Payload: payload,
+		}},
+	}
+
+	notify, err := buildEphemeralNotify(r.self, eff)
+	if err != nil {
+		slog.Debug("pubsub router: marshal message failed", "error", err)
+
+		return 0
+	}
+
 	sent := 0
 
 	for _, peerID := range targets {
-		if err := r.transport.SendOneWayTo(notify, wireData, peerID); err != nil {
+		if err := r.transport.SendOneWayTo(notify, notify.GetEffectData(), peerID); err != nil {
 			slog.Debug("pubsub router: one-way send failed",
 				"peer", peerID, "channel", channel, "error", err)
 
@@ -261,42 +292,37 @@ func (r *PubSubRouter) RouteMessage(channel string, payload []byte) int {
 // ClusterChannels returns every channel a remote peer is interested
 // in (deduped), filtered by pattern if non-empty.
 func (r *PubSubRouter) ClusterChannels(pattern string) []string {
-	token := r.mu.RLock()
-	defer r.mu.RUnlock(token)
+	r.mu.RLock()
 
-	seen := make(map[string]struct{})
+	var out []string
 
-	for _, set := range r.channels {
-		for ch := range set {
+	for _, peer := range r.peers {
+		for _, ch := range peer.channels {
 			if pattern == "" || keytrie.MatchGlob(ch, pattern) {
-				seen[ch] = struct{}{}
+				out = append(out, ch)
 			}
 		}
 	}
 
-	out := make([]string, 0, len(seen))
-	for ch := range seen {
-		out = append(out, ch)
-	}
+	r.mu.RUnlock()
+	slices.Sort(out)
 
-	sort.Strings(out)
-
-	return out
+	return shrink(slices.Compact(out))
 }
 
 // ClusterNumSub counts, per channel, the number of peers announcing
 // that exact channel. Patterns are not counted (Redis NUMSUB ignores
 // pattern subscriptions).
 func (r *PubSubRouter) ClusterNumSub(channels []string) map[string]int {
-	token := r.mu.RLock()
-	defer r.mu.RUnlock(token)
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 
 	out := make(map[string]int, len(channels))
 	for _, ch := range channels {
 		count := 0
 
-		for _, set := range r.channels {
-			if _, ok := set[ch]; ok {
+		for _, peer := range r.peers {
+			if _, ok := slices.BinarySearch(peer.channels, ch); ok {
 				count++
 			}
 		}
@@ -311,23 +337,17 @@ func (r *PubSubRouter) ClusterNumSub(channels []string) map[string]int {
 // remote peer. The local broker unions this with its own pattern set
 // to compute PUBSUB NUMPAT correctly across the cluster.
 func (r *PubSubRouter) ClusterPatterns() []string {
-	token := r.mu.RLock()
-	defer r.mu.RUnlock(token)
+	r.mu.RLock()
 
-	seen := make(map[string]struct{})
-
-	for _, set := range r.patterns {
-		for p := range set {
-			seen[p] = struct{}{}
-		}
+	var out []string
+	for _, peer := range r.peers {
+		out = append(out, peer.patterns...)
 	}
 
-	out := make([]string, 0, len(seen))
-	for p := range seen {
-		out = append(out, p)
-	}
+	r.mu.RUnlock()
+	slices.Sort(out)
 
-	return out
+	return shrink(slices.Compact(out))
 }
 
 // --- internals ----------------------------------------------------------
@@ -335,52 +355,35 @@ func (r *PubSubRouter) ClusterPatterns() []string {
 // targetsFor returns the peer IDs that should receive a PUBLISH for
 // the given channel, based on the per-peer table.
 func (r *PubSubRouter) targetsFor(channel string) []NodeId {
-	token := r.mu.RLock()
-	defer r.mu.RUnlock(token)
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 
-	matched := make(map[NodeId]struct{})
+	targets := make([]NodeId, 0, len(r.peers))
+	for _, peer := range r.peers {
+		if _, ok := slices.BinarySearch(peer.channels, channel); ok {
+			targets = append(targets, peer.id)
 
-	for peerID, set := range r.channels {
-		if _, ok := set[channel]; ok {
-			matched[peerID] = struct{}{}
-		}
-	}
-
-	for peerID, set := range r.patterns {
-		if _, ok := matched[peerID]; ok {
 			continue
 		}
 
-		for pat := range set {
+		for _, pat := range peer.patterns {
 			if keytrie.MatchGlob(channel, pat) {
-				matched[peerID] = struct{}{}
+				targets = append(targets, peer.id)
 
 				break
 			}
 		}
 	}
 
-	if len(matched) == 0 {
-		return nil
-	}
-
-	out := make([]NodeId, 0, len(matched))
-	for id := range matched {
-		out = append(out, id)
-	}
-
-	return out
+	return targets
 }
 
-// broadcastAnnounce sends an ephemeral SubscriptionEffect to every
-// connected peer via the replicator's broadcast path.
-func (r *PubSubRouter) broadcastAnnounce(routingKey []byte, unsubscribe bool) {
-	for _, peerID := range r.transport.PeerIDs() {
-		r.sendAnnounce(routingKey, unsubscribe, peerID)
+// sendAnnounce builds one subscription announcement for the entire fan-out.
+func (r *PubSubRouter) sendAnnounce(routingKey []byte, unsubscribe bool, peers ...NodeId) {
+	if len(peers) == 0 {
+		return
 	}
-}
 
-func (r *PubSubRouter) sendAnnounce(routingKey []byte, unsubscribe bool, peerID NodeId) {
 	hlc := timestamppb.Now()
 	eff := &pb.Effect{
 		Key:            routingKey,
@@ -394,44 +397,19 @@ func (r *PubSubRouter) sendAnnounce(routingKey []byte, unsubscribe bool, peerID 
 		}},
 	}
 
-	data, err := effects.MarshalEffect(eff)
+	notify, err := buildEphemeralNotify(r.self, eff)
 	if err != nil {
 		slog.Debug("pubsub router: marshal announce failed", "error", err)
 
 		return
 	}
 
-	notify := buildEphemeralNotify(r.self, eff, data)
-	if err := r.transport.SendOneWayTo(notify, notify.GetEffectData(), peerID); err != nil {
-		slog.Debug("pubsub router: announce send failed",
-			"peer", peerID, "unsubscribe", unsubscribe, "error", err)
+	for _, peerID := range peers {
+		if err := r.transport.SendOneWayTo(notify, notify.GetEffectData(), peerID); err != nil {
+			slog.Debug("pubsub router: announce send failed",
+				"peer", peerID, "unsubscribe", unsubscribe, "error", err)
+		}
 	}
-}
-
-func (r *PubSubRouter) buildPubSubMessage(channel string, payload []byte) (*pb.OffsetNotify, []byte) {
-	routingKey := encodeRoutingKey(chKeyPrefix, channel)
-	hlc := timestamppb.Now()
-	eff := &pb.Effect{
-		Key:            routingKey,
-		Hlc:            hlc,
-		NodeId:         uint64(r.self),
-		ForkChoiceHash: effects.ComputeForkChoiceHash(r.self, hlc),
-		Kind: &pb.Effect_PubsubMessage{PubsubMessage: &pb.PubSubMessage{
-			Channel: []byte(channel),
-			Payload: payload,
-		}},
-	}
-
-	data, err := effects.MarshalEffect(eff)
-	if err != nil {
-		slog.Debug("pubsub router: marshal message failed", "error", err)
-
-		return nil, nil
-	}
-
-	notify := buildEphemeralNotify(r.self, eff, data)
-
-	return notify, notify.GetEffectData()
 }
 
 // buildEphemeralNotify delegates to effects.BuildOffsetNotify so wire
@@ -439,8 +417,13 @@ func (r *PubSubRouter) buildPubSubMessage(channel string, payload []byte) (*pb.O
 // receiver short-circuits on the SubscriptionEffect.Ephemeral /
 // PubSubMessage branches before any real offset/log lookup, but
 // HandleRemote rejects nil origins so we set a plausible one.
-func buildEphemeralNotify(self NodeId, eff *pb.Effect, data []byte) *pb.OffsetNotify {
+func buildEphemeralNotify(self NodeId, eff *pb.Effect) (*pb.OffsetNotify, error) {
+	data, err := effects.MarshalEffect(eff)
+	if err != nil {
+		return nil, err
+	}
+
 	origin := keytrie.EffectRef{uint64(self), uint64(time.Now().UnixNano())}
 
-	return effects.BuildOffsetNotify(self, origin, eff, data, nil)
+	return effects.BuildOffsetNotify(self, origin, eff, data, nil), nil
 }

@@ -969,7 +969,6 @@ func TestCompaction_SnapshotAppearsInDAG(t *testing.T) {
 	}
 
 	d := newDag(e, "k", "")
-	d.visited = make(map[Tip]bool, 64)
 
 	d.nodes = make(map[Tip]*pb.Effect, 64)
 	if err := d.bfs(tips.Tips(), &d.lcaTip); err != nil {
@@ -1108,7 +1107,6 @@ func TestCompaction_BeaconPattern(t *testing.T) {
 	}
 
 	d := newDag(e, key, "")
-	d.visited = make(map[Tip]bool, 256)
 
 	d.nodes = make(map[Tip]*pb.Effect, 256)
 	if err := d.bfs(tips.Tips(), &d.lcaTip); err != nil {

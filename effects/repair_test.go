@@ -185,7 +185,7 @@ func TestInstallCloudTipsPreservesReadableSiblings(t *testing.T) {
 		t.Fatalf("post-install tips = %v, want the readable tip installed", ts.Tips())
 	}
 
-	if ts != nil && slices.Contains(ts.Tips(), holedTip) {
+	if slices.Contains(ts.Tips(), holedTip) {
 		t.Fatalf("post-install tips = %v, holed tip must never be installed", ts.Tips())
 	}
 

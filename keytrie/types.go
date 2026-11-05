@@ -47,22 +47,24 @@ func NewTipSet(refs ...EffectRef) *TipSet {
 	}
 
 	deduped := make([]EffectRef, 0, len(refs))
-	if len(refs) <= smallTipSetDedup {
-		for _, r := range refs {
-			if !slices.Contains(deduped, r) {
-				deduped = append(deduped, r)
-			}
-		}
 
-		return &TipSet{tips: deduped}
+	var seen map[EffectRef]struct{}
+	if len(refs) > smallTipSetDedup {
+		seen = make(map[EffectRef]struct{}, len(refs))
 	}
 
-	seen := make(map[EffectRef]struct{}, len(refs))
 	for _, r := range refs {
-		if _, ok := seen[r]; !ok {
+		if seen != nil {
+			if _, ok := seen[r]; ok {
+				continue
+			}
+
 			seen[r] = struct{}{}
-			deduped = append(deduped, r)
+		} else if slices.Contains(deduped, r) {
+			continue
 		}
+
+		deduped = append(deduped, r)
 	}
 
 	return &TipSet{tips: deduped}
@@ -106,10 +108,6 @@ func (ts *TipSet) Single() (EffectRef, bool) {
 
 // ContainsAll reports whether the tip set contains all of the given refs.
 func (ts *TipSet) ContainsAll(refs []EffectRef) bool {
-	if ts == nil {
-		return len(refs) == 0
-	}
-
 	for _, r := range refs {
 		if !ts.Contains(r) {
 			return false
@@ -117,6 +115,40 @@ func (ts *TipSet) ContainsAll(refs []EffectRef) bool {
 	}
 
 	return true
+}
+
+// tipDifference returns refs absent from excluded, preserving their order.
+// Both inputs and the result are immutable. An unchanged result shares refs;
+// a partial result owns exactly the retained capacity.
+func tipDifference(refs, excluded []EffectRef) []EffectRef {
+	if len(excluded) == 0 {
+		return refs
+	}
+
+	remaining := 0
+
+	for _, ref := range refs {
+		if !slices.Contains(excluded, ref) {
+			remaining++
+		}
+	}
+
+	switch remaining {
+	case 0:
+		return nil
+	case len(refs):
+		return refs
+	}
+
+	kept := make([]EffectRef, 0, remaining)
+
+	for _, ref := range refs {
+		if !slices.Contains(excluded, ref) {
+			kept = append(kept, ref)
+		}
+	}
+
+	return kept
 }
 
 // ReleaseClaimFunc is a function that releases a claimed key.

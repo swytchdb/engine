@@ -2,14 +2,124 @@ package beacon
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/swytchdb/engine/cluster"
 	pb "github.com/swytchdb/engine/cluster/proto"
 	"github.com/swytchdb/engine/effects"
 )
+
+func TestStartWaitsForMembershipReadRecovery(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		b, probe := membershipWithMissingDependency(t)
+		defer b.Stop()
+
+		done := make(chan error, 1)
+		go func() { done <- b.Start(t.Context()) }()
+
+		<-probe.failed
+		synctest.Wait()
+
+		select {
+		case err := <-done:
+			t.Fatalf("Start returned before membership recovered: %v", err)
+		default:
+		}
+
+		probe.available.Store(true)
+
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+
+		if members := b.Members(); len(members) != 1 || members[0].Addr != "127.0.0.1:7381" {
+			t.Fatalf("Start returned without projecting recovered membership: %v", members)
+		}
+	})
+}
+
+func TestStartMembershipReadRetryExpires(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		b, _ := membershipWithMissingDependency(t)
+		defer b.Stop()
+
+		start := time.Now()
+
+		err := b.Start(t.Context())
+		if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, errMembershipFetch) {
+			t.Fatalf("expected retry deadline and last fetch error, got %v", err)
+		}
+
+		if elapsed := time.Since(start); elapsed != 30*time.Second {
+			t.Fatalf("retry budget elapsed after %v, want 30s", elapsed)
+		}
+
+		if b.selfRegistered || b.ctx.Err() == nil {
+			t.Fatal("failed Start did not roll back registration and cancel background work")
+		}
+	})
+}
+
+func TestStartMembershipReadRetryCancels(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		b, probe := membershipWithMissingDependency(t)
+		defer b.Stop()
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		done := make(chan error, 1)
+		go func() { done <- b.Start(ctx) }()
+
+		<-probe.failed
+		synctest.Wait()
+		cancel()
+
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected cancellation, got %v", err)
+		}
+
+		if b.selfRegistered {
+			t.Fatal("cancelled Start did not roll back registration")
+		}
+	})
+}
+
+type delayedMembershipFetch struct {
+	effects.Broadcaster
+}
+
+func (p delayedMembershipFetch) FetchFromAny(ref *pb.EffectRef, hint effects.FetchHint) ([]byte, error) {
+	time.Sleep(31 * time.Second)
+
+	return p.Broadcaster.FetchFromAny(ref, hint)
+}
+
+func TestStartRejectsMembershipReadAfterDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		b, probe := membershipWithMissingDependency(t)
+		defer b.Stop()
+
+		probe.available.Store(true)
+		b.engine.SetBroadcaster(delayedMembershipFetch{Broadcaster: probe})
+
+		if err := b.Start(t.Context()); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("expected deadline despite successful late fetch, got %v", err)
+		}
+
+		if members := b.Members(); len(members) != 1 || members[0].Addr != b.cfg.AdvertiseAddr {
+			t.Fatalf("late read changed topology after deadline: %v", members)
+		}
+
+		if b.selfRegistered {
+			t.Fatal("timed out Start did not roll back registration")
+		}
+	})
+}
 
 func TestJoinExchangesCachedMembershipAndAttemptsDiscoveredPeers(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)

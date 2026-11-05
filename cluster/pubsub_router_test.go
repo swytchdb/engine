@@ -24,6 +24,7 @@
 package cluster
 
 import (
+	"fmt"
 	"slices"
 	"sync"
 	"testing"
@@ -31,6 +32,77 @@ import (
 	pb "github.com/swytchdb/engine/cluster/proto"
 	"google.golang.org/protobuf/proto"
 )
+
+func TestPubSubSubscriptionChurn(t *testing.T) {
+	r := NewPubSubRouter(1, nil, nil)
+
+	for id := uint64(2); id <= 129; id++ {
+		for n := range 128 {
+			key := routingKeyFor(fmt.Sprintf("channel-%03d", n), false)
+			r.HandleEphemeralSubscribe(id, key, false)
+			r.HandleEphemeralSubscribe(id, key, false) // replay is idempotent
+		}
+	}
+
+	for id := uint64(3); id <= 129; id++ {
+		r.OnPeerRemoved(NodeId(id))
+	}
+
+	for n := range 127 {
+		r.HandleEphemeralSubscribe(2, routingKeyFor(fmt.Sprintf("channel-%03d", n), false), true)
+	}
+
+	if got := r.ClusterChannels(""); !slices.Equal(got, []string{"channel-127"}) {
+		t.Fatalf("churn lost the remaining subscription: %v", got)
+	}
+
+	if cap(r.peers) > 4 || cap(r.peers[0].channels) > 4 {
+		t.Fatal("subscription storage retained peak capacity after churn")
+	}
+
+	r.HandleEphemeralSubscribe(2, routingKeyFor("channel-127", false), true)
+
+	if r.peers != nil {
+		t.Fatal("empty router retained subscription storage")
+	}
+}
+
+func TestPubSubConcurrentSubscriptions(t *testing.T) {
+	r := NewPubSubRouter(1, nil, nil)
+	key := routingKeyFor("events", false)
+	pattern := routingKeyFor("ev*", true)
+
+	r.HandleEphemeralSubscribe(99, key, false)
+
+	var wg sync.WaitGroup
+	for id := uint64(2); id < 6; id++ {
+		wg.Go(func() {
+			for range 100 {
+				r.HandleEphemeralSubscribe(id, key, false)
+				r.HandleEphemeralSubscribe(id, pattern, false)
+				r.HandleEphemeralSubscribe(id, key, true)
+				r.OnPeerRemoved(NodeId(id))
+			}
+		})
+	}
+
+	for range 100 {
+		targets := r.targetsFor("events")
+		if !slices.Contains(targets, 99) || len(slices.Compact(slices.Clone(targets))) != len(targets) {
+			t.Fatalf("missing stable subscriber or duplicate delivery: %v", targets)
+		}
+
+		r.ClusterChannels("")
+		r.ClusterPatterns()
+		r.ClusterNumSub([]string{"events"})
+	}
+
+	wg.Wait()
+
+	if got := r.targetsFor("events"); !slices.Equal(got, []NodeId{99}) {
+		t.Fatalf("departed peers retained: %v", got)
+	}
+}
 
 // --- Mocks --------------------------------------------------------------
 
@@ -413,18 +485,14 @@ func mustDecodeEffect(t *testing.T, notify *pb.OffsetNotify) *pb.Effect {
 		t.Fatalf("wire data truncated")
 	}
 
-	proto := data[4+keyLen:]
+	pr := data[4+keyLen:]
 
 	eff := &pb.Effect{}
-	if err := unmarshalProto(proto, eff); err != nil {
+	if err := proto.Unmarshal(pr, eff); err != nil {
 		t.Fatalf("unmarshal effect: %v", err)
 	}
 
 	return eff
-}
-
-func unmarshalProto(b []byte, m *pb.Effect) error {
-	return proto.Unmarshal(b, m)
 }
 
 func sortNodeIDs(ids []NodeId) []NodeId {

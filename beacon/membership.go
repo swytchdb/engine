@@ -25,6 +25,7 @@ package beacon
 
 import (
 	"encoding/binary"
+	"iter"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
 )
@@ -71,14 +72,6 @@ func buildMemberInsert(nodeID uint64, addr string) *pb.Effect {
 	}
 }
 
-// buildMemberTypeTag creates a MetaEffect that tags the key as a hash type.
-func buildMemberTypeTag() *pb.Effect {
-	return &pb.Effect{
-		Key:  []byte(MembershipKey),
-		Kind: &pb.Effect_Meta{Meta: &pb.MetaEffect{TypeTag: pb.ValueType_TYPE_HASH}},
-	}
-}
-
 // buildMemberRemove creates a REMOVE_OP DataEffect for graceful departure.
 func buildMemberRemove(nodeID uint64) *pb.Effect {
 	return &pb.Effect{
@@ -91,28 +84,49 @@ func buildMemberRemove(nodeID uint64) *pb.Effect {
 	}
 }
 
-// parseMembership extracts the member list from a reduced snapshot of __swytch:members.
-func parseMembership(reduced *pb.ReducedEffect) []Member {
-	if reduced == nil || reduced.NetAdds == nil {
+// membershipEntries decodes valid members without copying their addresses.
+// Address bytes belong to the snapshot and must be treated as read-only.
+func membershipEntries(snapshot *pb.ReducedEffect) iter.Seq2[uint64, []byte] {
+	return func(yield func(uint64, []byte) bool) {
+		for id, elem := range snapshot.GetNetAdds() {
+			nodeID := nodeIDFromBytes([]byte(id))
+			if nodeID == 0 {
+				continue
+			}
+
+			addr := elem.GetData().Decompress()
+			if len(addr) > 0 && !yield(nodeID, addr) {
+				return
+			}
+		}
+	}
+}
+
+// matchesMembership compares decoded entries without allocating a second map.
+// Count only valid entries so malformed data cannot force repeated updates.
+func matchesMembership(snapshot *pb.ReducedEffect, members map[uint64]string) bool {
+	count := 0
+
+	for id, addr := range membershipEntries(snapshot) {
+		if members[id] != string(addr) {
+			return false
+		}
+
+		count++
+	}
+
+	return count == len(members)
+}
+
+// parseMembership copies valid members into an owned map.
+func parseMembership(snapshot *pb.ReducedEffect) map[uint64]string {
+	if len(snapshot.GetNetAdds()) == 0 {
 		return nil
 	}
 
-	members := make([]Member, 0, len(reduced.GetNetAdds()))
-	for idStr, elem := range reduced.GetNetAdds() {
-		nodeID := nodeIDFromBytes([]byte(idStr))
-		if nodeID == 0 {
-			continue
-		}
-
-		addr := string(elem.GetData().Decompress())
-		if addr == "" {
-			continue
-		}
-
-		members = append(members, Member{
-			NodeID: nodeID,
-			Addr:   addr,
-		})
+	members := make(map[uint64]string, len(snapshot.GetNetAdds()))
+	for id, addr := range membershipEntries(snapshot) {
+		members[id] = string(addr)
 	}
 
 	return members

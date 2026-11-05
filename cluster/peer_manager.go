@@ -81,6 +81,10 @@ type PeerManager struct {
 	serverTLS *tls.Config
 	clientTLS *tls.Config
 
+	// Own the QUIC transport and its socket so Stop can release the port
+	// synchronously; closing a ListenAddr listener alone does not wait for it.
+	serverTransport *quic.Transport
+
 	// QUIC notification transport (replaces UDP + Noise + chunking + pacing)
 	healthTable   *PeerHealthTable
 	heartbeat     *HeartbeatManager
@@ -268,16 +272,7 @@ func (pm *PeerManager) Start(ctx context.Context) error {
 	peers := pm.config.Peers()
 	pm.mu.Lock()
 	for _, peer := range peers {
-		peerID := peer.ID
-		pc := newPeerConn(peer.ID, peer.Address, peer.Region, selfRegion, pm.handler, pm.clientTLS, func(conn *quic.Conn) {
-			pm.acceptOutboundStreams(conn)
-
-			if pm.heartbeat != nil {
-				pm.heartbeat.SendTickTo(peerID)
-			}
-
-			pm.sendKeyFilterTo(peerID)
-		})
+		pc := pm.newPeerConnection(peer, selfRegion)
 		pm.peers[peer.ID] = pc
 		pc.Start(pm.ctx)
 	}
@@ -295,9 +290,16 @@ func (pm *PeerManager) Start(ctx context.Context) error {
 // WaitForAnyPeer blocks until at least one peer connection is ready for
 // streaming, or the context is cancelled. Must be called after Start.
 func (pm *PeerManager) WaitForAnyPeer(ctx context.Context) error {
-	if len(pm.config.Peers()) == 0 {
+	token := pm.mu.RLock()
+	noPeers := len(pm.peers) == 0
+	pm.mu.RUnlock(token)
+
+	if noPeers {
 		return nil
 	}
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
 
 	for {
 		token := pm.mu.RLock()
@@ -314,7 +316,7 @@ func (pm *PeerManager) WaitForAnyPeer(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(100 * time.Millisecond):
+		case <-ticker.C:
 		}
 	}
 }
@@ -413,14 +415,8 @@ func (pm *PeerManager) Stop() {
 	// onPeerRemoved hooks outside it — both can block / re-enter
 	// PeerManager via pm.mu.RLock.
 	pm.mu.Lock()
-	conns := make([]*PeerConn, 0, len(pm.peers))
-
-	departing := make([]NodeId, 0, len(pm.peers))
-	for id, pc := range pm.peers {
-		conns = append(conns, pc)
-		departing = append(departing, id)
-		delete(pm.peers, id)
-	}
+	conns := pm.peers
+	pm.peers = make(map[NodeId]*PeerConn)
 	pm.mu.Unlock()
 
 	for _, pc := range conns {
@@ -428,22 +424,25 @@ func (pm *PeerManager) Stop() {
 	}
 
 	if pm.onPeerRemoved != nil {
-		for _, id := range departing {
+		for id := range conns {
 			pm.onPeerRemoved(id)
 		}
 	}
 
-	if pm.listener != nil {
-		if err := pm.listener.Close(); err != nil {
-			slog.Error("failed to close QUIC listener", "error", err)
+	if pm.serverTransport != nil {
+		if err := pm.serverTransport.Close(); err != nil {
+			slog.Error("failed to close QUIC server transport", "error", err)
+		}
+
+		if err := pm.serverTransport.Conn.Close(); err != nil {
+			slog.Error("failed to close QUIC server socket", "error", err)
 		}
 	}
 
 	slog.Info("peer manager stopped", "node_id", pm.config.NodeID)
 }
 
-// Broadcast sends an OffsetNotify to all connected peers. Fire-and-forget.
-// HealthTable returns the peer health table, or nil if UDP/Noise is not configured.
+// HealthTable returns the peer health table, or nil before cluster startup.
 func (pm *PeerManager) HealthTable() *PeerHealthTable {
 	return pm.healthTable
 }
@@ -459,12 +458,13 @@ func (pm *PeerManager) SendOneWayTo(notify *pb.OffsetNotify, wireData []byte, ta
 	return pm.replicator.SendOneWay(notify, wireData, targetNodeID)
 }
 
+// Broadcast sends an OffsetNotify to all connected peers. Fire-and-forget.
 func (pm *PeerManager) Broadcast(notify *pb.OffsetNotify) {
 	pm.BroadcastWithData(notify, nil)
 }
 
 // BroadcastWithData sends an OffsetNotify to all connected peers.
-// Routes through the replicator (UDP) when available.
+// Routes through the replicator when available.
 func (pm *PeerManager) BroadcastWithData(notify *pb.OffsetNotify, effectData []byte) {
 	if pm.replicator != nil {
 		pm.replicator.Replicate(notify, effectData)
@@ -476,9 +476,8 @@ func (pm *PeerManager) BroadcastWithData(notify *pb.OffsetNotify, effectData []b
 }
 
 // Replicate sends the notification using first-ACK semantics for same-region peers.
-// Blocks until at least one same-region peer ACKs or the replication timeout expires.
-// Returns nil on success, or an error if replication failed (no peers, timeout, etc.).
-// If the replicator is not set up (no UDP transport), falls back to BroadcastWithData.
+// Blocks until at least one same-region peer ACKs or all tracked peers give up.
+// Requires a started replicator. Returns nil on success or a replication error.
 func (pm *PeerManager) Replicate(notify *pb.OffsetNotify, wireData []byte) error {
 	remoteCtx := tracing.ExtractFromBytes(notify.GetTraceContext())
 
@@ -639,39 +638,29 @@ func (pm *PeerManager) FetchFromAny(offset *pb.EffectRef, hint effects.FetchHint
 func (pm *PeerManager) fetchConns() []*quic.Conn {
 	token := pm.mu.RLock()
 
-	pcs := make([]*PeerConn, 0, len(pm.peers))
+	seen := make(map[*quic.Conn]struct{}, len(pm.peers))
 	for _, pc := range pm.peers {
-		pcs = append(pcs, pc)
+		if c := pc.GetQuicConn(); c != nil {
+			seen[c] = struct{}{}
+		}
 	}
 
 	pm.mu.RUnlock(token)
 
-	seen := make(map[*quic.Conn]struct{})
-	conns := make([]*quic.Conn, 0, len(pcs))
-
-	add := func(c *quic.Conn) {
-		if c == nil {
-			return
-		}
-
-		if _, ok := seen[c]; ok {
-			return
-		}
-
-		seen[c] = struct{}{}
-		conns = append(conns, c)
-	}
-	for _, pc := range pcs {
-		add(pc.GetQuicConn())
-	}
-
 	pm.inboundMu.RLock()
 
 	for _, c := range pm.inboundConns {
-		add(c)
+		if c != nil {
+			seen[c] = struct{}{}
+		}
 	}
 
 	pm.inboundMu.RUnlock()
+
+	conns := make([]*quic.Conn, 0, len(seen))
+	for conn := range seen {
+		conns = append(conns, conn)
+	}
 
 	return conns
 }
@@ -681,6 +670,16 @@ func (pm *PeerManager) fetchConns() []*quic.Conn {
 func (pm *PeerManager) fetchFromConns(ctx context.Context, offset *pb.EffectRef, conns []*quic.Conn) ([]byte, error) {
 	if len(conns) == 0 {
 		return nil, ErrPeerUnavailable
+	}
+
+	// The usual two-node cluster needs no fan-out goroutine or result channel.
+	if len(conns) == 1 {
+		data, err := fetchOverConn(ctx, conns[0], offset)
+		if err == nil && len(data) == 0 {
+			err = errFetchNotFound
+		}
+
+		return data, err
 	}
 
 	type result struct {
@@ -695,19 +694,11 @@ func (pm *PeerManager) fetchFromConns(ctx context.Context, offset *pb.EffectRef,
 	for _, c := range conns {
 		go func(c *quic.Conn) {
 			data, err := fetchOverConn(ctx, c, offset)
-			if err != nil {
-				ch <- result{nil, err}
-
-				return
+			if err == nil && len(data) == 0 {
+				err = errFetchNotFound
 			}
 
-			if len(data) == 0 {
-				ch <- result{nil, errFetchNotFound}
-
-				return
-			}
-
-			ch <- result{data, nil}
+			ch <- result{data, err}
 		}(c)
 	}
 
@@ -761,25 +752,9 @@ func (pm *PeerManager) UpdateTopology(newCfg *ClusterConfig) {
 		return
 	}
 
-	diff := DiffTopology(pm.config, newCfg)
-
 	selfRegion := ""
 	if self := newCfg.Self(); self != nil {
 		selfRegion = self.Region
-	}
-
-	connect := func(n NodeConfig) *PeerConn {
-		peerID := n.ID
-
-		return newPeerConn(n.ID, n.Address, n.Region, selfRegion, pm.handler, pm.clientTLS, func(conn *quic.Conn) {
-			pm.acceptOutboundStreams(conn)
-
-			if pm.heartbeat != nil {
-				pm.heartbeat.SendTickTo(peerID)
-			}
-
-			pm.sendKeyFilterTo(peerID)
-		})
 	}
 
 	// pm.mu only protects pm.peers and pm.config. Detach departing
@@ -789,6 +764,7 @@ func (pm *PeerManager) UpdateTopology(newCfg *ClusterConfig) {
 	// PeerManager via the QUIC connFunc (which RLocks pm.mu).
 	pm.mu.Lock()
 
+	diff := DiffTopology(pm.config, newCfg)
 	stops := make([]*PeerConn, 0, len(diff.Removed)+len(diff.Changed))
 
 	for _, removed := range diff.Removed {
@@ -803,7 +779,7 @@ func (pm *PeerManager) UpdateTopology(newCfg *ClusterConfig) {
 
 	for _, added := range diff.Added {
 		slog.Info("connecting to new peer", "peer", added.ID, "address", added.Address, "region", added.Region)
-		pc := connect(added)
+		pc := pm.newPeerConnection(added, selfRegion)
 		pm.peers[added.ID] = pc
 		pc.Start(pm.ctx)
 	}
@@ -816,7 +792,7 @@ func (pm *PeerManager) UpdateTopology(newCfg *ClusterConfig) {
 			delete(pm.peers, changed.ID)
 		}
 
-		pc := connect(changed)
+		pc := pm.newPeerConnection(changed, selfRegion)
 		pm.peers[changed.ID] = pc
 		pc.Start(pm.ctx)
 	}
@@ -878,6 +854,9 @@ func (pm *PeerManager) WaitForInitialConnections(ctx context.Context) error {
 
 // WaitForPeer blocks until the given peer's stream is ready or context is cancelled.
 func (pm *PeerManager) WaitForPeer(ctx context.Context, nodeID NodeId) bool {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
 	for {
 		token := pm.mu.RLock()
 		pc := pm.peers[nodeID]
@@ -890,7 +869,7 @@ func (pm *PeerManager) WaitForPeer(ctx context.Context, nodeID NodeId) bool {
 		select {
 		case <-ctx.Done():
 			return false
-		case <-time.After(50 * time.Millisecond):
+		case <-ticker.C:
 		}
 	}
 }
@@ -995,11 +974,19 @@ func (pm *PeerManager) startServer() error {
 	tlsCfg = tlsCfg.Clone()
 	tlsCfg.NextProtos = []string{"swytch-cluster"}
 
-	listener, err := quic.ListenAddr(self.Address, tlsCfg, clusterQUICConfig())
+	conn, err := net.ListenPacket("udp", self.Address)
 	if err != nil {
 		return err
 	}
 
+	transport := &quic.Transport{Conn: conn}
+
+	listener, err := transport.Listen(tlsCfg, clusterQUICConfig())
+	if err != nil {
+		return errors.Join(err, transport.Close(), conn.Close())
+	}
+
+	pm.serverTransport = transport
 	pm.listener = listener
 	pm.lisAddr = listener.Addr()
 
@@ -1053,11 +1040,16 @@ func (pm *PeerManager) dispatchConnStreams(conn *quic.Conn) {
 	}
 }
 
-// acceptOutboundStreams is the callback PeerConn fires after a
-// successful dial. It wires the accept loops onto our dialed
-// connection so the peer can open return streams (e.g. NACKs
-// routed via their own inboundConns fallback to our outbound
-// conn).
-func (pm *PeerManager) acceptOutboundStreams(conn *quic.Conn) {
-	pm.dispatchConnStreams(conn)
+// newPeerConnection wires the same connection lifecycle for initial peers
+// and topology updates. Callbacks run after dialing, outside pm.mu.
+func (pm *PeerManager) newPeerConnection(peer NodeConfig, selfRegion string) *PeerConn {
+	return newPeerConn(peer.ID, peer.Address, peer.Region, selfRegion, pm.clientTLS, func(conn *quic.Conn) {
+		pm.dispatchConnStreams(conn)
+
+		if pm.heartbeat != nil {
+			pm.heartbeat.SendTickTo(peer.ID)
+		}
+
+		pm.sendKeyFilterTo(peer.ID)
+	})
 }

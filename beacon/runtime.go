@@ -133,8 +133,6 @@ type Runtime struct {
 	Beacon      *Beacon
 	CloudSync   *cluster.CloudSync
 
-	cfg RuntimeConfig
-
 	// joinCancel/joinWG track an in-flight AsyncJoin goroutine so Stop can
 	// cancel it and wait for it to return before tearing down the peer
 	// manager and engine it touches. Both are zero-valued (nil / empty)
@@ -154,7 +152,7 @@ type Runtime struct {
 // adds its own callbacks via Engine.OnKeyDataAdded etc. is
 // responsible for unwiring those — Stop only tears down what
 // NewRuntime built.
-func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
+func NewRuntime(ctx context.Context, cfg RuntimeConfig) (_ *Runtime, err error) {
 	log := cfg.Logger
 	if log == nil {
 		log = slog.Default()
@@ -174,35 +172,33 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 
 	log.Info("effects engine initialized", "node_id", engine.NodeID())
 
+	// Startup transfers each resource to rt as it is acquired. Failed startup
+	// uses the same teardown order as normal shutdown, including safety watchers.
+	rt := &Runtime{Engine: engine}
+
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, rt.Stop())
+		}
+	}()
+
 	// The connection secret is derive-and-drop: everything needed later comes
 	// from these two derivations, and no config copy retains the master.
 	passphrase := cfg.ClusterPassphrase
-	cloudEnabled := cfg.ConnectionSecret != ""
-
-	var cloudSync *cluster.CloudSync
-
-	if cloudEnabled {
+	if cfg.ConnectionSecret != "" {
 		if cfg.ClusterPassphrase != "" {
-			return nil, errors.Join(
-				fmt.Errorf("ConnectionSecret is exclusive with ClusterPassphrase: the mTLS passphrase derives from the secret"),
-				closeEngineOnError(engine),
-			)
+			return nil, fmt.Errorf("ConnectionSecret is exclusive with ClusterPassphrase: the mTLS passphrase derives from the secret")
 		}
 
 		if cfg.OnLocalEffect != nil || cfg.CloudReader != nil || cfg.CDNFetcher != nil {
-			return nil, errors.Join(
-				fmt.Errorf("ConnectionSecret is exclusive with the embedder durability seams"),
-				closeEngineOnError(engine),
-			)
+			return nil, fmt.Errorf("ConnectionSecret is exclusive with the embedder durability seams")
 		}
 
 		passphrase = cluster.DeriveClusterPassphrase(cfg.ConnectionSecret)
 
-		var err error
-
-		cloudSync, err = cluster.NewCloudSync(engine, cfg.ConnectionSecret)
+		rt.CloudSync, err = cluster.NewCloudSync(engine, cfg.ConnectionSecret)
 		if err != nil {
-			return nil, errors.Join(err, closeEngineOnError(engine))
+			return nil, err
 		}
 
 		cfg.ConnectionSecret = ""
@@ -222,17 +218,11 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 		engine.SetCloudReader(cfg.CloudReader)
 	}
 
-	rt := &Runtime{
-		Engine:    engine,
-		CloudSync: cloudSync,
-		cfg:       cfg,
-	}
-
 	// Single-node mode: done.
 	if passphrase == "" {
 		rt.safety = newSafetyWatcher(engine)
 		if err := rt.safety.start(ctx); err != nil {
-			return nil, errors.Join(err, closeRuntimeOnError(rt))
+			return nil, err
 		}
 
 		log.Debug("no cluster passphrase, running single-node")
@@ -241,10 +231,7 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 	}
 
 	if cfg.ClusterPort == 0 {
-		return nil, errors.Join(
-			fmt.Errorf("cluster mode requires a non-zero ClusterPort"),
-			closeRuntimeOnError(rt),
-		)
+		return nil, fmt.Errorf("cluster mode requires a non-zero ClusterPort")
 	}
 
 	// Figure out what address we tell peers to dial us on. Auto-detect
@@ -274,15 +261,9 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 		TLSPassphrase: passphrase,
 	}
 
-	logReader := cluster.NewEngineLogReader(engine.EffectCache())
-	effectHandler := cluster.NewEngineEffectHandler(engine)
-
-	pm, err := cluster.NewPeerManager(peerCfg, effectHandler, logReader)
+	pm, err := cluster.NewPeerManager(peerCfg, cluster.NewEngineEffectHandler(engine), cluster.NewEngineLogReader(engine.EffectCache()))
 	if err != nil {
-		return nil, errors.Join(
-			fmt.Errorf("failed to create peer manager: %w", err),
-			closeRuntimeOnError(rt),
-		)
+		return nil, fmt.Errorf("failed to create peer manager: %w", err)
 	}
 
 	rt.PeerManager = pm
@@ -292,26 +273,23 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 	pm.SetKeyFilterProvider(engine)
 
 	if err := pm.Start(ctx); err != nil {
-		return nil, errors.Join(
-			fmt.Errorf("failed to start peer manager: %w", err),
-			closeRuntimeOnError(rt),
-		)
+		return nil, fmt.Errorf("failed to start peer manager: %w", err)
 	}
 
 	// Engine replicates outbound via the PeerManager.
 	engine.SetBroadcaster(pm)
 
-	if cloudSync != nil {
-		if err := cloudSync.Start(); err != nil {
-			return nil, errors.Join(err, closeRuntimeOnError(rt))
+	if rt.CloudSync != nil {
+		if err := rt.CloudSync.Start(); err != nil {
+			return nil, err
 		}
 		// Recursive dep fetches now race the CDN against peers, so effects no
 		// live peer holds are recoverable from cloud durability.
-		pm.SetCDNFetcher(cloudSync)
+		pm.SetCDNFetcher(rt.CloudSync)
 		// Read-miss backstop: a key evicted from every live peer may still live
 		// in Cloud. The engine asks Cloud for its frontier and rehydrates before
 		// treating the read as a miss (tiered storage).
-		engine.SetCloudReader(cloudSync)
+		engine.SetCloudReader(rt.CloudSync)
 	}
 
 	if cfg.CDNFetcher != nil {
@@ -337,8 +315,9 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 		AdvertiseAddr: advertise,
 		NodeID:        engine.NodeID(),
 		Passphrase:    passphrase,
-		Cloud:         cloudSync,
+		Cloud:         rt.CloudSync,
 	}, engine, pm)
+	rt.Beacon = b
 
 	if cfg.AsyncJoin {
 		// Local engine + QUIC listener are already up; run the blocking
@@ -348,7 +327,6 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 		// return before closing the peer manager / engine the join uses.
 		joinCtx, joinCancel := context.WithCancel(ctx)
 		rt.joinCancel = joinCancel
-		rt.Beacon = b
 		rt.joinWG.Go(func() {
 			if err := b.Start(joinCtx); err != nil {
 				log.Warn("cluster join did not complete; serving solo, will converge in background", "error", err)
@@ -362,15 +340,11 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 		})
 	} else {
 		if err := b.Start(ctx); err != nil {
-			return nil, errors.Join(
-				fmt.Errorf("failed to start beacon: %w", err),
-				closeRuntimeOnError(rt),
-			)
+			return nil, fmt.Errorf("failed to start beacon: %w", err)
 		}
 
-		rt.Beacon = b
 		if err := b.startSafety(ctx); err != nil {
-			return nil, errors.Join(err, closeRuntimeOnError(rt))
+			return nil, err
 		}
 	}
 
@@ -403,8 +377,6 @@ func (r *Runtime) Stop() error {
 		r.safety.stop()
 	}
 
-	var errs []error
-
 	if r.Beacon != nil {
 		r.Beacon.Stop()
 		r.Beacon = nil
@@ -420,15 +392,18 @@ func (r *Runtime) Stop() error {
 		r.PeerManager = nil
 	}
 
-	if r.Engine != nil {
-		if err := r.Engine.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("close engine: %w", err))
-		}
-
-		r.Engine = nil
+	if r.Engine == nil {
+		return nil
 	}
 
-	return errors.Join(errs...)
+	err := r.Engine.Close()
+	r.Engine = nil
+
+	if err != nil {
+		return fmt.Errorf("close engine: %w", err)
+	}
+
+	return nil
 }
 
 // SetForwardHandler wires the transport's ForwardHandler into the
@@ -439,36 +414,4 @@ func (r *Runtime) SetForwardHandler(h cluster.ForwardHandler) {
 	if r.PeerManager != nil {
 		r.PeerManager.SetForwardHandler(h)
 	}
-}
-
-func closeEngineOnError(engine *effects.Engine) error {
-	if err := engine.Close(); err != nil {
-		return fmt.Errorf("close engine: %w", err)
-	}
-
-	return nil
-}
-
-func closeRuntimeOnError(r *Runtime) error {
-	var errs []error
-
-	if r.Beacon != nil {
-		r.Beacon.Stop()
-	}
-
-	if r.CloudSync != nil {
-		r.CloudSync.Stop()
-	}
-
-	if r.PeerManager != nil {
-		r.PeerManager.Stop()
-	}
-
-	if r.Engine != nil {
-		if err := r.Engine.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("close engine: %w", err))
-		}
-	}
-
-	return errors.Join(errs...)
 }

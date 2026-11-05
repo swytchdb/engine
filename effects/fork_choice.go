@@ -49,3 +49,23 @@ func ComputeForkChoiceHash(nodeID proto.NodeID, hlc *timestamppb.Timestamp) []by
 func ForkChoiceLess(a, b []byte) bool {
 	return bytes.Compare(a, b) < 0
 }
+
+// bindsShareBase compares the immutable bind data directly: a conflict needs
+// both an overlapping key and a shared consumed tip on that key.
+func bindsShareBase(a, b *proto.TransactionalBindEffect) bool {
+	for _, ak := range a.GetKeys() {
+		for _, bk := range b.GetKeys() {
+			if !bytes.Equal(ak.GetKey(), bk.GetKey()) {
+				continue
+			}
+
+			for _, ref := range ak.GetConsumedTips() {
+				if refsContain(bk.GetConsumedTips(), r(ref)) {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
+}

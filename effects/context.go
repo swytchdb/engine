@@ -31,6 +31,7 @@ import (
 	"log/slog"
 	"maps"
 	rand "math/rand/v2"
+	"slices"
 	"sort"
 	"sync"
 
@@ -54,6 +55,7 @@ type watchedKeyState struct {
 
 // Context tracks per-key state for dep chaining (Emit) and deferred
 // index update + broadcast (Flush). One Context per command invocation.
+// A context may be reused after Flush or Abort, but is not safe for concurrent use.
 type Context struct {
 	engine      *Engine
 	traceCtx    context.Context // carries the active OTel span for this command
@@ -117,31 +119,13 @@ type ContextSavepoint struct {
 // TakeSavepoint captures a deep-enough copy of the Context's pending
 // key state that RestoreSavepoint can revert every Emit issued
 // between Take and Restore. Cheap: each contextKey is a small struct
-// with slice fields that we clone by reference (the underlying
-// values — notifies, elementIDs — are immutable once added).
+// with slice storage that we copy; the underlying values (notifies and
+// elementIDs) are immutable once added and can be shared.
 func (c *Context) TakeSavepoint() *ContextSavepoint {
-	snap := &ContextSavepoint{
-		keys:    make(map[string]*contextKey, len(c.keys)),
+	return &ContextSavepoint{
+		keys:    cloneContextKeys(c.keys),
 		readErr: c.readErr,
 	}
-	for k, ck := range c.keys {
-		cloned := *ck
-		// Clone mutable slices so later Emits on the Context don't
-		// extend the saved slices in place.
-		if len(ck.notifies) > 0 {
-			cloned.notifies = make([]*pb.OffsetNotify, len(ck.notifies))
-			copy(cloned.notifies, ck.notifies)
-		}
-
-		if len(ck.elementIDs) > 0 {
-			cloned.elementIDs = make([][]byte, len(ck.elementIDs))
-			copy(cloned.elementIDs, ck.elementIDs)
-		}
-
-		snap.keys[k] = &cloned
-	}
-
-	return snap
 }
 
 // RestoreSavepoint replaces the Context's pending-key state with the
@@ -156,34 +140,36 @@ func (c *Context) RestoreSavepoint(sp *ContextSavepoint) {
 	// Clone the snapshot's keys map so subsequent Emits don't mutate
 	// it (in case the caller retains the snapshot for nested
 	// rollbacks).
-	restored := make(map[string]*contextKey, len(sp.keys))
-	for k, ck := range sp.keys {
-		cloned := *ck
-		if len(ck.notifies) > 0 {
-			cloned.notifies = make([]*pb.OffsetNotify, len(ck.notifies))
-			copy(cloned.notifies, ck.notifies)
-		}
-
-		if len(ck.elementIDs) > 0 {
-			cloned.elementIDs = make([][]byte, len(ck.elementIDs))
-			copy(cloned.elementIDs, ck.elementIDs)
-		}
-
-		restored[k] = &cloned
-	}
-
-	c.keys = restored
+	c.keys = cloneContextKeys(sp.keys)
 	// Explicit command rollback discards its partial writes and handles its
 	// read failure. Unhandled failures still prevent Flush from committing.
 	// Snapshot membership stays fixed: rollback cannot undo exposed values.
 	c.readErr = sp.readErr
 }
 
+// Savepoints own the mutable slice storage. Elements and tip sets are immutable
+// once emitted, so their contents can be shared across repeated restores.
+func cloneContextKeys(keys map[string]*contextKey) map[string]*contextKey {
+	if len(keys) == 0 {
+		return nil
+	}
+
+	cloned := make(map[string]*contextKey, len(keys))
+	for key, state := range keys {
+		clonedState := *state
+		clonedState.notifies = slices.Clone(state.notifies)
+		clonedState.elementIDs = slices.Clone(state.elementIDs)
+		clonedState.subOps = slices.Clone(state.subOps)
+		cloned[key] = &clonedState
+	}
+
+	return cloned
+}
+
 // NewContext creates a new write context bound to the engine.
 func (e *Engine) NewContext() *Context {
 	return &Context{
 		engine: e,
-		keys:   make(map[string]*contextKey),
 	}
 }
 
@@ -194,7 +180,6 @@ func (e *Engine) NewContext() *Context {
 func (e *Engine) NewReadOnlyContext() *Context {
 	return &Context{
 		engine:   e,
-		keys:     make(map[string]*contextKey),
 		readOnly: true,
 	}
 }
@@ -482,7 +467,7 @@ func (c *Context) getSnapshotFromTx(key string) (*pb.ReducedEffect, []Tip, error
 
 	tipOffsets := c.engine.resolveTipDeps(snapshotTips)
 
-	tipOffsets = append(append([]Tip(nil), tipOffsets...), c.txSnapshot.views[key].anchors[key]...)
+	tipOffsets = slices.Concat(tipOffsets, c.txSnapshot.views[key].anchors[key])
 
 	var result *pb.ReducedEffect
 	if len(tipOffsets) != 0 {
@@ -589,7 +574,7 @@ func (c *Context) Watch(key string) error {
 // MULTI/EXEC (c.inTx) the id is load-bearing for in-flight effects
 // and must be preserved.
 func (c *Context) ClearWatches() {
-	clear(c.watchedKeys)
+	c.watchedKeys = nil
 
 	if !c.inTx {
 		c.txnID = ""
@@ -649,7 +634,7 @@ func (c *Context) CheckWatches() bool {
 			continue // key didn't exist at WATCH time, still doesn't after flush
 		}
 		// Key was modified — abort
-		clear(c.watchedKeys)
+		c.watchedKeys = nil
 		c.inTx = false
 		c.txnID = ""
 		c.txSnapshot = nil
@@ -666,7 +651,8 @@ func (c *Context) CheckWatches() bool {
 			Kind: &pb.Effect_Noop{Noop: &pb.NoopEffect{}},
 		}, []Tip{ws.noopOffset}); err != nil {
 			slog.Error("CheckWatches: transactional NOOP emit failed", "key", key, "error", err)
-			clear(c.watchedKeys)
+
+			c.watchedKeys = nil
 			c.inTx = false
 			c.txnID = ""
 			c.txSnapshot = nil
@@ -679,7 +665,7 @@ func (c *Context) CheckWatches() bool {
 		}
 	}
 
-	clear(c.watchedKeys)
+	c.watchedKeys = nil
 
 	return true
 }
@@ -687,12 +673,8 @@ func (c *Context) CheckWatches() bool {
 // Abort discards pending index updates and broadcasts. Effects already
 // written to the log remain durable but invisible (index not updated).
 func (c *Context) Abort() {
-	clear(c.keys)
-	clear(c.watchedKeys)
-	c.inTx = false
-	c.txnID = ""
-	c.txSnapshot = nil
-	c.readErr = nil
+	c.reset()
+	c.watchedKeys = nil
 }
 
 // Emit writes a single effect to the log. The context tracks per-key
@@ -788,6 +770,10 @@ func (c *Context) Emit(eff *pb.Effect, snapshotTips ...[]Tip) error {
 		}
 
 		ck = &contextKey{initialTips: tips, readOnly: c.inTx}
+		if c.keys == nil {
+			c.keys = make(map[string]*contextKey)
+		}
+
 		c.keys[key] = ck
 
 		if tips != nil {
@@ -828,7 +814,7 @@ func (c *Context) Emit(eff *pb.Effect, snapshotTips ...[]Tip) error {
 
 			ck.collection = data.GetCollection()
 			if len(data.GetId()) > 0 {
-				ck.elementIDs = append(ck.elementIDs, data.GetId())
+				ck.elementIDs = append(ck.elementIDs, bytes.Clone(data.GetId()))
 			}
 		}
 		// A RowWriteEffect is semantic evidence of a row-level write
@@ -1011,11 +997,10 @@ func (c *Context) Flush() error {
 		defer flushSpan.End()
 	}
 
-	// Back-pressure once per command, not once per effect: the effects were
-	// already pooled during Emit, so a command that wrote N effects (e.g. value +
-	// type-tag, or a read that also compacted) pays a single bounded eviction
-	// slice here instead of N. The drain itself is cheap — it drops victim tips and
-	// defers their ref-release walk to the governor (see Engine.releaseItems).
+	// Pace only contexts that published effects. An empty/read-only flush must
+	// not wait behind write pressure. Publication finishes before the wait.
+	wrote := len(c.keys) != 0
+
 	var err error
 	if !c.inTx {
 		err = c.flushNonTx()
@@ -1023,7 +1008,13 @@ func (c *Context) Flush() error {
 		err = c.flushTx()
 	}
 
-	c.engine.backpressure()
+	if wrote {
+		c.engine.backpressure(c.TraceCtx())
+	} else {
+		// Reads can fetch/cache effects too; keep background reclamation
+		// prompt without making readers join the write-pressure wait.
+		c.engine.wakeMemoryGovernor()
+	}
 
 	return err
 }
@@ -1212,22 +1203,10 @@ func (c *Context) flushTx() error {
 			continue
 		}
 
-		initialSet := make(map[Tip]bool, len(initial))
-		for _, t := range initial {
-			initialSet[t] = true
-		}
-
 		current := c.engine.index.Contains(key)
-		currentSet := make(map[Tip]bool)
-
-		if current != nil {
-			for _, t := range current.Tips() {
-				currentSet[t] = true
-			}
-		}
 
 		for _, t := range initial {
-			if !currentSet[t] {
+			if !current.Contains(t) {
 				slog.Debug("flushTx: stale consumed tip, aborting before emission",
 					"key", key, "stale_tip", t, "current_tips", current)
 
@@ -1248,8 +1227,8 @@ func (c *Context) flushTx() error {
 			}
 		}
 
-		for t := range currentSet {
-			if initialSet[t] {
+		for _, t := range current.Tips() {
+			if ck.initialTips.Contains(t) {
 				continue
 			}
 			// Subscription tips are commutative metadata, not bind writes
@@ -1566,7 +1545,7 @@ func (c *Context) flushTx() error {
 			// chance to commit it.
 			slog.Debug("flushTx: no subscribers, committing immediately",
 				"bind_offset", bindOffset)
-			commitPendingTxn(ptxn)
+			ptxn.finish(txnStateCommitted)
 		} else {
 			// Peers exist — bind stays invisible until we finish processing
 			// peer responses and explicitly call MakeVisible (commit) or
@@ -1665,7 +1644,7 @@ func (c *Context) flushTx() error {
 								"detail_is_bind", detail.GetIsBind(),
 								"detail_is_data", detail.GetIsData(),
 								"detail_is_tx", detail.GetIsTransactional())
-							abortPendingTxn(ptxn)
+							ptxn.finish(txnStateAborted)
 
 							break
 						}
@@ -1689,8 +1668,8 @@ func (c *Context) flushTx() error {
 						"bind_offset", bindOffset,
 						"responses", responseCount,
 						"subscribers", len(subscribers))
-					markPendingTxnAmbiguous(ptxn)
-				} else if commitPendingTxn(ptxn) {
+					ptxn.finish(txnStateAmbiguous)
+				} else if ptxn.finish(txnStateCommitted) {
 					slog.Debug("flushTx: all subscribers responded, committed",
 						"bind_offset", bindOffset,
 						"subscribers", len(subscribers))
@@ -1769,7 +1748,7 @@ func (c *Context) flushTx() error {
 		}
 	} else {
 		// Standalone: commit immediately
-		commitPendingTxn(ptxn)
+		ptxn.finish(txnStateCommitted)
 	}
 
 	// Step 6: Process result
@@ -1841,64 +1820,6 @@ func (c *Context) flushTx() error {
 	return nil
 }
 
-// collectSubscribers gathers unique subscriber node IDs across all touched
-// keys, filtered to peers that are still current cluster members. Subscriber
-// sets live on each key's leaf (leafState.subscribers), maintained
-// incrementally by ensureSubscribed (peers that NACK back are subscribed) and
-// HandleRemote (foreign SubscriptionEffect arrival/unsubscribe). Reading the
-// DAG via reconstruct here was the prior implementation; it produced
-// subscribers:0 whenever reconstruct legitimately returned a Subscribers-less
-// result (verdict-only snapshot at LCA, all-lost bind set, NoopEffect chain),
-// which silently dropped the bind broadcast and produced missing verdict
-// snapshots downstream.
-//
-// The membership filter is what lets a departed peer's stale id fall out
-// lazily instead of needing an eager scrub on peer removal: PeerIDs() shrinks
-// only on genuine topology removal, so a member that is merely unreachable
-// stays in the required set (flushTx then reports an ambiguous outcome when it
-// can't respond), while a truly departed peer is dropped so the
-// key can still make progress.
-func (c *Context) collectSubscribers() []pb.NodeID {
-	var members map[pb.NodeID]struct{}
-
-	if c.engine.broadcaster != nil {
-		ids := c.engine.broadcaster.PeerIDs()
-
-		members = make(map[pb.NodeID]struct{}, len(ids))
-		for _, id := range ids {
-			members[id] = struct{}{}
-		}
-	}
-
-	seen := make(map[pb.NodeID]struct{})
-
-	for key := range c.keys {
-		ls, _ := c.engine.index.LoadOrStoreData(key, &leafState{})
-		if ls == nil {
-			continue
-		}
-
-		ls.subMu.Lock()
-		for id := range ls.subscribers {
-			if members != nil {
-				if _, ok := members[id]; !ok {
-					continue
-				}
-			}
-
-			seen[id] = struct{}{}
-		}
-		ls.subMu.Unlock()
-	}
-
-	result := make([]pb.NodeID, 0, len(seen))
-	for id := range seen {
-		result = append(result, id)
-	}
-
-	return result
-}
-
 // emitSerializationEffect emits a serialization request for a key without
 // a transaction so it becomes visible immediately. Under heavy contention
 // the transactional path would abort or remain invisible behind pending
@@ -1934,7 +1855,14 @@ func (c *Context) emitSerializationEffect(key string) {
 
 // reset clears the context for reuse.
 func (c *Context) reset() {
-	clear(c.keys)
+	// Reuse small command maps, but let an unusually large transaction's map
+	// go: clear alone retains its buckets for the lifetime of the context.
+	if len(c.keys) > 16 {
+		c.keys = nil
+	} else {
+		clear(c.keys)
+	}
+
 	c.inTx = false
 	c.txnID = ""
 	c.txSnapshot = nil
@@ -2032,7 +1960,7 @@ func BuildOffsetNotify(nodeID pb.NodeID, offset Tip, eff *pb.Effect, data []byte
 	notify := &pb.OffsetNotify{
 		Origin:     toPbRef(offset),
 		Hlc:        eff.GetHlc(),
-		Key:        eff.GetKey(),
+		Key:        bytes.Clone(eff.GetKey()),
 		Deps:       eff.GetDeps(),
 		EffectData: wireData,
 	}

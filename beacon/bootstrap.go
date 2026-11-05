@@ -25,16 +25,12 @@ package beacon
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"log/slog"
 	"net"
-	"sync"
+	"slices"
 	"time"
 
 	"github.com/swytchdb/engine/cluster"
-	pb "github.com/swytchdb/engine/cluster/proto"
-	"github.com/swytchdb/engine/effects"
 )
 
 // bootstrap performs peer discovery (DNS, or the cloud membership roster when
@@ -70,7 +66,15 @@ func (b *Beacon) bootstrap(ctx context.Context) error {
 		}
 	}
 
-	candidates = b.filterSelf(candidates)
+	if b.cfg.AdvertiseAddr != "" {
+		selfHost, selfPort, _ := net.SplitHostPort(b.cfg.AdvertiseAddr)
+		candidates = slices.DeleteFunc(candidates, func(addr string) bool {
+			host, port, _ := net.SplitHostPort(addr)
+
+			return host == selfHost && port == selfPort
+		})
+	}
+
 	if len(candidates) == 0 {
 		slog.Info("beacon: no peers found, starting solo")
 
@@ -106,64 +110,15 @@ func (b *Beacon) bootstrap(ctx context.Context) error {
 	return nil
 }
 
-// cloudCandidates discovers peer addresses from the cloud's membership
-// roster. A discovery *error* is retried with capped backoff, same as the DNS
-// path — a transient cloud hiccup at startup must not strand this node solo
-// while the rest of the fleet joins. A *successful* read that yields no
-// members is authoritative (fresh cluster, or we're first) and starts solo.
-//
-// Starting solo is a claim about the whole fleet, so only an authoritative
-// answer may produce one: a successful read. "We could not find out" is not
-// an answer — conceding solo on it forks the cluster, and a fork is silent (a
-// solo node's members count looks exactly like a legitimately fresh one)
-// where a stalled boot is loud. A durable frontier hole (ErrCDNBlobMissing)
-// is not grounds for solo either: Cloud's own reconcile/billing sweep owns
-// healing or pruning holed markers, so this just keeps retrying with the
-// existing loud complaint until the cloud does so. So the only error that
-// reaches here is shutdown.
+// cloudCandidates reads peer addresses, excluding self, retrying until success
+// or cancellation. Only a successful empty read permits solo startup.
+// Unlike DNS discovery, it has no deadline: work grows with membership history,
+// and a slow walk does not establish that the cluster is empty. Warn periodically
+// so a stalled startup stays visible while cloud reconciliation repairs it.
 func (b *Beacon) cloudCandidates(ctx context.Context) ([]string, error) {
-	reduced, err := b.discoverMembersWithRetry(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	members := parseMembership(reduced)
-	selfID := uint64(b.cfg.NodeID)
-
-	addrs := make([]string, 0, len(members))
-	for _, m := range members {
-		if m.NodeID == selfID {
-			continue
-		}
-
-		addrs = append(addrs, m.Addr)
-	}
-
-	return addrs, nil
-}
-
-// discoverMembersWithRetry reads the cloud membership roster, retrying on
-// error with capped backoff until it succeeds or ctx is done. Same rationale
-// as resolveJoinAddrWithRetry: an error means "the cloud isn't reachable yet",
-// not "there is no cluster", and conceding solo on the first error is what
-// strands nodes in a split-brain membership.
-//
-// There is deliberately no overall deadline, and no per-attempt one. Neither
-// bounds anything real: a discovery walk's cost is the membership DAG's depth,
-// which grows with the fleet's history, so a fixed budget is a bound on
-// unbounded work and every cluster eventually outgrows it. What the budget
-// actually produced on expiry was an error indistinguishable from an outage,
-// which the caller resolved by forking the cluster. Taking a long time is a
-// latency problem and belongs in the logs; it is never grounds to answer a
-// question we did not get an answer to. The one hard stop is ctx — the node is
-// shutting down, and then there is nothing to be correct about.
-func (b *Beacon) discoverMembersWithRetry(ctx context.Context) (*pb.ReducedEffect, error) {
 	const (
-		backoffStart = 250 * time.Millisecond
-		backoffMax   = 3 * time.Second
-		// A boot that cannot reach the cloud is stuck until an operator acts,
-		// so complain on the first failure and keep complaining. Silence here
-		// is what let the old deadline pass for normal startup.
+		backoffStart  = 250 * time.Millisecond
+		backoffMax    = 3 * time.Second
 		complainEvery = 30 * time.Second
 	)
 
@@ -181,7 +136,14 @@ func (b *Beacon) discoverMembersWithRetry(ctx context.Context) (*pb.ReducedEffec
 					"attempts", attempt, "elapsed", time.Since(started))
 			}
 
-			return reduced, nil
+			addrs := make([]string, 0, len(reduced.GetNetAdds()))
+			for id, addr := range membershipEntries(reduced) {
+				if id != uint64(b.cfg.NodeID) {
+					addrs = append(addrs, string(addr))
+				}
+			}
+
+			return addrs, nil
 		}
 
 		if ctx.Err() != nil {
@@ -229,8 +191,6 @@ func (b *Beacon) resolveJoinAddrWithRetry(ctx context.Context) ([]string, error)
 
 	backoff := backoffStart
 
-	var lastErr error
-
 	for {
 		attemptCtx, attemptCancel := context.WithTimeout(deadlineCtx, perAttemptTimeout)
 		candidates, err := ResolveJoinAddr(attemptCtx, nil, b.cfg.JoinAddr, b.cfg.ClusterPort)
@@ -241,170 +201,16 @@ func (b *Beacon) resolveJoinAddrWithRetry(ctx context.Context) ([]string, error)
 			return candidates, nil
 		}
 
-		lastErr = err
 		slog.Debug("beacon: DNS resolution failed, retrying", "error", err, "backoff", backoff)
 
 		select {
 		case <-deadlineCtx.Done():
-			return nil, lastErr
+			return nil, err
 		case <-time.After(backoff):
 		}
 
 		backoff = min(backoff*2, backoffMax)
 	}
-}
-
-// joinMembership attempts a membership exchange with every known peer before
-// serving traffic. A seed's address count is not the cluster's membership count:
-// project the exchanged roster and also attempt peers learned through it.
-// Failed peers do not hold join open waiting for full convergence; normal
-// reconnection and membership observation continue after this initial attempt.
-// Self-registration precedes this so simultaneous joiners can discover each other.
-func (b *Beacon) joinMembership(ctx context.Context) error {
-	attempted := make(map[cluster.NodeId]bool)
-
-	for {
-		if err := b.pm.WaitForInitialConnections(ctx); err != nil {
-			return err
-		}
-
-		var peers []cluster.NodeId
-
-		for _, peer := range b.pm.PeerIDs() {
-			if !attempted[peer] {
-				peers = append(peers, peer)
-			}
-		}
-
-		if len(peers) > 0 {
-			if err := b.exchangeMembership(ctx, peers); err != nil {
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-
-				slog.Warn("beacon: membership exchange incomplete; continuing after attempt", "error", err)
-			}
-
-			for _, peer := range peers {
-				attempted[peer] = true
-			}
-		}
-
-		snapshot, _, err := b.engine.NewReadOnlyContext().GetSnapshot(MembershipKey)
-		if err != nil {
-			return err
-		}
-
-		b.syncMembership(snapshot)
-
-		if len(peers) == 0 {
-			// Projection can discover peers even without an exchange (e.g.
-			// an inbound arrival during bootstrap). Attempt those as well.
-			pending := false
-			for _, peer := range b.pm.PeerIDs() {
-				pending = pending || !attempted[peer]
-			}
-
-			if !pending {
-				return ctx.Err()
-			}
-		}
-	}
-}
-
-// exchangeMembership reannounces the existing membership tips, including our
-// registration, and ingests the peers' NACK frontiers before returning. A cached
-// read alone does neither. Reuse normal effect replication; no new membership
-// records or compaction snapshots are minted by the exchange.
-func (b *Beacon) exchangeMembership(ctx context.Context, peers []cluster.NodeId) error {
-	_, tips, err := b.engine.NewReadOnlyContext().GetSnapshot(MembershipKey)
-	if err != nil {
-		return err
-	}
-
-	var notifies []*pb.OffsetNotify
-
-	for _, tip := range tips {
-		eff, ok := b.engine.EffectCache().Get(tip)
-		if !ok {
-			return fmt.Errorf("membership tip %v unavailable", tip)
-		}
-
-		wire, err := effects.MarshalEffect(eff)
-		if err != nil {
-			return err
-		}
-
-		notifies = append(notifies, effects.BuildOffsetNotify(pb.NodeID(tip[0]), tip, eff, wire, ctx))
-	}
-
-	type response struct {
-		nacks []*pb.NackNotify
-		err   error
-	}
-
-	responses := make(chan response, len(peers))
-
-	var wg sync.WaitGroup
-	for _, peer := range peers {
-		wg.Go(func() {
-			var res response
-
-			for _, notify := range notifies {
-				if ctx.Err() != nil {
-					res.err = errors.Join(res.err, ctx.Err())
-
-					break
-				}
-
-				nacks, err := b.pm.ReplicateTo(notify, notify.GetEffectData(), peer)
-
-				res.nacks = append(res.nacks, nacks...)
-				if err != nil {
-					res.err = fmt.Errorf("peer %d: %w", peer, err)
-
-					break
-				}
-			}
-
-			responses <- res
-		})
-	}
-
-	wg.Wait()
-	close(responses)
-
-	var errs []error
-	for res := range responses {
-		errs = append(errs, res.err)
-		for _, nack := range res.nacks {
-			errs = append(errs, b.engine.HandleNack(nack))
-		}
-	}
-
-	return errors.Join(errs...)
-}
-
-// filterSelf removes addresses that match this node's advertise address.
-func (b *Beacon) filterSelf(candidates []string) []string {
-	selfAddr := b.cfg.AdvertiseAddr
-	if selfAddr == "" {
-		return candidates
-	}
-
-	selfHost, selfPort, _ := net.SplitHostPort(selfAddr)
-
-	filtered := make([]string, 0, len(candidates))
-	for _, addr := range candidates {
-		host, port, _ := net.SplitHostPort(addr)
-		if host == selfHost && port == selfPort {
-			continue
-		}
-
-		filtered = append(filtered, addr)
-	}
-
-	return filtered
 }
 
 // setTemporaryTopology builds a ClusterConfig with the given addresses as
@@ -422,19 +228,12 @@ func (b *Beacon) setTemporaryTopology(candidates []string) {
 		// Use synthetic NodeIDs for temporary peers. These are distinguishable
 		// from real NodeIDs (which have timestamp in upper 32 bits) by using
 		// small sequential values.
-		syntheticID := cluster.NodeId(uint64(i + 1))
 		nodes = append(nodes, cluster.NodeConfig{
-			ID:      syntheticID,
+			ID:      cluster.NodeId(i + 1),
 			Address: addr,
 		})
 	}
 
-	cfg := &cluster.ClusterConfig{
-		NodeID:        b.cfg.NodeID,
-		Nodes:         nodes,
-		TLSPassphrase: b.cfg.Passphrase,
-	}
-
-	b.pm.UpdateTopology(cfg)
+	b.updateTopology(nodes)
 	slog.Debug("beacon: set temporary topology", "candidates", len(candidates))
 }

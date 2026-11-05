@@ -1,3 +1,26 @@
+/*
+ * Copyright 2026 Swytch Labs BV
+ *
+ * This file is part of Swytch.
+ *
+ * Swytch is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of
+ * the License, or (at your option) any later version.
+ *
+ * Swytch is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with Swytch. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * Additional permissions under GNU AGPL version 3 section 7 apply to
+ * this file. See the NOTICE.md file distributed with this source code
+ * for the current set of additional permissions.
+ */
+
 package effects
 
 import (
@@ -54,7 +77,7 @@ func (e *Engine) historicalFrontier(ctx context.Context, key string, tips []Tip,
 		if bind := eff.GetTxnBind(); bind != nil {
 			for _, kb := range bind.GetKeys() {
 				if string(kb.GetKey()) == key {
-					stack = append(stack, fromPbRefs(kb.GetConsumedTips())...)
+					stack = appendRefs(stack, kb.GetConsumedTips())
 
 					break
 				}
@@ -62,7 +85,7 @@ func (e *Engine) historicalFrontier(ctx context.Context, key string, tips []Tip,
 		} else {
 			// Snapshot.Deps describe the state it compacted. PrevSnapshot
 			// alone can skip intervening writes, so it is not a substitute.
-			stack = append(stack, fromPbRefs(eff.GetDeps())...)
+			stack = appendRefs(stack, eff.GetDeps())
 		}
 	}
 
@@ -76,39 +99,21 @@ func (e *Engine) historicalFrontier(ctx context.Context, key string, tips []Tip,
 func (e *Engine) historicalReadView(ctx context.Context, keys []string, frontier func(string) ([]Tip, error)) (*snapshotReadView, error) {
 	v := newSnapshotReadView(e, ctx)
 	v.historical = true
-	capture := func(key string) ([]Tip, error) {
-		if tips, ok := v.resolved[key]; ok {
-			return tips, nil
+
+	err := v.discover(keys, func(key string) ([]Tip, error) {
+		if captured, ok := v.frontiers[key]; ok {
+			return captured.resolved, nil
 		}
 
 		tips, err := frontier(key)
 		if err == nil {
-			v.resolved[key] = tips
+			v.frontiers[key] = snapshotFrontier{resolved: tips}
 		}
 
 		return tips, err
-	}
-
-	var err error
-
-	v.keys, v.anchors, v.verdicts, err = e.bindKeyClosureFrom(keys, capture, true)
+	})
 	if err != nil {
 		return nil, err
-	}
-
-	for txn, entry := range v.verdicts {
-		if entry.verdict == pb.Verdict_LOST {
-			v.lost[txn] = struct{}{}
-		}
-	}
-
-	for key := range v.keys {
-		losers, walked := e.losersOnKeyAt(key, v.resolved[key], v.anchors[key], v.verdicts, v.isInvisible, false)
-
-		v.walked += walked
-		for txn := range losers {
-			v.lost[txn] = struct{}{}
-		}
 	}
 
 	return v, nil

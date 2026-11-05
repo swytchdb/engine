@@ -130,11 +130,12 @@ func (e *Engine) checkNackConflict(ptxn *pendingTxn, key string, detail *pb.Nack
 		visited[tip] = true
 
 		if cur.GetIsData() || cur.GetIsBind() {
-			if e.isRealConflictTip(ptxn, key, cur) {
+			conflict, txn := e.classifyNackTip(ptxn, key, cur)
+			if conflict {
 				return true, nil
 			}
 
-			if txn := e.defeatedCompetitor(ptxn, key, cur); txn != "" {
+			if txn != "" {
 				if defeated == nil {
 					defeated = make(map[string]Tip)
 				}
@@ -213,15 +214,18 @@ func (e *Engine) nackTipOrdered(ptxn *pendingTxn, key string, detail *pb.NackTip
 	return false
 }
 
-func (e *Engine) isRealConflictTip(ptxn *pendingTxn, key string, detail *pb.NackTipDetail) bool {
-	if e.nackTipOrdered(ptxn, key, detail) {
-		return false
-	}
-
+// classifyNackTip decides both sides of fork choice in one pass. Ordered or
+// predicate-disjoint effects coexist; otherwise a bind's hash selects the loser.
+// The returned transaction ID identifies a defeated competitor, when known.
+func (e *Engine) classifyNackTip(ptxn *pendingTxn, key string, detail *pb.NackTipDetail) (conflict bool, defeated string) {
 	// Commutative effects: never conflict
 	if !detail.GetIsData() && !detail.GetIsBind() {
 		// MetaEffect, SubscriptionEffect, SerializationEffect, NoopEffect
-		return false
+		return false, ""
+	}
+
+	if e.nackTipOrdered(ptxn, key, detail) {
+		return false, ""
 	}
 
 	// Competing bind: NACK tells us there's a competitor; fork-choice
@@ -241,7 +245,7 @@ func (e *Engine) isRealConflictTip(ptxn *pendingTxn, key string, detail *pb.Nack
 		}
 
 		if theirTxnID != "" && theirTxnID == ptxn.txnID {
-			return false // our own bind
+			return false, "" // our own bind
 		}
 
 		if ptxn.txnID != "" && theirTxnID != "" {
@@ -252,34 +256,31 @@ func (e *Engine) isRealConflictTip(ptxn *pendingTxn, key string, detail *pb.Nack
 				ourStart,
 				[]Tip{theirBindOffset})
 			if bothHadEvidence && !conflict {
-				return false // disjoint predicates — can coexist
+				return false, "" // disjoint predicates — can coexist
 			}
 		}
 
 		if ForkChoiceLess(detail.GetBindForkChoiceHash(), ptxn.forkChoiceHash) {
 			// Their hash is lower → they win, we lose, abort.
-			return true
+			return true, ""
 		}
-		// Our hash is lower → we win, continue.
-		return false
+
+		if detail.GetRef() != nil && ForkChoiceLess(ptxn.forkChoiceHash, detail.GetBindForkChoiceHash()) {
+			return false, theirTxnID
+		}
+
+		return false, ""
 	}
 
 	// Transactional effect without a bind: in-progress, not yet competing
-	if detail.GetIsTransactional() && !detail.GetIsBind() {
-		return false
+	if detail.GetIsTransactional() {
+		return false, ""
 	}
 
 	// Non-transactional DataEffect on same key
-	if detail.GetIsData() {
-		pk := findPendingKey(ptxn, key)
-		if pk == nil {
-			return false
-		}
+	pk := findPendingKey(ptxn, key)
 
-		return affectsSameData(pk, detail)
-	}
-
-	return false
+	return pk != nil && affectsSameData(pk, detail), ""
 }
 
 // reachesFromTx returns true if target is in the DAG ancestry of our
@@ -356,22 +357,14 @@ func (e *Engine) reachesFromTxOnKey(ptxn *pendingTxn, key *string, targets ...Ti
 
 		refs := allDeps(eff)
 		if key != nil {
-			if bind := eff.GetTxnBind(); bind != nil {
-				refs = nil
-
-				for _, kb := range bind.GetKeys() {
-					if string(kb.GetKey()) == *key {
-						refs = []*pb.EffectRef{kb.GetNewTip()}
-
-						break
-					}
-				}
-			} else if string(eff.GetKey()) != *key {
+			if eff.GetTxnBind() == nil && string(eff.GetKey()) != *key {
 				continue
 			}
+
+			refs = keyDeps(*key, eff)
 		}
 
-		for _, dep := range refs {
+		for dep := range refs {
 			push(r(dep))
 		}
 	}
@@ -399,9 +392,6 @@ func collectOurBindTips(ptxn *pendingTxn, key string) []Tip {
 func affectsSameData(pk *pendingTxnKey, detail *pb.NackTipDetail) bool {
 	// If our key is read-only (NoopEffect), any SCALAR write is a phantom write conflict
 	if pk.readOnly {
-		if detail.GetCollection() == pb.CollectionKind_SCALAR {
-			return true
-		}
 		// For KEYED/ORDERED, a noop read doesn't conflict with writes to
 		// different elements, but we conservatively treat it as conflict
 		// because we can't distinguish which elements were "read".
@@ -444,82 +434,11 @@ func findPendingKey(ptxn *pendingTxn, key string) *pendingTxnKey {
 	return nil
 }
 
-// defeatedCompetitor returns the txnID of a competing bind that the local
-// pendingTxn beat in fork-choice on the given key, or "" if `detail` is not
-// a competing bind, names our own tx, is predicate-disjoint (coexists), or
-// has a strictly-lower hash than ours. flushTx's NACK loop calls this after
-// isRealConflict returns false to gather verdicts for the winner-commit
-// snapshot. Mirrors isRealConflict's filtering structure exactly so the two
-// classifications stay aligned.
-func (e *Engine) defeatedCompetitor(ptxn *pendingTxn, key string, detail *pb.NackTipDetail) string {
-	if !detail.GetIsBind() || detail.GetRef() == nil {
-		return ""
-	}
-
-	theirBindOffset := r(detail.GetRef())
-
-	var theirTxnID string
-	if theirEff, err := e.getEffect(key, theirBindOffset); err == nil {
-		theirTxnID = theirEff.GetTxnId()
-	}
-
-	if theirTxnID == "" || theirTxnID == ptxn.txnID {
-		return ""
-	}
-	// Reachability filters mirror isRealConflict: a foreign bind that is
-	// causally ordered relative to our pending tx is not a competitor and
-	// must not enter defeatedSet. Without these, our post-commit snapshot
-	// records LOST for a transaction that committed cleanly elsewhere
-	// and propagates the wrong verdict.
-	if e.nackTipOrdered(ptxn, key, detail) {
-		return ""
-	}
-
-	if ptxn.txnID != "" {
-		ourStart := collectOurBindTips(ptxn, key)
-
-		conflict, bothHadEvidence := e.hasPredicateConflict(
-			ptxn.txnID, theirTxnID, key,
-			ourStart,
-			[]Tip{theirBindOffset})
-		if bothHadEvidence && !conflict {
-			return ""
-		}
-	}
-
-	if !ForkChoiceLess(ptxn.forkChoiceHash, detail.GetBindForkChoiceHash()) {
-		return ""
-	}
-
-	return theirTxnID
-}
-
-// commitPendingTxn CAS-sets the state to committed and closes the done channel.
-func commitPendingTxn(ptxn *pendingTxn) bool {
-	if ptxn.state.CompareAndSwap(txnStatePending, txnStateCommitted) {
-		close(ptxn.done)
-
-		return true
-	}
-
-	return false
-}
-
-// abortPendingTxn CAS-sets the state to aborted and closes the done channel.
-func abortPendingTxn(ptxn *pendingTxn) bool {
-	if ptxn.state.CompareAndSwap(txnStatePending, txnStateAborted) {
-		close(ptxn.done)
-
-		return true
-	}
-
-	return false
-}
-
-// markPendingTxnAmbiguous ends the local wait without claiming a cluster-wide
-// commit or abort. A known conflict that already aborted the txn takes priority.
-func markPendingTxnAmbiguous(ptxn *pendingTxn) bool {
-	if ptxn.state.CompareAndSwap(txnStatePending, txnStateAmbiguous) {
+// finish publishes one terminal decision and wakes waiters exactly once.
+// Ambiguous ends the local wait without claiming commit or abort; an already
+// recorded decision always takes priority over a later attempt.
+func (ptxn *pendingTxn) finish(state uint32) bool {
+	if ptxn.state.CompareAndSwap(txnStatePending, state) {
 		close(ptxn.done)
 
 		return true

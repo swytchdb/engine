@@ -1,3 +1,26 @@
+/*
+ * Copyright 2026 Swytch Labs BV
+ *
+ * This file is part of Swytch.
+ *
+ * Swytch is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of
+ * the License, or (at your option) any later version.
+ *
+ * Swytch is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with Swytch. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * Additional permissions under GNU AGPL version 3 section 7 apply to
+ * this file. See the NOTICE.md file distributed with this source code
+ * for the current set of additional permissions.
+ */
+
 package effects
 
 import (
@@ -61,7 +84,7 @@ func TestBindKeyClosure_CrossKeyCandidate(t *testing.T) {
 			e.updateIndex("payout:alice", nil, alice)
 			e.updateIndex("payout:bob", nil, bob)
 
-			_, anchors, verdicts, err := e.bindKeyClosure("payout:bob")
+			anchors, verdicts, err := e.bindKeyClosure("payout:bob")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -91,12 +114,12 @@ func TestBindKeyClosure_RevisitsKeyForNewAnchor(t *testing.T) {
 
 	// a is visited first, then b reveals another a branch carrying (a,c).
 	// That branch is absent from a's index and b's same-key ancestry.
-	keys, anchors, _, err := e.bindKeyClosure("a")
+	anchors, _, err := e.bindKeyClosure("a")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if _, ok := keys["c"]; !ok || !slices.Contains(anchors["c"], old) {
-		t.Fatalf("late branch not explored: keys=%v anchors=%v", keys, anchors)
+	if !slices.Contains(anchors["c"], old) {
+		t.Fatalf("late branch not explored: anchors=%v", anchors)
 	}
 }

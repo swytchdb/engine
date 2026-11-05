@@ -1,8 +1,32 @@
+/*
+ * Copyright 2026 Swytch Labs BV
+ *
+ * This file is part of Swytch.
+ *
+ * Swytch is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of
+ * the License, or (at your option) any later version.
+ *
+ * Swytch is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with Swytch. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * Additional permissions under GNU AGPL version 3 section 7 apply to
+ * this file. See the NOTICE.md file distributed with this source code
+ * for the current set of additional permissions.
+ */
+
 package effects
 
 import (
 	"context"
 	"fmt"
+	"slices"
 	"time"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
@@ -41,7 +65,7 @@ func (s *transactionSnapshot) tips(ctx context.Context, key string) (*keytrie.Ti
 
 	v := s.views[key]
 
-	tips := append([]Tip(nil), v.resolved[key]...)
+	tips := v.frontiers[key].resolved
 	if len(tips) == 0 {
 		return nil, nil
 	}
@@ -58,8 +82,7 @@ func (s *transactionSnapshot) contains(ctx context.Context, key string, target T
 		return false, nil
 	}
 
-	frontier := append([]Tip(nil), v.resolved[key]...)
-	frontier = append(frontier, v.anchors[key]...)
+	frontier := slices.Concat(v.frontiers[key].resolved, v.anchors[key])
 	seen := make(map[Tip]bool)
 
 	for len(frontier) != 0 {
@@ -85,7 +108,7 @@ func (s *transactionSnapshot) contains(ctx context.Context, key string, target T
 
 			seen[tip] = true
 
-			frontier = append(frontier, fromPbRefs(eff.GetDeps())...)
+			frontier = appendRefs(frontier, eff.GetDeps())
 		}
 	}
 
@@ -108,11 +131,11 @@ func (s *transactionSnapshot) member(ctx context.Context, tip Tip, eff *pb.Effec
 	visiting[tip] = true
 	defer delete(visiting, tip)
 
-	choose := func(include bool, why string) (bool, error) {
+	choose := func(include bool, why string) bool {
 		s.decided[tip] = include
 		temporalDebug(ctx, s.at, tip, why)
 
-		return include, nil
+		return include
 	}
 
 	// A newly discovered branch cannot extend a key whose history was
@@ -139,14 +162,14 @@ func (s *transactionSnapshot) member(ctx context.Context, tip Tip, eff *pb.Effec
 		}
 
 		if !included {
-			return choose(false, "outside frozen key frontier")
+			return choose(false, "outside frozen key frontier"), nil
 		}
 
 		knownPast = true
 	}
 
 	if knownPast {
-		return choose(true, "ancestor of frozen frontier")
+		return choose(true, "ancestor of frozen frontier"), nil
 	}
 
 	lower, upper, err := s.clocks.Difference(s.at, effectSample(eff))
@@ -155,17 +178,17 @@ func (s *transactionSnapshot) member(ctx context.Context, tip Tip, eff *pb.Effec
 	}
 
 	if lower > 0 {
-		return choose(false, "numerically after boundary")
+		return choose(false, "numerically after boundary"), nil
 	}
 	// A proven-before state snapshot summarizes an entire causal prefix.
 	// Before any keys have been frozen there are no prior cut choices that
 	// could reject part of that prefix. Do not demand discarded ancestry
 	// merely to re-prove what an existing state snapshot already records.
 	if eff.GetSnapshot().GetState() != nil && upper <= 0 && len(s.views) == 0 {
-		return choose(true, "before-boundary state snapshot")
+		return choose(true, "before-boundary state snapshot"), nil
 	}
 
-	for _, ref := range allDeps(eff) {
+	for ref := range allDeps(eff) {
 		parent, err := s.engine.getEffect(string(eff.GetKey()), r(ref))
 		if err != nil {
 			return false, err
@@ -177,17 +200,17 @@ func (s *transactionSnapshot) member(ctx context.Context, tip Tip, eff *pb.Effec
 		}
 
 		if !include {
-			return choose(false, "descendant of excluded history")
+			return choose(false, "descendant of excluded history"), nil
 		}
 	}
 
 	if upper <= 0 {
-		return choose(true, "numerically before boundary")
+		return choose(true, "numerically before boundary"), nil
 	}
 
 	s.ambiguous++
 
-	return choose(true, "ambiguous; fixed causal inclusion")
+	return choose(true, "ambiguous; fixed causal inclusion"), nil
 }
 
 func (s *transactionSnapshot) prepare(ctx context.Context, requested []string) error {
@@ -224,13 +247,12 @@ func (s *transactionSnapshot) prepare(ctx context.Context, requested []string) e
 	}
 
 	live := newSnapshotReadView(s.engine, ctx)
-	if err := live.discover(keys); err != nil {
+	if err := live.discover(keys, live.capture); err != nil {
 		return err
 	}
 
-	for key := range live.keys {
-		tips := append([]Tip(nil), live.resolved[key]...)
-		tips = append(tips, live.anchors[key]...)
+	for key := range live.anchors {
+		tips := slices.Concat(live.frontiers[key].resolved, live.anchors[key])
 
 		d := newDag(s.engine, key, "")
 		if err := d.prepare(tips); err != nil {
@@ -240,8 +262,7 @@ func (s *transactionSnapshot) prepare(ctx context.Context, requested []string) e
 		for _, tip := range d.topoOrder {
 			eff := d.nodes[tip]
 			if eff.GetTxnBind() != nil && s.engine.horizon != nil && s.engine.horizon.IsInvisible(eff.GetTxnId()) {
-				wait := s.engine.horizon.WaitForClear(eff.GetTxnId())
-				wait.Release()
+				s.engine.horizon.WaitForClear(eff.GetTxnId())
 				// Completion can reveal verdicts and competitors. Recollect
 				// the closure before publishing any value from this read.
 				return s.prepare(ctx, keys)
@@ -254,14 +275,14 @@ func (s *transactionSnapshot) prepare(ctx context.Context, requested []string) e
 	// early read-admission gate. Existing inclusion/exclusion decisions win
 	// over subsequent numerical tightening.
 	s.clocks = s.engine.clockEvidence()
-	selected := make(map[string][]Tip)
-	frontier := func(key string) ([]Tip, error) {
-		if old := s.views[key]; old != nil {
-			return old.resolved[key], nil
-		}
 
-		if tips, ok := selected[key]; ok {
-			return tips, nil
+	// member removes each active visit on return; reuse the cycle detector
+	// across frontier candidates instead of allocating one map per candidate.
+	visiting := make(map[Tip]bool)
+
+	view, err := s.engine.historicalReadView(ctx, keys, func(key string) ([]Tip, error) {
+		if old := s.views[key]; old != nil {
+			return old.frontiers[key].resolved, nil
 		}
 
 		_, err := live.capture(key)
@@ -272,24 +293,17 @@ func (s *transactionSnapshot) prepare(ctx context.Context, requested []string) e
 		// tips. resolveTipDeps is a reconstruction operation: substituting
 		// pending WATCH/transaction tips here would turn valid consumed
 		// tips into stale ancestors before the existing commit protocol.
-		tips := live.frontier[key].Tips()
+		tips := live.frontiers[key].index.Tips()
 
-		tips, err = s.engine.historicalFrontier(ctx, key, tips, func(t Tip, eff *pb.Effect) (bool, error) {
-			return s.member(ctx, t, eff, make(map[Tip]bool))
+		return s.engine.historicalFrontier(ctx, key, tips, func(t Tip, eff *pb.Effect) (bool, error) {
+			return s.member(ctx, t, eff, visiting)
 		})
-		if err == nil {
-			selected[key] = tips
-		}
-
-		return tips, err
-	}
-
-	view, err := s.engine.historicalReadView(ctx, keys, frontier)
+	})
 	if err != nil {
 		return err
 	}
 
-	for key := range view.keys {
+	for key := range view.anchors {
 		if s.views[key] == nil {
 			s.views[key] = view
 		}

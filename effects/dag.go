@@ -24,39 +24,64 @@
 package effects
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"iter"
 	"log/slog"
+	"slices"
 	"sort"
 	"strings"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
 )
 
-// allDeps copies the effect's Deps and appends any KeyBind.NewTip offsets
-// for bind effects. The returned slice is always a fresh allocation when
-// bind tips are present to avoid racing with concurrent callers.
-func allDeps(eff *pb.Effect) []*pb.EffectRef {
-	bind := eff.GetTxnBind()
-	if bind == nil || len(bind.GetKeys()) == 0 {
-		return eff.GetDeps()
+// allDeps visits ordinary dependencies followed by a bind's new tips without
+// copying or modifying the immutable effect's slices.
+func allDeps(eff *pb.Effect) iter.Seq[*pb.EffectRef] {
+	return func(yield func(*pb.EffectRef) bool) {
+		for _, ref := range eff.GetDeps() {
+			if !yield(ref) {
+				return
+			}
+		}
+
+		for _, kb := range eff.GetTxnBind().GetKeys() {
+			if !yield(kb.GetNewTip()) {
+				return
+			}
+		}
 	}
+}
 
-	deps := make([]*pb.EffectRef, len(eff.GetDeps()), len(eff.GetDeps())+len(bind.GetKeys()))
-	copy(deps, eff.GetDeps())
+// keyDeps follows a bind through this key's new tip, excluding other keys.
+// Ordinary effects retain all dependencies, including cross-key read evidence.
+func keyDeps(key string, eff *pb.Effect) iter.Seq[*pb.EffectRef] {
+	return func(yield func(*pb.EffectRef) bool) {
+		if bind := eff.GetTxnBind(); bind != nil {
+			for _, kb := range bind.GetKeys() {
+				if string(kb.GetKey()) == key {
+					yield(kb.GetNewTip())
 
-	for _, kb := range bind.GetKeys() {
-		deps = append(deps, kb.GetNewTip())
+					return
+				}
+			}
+
+			return
+		}
+
+		for _, ref := range eff.GetDeps() {
+			if !yield(ref) {
+				return
+			}
+		}
 	}
-
-	return deps
 }
 
 type dag struct {
 	engine      *Engine
 	key         string
 	activeTxnID string
-	visited     map[Tip]bool
 	nodes       map[Tip]*pb.Effect
 	lcaTip      Tip
 	// topoOrder is the post-order DFS sequence of every tip reached
@@ -66,6 +91,16 @@ type dag struct {
 	// invisibility propagation in reconstruct) read this between
 	// prepare and iterate.
 	topoOrder []Tip
+}
+
+// dagTip carries the effect while sorting, avoiding map lookups per comparison.
+type dagTip struct {
+	tip Tip
+	eff *pb.Effect
+}
+
+func compareDagTips(a, b dagTip) int {
+	return bytes.Compare(a.eff.GetForkChoiceHash(), b.eff.GetForkChoiceHash())
 }
 
 func newDag(engine *Engine, key string, activeTxnID string) *dag {
@@ -101,7 +136,8 @@ func (d *dag) walk(tips []Tip, processor func(*pb.Effect) error) error {
 // prepare runs BFS + LCA trim and builds d.topoOrder. Safe to read
 // d.nodes and d.topoOrder after this returns successfully.
 func (d *dag) prepare(tips []Tip) error {
-	d.visited = make(map[Tip]bool, len(tips)*8)
+	d.lcaTip = Tip{}
+	d.topoOrder = nil
 	d.nodes = make(map[Tip]*pb.Effect, len(tips)*8)
 
 	if err := d.bfs(tips, &d.lcaTip); err != nil {
@@ -129,26 +165,17 @@ func (d *dag) prepare(tips []Tip) error {
 	d.topoOrder = make([]Tip, 0, len(d.nodes))
 	topoVisited := make(map[Tip]bool, len(d.nodes))
 
-	type pair struct {
-		tip Tip
-		eff *pb.Effect
-	}
-
-	sortedTips := make([]pair, 0, len(tips))
-	for _, t := range tips {
-		if eff, ok := d.nodes[t]; ok {
-			sortedTips = append(sortedTips, pair{t, eff})
+	sortedTips := make([]dagTip, 0, len(tips))
+	for _, tip := range tips {
+		if eff, ok := d.nodes[tip]; ok {
+			sortedTips = append(sortedTips, dagTip{tip, eff})
 		}
 	}
 
-	if len(sortedTips) > 1 {
-		sort.Slice(sortedTips, func(i, j int) bool {
-			return ForkChoiceLess(sortedTips[i].eff.GetForkChoiceHash(), sortedTips[j].eff.GetForkChoiceHash())
-		})
-	}
+	slices.SortFunc(sortedTips, compareDagTips)
 
-	for _, p := range sortedTips {
-		d.topoCollect(p.tip, topoVisited)
+	for _, entry := range sortedTips {
+		d.topoCollect(entry.tip, topoVisited)
 	}
 
 	return nil
@@ -197,6 +224,7 @@ func (d *dag) shouldEmit(t Tip, eff *pb.Effect) bool {
 // single dead-end tip and no way to recover the underlying chain.
 func (d *dag) bfs(tips []Tip, lcaTip *Tip) error {
 	queue := make([]Tip, 0, len(tips)*2)
+	queuePos := 0
 	snapshots := make([]Tip, 0, len(tips))
 	frontier := make(map[Tip]struct{}, len(tips))
 	enqueue := func(t Tip, eff *pb.Effect) {
@@ -208,7 +236,7 @@ func (d *dag) bfs(tips []Tip, lcaTip *Tip) error {
 	}
 
 	for _, t := range tips {
-		if d.visited[t] {
+		if _, seen := d.nodes[t]; seen {
 			continue
 		}
 
@@ -217,7 +245,6 @@ func (d *dag) bfs(tips []Tip, lcaTip *Tip) error {
 			return err
 		}
 
-		d.visited[t] = true
 		d.nodes[t] = eff
 		// A standalone subscription tip carries no data ancestry. If another
 		// path later references it, it becomes part of that path's frontier.
@@ -231,8 +258,13 @@ func (d *dag) bfs(tips []Tip, lcaTip *Tip) error {
 	for len(queue) > 0 || len(snapshots) > 0 {
 		var cur Tip
 		if len(queue) > 0 {
-			cur = queue[0]
-			queue = queue[1:]
+			cur = queue[queuePos]
+			queuePos++
+
+			if queuePos == len(queue) {
+				queue = queue[:0]
+				queuePos = 0
+			}
 		} else {
 			// Let ordinary paths reach a pending snapshot before expanding
 			// its ancestry. Each effect is still fetched and expanded once.
@@ -248,29 +280,18 @@ func (d *dag) bfs(tips []Tip, lcaTip *Tip) error {
 			return nil
 		}
 
-		var refs []*pb.EffectRef
-
-		if bind := eff.GetTxnBind(); bind != nil {
-			for _, kb := range bind.GetKeys() {
-				if string(kb.GetKey()) == d.key {
-					refs = []*pb.EffectRef{kb.GetNewTip()}
-
-					break
-				}
-			}
-		} else {
-			refs = eff.GetDeps()
-		}
-
 		// Roots finish queued work without resolving their dependency path.
-		if len(refs) > 0 {
-			delete(frontier, cur)
-		}
+		first := true
+		for ref := range keyDeps(d.key, eff) {
+			if first {
+				delete(frontier, cur)
 
-		for _, ref := range refs {
+				first = false
+			}
+
 			dt := r(ref)
-			if d.visited[dt] {
-				if dep := d.nodes[dt]; dep.GetSubscription() != nil && len(dep.GetDeps()) == 0 {
+			if dep, seen := d.nodes[dt]; seen {
+				if dep.GetSubscription() != nil && len(dep.GetDeps()) == 0 {
 					frontier[dt] = struct{}{}
 				}
 
@@ -282,7 +303,6 @@ func (d *dag) bfs(tips []Tip, lcaTip *Tip) error {
 				return err
 			}
 
-			d.visited[dt] = true
 			d.nodes[dt] = depEff
 			frontier[dt] = struct{}{}
 			enqueue(dt, depEff)
@@ -322,8 +342,6 @@ func (d *dag) trimAncestorsOfLCA() {
 		return
 	}
 
-	folded := make(map[Tip]struct{})
-
 	stack := make([]Tip, 0, len(lcaEff.GetDeps()))
 	for _, dep := range lcaEff.GetDeps() {
 		stack = append(stack, r(dep))
@@ -333,39 +351,18 @@ func (d *dag) trimAncestorsOfLCA() {
 		cur := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
 
-		if _, seen := folded[cur]; seen {
-			continue
-		}
-
-		folded[cur] = struct{}{}
-
 		eff, ok := d.nodes[cur]
 		if !ok {
 			continue
 		}
 
-		var refs []*pb.EffectRef
+		// Removing a node also marks it visited, so shared ancestors need no
+		// separate set and are expanded only once.
+		delete(d.nodes, cur)
 
-		if bind := eff.GetTxnBind(); bind != nil {
-			for _, kb := range bind.GetKeys() {
-				if string(kb.GetKey()) == d.key {
-					refs = []*pb.EffectRef{kb.GetNewTip()}
-
-					break
-				}
-			}
-		} else {
-			refs = eff.GetDeps()
-		}
-
-		for _, dep := range refs {
+		for dep := range keyDeps(d.key, eff) {
 			stack = append(stack, r(dep))
 		}
-	}
-
-	for t := range folded {
-		delete(d.nodes, t)
-		delete(d.visited, t)
 	}
 }
 
@@ -393,44 +390,30 @@ func (d *dag) topoCollect(t Tip, visited map[Tip]bool) {
 		return
 	}
 
-	// Follow deps within collected set
-	var refs []*pb.EffectRef
+	// Ordinary chains need neither an iterator nor a sorting buffer.
+	if eff.GetTxnBind() == nil && len(eff.GetDeps()) == 1 {
+		d.topoCollect(r(eff.GetDeps()[0]), visited)
+		d.topoOrder = append(d.topoOrder, t)
 
-	if bind := eff.GetTxnBind(); bind != nil {
-		for _, kb := range bind.GetKeys() {
-			if string(kb.GetKey()) == d.key {
-				refs = []*pb.EffectRef{kb.GetNewTip()}
-
-				break
-			}
-		}
-	} else {
-		refs = eff.GetDeps()
+		return
 	}
 
-	if len(refs) > 0 {
-		type pair struct {
-			tip Tip
-			eff *pb.Effect
-		}
+	// Typical forks fit on the stack; unusually wide forks can grow the slice.
+	var local [8]dagTip
 
-		deps := make([]pair, 0, len(refs))
-		for _, ref := range refs {
-			dt := r(ref)
-			if de, ok := d.nodes[dt]; ok {
-				deps = append(deps, pair{dt, de})
-			}
-		}
+	deps := local[:0]
 
-		if len(deps) > 1 {
-			sort.Slice(deps, func(i, j int) bool {
-				return ForkChoiceLess(deps[i].eff.GetForkChoiceHash(), deps[j].eff.GetForkChoiceHash())
-			})
+	for ref := range keyDeps(d.key, eff) {
+		tip := r(ref)
+		if dep, ok := d.nodes[tip]; ok {
+			deps = append(deps, dagTip{tip, dep})
 		}
+	}
 
-		for _, dep := range deps {
-			d.topoCollect(dep.tip, visited)
-		}
+	slices.SortFunc(deps, compareDagTips)
+
+	for _, dep := range deps {
+		d.topoCollect(dep.tip, visited)
 	}
 
 	d.topoOrder = append(d.topoOrder, t)

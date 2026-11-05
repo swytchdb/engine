@@ -30,7 +30,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -100,8 +99,8 @@ type bootstrapCollector struct {
 }
 
 // Engine is the central coordinator for the causal effect log.
-// Lock-free: the log uses CAS, the index manages its own concurrency,
-// and safety config is swapped atomically.
+// The index and vertex pool synchronize their own state. Engine locks protect
+// lifecycle transitions and shared bookkeeping; Context owns command-local state.
 type Engine struct {
 	recovery atomic.Pointer[recoveryRun]
 	// index is the per-key tip frontier. Its leaf payload is *leafState,
@@ -142,14 +141,13 @@ type Engine struct {
 	// the connection handshake, real-time from inbound SubscriptionEffects
 	// (see cuckoo.go and keyfilter.go). unfilteredPeers counts connected
 	// peers whose bulk filter hasn't arrived: until it does, the peer is
-	// presumed to hold every key. Guarded by keyFilterMu (plain map + mutex,
-	// never sync.Map).
+	// presumed to hold every key. keyFilterMu owns the filters and peer slice.
 	keyFilterMu       sync.RWMutex
 	ownKeyFilter      CuckooChain
 	ownFilterVer      uint64
 	ownFilterBytes    []byte // cached marshal of ownKeyFilter at ownFilterBytesVer
 	ownFilterBytesVer uint64
-	peerKeyFilters    map[pb.NodeID]*peerKeyFilter
+	peerKeyFilters    []peerKeyFilter // sorted by nodeID; shrinks on departure
 	unfilteredPeers   int
 
 	// Deserialized effect store — effects are immutable once written.
@@ -157,24 +155,31 @@ type Engine struct {
 	// memory governor (see startMemoryGovernor), not the pool itself.
 	effectCache *VertexPool
 
-	// Memory governor lifecycle (RSS-driven below-LCA sweeps).
-	memGovStop chan struct{}
-	memGovWg   sync.WaitGroup
+	// Memory governor lifecycle (owned-capacity eviction).
+	memGovStop  chan struct{}
+	memGovWg    sync.WaitGroup
+	memPressure atomic.Pointer[memoryPressure]
 
 	// memTarget is the resolved byte budget the governor holds the pool under
 	// (0 = unbounded). Exposed via MemoryTarget for heartbeat telemetry.
-	memTarget int64
+	memTarget       int64
+	cacheTarget     int64
+	goMemoryLimit   int64
+	cachedDagBytes  atomic.Int64
+	subscriberBytes atomic.Int64
+	memWake         chan struct{}
+	keyMemoryMu     sync.Mutex
+	keyOwners       map[string]keyOwner
+	keyHighWater    int
+	keyBytes        int64
 
 	// compressValues makes Emit store data values zstd-compressed inside the
 	// effect (--compress). Write-side only: reading inflates unconditionally,
 	// driven by the per-effect flag, never by this setting.
 	compressValues bool
 
-	// evictBudget is the number of keys the governor wants evicted, computed each
-	// tick from the live-heap overage. The write path drains it inline (see
-	// drainEvictBudget) so insertion is back-pressured by eviction — you cannot
-	// add faster than you make room. The governor drains any leftover for the
-	// idle/low-write case. Zero means at/under target: writes evict nothing.
+	// evictBudget is the current background batch's remaining key count.
+	// The governor drains references and remeasures ownership between batches.
 	evictBudget atomic.Int64
 
 	// releaseItems defers cold-evicted keys' creation-ref chain walk
@@ -182,9 +187,8 @@ type Engine struct {
 	// tip synchronously (the act that bounds memory) and enqueues the key here;
 	// the expensive resident-chain walk that releases its refs is bookkeeping the
 	// governor drains at the top of each reclaimUnreferenced, then frees the
-	// now-refs-0 vertices in the same pass — so memory frees on the same tick it
-	// would have, with the walk off the write/read latency path. Many write-path
-	// drains enqueue, the single governor consumes.
+	// now-refs-0 vertices in the same pass. The governor then remeasures owned
+	// bytes before choosing another batch. The walk stays off the command path.
 	//
 	// This is deliberately a mutex+slice pair and NOT xsync's UMPSCQueue: that
 	// queue never zeroes a dequeued slot and pools consumed segments fully
@@ -257,6 +261,7 @@ type Engine struct {
 // subscriptionState tracks a subscription's readiness.
 // The ready channel is closed once bootstrapping completes.
 type subscriptionState struct {
+	ownedKey   bool
 	ready      chan struct{}
 	incomplete atomic.Bool // true if bootstrap saw unreachable effects
 	closeOnce  sync.Once   // guards close(ready)
@@ -396,17 +401,17 @@ func newEngine(cfg EngineConfig) *Engine {
 		nodeID:             pb.NewNodeID(),
 		clock:              crdt.NewHLC(),
 		rttProvider:        cfg.RTTProvider,
-		serializationState: initSerializationState(),
+		serializationState: xsync.NewMap[string, *keySerializationState](),
 		subscriptions:      xsync.NewMap[string, *subscriptionState](),
 		pendingTxns:        xsync.NewMap[keytrie.EffectRef, *pendingTxn](),
 		pendingTxTips:      xsync.NewMap[keytrie.EffectRef, []Tip](),
 		txAbortCounts:      xsync.NewMap[string, *atomic.Int32](),
 		pendingBootstraps:  xsync.NewMap[string, *bootstrapCollector](),
-		peerKeyFilters:     make(map[pb.NodeID]*peerKeyFilter),
 		effectCache:        newVertexPool(),
 		spokenBinds:        clox.NewCloxCache[Tip, *spokenBindHistory](clox.ConfigFromCapacity(8192)),
 		compressValues:     cfg.CompressValues,
 	}
+	e.configureIndexKeyOwnership()
 
 	// Creation refs are seeded at PutSized (one per tipset a vertex occupies) and
 	// released by the key-removal walk (releaseChainRefs) on eviction/flush; read
@@ -414,11 +419,8 @@ func newEngine(cfg EngineConfig) *Engine {
 	// is needed — a superseded tip stays reachable and must keep its ref, so the
 	// only refcount signals are creation, adoption, and whole-key removal.
 
-	// Memory governor: keep process RSS near the target. Under pressure it
-	// first reclaims refs-0 vertices (below-LCA / orphans), then evicts cold
-	// keys whose active state still exceeds the budget. Percent-based uses a
-	// fraction of available memory; absolute uses the exact byte budget from
-	// --maxmemory. The governor also sets GOMEMLIMIT so the GC cooperates.
+	// Resolve the owned-cache budget. Go's collector limit and runtime heap
+	// observations are independent of the cache eviction threshold.
 	var memTarget int64
 	if cfg.MemoryLimitPercent > 0 && cfg.MemoryLimitPercent <= 1.0 {
 		memTarget = int64(float64(clox.GetAvailableMemory()) * cfg.MemoryLimitPercent)
@@ -509,94 +511,6 @@ func (e *Engine) VertexCount() int {
 // rather than slot-bounded, so this is its capacity for heartbeat telemetry.
 func (e *Engine) MemoryTarget() int64 {
 	return e.memTarget
-}
-
-// addPeerSubscriber records that peer is subscribed to key. Idempotent.
-// Called from ensureSubscribed (peers that NACK back during bootstrap)
-// and HandleRemote (foreign SubscriptionEffect arrival). The subscriber set
-// lives on the key's leaf; if the key has no leaf (never read/written or
-// already evicted), there is nothing to subscribe to and the call is a no-op.
-func (e *Engine) addPeerSubscriber(key string, peer pb.NodeID) {
-	if peer == e.nodeID {
-		return
-	}
-
-	ls, _ := e.index.LoadOrStoreData(key, &leafState{})
-	if ls == nil {
-		return
-	}
-
-	ls.subMu.Lock()
-	if ls.subscribers == nil {
-		ls.subscribers = make(map[pb.NodeID]struct{})
-	}
-
-	ls.subscribers[peer] = struct{}{}
-	ls.subMu.Unlock()
-}
-
-// removePeerSubscriber removes peer from the subscriber set for key.
-// Called from HandleRemote on a foreign unsubscribe SubscriptionEffect.
-func (e *Engine) removePeerSubscriber(key string, peer pb.NodeID) {
-	ls, _ := e.index.LoadOrStoreData(key, &leafState{})
-	if ls == nil {
-		return
-	}
-
-	ls.subMu.Lock()
-	delete(ls.subscribers, peer)
-	ls.subMu.Unlock()
-}
-
-// snapshotSubscribers returns the key's current subscriber set in the proto
-// map form, for stamping into a compaction SnapshotEffect's reduced state so
-// the set survives chain compaction and is available to a bootstrapping peer.
-// Returns nil when there are no subscribers. Sourced from the authoritative
-// leafState set — no DAG walk.
-func (e *Engine) snapshotSubscribers(key string) map[uint64]bool {
-	ls, _ := e.index.LoadOrStoreData(key, &leafState{})
-	if ls == nil {
-		return nil
-	}
-
-	ls.subMu.Lock()
-	defer ls.subMu.Unlock()
-
-	if len(ls.subscribers) == 0 {
-		return nil
-	}
-
-	m := make(map[uint64]bool, len(ls.subscribers))
-	for id := range ls.subscribers {
-		m[uint64(id)] = true
-	}
-
-	return m
-}
-
-// PeerSubscribers returns the current subscriber set for key. The returned
-// slice is a snapshot; callers may iterate without holding any lock. It is
-// unfiltered by membership — flushTx's collectSubscribers applies the
-// current-membership filter at broadcast time.
-func (e *Engine) PeerSubscribers(key string) []pb.NodeID {
-	ls, _ := e.index.LoadOrStoreData(key, &leafState{})
-	if ls == nil {
-		return nil
-	}
-
-	ls.subMu.Lock()
-	defer ls.subMu.Unlock()
-
-	if len(ls.subscribers) == 0 {
-		return nil
-	}
-
-	result := make([]pb.NodeID, 0, len(ls.subscribers))
-	for id := range ls.subscribers {
-		result = append(result, id)
-	}
-
-	return result
 }
 
 // DropPeer releases per-peer cached state when a peer permanently leaves the
@@ -720,21 +634,7 @@ func NormalizeCloudTipCandidates(key string, candidates, localRoots []Tip, load 
 			return nil, nil, loadErr
 		}
 
-		var refs []*pb.EffectRef
-
-		if bind := eff.GetTxnBind(); bind != nil {
-			for _, kb := range bind.GetKeys() {
-				if string(kb.GetKey()) == key {
-					refs = []*pb.EffectRef{kb.GetNewTip()}
-
-					break
-				}
-			}
-		} else {
-			refs = eff.GetDeps()
-		}
-
-		for _, ref := range refs {
+		for ref := range keyDeps(key, eff) {
 			dep := r(ref)
 			if _, candidate := candidateSet[dep]; candidate && dep != cur {
 				supersededSet[dep] = struct{}{}
@@ -1191,7 +1091,7 @@ func (e *Engine) emitSnapshot(key string, verdicts map[string]pb.Verdict) error 
 
 // applySnapshotVerdicts promotes every txn named in a SnapshotEffect's
 // verdict map out of horizon. The verdict snapshot is emitted by the
-// originator only after commitPendingTxn returns (every subscriber
+// originator only after finishing the pending transaction (every subscriber
 // responded, isRealConflict cleared), so its arrival is strictly stronger
 // evidence than the 1×RTT timer that any concurrent competitor has had
 // its chance. MakeVisible is idempotent — txns not in horizon are a
@@ -1254,19 +1154,7 @@ func (e *Engine) lookupSnapshotVerdict(key, txnID string) (pb.Verdict, bool) {
 			continue
 		}
 
-		if bind := eff.GetTxnBind(); bind != nil {
-			for _, kb := range bind.GetKeys() {
-				if string(kb.GetKey()) == key {
-					stack = append(stack, r(kb.GetNewTip()))
-
-					break
-				}
-			}
-
-			continue
-		}
-
-		for _, dep := range eff.GetDeps() {
+		for dep := range keyDeps(key, eff) {
 			stack = append(stack, r(dep))
 		}
 	}
@@ -1527,14 +1415,10 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 		}
 	}
 
+	indexed := canonicalIndexable
 	if canonicalIndexable {
 		// Consume deps and add the new tip in a single index transition.
 		e.updateIndex(key, keytrie.NewTipSet(fromPbRefs(deps)...), r(notify.GetOrigin()))
-		// Remote inserts pay their own eviction debt: a subscribed node that runs
-		// no local commands never reaches Flush's back-pressure, so without this its
-		// pool would grow unbounded on replication traffic and dump the whole debt
-		// on the next read. Owned ingest (we serve this key) makes room as it lands.
-		e.backpressure()
 	}
 
 	if bind := eff.GetTxnBind(); bind != nil {
@@ -1559,6 +1443,8 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 				"key", kbKey, "bind_offset", notify.GetOrigin(),
 				"pre_tips", preOffsets)
 			e.updateIndex(kbKey, nil, r(notify.GetOrigin()))
+
+			indexed = true
 			postTips := e.index.Contains(kbKey)
 
 			var postOffsets []Tip
@@ -1570,6 +1456,12 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 				"key", kbKey, "bind_offset", notify.GetOrigin(),
 				"post_tips", postOffsets)
 		}
+	}
+
+	if indexed {
+		// Pace owned replication even when only an additional bind key is
+		// served here. Finish all indexing and callbacks before waiting.
+		defer e.backpressure(context.Background())
 	}
 
 	// Collect NACKs to return synchronously (replaces async SendNack calls).
@@ -1590,17 +1482,10 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 			// doesn't know about? The bind knows about its ConsumedTips
 			// and its own effects (NewTip + the bind offset itself).
 			// Any other tip means a concurrent write happened — NACK.
-			known := make(map[Tip]bool, len(kb.GetConsumedTips())+2)
-			for _, ct := range kb.GetConsumedTips() {
-				known[r(ct)] = true
-			}
-
-			known[r(kb.GetNewTip())] = true
-			known[r(notify.GetOrigin())] = true // the bind itself
 			diverged := false
 
 			for _, tip := range kbTips.Tips() {
-				if !known[tip] {
+				if tip != r(kb.GetNewTip()) && tip != r(notify.GetOrigin()) && !refsContain(kb.GetConsumedTips(), tip) {
 					diverged = true
 
 					break
@@ -1616,10 +1501,13 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 			}
 		}
 	} else if initialTips != nil && len(eff.GetDeps()) > 0 {
-		preTips := initialTips.Tips()
-		if !depsMatchTips(fromPbRefs(eff.GetDeps()), preTips) {
+		for _, dep := range eff.GetDeps() {
+			if initialTips.Contains(r(dep)) {
+				continue
+			}
+
 			slog.Debug("HandleRemote: deps diverged, NACK",
-				"key", key, "deps", eff.GetDeps(), "tips", preTips)
+				"key", key, "deps", eff.GetDeps(), "tips", initialTips.Tips())
 			postTips := e.index.Contains(key)
 
 			var postTipOffsets []Tip
@@ -1628,6 +1516,8 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 			}
 
 			nacks = append(nacks, e.buildEnrichedNack(key, notify.GetOrigin(), postTipOffsets))
+
+			break
 		}
 	}
 
@@ -1860,7 +1750,7 @@ func (e *Engine) handleRemoteBind(bind *pb.TransactionalBindEffect, bindOffset T
 		// and reconstruct picks a different winner — the earlier read
 		// becomes a retroactive lie.
 		e.horizon.Add(txnID, bindOffset, bind)
-		e.horizon.ScheduleMakeVisible(txnID, e.horizon.computeHorizonWait())
+		e.horizon.ScheduleMakeVisible(txnID, horizonFallbackWait)
 	} else {
 		// Standalone: remove bound key tips from pendingTxTips immediately
 		for _, kb := range bind.GetKeys() {
@@ -1877,7 +1767,7 @@ func (e *Engine) handleRemoteBind(bind *pb.TransactionalBindEffect, bindOffset T
 		e.pendingTxns.Range(func(_ Tip, ptxn *pendingTxn) bool {
 			for _, pk := range ptxn.keys {
 				if pk.newTip == aborted {
-					abortPendingTxn(ptxn)
+					ptxn.finish(txnStateAborted)
 
 					return false // stop ranging
 				}
@@ -2050,19 +1940,6 @@ func (e *Engine) checkCompetingBinds(bind *pb.TransactionalBindEffect, txnID str
 // gating) or against a concurrent non-tx data effect (SSI). flushTx
 // uses this to abort before emitting.
 func (e *Engine) evaluateBindForkChoice(bind *pb.TransactionalBindEffect, bindOffset Tip, bindHash []byte, txnID string) bool {
-	newEntry := &forkChoiceBindEntry{
-		offset: bindOffset,
-		hash:   bindHash,
-		txnID:  txnID,
-		keys:   make(map[string][]Tip, len(bind.GetKeys())),
-		tips:   make(map[string]Tip, len(bind.GetKeys())),
-	}
-	for _, kb := range bind.GetKeys() {
-		k := string(kb.GetKey())
-		newEntry.keys[k] = fromPbRefs(kb.GetConsumedTips())
-		newEntry.tips[k] = r(kb.GetNewTip())
-	}
-
 	for _, kb := range bind.GetKeys() {
 		k := string(kb.GetKey())
 
@@ -2091,20 +1968,14 @@ func (e *Engine) evaluateBindForkChoice(bind *pb.TransactionalBindEffect, bindOf
 					continue
 				}
 
-				otherEntry := &forkChoiceBindEntry{
-					offset: tipOff,
-					hash:   eff.GetForkChoiceHash(),
-					txnID:  eff.GetTxnId(),
-					keys:   make(map[string][]Tip, len(otherBind.GetKeys())),
-				}
+				if bindsShareBase(bind, otherBind) {
+					var theirTip Tip
 
-				theirNewTips := make(map[string]Tip, len(otherBind.GetKeys()))
-				for _, okb := range otherBind.GetKeys() {
-					otherEntry.keys[string(okb.GetKey())] = fromPbRefs(okb.GetConsumedTips())
-					theirNewTips[string(okb.GetKey())] = r(okb.GetNewTip())
-				}
-
-				if bindsShareBase(newEntry, otherEntry) {
+					for _, otherKey := range otherBind.GetKeys() {
+						if bytes.Equal(kb.GetKey(), otherKey.GetKey()) {
+							theirTip = r(otherKey.GetNewTip())
+						}
+					}
 					// Predicate refinement: suppress the fork-choice
 					// when both txs carry obs/row-write evidence on
 					// this key and their predicates don't intersect
@@ -2113,13 +1984,13 @@ func (e *Engine) evaluateBindForkChoice(bind *pb.TransactionalBindEffect, bindOf
 					// (schema-only mutations, non-SQL binds, etc.).
 					conflict, bothHadEvidence := e.hasPredicateConflict(
 						txnID, eff.GetTxnId(), k,
-						[]Tip{newEntry.tips[k], bindOffset},
-						[]Tip{theirNewTips[k], tipOff})
+						[]Tip{r(kb.GetNewTip()), bindOffset},
+						[]Tip{theirTip, tipOff})
 					if bothHadEvidence && !conflict {
 						continue
 					}
 
-					if !ForkChoiceLess(newEntry.hash, otherEntry.hash) {
+					if !ForkChoiceLess(bindHash, eff.GetForkChoiceHash()) {
 						return true
 					}
 				}
@@ -2129,10 +2000,7 @@ func (e *Engine) evaluateBindForkChoice(bind *pb.TransactionalBindEffect, bindOf
 			if eff.GetTxnId() == "" && eff.GetData() != nil {
 				// Check if this effect is concurrent with our bind on this key:
 				// not in the ancestor set of our consumed tips for this key.
-				consumed := fromPbRefs(kb.GetConsumedTips())
-
-				isAncestor := slices.Contains(consumed, tipOff)
-				if !isAncestor {
+				if !refsContain(kb.GetConsumedTips(), tipOff) {
 					// Not a consumed tip — could be concurrent.
 					// Check if it's a descendant of our bind (depends on us).
 					// If it depends on our NewTip or bindOffset, it's sequential.
@@ -2163,7 +2031,7 @@ func (e *Engine) evaluateBindForkChoice(bind *pb.TransactionalBindEffect, bindOf
 							continue
 						}
 
-						stack = append(stack, fromPbRefs(depEff.GetDeps())...)
+						stack = appendRefs(stack, depEff.GetDeps())
 					}
 
 					if !isDescendant {
@@ -2224,7 +2092,7 @@ func (e *Engine) HandleNack(nack *pb.NackNotify) error {
 	// Transactional NACK: smart conflict detection across all keys in the tx
 	for _, detail := range nack.GetTipDetails() {
 		if e.isRealConflict(matchedTxn, string(nack.GetKey()), detail) {
-			abortPendingTxn(matchedTxn)
+			matchedTxn.finish(txnStateAborted)
 
 			return nil
 		}
@@ -2373,25 +2241,14 @@ func (e *Engine) collectCausalChain(key string, tips []keytrie.EffectRef) []*pb.
 			break
 		}
 
-		var refs []*pb.EffectRef
+		first := true
+		for ref := range keyDeps(key, eff) {
+			if first {
+				delete(frontier, cur)
 
-		if bind := eff.GetTxnBind(); bind != nil {
-			for _, kb := range bind.GetKeys() {
-				if string(kb.GetKey()) == key {
-					refs = []*pb.EffectRef{kb.GetNewTip()}
-
-					break
-				}
+				first = false
 			}
-		} else {
-			refs = eff.GetDeps()
-		}
 
-		if len(refs) > 0 {
-			delete(frontier, cur)
-		}
-
-		for _, ref := range refs {
 			enqueue(r(ref), false)
 		}
 	}
@@ -2487,25 +2344,14 @@ func (e *Engine) ingestNackTips(nack *pb.NackNotify) {
 			break
 		}
 
-		var refs []*pb.EffectRef
+		first := true
+		for ref := range keyDeps(string(nack.GetKey()), eff) {
+			if first {
+				delete(frontier, cur)
 
-		if bind := eff.GetTxnBind(); bind != nil {
-			for _, kb := range bind.GetKeys() {
-				if string(kb.GetKey()) == string(nack.GetKey()) {
-					refs = []*pb.EffectRef{kb.GetNewTip()}
-
-					break
-				}
+				first = false
 			}
-		} else {
-			refs = eff.GetDeps()
-		}
 
-		if len(refs) > 0 {
-			delete(frontier, cur)
-		}
-
-		for _, ref := range refs {
 			enqueue(r(ref), false)
 		}
 	}
@@ -2613,9 +2459,10 @@ func (e *Engine) prefetchEffects(refs []Tip) {
 // evictedKey is a cold-evicted key queued for deferred creation-ref release; see
 // Engine.releaseItems.
 type evictedKey struct {
-	key  string
-	tips []Tip
-	ls   *leafState
+	key      string
+	tips     []Tip
+	ls       *leafState
+	ownedKey bool
 }
 
 func (e *Engine) onLeafEvicted(key string, tips []Tip, ls *leafState) {
@@ -2628,8 +2475,9 @@ func (e *Engine) onLeafEvicted(key string, tips []Tip, ls *leafState) {
 	// must not sit on the write/read latency path that triggered this eviction.
 	// The governor drains releaseItems at the top of reclaimUnreferenced, so the
 	// vertices still free on the same tick.
+	key = e.retainKey(key)
 	e.releaseMu.Lock()
-	e.releaseItems = append(e.releaseItems, evictedKey{key: key, tips: tips, ls: ls})
+	e.releaseItems = append(e.releaseItems, evictedKey{key: key, tips: tips, ls: ls, ownedKey: true})
 	e.releaseMu.Unlock()
 
 	// Count the real cold-key eviction here (once per victim) — the bounded
@@ -2664,10 +2512,18 @@ func (e *Engine) releaseChainRefs(key string, tips []Tip, ls *leafState) {
 	// flush) a no-op.
 	if ls != nil {
 		if cs := ls.subdag.Swap(evictedSubdag); cs != nil && cs != evictedSubdag {
+			e.cachedDagBytes.Add(-cs.bytes)
+
 			for _, tip := range cs.topoOrder {
 				e.effectCache.decref(tip)
 			}
 		}
+
+		ls.subMu.Lock()
+		e.subscriberBytes.Add(-ls.subscriberBytes)
+		ls.subscriberBytes = 0
+		ls.subscribers = nil
+		ls.subMu.Unlock()
 	}
 
 	visited := make(map[Tip]struct{}, len(tips)*8)
@@ -2688,19 +2544,7 @@ func (e *Engine) releaseChainRefs(key string, tips []Tip, ls *leafState) {
 			continue // not resident — nothing below to release
 		}
 
-		if bind := eff.GetTxnBind(); bind != nil {
-			for _, kb := range bind.GetKeys() {
-				if string(kb.GetKey()) == key {
-					stack = append(stack, r(kb.GetNewTip()))
-
-					break
-				}
-			}
-
-			continue
-		}
-
-		for _, dep := range eff.GetDeps() {
+		for dep := range keyDeps(key, eff) {
 			stack = append(stack, r(dep))
 		}
 	}
@@ -2759,7 +2603,7 @@ func (e *Engine) broadcastUnsubscribe(key string, tips []Tip) {
 		}
 	}
 
-	e.subscriptions.Delete(key)
+	e.dropSubscription(key)
 	slog.Debug("onLeafEvicted: evicted cold key", "key", key)
 }
 
@@ -2988,16 +2832,7 @@ func (e *Engine) probeAndFetchKey(key string) {
 		return
 	}
 
-	// Deduplicate
-	seen := make(map[Tip]struct{}, len(allTipOffsets))
-
-	unique := make([]Tip, 0, len(allTipOffsets))
-	for _, off := range allTipOffsets {
-		if _, ok := seen[off]; !ok {
-			seen[off] = struct{}{}
-			unique = append(unique, off)
-		}
-	}
+	unique := compactTips(allTipOffsets)
 
 	// Filter out tips we already have locally
 	localTips := e.index.Contains(key)
@@ -3039,7 +2874,7 @@ func (e *Engine) probeAndFetchKey(key string) {
 
 		if e.effectCache != nil {
 			if cached, ok := e.effectCache.Get(off); ok {
-				fetchStack = append(fetchStack, fromPbRefs(cached.GetDeps())...)
+				fetchStack = appendRefs(fetchStack, cached.GetDeps())
 
 				continue
 			}
@@ -3067,7 +2902,7 @@ func (e *Engine) probeAndFetchKey(key string) {
 			continue
 		}
 
-		fetchStack = append(fetchStack, fromPbRefs(fetchedEff.GetDeps())...)
+		fetchStack = appendRefs(fetchStack, fetchedEff.GetDeps())
 	}
 
 	slog.Debug("anti-entropy: synced", "key", key, "fetched", len(fetched), "new_tips", len(missing))
@@ -3095,29 +2930,13 @@ func (e *Engine) storeWireData(offset Tip, wireData []byte) error {
 	return e.putIngested(offset, eff, len(protoData))
 }
 
-// depsMatchTips checks if the effect's deps are a subset of current tips.
-func depsMatchTips(deps []Tip, tips []Tip) bool {
-	if len(tips) == 0 {
-		return len(deps) == 0
-	}
-
-	tipSet := make(map[Tip]struct{}, len(tips))
-	for _, t := range tips {
-		tipSet[t] = struct{}{}
-	}
-
-	for _, d := range deps {
-		if _, ok := tipSet[d]; !ok {
-			return false
-		}
-	}
-
-	return true
-}
-
 // incrementAbortCount increments the abort counter for a key and returns
 // true if the serialization threshold has been exceeded.
 func (e *Engine) incrementAbortCount(key string) bool {
+	if !adaptiveSerializationEnabled {
+		return false
+	}
+
 	counter, _ := e.txAbortCounts.LoadOrStore(key, &atomic.Int32{})
 	count := counter.Add(1)
 

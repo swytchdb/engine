@@ -43,16 +43,14 @@ import (
 //
 // Relocation safety rests on the existing lock discipline:
 //   - Every leaf-field mutator (Insert, RemoveTips, LoadOrStoreData,
-//     DeleteAndSnapshot, the eviction sweep) holds the reap read-lock for its
-//     whole critical section, so the write lock excludes all of them.
+//     DeleteAndSnapshot, the eviction sweep) holds the reap lock, shared or
+//     exclusive, for its whole critical section, so relocation excludes all of them.
 //   - Splices are identity-checked by descent, exactly like unlinkLeaf: a slot
 //     whose key path resolves to a different node is an orphan husk and is
 //     skipped, and stale reapQueue entries no-op the same way.
-//   - Pure readers (Contains, Range) are lock-free and stale-tolerant: the
-//     husk's fields are left intact — deleted flag, tips, and payload — so a
-//     reader that captured the old pointer mid-descent finishes with a correct
-//     answer, and GC keeps the dropped chunk's memory alive until the last
-//     such reader lets go (the same grace dropChunk has always relied on).
+//   - Readers copy their result under the reap read lock. The write lock gives
+//     relocation a grace period to clear the detached slot's references. Range
+//     cursors restart on readRevision changes before reading an old path.
 //   - TipSets and leaf payloads move by pointer, so escaped *T references and
 //     tip refcounts are untouched; no refDelta fires for a relocation.
 const (
@@ -66,6 +64,10 @@ const (
 	// badly fragmented trie converges over several reap cycles instead of one
 	// long stall.
 	compactMaxChunksPerPass = 256
+
+	// compactBatchSize bounds slots examined under one exclusive lock hold.
+	// Both arenas yield to readers/writers between batches, even within a chunk.
+	compactBatchSize = 64
 )
 
 // compactMinWasteBytes gates compaction entirely while the reclaimable waste
@@ -76,7 +78,7 @@ var compactMinWasteBytes = int64(32 << 20)
 // maybeCompact runs a bounded compaction pass when the arenas hold
 // substantially more slots than the tree has linked nodes. Called from the
 // reap goroutine (serialized by reapRunning), so it never runs concurrently
-// with itself, drainReap, or the BFS reap.
+// with itself, drainReap, or the full-tree reap.
 func (c *Critbit[T]) maybeCompact() {
 	if c.closed.Load() {
 		return
@@ -129,14 +131,14 @@ func (c *Critbit[T]) compactLeafChunks(maxChunks int) int {
 		// allocations — evacuating it would relocate its few residents for
 		// nothing, and its counter can't fill until every recycled slot has been
 		// handed out anyway.
-		if list.outstanding[ci].Load() > 0 {
+		if chunk.outstanding.Load() > 0 {
 			continue
 		}
 
 		live := 0
 
-		for i := range chunk {
-			if !chunk[i].deleted.Load() {
+		for i := range chunk.nodes {
+			if !chunk.nodes[i].deleted.Load() {
 				live++
 			}
 		}
@@ -145,7 +147,7 @@ func (c *Critbit[T]) compactLeafChunks(maxChunks int) int {
 			continue
 		}
 
-		if c.evacuateLeafChunk(chunk) {
+		if c.evacuateLeafChunk(chunk.nodes) {
 			evacuated++
 		}
 	}
@@ -153,7 +155,7 @@ func (c *Critbit[T]) compactLeafChunks(maxChunks int) int {
 	return evacuated
 }
 
-// evacuateLeafChunk empties one leaf chunk under a single reap write-lock hold.
+// evacuateLeafChunk empties one leaf chunk in bounded reap write-lock holds.
 // Live leaves are relocated, dead-pending leaves are unlinked, ghosts forfeit
 // their warm-restart hint (a ghost stranded in a near-empty chunk is stale
 // anyway), and orphan husks need nothing — the identity-checked descent skips
@@ -164,6 +166,16 @@ func (c *Critbit[T]) compactLeafChunks(maxChunks int) int {
 // which is safe: a full counter means every remaining slot is an
 // already-accounted husk whose disposal below is a no-op.
 func (c *Critbit[T]) evacuateLeafChunk(chunk []critNode[T]) bool {
+	for start := 0; start < len(chunk); start += compactBatchSize {
+		if !c.evacuateLeafBatch(chunk[start:min(start+compactBatchSize, len(chunk))]) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func (c *Critbit[T]) evacuateLeafBatch(batch []critNode[T]) bool {
 	c.reapMu.Lock()
 	defer c.reapMu.Unlock()
 
@@ -171,8 +183,8 @@ func (c *Critbit[T]) evacuateLeafChunk(chunk []critNode[T]) bool {
 		return false
 	}
 
-	for i := range chunk {
-		n := &chunk[i]
+	for i := range batch {
+		n := &batch[i]
 		if n.deleted.Load() {
 			if n.freq.Load() < 0 {
 				// Ghost: shed ghost status (unlinkLeaf refuses freq < 0), then
@@ -202,34 +214,18 @@ func (c *Critbit[T]) evacuateLeafChunk(chunk []critNode[T]) bool {
 }
 
 // relocateLeaf copies a live leaf into a fresh slot and splices it in place of
-// the original. Caller holds the reap write lock. The husk is left untouched —
-// still live-looking, sharing the same TipSet and payload pointers — so a
-// stale lock-free reader finishes through it correctly; it is unreachable from
-// the tree the moment the splice lands, and its slot is accounted right here so
+// the original. Caller holds the reap write lock. The detached slot's references
+// are cleared after the splice; readers have finished copying their result.
+// Its slot is accounted right here so
 // the chunk's counter can fire the drop. Returns false when the slot isn't
 // actually linked (an orphan husk, accounted at abandonment).
 func (c *Critbit[T]) relocateLeaf(old *critNode[T]) bool {
-	root := c.root.Load()
-	if root == nil {
-		return false
-	}
+	link := &c.root
 
-	var (
-		p    *critNode[T]
-		pDir int
-	)
-
-	cur := root
-	for !cur.isLeaf {
-		dir := getDirection(old.key, cur.bytePos, cur.otherbits)
-		p, pDir = cur, dir
-
-		next := cur.child[dir].Load()
-		if next == nil {
-			return false
-		}
-
-		cur = next
+	cur := link.Load()
+	for cur != nil && !cur.isLeaf {
+		link = &cur.child[getDirection(old.key, cur.bytePos, cur.otherbits)]
+		cur = link.Load()
 	}
 
 	if cur != old {
@@ -238,38 +234,43 @@ func (c *Critbit[T]) relocateLeaf(old *critNode[T]) bool {
 
 	n2, ci := c.leafArena.alloc() // born deleted=true via the arena init hook
 	n2.chunkIdx = ci
+
 	n2.key = old.key
+	if c.retainKey != nil {
+		n2.key = c.retainKey(n2.key)
+	}
+
 	n2.pinned = old.pinned
 	n2.pins.Store(old.pins.Load())
 	n2.tips.Store(old.tips.Load())
 	n2.data.Store(old.data.Load())
+	c.leafArena.addExtra(ci, c.keyBytes(n2.key)+tipSetBytes(n2.tips.Load())+payloadBytes(n2.data.Load()))
 	n2.freq.Store(old.freq.Load())
 	n2.lastAccess.Store(old.lastAccess.Load())
+	n2.lastDecayEpoch.Store(old.lastDecayEpoch.Load())
 	// Publish before splicing: unreachable until the splice, and the write lock
-	// excludes the sweep, so no scanner can see it early — while a lock-free
-	// reader arriving through the new parent pointer must find deleted=false.
+	// excludes scanners until the relocated leaf is ready.
 	n2.deleted.Store(false)
 
-	if p == nil {
-		c.root.Store(n2)
-	} else {
-		p.child[pDir].Store(n2)
-	}
+	link.Store(n2)
 
-	c.leafArena.recordReaped(old.chunkIdx)
+	c.readRevision++
+	c.retireLeaf(old)
 
 	return true
 }
 
 // compactInternalChunks evacuates up to maxChunks sparse internal chunks.
-// Internal nodes carry no key, so victims are found by walking the tree:
-// one shared-lock DFS counts linked internals per chunk (advisory), then one
-// write-lock DFS collects the victims' members with their parents and
-// relocates them. Splice order is handled by a replacement map, so a victim
-// child spliced after its victim parent lands on the parent's clone. Each
-// relocated husk is accounted through recordReaped, which fires the drop when
-// the victim's last slot dies — compaction never drops a chunk directly.
+// The arena's retired-slot counters identify sparse, fully allocated chunks.
+// Scan their slots directly, not the whole trie. Retired slots have nil children;
+// survivors find their current parent along a descendant leaf's key path.
+// Each relocated husk is accounted through recordReaped, which fires the drop
+// when the victim's last slot dies — compaction never drops a chunk directly.
 func (c *Critbit[T]) compactInternalChunks(maxChunks int) int {
+	if c.closed.Load() || maxChunks <= 0 || c.root.Load() == nil {
+		return 0
+	}
+
 	list := c.internalArena.list.Load()
 	chunks, chunkSize := list.chunks, c.internalArena.chunkSize
 
@@ -278,133 +279,91 @@ func (c *Critbit[T]) compactInternalChunks(maxChunks int) int {
 		return 0
 	}
 
-	// Pass 1 (shared lock, concurrent with traffic): count linked internals
-	// per chunk.
-	counts := make([]int, len(chunks))
-	rt := c.reapMu.RLock()
-
-	root := c.root.Load()
-	if root == nil {
-		c.reapMu.RUnlock(rt)
-
-		return 0
-	}
-
-	stack := make([]*critNode[T], 0, 64)
-
-	stack = append(stack, root)
-	for len(stack) > 0 {
-		n := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-
-		if n.isLeaf {
-			continue
-		}
-
-		if int(n.chunkIdx) < len(counts) {
-			counts[n.chunkIdx]++
-		}
-
-		for dir := range 2 {
-			if ch := n.child[dir].Load(); ch != nil && !ch.isLeaf {
-				stack = append(stack, ch)
-			}
-		}
-	}
-
-	c.reapMu.RUnlock(rt)
-
 	threshold := int(chunkSize) * compactOccupancyPct / 100
 
-	victims := make(map[uint32]bool)
-	for ci := 0; ci < len(chunks) && ci < tail && len(victims) < maxChunks; ci++ {
-		if chunks[ci] == nil {
+	evacuated := 0
+	for ci := 0; ci < len(chunks) && ci < tail && evacuated < maxChunks; ci++ {
+		chunk := chunks[ci]
+		if chunk == nil {
 			continue
 		}
 		// Recycled chunks awaiting re-allocation look sparse but are refilling;
 		// see the same skip in compactLeafChunks.
-		if list.outstanding[ci].Load() > 0 {
+		if chunk.outstanding.Load() > 0 {
 			continue
 		}
 
-		if counts[ci] <= threshold {
-			victims[uint32(ci)] = true
+		// Advisory selection: the write lock in each batch waits for any
+		// in-flight allocation/publication, and relocation revalidates identity.
+		if int(chunkSize)-int(chunk.reaped.Load()) > threshold {
+			continue
+		}
+
+		if c.evacuateInternalChunk(chunk.nodes) {
+			evacuated++
 		}
 	}
 
-	if len(victims) == 0 {
-		return 0
+	return evacuated
+}
+
+func (c *Critbit[T]) evacuateInternalChunk(chunk []critNode[T]) bool {
+	for start := 0; start < len(chunk); start += compactBatchSize {
+		if !c.evacuateInternalBatch(chunk[start:min(start+compactBatchSize, len(chunk))]) {
+			return false
+		}
 	}
 
-	// Pass 2 (write lock): collect victim members with parents, relocate, drop.
+	return true
+}
+
+func (c *Critbit[T]) evacuateInternalBatch(batch []critNode[T]) bool {
 	c.reapMu.Lock()
 	defer c.reapMu.Unlock()
 
 	if c.closed.Load() {
-		return 0
+		return false
 	}
 
-	root = c.root.Load()
-	if root == nil {
-		return 0
+	for i := range batch {
+		c.relocateInternal(&batch[i])
 	}
 
-	type frame struct {
-		node   *critNode[T]
-		parent *critNode[T]
-		dir    int
+	return true
+}
+
+// relocateInternal uses one descendant's key to locate the incoming link.
+// Internal arena order need not match tree order: a previously moved parent
+// is found at its current location. The write lock excludes structural changes
+// throughout both descents and the splice. Old chunk generations remain safe
+// across batches because retirement clears their children before recycling;
+// arrays are never reused in place.
+func (c *Critbit[T]) relocateInternal(old *critNode[T]) bool {
+	leaf := old.child[0].Load()
+	for leaf != nil && !leaf.isLeaf {
+		leaf = leaf.child[0].Load()
 	}
 
-	var moves []frame
+	if leaf == nil {
+		return false // retired or never published
+	}
 
-	fstack := make([]frame, 0, 64)
-
-	fstack = append(fstack, frame{node: root})
-	for len(fstack) > 0 {
-		f := fstack[len(fstack)-1]
-		fstack = fstack[:len(fstack)-1]
-
-		if f.node.isLeaf {
-			continue
+	link := &c.root
+	for node := link.Load(); node != old; node = link.Load() {
+		if node == nil || node.isLeaf {
+			return false // no longer linked
 		}
 
-		if victims[f.node.chunkIdx] {
-			// DFS is pre-order, so an ancestor always precedes its descendants
-			// in moves — the replacement map below can therefore always resolve
-			// a relocated parent before its child splices through it.
-			moves = append(moves, f)
-		}
-
-		for dir := range 2 {
-			if ch := f.node.child[dir].Load(); ch != nil && !ch.isLeaf {
-				fstack = append(fstack, frame{node: ch, parent: f.node, dir: dir})
-			}
-		}
+		link = &node.child[getDirection(leaf.key, node.bytePos, node.otherbits)]
 	}
 
-	replaced := make(map[*critNode[T]]*critNode[T], len(moves))
-	for _, m := range moves {
-		n2, ci := c.internalArena.alloc()
-		n2.chunkIdx = ci
-		n2.bytePos = m.node.bytePos
-		n2.otherbits = m.node.otherbits
-		n2.child[0].Store(m.node.child[0].Load())
-		n2.child[1].Store(m.node.child[1].Load())
+	n2 := c.allocInternalNode(old.bytePos, old.otherbits)
+	n2.child[0].Store(old.child[0].Load())
+	n2.child[1].Store(old.child[1].Load())
+	link.Store(n2)
 
-		if m.parent == nil {
-			c.root.Store(n2)
-		} else {
-			p := m.parent
-			if rp, ok := replaced[p]; ok {
-				p = rp
-			}
+	c.readRevision++
+	c.retireInternal(old)
 
-			p.child[m.dir].Store(n2)
-		}
-
-		replaced[m.node] = n2
-		c.internalArena.recordReaped(m.node.chunkIdx)
-	}
-
-	return len(victims)
+	return true
 }

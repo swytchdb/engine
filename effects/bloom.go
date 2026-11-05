@@ -61,10 +61,6 @@ const (
 	// lands the fill between ~0.3 and ~0.5 for n keys.
 	BloomTargetBitsPerKey = 10
 
-	// BloomResizeFill is the set-bit fraction past which the holder should
-	// rebuild larger — above it the FP rate degrades past ~2%.
-	BloomResizeFill = 0.55
-
 	// bloomFrameVersion tags the wire frame; the decoder rejects anything
 	// else, so a frame from a different scheme can never be misread as bits.
 	bloomFrameVersion = 0x01

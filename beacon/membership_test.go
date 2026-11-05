@@ -25,9 +25,11 @@ package beacon
 
 import (
 	"encoding/binary"
+	"maps"
 	"testing"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
+	"github.com/swytchdb/engine/effects"
 )
 
 func TestNodeIDBytes_Roundtrip(t *testing.T) {
@@ -164,40 +166,89 @@ func TestParseMembership(t *testing.T) {
 		t.Fatalf("expected 2 members, got %d", len(members))
 	}
 
-	byID := map[uint64]string{}
-	for _, m := range members {
-		byID[m.NodeID] = m.Addr
+	if members[100] != "10.0.0.1:7379" {
+		t.Fatalf("expected node 100 at 10.0.0.1:7379, got %q", members[100])
 	}
 
-	if byID[100] != "10.0.0.1:7379" {
-		t.Fatalf("expected node 100 at 10.0.0.1:7379, got %q", byID[100])
-	}
-
-	if byID[200] != "10.0.0.2:7379" {
-		t.Fatalf("expected node 200 at 10.0.0.2:7379, got %q", byID[200])
+	if members[200] != "10.0.0.2:7379" {
+		t.Fatalf("expected node 200 at 10.0.0.2:7379, got %q", members[200])
 	}
 }
 
-func TestMembersEqual(t *testing.T) {
-	a := []Member{{NodeID: 1, Addr: "a"}, {NodeID: 2, Addr: "b"}}
-	b := []Member{{NodeID: 2, Addr: "b"}, {NodeID: 1, Addr: "a"}}
+func TestParseMembershipIgnoresInvalidEntries(t *testing.T) {
+	snapshot := &pb.ReducedEffect{NetAdds: map[string]*pb.ReducedElement{
+		"invalid":                    {Data: buildMemberInsert(99, "invalid-id").GetData()},
+		string(nodeIDBytes(0)):       {Data: buildMemberInsert(0, "zero-id").GetData()},
+		string(nodeIDBytes(3)):       nil,
+		string(nodeIDBytes(4)):       {Data: buildMemberInsert(4, "").GetData()},
+		string(nodeIDBytes(2)):       {Data: buildMemberInsert(2, "b").GetData()},
+		string(nodeIDBytes(1)):       {Data: buildMemberInsert(1, "a").GetData()},
+		string(nodeIDBytes(1 << 63)): {Data: buildMemberInsert(1<<63, "c").GetData()},
+	}}
+	want := map[uint64]string{1: "a", 2: "b", 1 << 63: "c"}
 
-	if !membersEqual(a, b) {
-		t.Fatal("expected equal")
+	for range 20 {
+		if got := parseMembership(snapshot); !maps.Equal(got, want) {
+			t.Fatalf("membership = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestMatchesMembership(t *testing.T) {
+	for _, compressed := range []bool{false, true} {
+		data := buildMemberInsert(1, "peer:7380").GetData()
+		if compressed {
+			data.Value = &pb.DataEffect_Compressed{Compressed: &pb.CompressedValue{
+				Codec: pb.Compression_COMPRESSION_ZSTD,
+				Data:  effects.Compress(data.GetRaw()),
+			}}
+		}
+
+		snapshot := &pb.ReducedEffect{NetAdds: map[string]*pb.ReducedElement{
+			string(nodeIDBytes(1)): {Data: data},
+			string(nodeIDBytes(0)): {Data: buildMemberInsert(0, "zero").GetData()},
+			string(nodeIDBytes(2)): nil,
+			string(nodeIDBytes(3)): {Data: buildMemberInsert(3, "").GetData()},
+			"invalid":              {Data: data},
+		}}
+
+		for _, tc := range []struct {
+			name    string
+			members map[uint64]string
+			match   bool
+		}{
+			{name: "unchanged", members: map[uint64]string{1: "peer:7380"}, match: true},
+			{name: "added", members: nil},
+			{name: "removed", members: map[uint64]string{1: "peer:7380", 2: "removed:7380"}},
+			{name: "changed address", members: map[uint64]string{1: "other:7380"}},
+			{name: "replaced id", members: map[uint64]string{4: "peer:7380"}},
+		} {
+			if got := matchesMembership(snapshot, tc.members); got != tc.match {
+				t.Errorf("%s (compressed=%v): got %v, want %v", tc.name, compressed, got, tc.match)
+			}
+		}
+
+		if got := parseMembership(snapshot); !maps.Equal(got, map[uint64]string{1: "peer:7380"}) {
+			t.Errorf("parsed compressed=%v: %v", compressed, got)
+		}
 	}
 
-	c := []Member{{NodeID: 1, Addr: "a"}, {NodeID: 3, Addr: "c"}}
-	if membersEqual(a, c) {
-		t.Fatal("expected not equal (different IDs)")
+	if !matchesMembership(nil, nil) || matchesMembership(nil, map[uint64]string{1: "gone"}) {
+		t.Fatal("empty snapshot did not match empty membership only")
+	}
+}
+
+func TestUnchangedMembershipDoesNotCopy(t *testing.T) {
+	snapshot := &pb.ReducedEffect{NetAdds: make(map[string]*pb.ReducedElement, 256)}
+
+	for id := range 256 {
+		data := buildMemberInsert(uint64(id+1), "peer:7380").GetData()
+		snapshot.NetAdds[string(data.GetId())] = &pb.ReducedElement{Data: data}
 	}
 
-	d := []Member{{NodeID: 1, Addr: "a"}}
-	if membersEqual(a, d) {
-		t.Fatal("expected not equal (different lengths)")
-	}
-
-	e := []Member{{NodeID: 1, Addr: "changed"}, {NodeID: 2, Addr: "b"}}
-	if membersEqual(a, e) {
-		t.Fatal("expected not equal (different addrs)")
+	b := &Beacon{members: parseMembership(snapshot)}
+	// No peer manager: unchanged membership must not rebuild its connections.
+	if allocs := testing.AllocsPerRun(100, func() { b.syncMembership(snapshot) }); allocs != 0 {
+		t.Fatalf("unchanged membership allocated %g times", allocs)
 	}
 }

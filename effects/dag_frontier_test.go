@@ -1,3 +1,26 @@
+/*
+ * Copyright 2026 Swytch Labs BV
+ *
+ * This file is part of Swytch.
+ *
+ * Swytch is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of
+ * the License, or (at your option) any later version.
+ *
+ * Swytch is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with Swytch. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * Additional permissions under GNU AGPL version 3 section 7 apply to
+ * this file. See the NOTICE.md file distributed with this source code
+ * for the current set of additional permissions.
+ */
+
 package effects
 
 import (
@@ -5,6 +28,7 @@ import (
 	"testing"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
+	"github.com/swytchdb/engine/keytrie"
 )
 
 // S correctly summarizes A+B, but L bypasses it:
@@ -129,5 +153,44 @@ func TestDAGSnapshotDependencyFrontier(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func TestReconstructionPrunesOnlyCommittedAncestors(t *testing.T) {
+	for _, committed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("committed=%t", committed), func(t *testing.T) {
+			log := newSnapshotLog()
+			e := newSnapshotEngine(log)
+			root := log.putEffect(&pb.Effect{
+				Key: []byte("k"), Hlc: sTs(1), NodeId: 1,
+				Kind: &pb.Effect_Data{Data: scalarInsertInt(pb.MergeRule_ADDITIVE_INT, 1)},
+			})
+			child := log.putEffect(&pb.Effect{
+				Key: []byte("k"), Hlc: sTs(2), NodeId: 1, TxnId: "pending", Deps: toPbRefs([]Tip{root}),
+				Kind: &pb.Effect_Data{Data: scalarInsertInt(pb.MergeRule_ADDITIVE_INT, 1)},
+			})
+			unknown := Tip{99, 99}
+			indexed := []Tip{root, unknown}
+
+			if committed {
+				indexed = append(indexed, child)
+			}
+
+			e.index.Insert("k", nil, keytrie.NewTipSet(indexed...))
+
+			state, _, err := e.reconstruct("k", []Tip{root, child, root}, "pending", false)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if state.GetScalar().GetIntVal() != 2 {
+				t.Fatal("duplicate frontier replayed an ancestor twice")
+			}
+
+			current := e.index.Contains("k")
+			if current.Contains(root) == committed || !current.Contains(unknown) || current.Contains(child) != committed {
+				t.Fatalf("pruning changed an uncommitted or unwalked frontier: %v", current.Tips())
+			}
+		})
 	}
 }

@@ -30,7 +30,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -43,7 +42,7 @@ const (
 	backoffBase = 100 * time.Millisecond
 	backoffCap  = 10 * time.Second
 
-	// Stream type prefix for fetch requests (notifications use UDP)
+	// Bidirectional request types; notifications use QUIC uni-streams.
 	streamTypeFetch   byte = 0x02
 	streamTypeForward byte = 0x04
 )
@@ -57,9 +56,7 @@ type PeerConn struct {
 	localRegion string // this node's region
 	tlsConfig   *tls.Config
 
-	quicConn *quic.Conn
-
-	handler EffectHandler
+	quicConn atomic.Pointer[quic.Conn]
 
 	// onConnected is invoked every time the PeerConn successfully
 	// finishes a dial. QUIC is symmetric: once a connection is
@@ -71,7 +68,6 @@ type PeerConn struct {
 	// it runs on inbound QUIC connections.
 	onConnected func(*quic.Conn)
 
-	mu           sync.Mutex
 	cancel       context.CancelFunc
 	streamReady  atomic.Bool
 	firstAttempt chan struct{}
@@ -85,7 +81,6 @@ func newPeerConn(
 	nodeID NodeId,
 	addr string,
 	peerRegion, localRegion string,
-	handler EffectHandler,
 	tlsConfig *tls.Config,
 	onConnected func(*quic.Conn),
 ) *PeerConn {
@@ -94,7 +89,6 @@ func newPeerConn(
 		addr:         addr,
 		region:       peerRegion,
 		localRegion:  localRegion,
-		handler:      handler,
 		tlsConfig:    tlsConfig,
 		onConnected:  onConnected,
 		firstAttempt: make(chan struct{}),
@@ -103,10 +97,7 @@ func newPeerConn(
 
 // GetQuicConn returns the current QUIC connection, or nil if not connected.
 func (pc *PeerConn) GetQuicConn() *quic.Conn {
-	pc.mu.Lock()
-	defer pc.mu.Unlock()
-
-	return pc.quicConn
+	return pc.quicConn.Load()
 }
 
 // IsSameRegion returns true if the peer is in the same region as the local node.
@@ -122,15 +113,12 @@ func (pc *PeerConn) Start(ctx context.Context) {
 
 // Stop closes the connection.
 func (pc *PeerConn) Stop() {
-	pc.mu.Lock()
-	defer pc.mu.Unlock()
-
 	if pc.cancel != nil {
 		pc.cancel()
 	}
 
-	if pc.quicConn != nil {
-		if err := pc.quicConn.CloseWithError(0, "shutdown"); err != nil {
+	if conn := pc.GetQuicConn(); conn != nil {
+		if err := conn.CloseWithError(0, "shutdown"); err != nil {
 			slog.Warn("failed to close peer connection", "peer", pc.nodeID, "error", err)
 		}
 	}
@@ -138,11 +126,7 @@ func (pc *PeerConn) Stop() {
 
 // Fetch opens a short-lived QUIC stream to request effect data from this peer.
 func (pc *PeerConn) Fetch(ctx context.Context, offset *pb.EffectRef) ([]byte, error) {
-	pc.mu.Lock()
-	conn := pc.quicConn
-	pc.mu.Unlock()
-
-	return fetchOverConn(ctx, conn, offset)
+	return fetchOverConn(ctx, pc.GetQuicConn(), offset)
 }
 
 // fetchOverConn runs the fetch request/response protocol on an already-open
@@ -151,54 +135,9 @@ func (pc *PeerConn) Fetch(ctx context.Context, offset *pb.EffectRef) ([]byte, er
 // connection to is still a valid fetch source — symmetric with the send path,
 // which already falls back to inboundConns in the notify transport.
 func fetchOverConn(ctx context.Context, conn *quic.Conn, offset *pb.EffectRef) ([]byte, error) {
-	if conn == nil {
-		return nil, ErrPeerUnavailable
-	}
-
-	stream, err := conn.OpenStreamSync(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("open fetch stream: %w", err)
-	}
-	defer stream.CancelRead(0)
-
-	// quic-go's stream Read/Write don't observe a context once the stream is
-	// open, so a fetch that loses its race (CDN won, a sibling conn replied
-	// first) would block on the peer's reply until it arrives. Tear the stream
-	// down on cancellation to unblock the in-flight Write/Read. done fires on
-	// normal return (defer runs LIFO, before the CancelRead defer) so the
-	// watcher never cancels a healthy stream.
-	done := make(chan struct{})
-	defer close(done)
-
-	go func() {
-		select {
-		case <-ctx.Done():
-			stream.CancelWrite(0)
-			stream.CancelRead(0)
-		case <-done:
-		}
-	}()
-
-	// Write stream type prefix
-	if _, err := stream.Write([]byte{streamTypeFetch}); err != nil {
-		return nil, fmt.Errorf("write stream type: %w", err)
-	}
-
-	// Send fetch request
-	req := &pb.FetchRequest{Ref: offset}
-	if err := writeMessage(stream, req); err != nil {
-		return nil, fmt.Errorf("write fetch request: %w", err)
-	}
-
-	// Close write side (sends FIN) to signal we're done sending
-	if err := stream.Close(); err != nil {
-		return nil, fmt.Errorf("close write side: %w", err)
-	}
-
-	// Read fetch response
 	resp := &pb.FetchResponse{}
-	if err := readMessage(stream, resp); err != nil {
-		return nil, fmt.Errorf("read fetch response: %w", err)
+	if err := requestOverConn(ctx, conn, streamTypeFetch, &pb.FetchRequest{Ref: offset}, resp); err != nil {
+		return nil, err
 	}
 
 	return resp.GetEffectData(), nil
@@ -207,58 +146,53 @@ func fetchOverConn(ctx context.Context, conn *quic.Conn, offset *pb.EffectRef) (
 // ForwardTransaction opens a QUIC stream to forward a transaction to this peer
 // (the serialization leader). Returns the leader's response.
 func (pc *PeerConn) ForwardTransaction(ctx context.Context, tx *pb.ForwardedTransaction) (*pb.ForwardedResponse, error) {
-	pc.mu.Lock()
-	conn := pc.quicConn
-	pc.mu.Unlock()
+	resp := &pb.ForwardedResponse{}
+	if err := requestOverConn(ctx, pc.GetQuicConn(), streamTypeForward, tx, resp); err != nil {
+		return nil, err
+	}
 
+	return resp, nil
+}
+
+// requestOverConn owns the shared fetch/forward stream lifecycle and framing.
+func requestOverConn(ctx context.Context, conn *quic.Conn, streamType byte, request, response proto.Message) error {
 	if conn == nil {
-		return nil, ErrPeerUnavailable
+		return ErrPeerUnavailable
 	}
 
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("open forward stream: %w", err)
+		return fmt.Errorf("open stream: %w", err)
 	}
 	defer stream.CancelRead(0)
 
-	// See fetchOverConn: quic-go stream Read/Write don't observe a context once
-	// the stream is open, so tear it down on cancellation to unblock the
-	// in-flight Write/Read. done fires on normal return so a healthy stream is
-	// never cancelled.
-	done := make(chan struct{})
-	defer close(done)
-
-	go func() {
-		select {
-		case <-ctx.Done():
-			stream.CancelWrite(0)
-			stream.CancelRead(0)
-		case <-done:
-		}
-	}()
+	// Stream I/O does not observe ctx after opening. Register cancellation
+	// without keeping a watcher goroutine and channel alive per request.
+	stop := context.AfterFunc(ctx, func() {
+		stream.CancelWrite(0)
+		stream.CancelRead(0)
+	})
+	defer stop()
 
 	// Write stream type prefix
-	if _, err := stream.Write([]byte{streamTypeForward}); err != nil {
-		return nil, fmt.Errorf("write stream type: %w", err)
+	if _, err := stream.Write([]byte{streamType}); err != nil {
+		return fmt.Errorf("write stream type: %w", err)
 	}
 
-	// Send forwarded transaction
-	if err := writeMessage(stream, tx); err != nil {
-		return nil, fmt.Errorf("write forwarded transaction: %w", err)
+	if err := writeMessage(stream, request); err != nil {
+		return fmt.Errorf("write request: %w", err)
 	}
 
 	// Close write side to signal we're done sending
 	if err := stream.Close(); err != nil {
-		return nil, fmt.Errorf("close write side: %w", err)
+		return fmt.Errorf("close write side: %w", err)
 	}
 
-	// Read response
-	resp := &pb.ForwardedResponse{}
-	if err := readMessage(stream, resp); err != nil {
-		return nil, fmt.Errorf("read forwarded response: %w", err)
+	if err := readMessage(stream, response); err != nil {
+		return fmt.Errorf("read response: %w", err)
 	}
 
-	return resp, nil
+	return nil
 }
 
 // IsStreamReady returns true if the QUIC connection is established.
@@ -270,9 +204,15 @@ func (pc *PeerConn) IsStreamReady() bool {
 func (pc *PeerConn) connectLoop(ctx context.Context) {
 	backoff := backoffBase
 
-	var first sync.Once
+	// Only this loop reports attempts; no synchronization is needed here.
+	firstAttempt := pc.firstAttempt
 
-	attempted := func() { first.Do(func() { close(pc.firstAttempt) }) }
+	attempted := func() {
+		if firstAttempt != nil {
+			close(firstAttempt)
+			firstAttempt = nil
+		}
+	}
 	defer attempted()
 
 	for {
@@ -305,16 +245,18 @@ func (pc *PeerConn) connectLoop(ctx context.Context) {
 
 		pc.streamReady.Store(true)
 
+		conn := pc.GetQuicConn()
 		if pc.onConnected != nil {
-			pc.onConnected(pc.quicConn)
+			pc.onConnected(conn)
 		}
 
 		attempted()
 
 		// Wait for connection to close
-		<-pc.quicConn.Context().Done()
+		<-conn.Context().Done()
 
 		pc.streamReady.Store(false)
+		pc.quicConn.Store(nil)
 
 		if ctx.Err() != nil {
 			RecordPeerDisconnected(pc.nodeID)
@@ -324,11 +266,6 @@ func (pc *PeerConn) connectLoop(ctx context.Context) {
 
 		slog.Warn("peer connection lost", "peer", pc.nodeID)
 		RecordPeerDisconnected(pc.nodeID)
-
-		// Clear connection before reconnecting
-		pc.mu.Lock()
-		pc.quicConn = nil
-		pc.mu.Unlock()
 	}
 }
 
@@ -353,9 +290,12 @@ func (pc *PeerConn) dial(ctx context.Context) error {
 		return err
 	}
 
-	pc.mu.Lock()
-	pc.quicConn = conn
-	pc.mu.Unlock()
+	pc.quicConn.Store(conn)
+	// Stop can cancel while DialAddr is completing. Publish first, then
+	// check cancellation so either Stop or this path closes the connection.
+	if ctx.Err() != nil {
+		pc.Stop()
+	}
 
 	return nil
 }

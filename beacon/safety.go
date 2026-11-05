@@ -32,10 +32,7 @@ func (w *safetyWatcher) notify(key string) {
 		return
 	}
 
-	select {
-	case w.changed <- struct{}{}:
-	default:
-	}
+	signal(w.changed)
 }
 
 func (w *safetyWatcher) refresh() error {

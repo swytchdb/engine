@@ -143,14 +143,16 @@ func TestMembershipObservationDoesNotCompact(t *testing.T) {
 	b := New(Config{NodeID: e.NodeID(), AdvertiseAddr: address}, e, nil)
 	// The unchanged projection needs no PeerManager. A long uncompacted
 	// history still must not make observation emit more membership effects.
-	b.members = []Member{{NodeID: uint64(e.NodeID()), Addr: address}}
+	b.members = map[uint64]string{uint64(e.NodeID()): address}
 
 	var minted atomic.Int32
 
 	e.SetOnLocalEffect(func(_ effects.Tip, _ *pb.Effect) { minted.Add(1) })
 
 	for range 20 {
-		b.refreshTopology()
+		if err := b.refreshTopology(); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	if minted.Load() != 0 {

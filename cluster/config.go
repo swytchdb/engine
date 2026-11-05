@@ -215,25 +215,16 @@ type TopologyDiff struct {
 func DiffTopology(old, updated *ClusterConfig) TopologyDiff {
 	var diff TopologyDiff
 
-	oldPeers := make(map[NodeId]NodeConfig)
-	newPeers := make(map[NodeId]NodeConfig)
+	oldPeers := old.peersByID()
+	newPeers := updated.peersByID()
 
-	if old != nil {
-		for _, p := range old.Peers() {
-			oldPeers[p.ID] = p
-		}
-	}
-
-	if updated != nil {
-		for _, p := range updated.Peers() {
-			newPeers[p.ID] = p
-		}
-	}
-
-	// Added: in new but not old
+	// Classify each new peer in one pass.
 	for id, n := range newPeers {
-		if _, exists := oldPeers[id]; !exists {
+		o, exists := oldPeers[id]
+		if !exists {
 			diff.Added = append(diff.Added, n)
+		} else if o.Address != n.Address || o.Region != n.Region {
+			diff.Changed = append(diff.Changed, n)
 		}
 	}
 
@@ -244,12 +235,20 @@ func DiffTopology(old, updated *ClusterConfig) TopologyDiff {
 		}
 	}
 
-	// Changed: in both but address or region differs
-	for id, n := range newPeers {
-		if o, exists := oldPeers[id]; exists && (o.Address != n.Address || o.Region != n.Region) {
-			diff.Changed = append(diff.Changed, n)
+	return diff
+}
+
+func (c *ClusterConfig) peersByID() map[NodeId]NodeConfig {
+	if c == nil {
+		return nil
+	}
+
+	peers := make(map[NodeId]NodeConfig, len(c.Nodes))
+	for _, node := range c.Nodes {
+		if node.ID != c.NodeID {
+			peers[node.ID] = node
 		}
 	}
 
-	return diff
+	return peers
 }

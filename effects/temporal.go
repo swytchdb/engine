@@ -1,3 +1,26 @@
+/*
+ * Copyright 2026 Swytch Labs BV
+ *
+ * This file is part of Swytch.
+ *
+ * Swytch is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of
+ * the License, or (at your option) any later version.
+ *
+ * Swytch is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with Swytch. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * Additional permissions under GNU AGPL version 3 section 7 apply to
+ * this file. See the NOTICE.md file distributed with this source code
+ * for the current set of additional permissions.
+ */
+
 package effects
 
 import (
@@ -110,7 +133,7 @@ func (e *Engine) observeTemporal(tip Tip, eff *pb.Effect, receipt bool) {
 	if observed&temporalDepsObserved == 0 {
 		completed |= temporalDepsObserved
 
-		for _, ref := range allDeps(eff) {
+		for ref := range allDeps(eff) {
 			parent, ok := e.effectCache.Get(r(ref))
 			if !ok {
 				completed &^= temporalDepsObserved

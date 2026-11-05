@@ -24,7 +24,9 @@
 package effects
 
 import (
+	"cmp"
 	"log/slog"
+	"slices"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
 )
@@ -51,6 +53,7 @@ import (
 // bulk filter, so clusterMaybeHasKey can answer the conservative default
 // without iterating peers on the read hot path.
 type peerKeyFilter struct {
+	nodeID   pb.NodeID
 	bulk     CuckooChain
 	bulkVer  uint64
 	hasBulk  bool // a bulk filter has been applied; empty and version-0 are both legitimate
@@ -111,19 +114,22 @@ func (e *Engine) peerFilterAdd(peer pb.NodeID, key string) {
 }
 
 // getOrCreatePeerFilter returns the filter entry for peer, creating it if
-// absent. Caller must hold keyFilterMu.
+// absent. Caller must hold keyFilterMu and not retain the pointer after unlocking:
+// inserting or removing another peer can move the slice's elements.
 func (e *Engine) getOrCreatePeerFilter(peer pb.NodeID) *peerKeyFilter {
-	if e.peerKeyFilters == nil {
-		e.peerKeyFilters = make(map[pb.NodeID]*peerKeyFilter)
+	i, found := e.peerFilterIndex(peer)
+	if !found {
+		e.peerKeyFilters = slices.Insert(e.peerKeyFilters, i, peerKeyFilter{nodeID: peer})
 	}
 
-	pf := e.peerKeyFilters[peer]
-	if pf == nil {
-		pf = &peerKeyFilter{}
-		e.peerKeyFilters[peer] = pf
-	}
+	return &e.peerKeyFilters[i]
+}
 
-	return pf
+// peerFilterIndex requires keyFilterMu, including for read-only lookups.
+func (e *Engine) peerFilterIndex(peer pb.NodeID) (int, bool) {
+	return slices.BinarySearchFunc(e.peerKeyFilters, peer, func(filter peerKeyFilter, id pb.NodeID) int {
+		return cmp.Compare(filter.nodeID, id)
+	})
 }
 
 // NotePeerConnected marks peer as a live cluster member whose key filter we
@@ -190,12 +196,13 @@ func (e *Engine) CachePeerFilter(peer pb.NodeID, data []byte, version uint64) {
 // as authority would fabricate misses for the new keys.
 func (e *Engine) removePeerKeyFilter(peer pb.NodeID) {
 	e.keyFilterMu.Lock()
-	if pf := e.peerKeyFilters[peer]; pf != nil {
+	if i, found := e.peerFilterIndex(peer); found {
+		pf := &e.peerKeyFilters[i]
 		if pf.counted && !pf.hasBulk {
 			e.unfilteredPeers--
 		}
 
-		delete(e.peerKeyFilters, peer)
+		e.peerKeyFilters = shrinkSlice(slices.Delete(e.peerKeyFilters, i, i+1))
 	}
 	e.keyFilterMu.Unlock()
 }

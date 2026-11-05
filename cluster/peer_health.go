@@ -98,13 +98,11 @@ func (t *PeerHealthTable) Remove(nodeID NodeId) {
 func (t *PeerHealthTable) AliveSymmetricPeers(localRegion string, peerRegions map[NodeId]string) []NodeId {
 	var result []NodeId
 
-	t.peers.Range(func(nodeID NodeId, ph *PeerHealth) bool {
-		if peerRegions[nodeID] == localRegion && ph.IsReplicationTarget() {
+	for nodeID, region := range peerRegions {
+		if ph := t.Get(nodeID); region == localRegion && ph != nil && ph.IsReplicationTarget() {
 			result = append(result, nodeID)
 		}
-
-		return true
-	})
+	}
 
 	return result
 }
@@ -115,13 +113,11 @@ func (t *PeerHealthTable) AliveSymmetricPeers(localRegion string, peerRegions ma
 func (t *PeerHealthTable) AllSameRegionPeers(localRegion string, peerRegions map[NodeId]string) []NodeId {
 	var result []NodeId
 
-	t.peers.Range(func(nodeID NodeId, _ *PeerHealth) bool {
-		if peerRegions[nodeID] == localRegion {
+	for nodeID, region := range peerRegions {
+		if region == localRegion {
 			result = append(result, nodeID)
 		}
-
-		return true
-	})
+	}
 
 	return result
 }
@@ -130,13 +126,11 @@ func (t *PeerHealthTable) AllSameRegionPeers(localRegion string, peerRegions map
 func (t *PeerHealthTable) AliveSymmetricCount(localRegion string, peerRegions map[NodeId]string) int {
 	count := 0
 
-	t.peers.Range(func(nodeID NodeId, ph *PeerHealth) bool {
-		if peerRegions[nodeID] == localRegion && ph.IsReplicationTarget() {
+	for nodeID, region := range peerRegions {
+		if ph := t.Get(nodeID); region == localRegion && ph != nil && ph.IsReplicationTarget() {
 			count++
 		}
-
-		return true
-	})
+	}
 
 	return count
 }
@@ -145,19 +139,13 @@ func (t *PeerHealthTable) AliveSymmetricCount(localRegion string, peerRegions ma
 // and has a verified symmetric path. Returns true when there are no
 // same-region peers (standalone or cross-region-only deployment).
 func (t *PeerHealthTable) AllRegionPeersReachable(localRegion string, peerRegions map[NodeId]string) bool {
-	reachable := true
-
-	t.peers.Range(func(nodeID NodeId, ph *PeerHealth) bool {
-		if peerRegions[nodeID] == localRegion && !ph.IsReplicationTarget() {
-			reachable = false
-
-			return false // short-circuit
+	for nodeID, region := range peerRegions {
+		if ph := t.Get(nodeID); region == localRegion && (ph == nil || !ph.IsReplicationTarget()) {
+			return false
 		}
+	}
 
-		return true
-	})
-
-	return reachable
+	return true
 }
 
 // InMajorityPartition returns true if this node (counting itself) can reach
@@ -168,17 +156,15 @@ func (t *PeerHealthTable) InMajorityPartition(localRegion string, peerRegions ma
 	total := 1     // count self
 	reachable := 1 // self is always reachable
 
-	t.peers.Range(func(nodeID NodeId, ph *PeerHealth) bool {
-		if peerRegions[nodeID] == localRegion {
+	for nodeID, region := range peerRegions {
+		if region == localRegion {
 			total++
 
-			if ph.IsReplicationTarget() {
+			if ph := t.Get(nodeID); ph != nil && ph.IsReplicationTarget() {
 				reachable++
 			}
 		}
-
-		return true
-	})
+	}
 
 	return reachable > total/2
 }

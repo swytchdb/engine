@@ -1,3 +1,26 @@
+/*
+ * Copyright 2026 Swytch Labs BV
+ *
+ * This file is part of Swytch.
+ *
+ * Swytch is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of
+ * the License, or (at your option) any later version.
+ *
+ * Swytch is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with Swytch. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * Additional permissions under GNU AGPL version 3 section 7 apply to
+ * this file. See the NOTICE.md file distributed with this source code
+ * for the current set of additional permissions.
+ */
+
 package stn
 
 import "container/heap"
@@ -6,19 +29,18 @@ import "container/heap"
 // search. Its reverse selection order is a PEO iff every vertex's higher-rank
 // neighbors form a clique. This preserves stars, trees, and all other chordal
 // inputs without adding fill, regardless of vertex numbering.
-func (s *Network) chordalOrder() []int {
+func (s *Network) chordalOrder() (order, rank []int) {
 	n := len(s.adj)
 	q := newCardinality(n)
-	order, rank := make([]int, n), make([]int, n)
+	order, rank = make([]int, n), make([]int, n)
 
-	selected := make([]bool, n)
 	for i := n - 1; i >= 0; i-- {
 		v := q.maximum()
 		q.remove(v)
 
-		order[i], rank[v], selected[v] = v, i, true
+		order[i], rank[v] = v, i
 		for u := range s.adj[v] {
-			if !selected[u] {
+			if q.contains(u) {
 				q.increment(u)
 			}
 		}
@@ -39,59 +61,66 @@ func (s *Network) chordalOrder() []int {
 		for u := range s.adj[v] {
 			if u != parent && rank[u] > rank[v] {
 				if _, ok := s.adj[parent][u]; !ok {
-					return nil
+					return order, nil
 				}
 			}
 		}
 	}
 
-	return order
+	return order, rank
 }
 
 // triangulate only adds fill when recognition fails. Minimum degree is a
 // heuristic, not an optimal-treewidth claim. add initializes the new edge's
 // weights; Connect supplies existing shortest-path bounds, New uses infinity.
 func (s *Network) triangulate(add func(int, int)) {
-	order := s.chordalOrder()
-	if order == nil {
-		n := len(s.adj)
+	order, rank := s.chordalOrder()
+	if rank != nil {
+		s.order, s.rank = order, rank
 
-		q := &degreeQueue{vertices: make([]int, n), position: make([]int, n), degree: make([]int, n)}
-		for v := range s.adj {
-			q.vertices[v], q.position[v], q.degree[v] = v, v, len(s.adj[v])
+		return
+	}
+
+	n := len(s.adj)
+	q := &degreeQueue{vertices: make([]int, n), position: make([]int, n), degree: make([]int, n)}
+
+	for v := range s.adj {
+		q.vertices[v], q.position[v], q.degree[v] = v, v, len(s.adj[v])
+	}
+
+	heap.Init(q)
+
+	order = order[:0]
+
+	var neighbors []int
+
+	for q.Len() != 0 {
+		v := heap.Pop(q).(int)
+		order = append(order, v)
+
+		neighbors = neighbors[:0]
+
+		for u := range s.adj[v] {
+			if q.position[u] < 0 {
+				continue
+			}
+
+			neighbors = append(neighbors, u)
+			q.degree[u]--
+			heap.Fix(q, q.position[u])
 		}
 
-		heap.Init(q)
-
-		order = make([]int, 0, n)
-
-		for q.Len() != 0 {
-			v := heap.Pop(q).(int)
-			order = append(order, v)
-
-			neighbors := make([]int, 0, q.degree[v])
-			for u := range s.adj[v] {
-				if q.position[u] < 0 {
+		for i, u := range neighbors {
+			for _, w := range neighbors[i+1:] {
+				if _, ok := s.adj[u][w]; ok {
 					continue
 				}
 
-				neighbors = append(neighbors, u)
-				q.degree[u]--
+				add(u, w)
+				q.degree[u]++
+				q.degree[w]++
 				heap.Fix(q, q.position[u])
-			}
-
-			for i, u := range neighbors {
-				for _, w := range neighbors[i+1:] {
-					if _, ok := s.adj[u][w]; ok {
-						continue
-					}
-
-					add(u, w)
-					q.degree[u]++
-					q.degree[w]++
-					heap.Fix(q, q.position[u])
-					heap.Fix(q, q.position[w])
-				}
+				heap.Fix(q, q.position[w])
 			}
 		}
 	}

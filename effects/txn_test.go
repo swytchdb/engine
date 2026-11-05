@@ -281,7 +281,7 @@ func TestCommitAbortPendingTxn(t *testing.T) {
 	ptxn := newTestPendingTxn()
 
 	// Commit should succeed
-	if !commitPendingTxn(ptxn) {
+	if !ptxn.finish(txnStateCommitted) {
 		t.Fatal("first commit should succeed")
 	}
 
@@ -297,12 +297,12 @@ func TestCommitAbortPendingTxn(t *testing.T) {
 	}
 
 	// Second commit should fail (already committed)
-	if commitPendingTxn(ptxn) {
+	if ptxn.finish(txnStateCommitted) {
 		t.Fatal("second commit should fail")
 	}
 
 	// Abort should also fail
-	if abortPendingTxn(ptxn) {
+	if ptxn.finish(txnStateAborted) {
 		t.Fatal("abort after commit should fail")
 	}
 }
@@ -310,7 +310,7 @@ func TestCommitAbortPendingTxn(t *testing.T) {
 func TestAbortThenCommit(t *testing.T) {
 	ptxn := newTestPendingTxn()
 
-	if !abortPendingTxn(ptxn) {
+	if !ptxn.finish(txnStateAborted) {
 		t.Fatal("first abort should succeed")
 	}
 
@@ -324,7 +324,7 @@ func TestAbortThenCommit(t *testing.T) {
 		t.Fatal("state should be aborted")
 	}
 
-	if commitPendingTxn(ptxn) {
+	if ptxn.finish(txnStateCommitted) {
 		t.Fatal("commit after abort should fail")
 	}
 }
@@ -370,8 +370,8 @@ func TestIsRealConflict_DependsOnBindOffset_NotConflict(t *testing.T) {
 	}
 }
 
-// defeatedCompetitor must apply the same reachability filters as
-// isRealConflict before declaring a foreign bind defeated. A NACK that
+// Both sides of NACK classification must apply the same reachability filters
+// before declaring either bind defeated. A NACK that
 // names a foreign bind which is causally-before our pending tx (i.e.,
 // reachable from our tx via deps) must NOT add that bind's txnID to
 // defeatedSet — otherwise the post-commit snapshot will record a LOST
@@ -441,7 +441,7 @@ func TestDefeatedCompetitor_TheirBindReachableViaDeps_NotDefeated(t *testing.T) 
 		},
 	}
 
-	if defeated := e.defeatedCompetitor(ptxn, "k", detail); defeated != "" {
+	if _, defeated := e.classifyNackTip(ptxn, "k", detail); defeated != "" {
 		t.Fatalf("bind reachable from our tx via deps must not be marked defeated; got %q", defeated)
 	}
 }
@@ -498,7 +498,7 @@ func TestDefeatedCompetitor_DetailDepsReferenceOurNewTip_NotDefeated(t *testing.
 		},
 	}
 
-	if defeated := e.defeatedCompetitor(ptxn, "k", detail); defeated != "" {
+	if _, defeated := e.classifyNackTip(ptxn, "k", detail); defeated != "" {
 		t.Fatalf("bind whose deps reference our newTip is causally-after us, not defeated; got %q", defeated)
 	}
 }
@@ -560,7 +560,7 @@ func TestDefeatedCompetitor_ConcurrentHigherHash_Defeated(t *testing.T) {
 		},
 	}
 
-	if defeated := e.defeatedCompetitor(ptxn, "k", detail); defeated != theirTxnID {
+	if _, defeated := e.classifyNackTip(ptxn, "k", detail); defeated != theirTxnID {
 		t.Fatalf("concurrent foreign bind with higher hash should be marked defeated; got %q want %q", defeated, theirTxnID)
 	}
 }

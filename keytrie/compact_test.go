@@ -25,13 +25,98 @@ package keytrie
 
 import (
 	"fmt"
+	"slices"
 	"sync"
 	"testing"
 	"unsafe"
 )
 
-// drainAllReaps runs the reap machinery to quiescence synchronously (the
-// production path is the async maybeReap goroutine).
+// Arena slots are allocated by insertion order, not parent-before-child order.
+// Relocation must find the current incoming link even after an ancestor or a
+// descendant has moved, and revisiting an old generation must not retire twice.
+func TestCompact_InternalArenaOrderAndStaleSlots(t *testing.T) {
+	for _, reverse := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reverse=%t", reverse), func(t *testing.T) {
+			c := NewCritbit[int]()
+			c.internalArena.init(8, nil)
+			c.reapRunning.Store(true)
+
+			t.Cleanup(func() { closeTestTrie(t, c) })
+
+			keys := make([]string, 0, 264)
+			keys = append(keys, "", "a", "aa", "ab", "b", "ba", "z", "za")
+
+			for i := range 128 {
+				keys = append(keys, fmt.Sprintf("key-%03d", (i*53)%128))
+			}
+
+			for i, key := range keys {
+				c.Insert(key, nil, NewTipSet(tip(uint64(i+1))))
+			}
+
+			var nodes []*critNode[int]
+			for _, chunk := range c.internalArena.list.Load().chunks {
+				for i := range chunk.nodes {
+					if n := &chunk.nodes[i]; n.child[0].Load() != nil {
+						nodes = append(nodes, n)
+					}
+				}
+			}
+
+			if reverse {
+				slices.Reverse(nodes)
+			}
+
+			for _, node := range nodes {
+				c.reapMu.Lock()
+				moved := c.relocateInternal(node)
+				c.reapMu.Unlock()
+
+				if !moved || node.child[0].Load() != nil || node.child[1].Load() != nil {
+					t.Fatal("linked internal node was not relocated and cleared")
+				}
+			}
+
+			// Refilling recycled indices must not make the old arrays live again.
+			for i := range 128 {
+				key := fmt.Sprintf("fresh-%03d", i)
+				keys = append(keys, key)
+				c.Insert(key, nil, NewTipSet(tip(uint64(len(keys)))))
+			}
+
+			before := c.internalArena.residentBytes()
+			for _, node := range nodes {
+				c.reapMu.Lock()
+				moved := c.relocateInternal(node)
+				c.reapMu.Unlock()
+
+				if moved {
+					t.Fatal("retired generation relocated twice")
+				}
+			}
+
+			if c.internalArena.residentBytes() != before {
+				t.Fatal("revisiting retired slots changed arena accounting")
+			}
+
+			for i, key := range keys {
+				if ts := c.Contains(key); ts == nil || !ts.Contains(tip(uint64(i+1))) {
+					t.Fatalf("key %q lost or changed after relocation", key)
+				}
+			}
+
+			slices.Sort(keys)
+
+			if got := c.Keys(); !slices.Equal(got, keys) {
+				t.Fatal("range changed after internal relocation")
+			}
+		})
+	}
+}
+
+// drainAllReaps runs maintenance synchronously. Callers must set reapRunning
+// before mutations to suppress the async worker: TryDequeue can fail under
+// consumer contention, and an empty queue can still have a batch in flight.
 func drainAllReaps[T any](c *Critbit[T]) {
 	for c.drainReap() > 0 {
 	}
@@ -48,6 +133,10 @@ func drainAllReaps[T any](c *Critbit[T]) {
 // lands on the free list for reuse).
 func TestCompact_EvacuatesSparseLeafChunk(t *testing.T) {
 	c := NewCritbit[int]()
+	c.reapRunning.Store(true) // this test owns draining and compaction
+
+	t.Cleanup(func() { closeTestTrie(t, c) })
+
 	n := defaultCritbitArenaChunkSize + 100 // fill chunk 0, spill into chunk 1
 
 	keys := make([]string, n)
@@ -129,6 +218,10 @@ func TestCompact_EvacuatesSparseLeafChunk(t *testing.T) {
 // tree stays fully readable.
 func TestCompact_InternalChunksFollowLeaves(t *testing.T) {
 	c := NewCritbit[struct{}]()
+	c.reapRunning.Store(true) // this test owns draining and compaction
+
+	t.Cleanup(func() { closeTestTrie(t, c) })
+
 	n := defaultCritbitArenaChunkSize + 100
 
 	keys := make([]string, n)
@@ -178,6 +271,10 @@ func TestCompact_InternalChunksFollowLeaves(t *testing.T) {
 // deleted accounting staying balanced.
 func TestCompact_GhostsForfeited(t *testing.T) {
 	c := NewCritbit[struct{}]()
+	c.reapRunning.Store(true) // this test owns draining and compaction
+
+	t.Cleanup(func() { closeTestTrie(t, c) })
+
 	c.SetEvictHooks(func(string) bool { return true }, func(string, []EffectRef, *struct{}) {}, func() bool { return true })
 
 	n := defaultCritbitArenaChunkSize + 100
@@ -232,6 +329,9 @@ func TestCompact_GhostsForfeited(t *testing.T) {
 // unlink path — no compaction involved.
 func TestOrphanSlots_DontPinChunks(t *testing.T) {
 	c := NewCritbit[struct{}]()
+	c.reapRunning.Store(true) // this test owns draining and compaction
+
+	t.Cleanup(func() { closeTestTrie(t, c) })
 
 	const (
 		workers   = 8
@@ -294,6 +394,9 @@ func TestOrphanSlots_DontPinChunks(t *testing.T) {
 // keyspace exactly. Run with -race to exercise the locking contract.
 func TestCompact_UnderConcurrentTraffic(t *testing.T) {
 	c := NewCritbit[int]()
+	c.reapRunning.Store(true) // the compactor goroutine below owns maintenance
+
+	t.Cleanup(func() { closeTestTrie(t, c) })
 
 	const (
 		workers   = 4

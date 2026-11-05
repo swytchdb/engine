@@ -557,7 +557,7 @@ func TestEvictBounded_PinsSystemKey(t *testing.T) {
 	e.index.Insert(usr, nil, keytrie.NewTipSet(Tip{1, 2}))
 
 	for i := 0; i < 10 && e.index.Contains(usr) != nil; i++ {
-		e.index.EvictBounded(64)
+		e.index.EvictBounded()
 	}
 
 	if e.index.Contains(sys) == nil {
@@ -924,7 +924,7 @@ func TestEvictBounded_CASProtectsConcurrentWrites(t *testing.T) {
 		go func() {
 			defer wg.Done()
 
-			e.index.EvictBounded(64)
+			e.index.EvictBounded()
 		}()
 		go func() {
 			defer wg.Done()

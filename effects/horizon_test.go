@@ -27,6 +27,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/puzpuzpuz/xsync/v4"
@@ -272,4 +273,115 @@ func TestHorizonSet_ScheduledTimerFiresMakesVisible(t *testing.T) {
 	if _, ok := e.pendingTxTips.Load(Tip{1, 20}); ok {
 		t.Fatal("pendingTxTips should be cleaned after timer fires")
 	}
+}
+
+func TestHorizonSet_FallbackSurvivesMergeAndAbort(t *testing.T) {
+	for _, abort := range []bool{false, true} {
+		name := "merge"
+		if abort {
+			name = "merge_and_abort"
+		}
+
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				e := newHorizonTestEngine()
+				h := e.horizon
+				baseA := &pb.EffectRef{NodeId: 1, Offset: 10}
+				baseB := &pb.EffectRef{NodeId: 1, Offset: 20}
+				h.Add("local", Tip{1, 31}, testBind([]*pb.EffectRef{baseA}, &pb.EffectRef{NodeId: 1, Offset: 30}))
+				h.Add("remote", Tip{1, 41}, testBind([]*pb.EffectRef{baseB}, &pb.EffectRef{NodeId: 1, Offset: 40}))
+				h.ScheduleMakeVisible("remote", time.Second)
+
+				// The local bridge merges the remote group into the untimed local group.
+				time.Sleep(500 * time.Millisecond)
+				h.Add("bridge", Tip{1, 51}, testBind([]*pb.EffectRef{baseA, baseB}, &pb.EffectRef{NodeId: 1, Offset: 50}))
+
+				if abort {
+					h.Abort("remote")
+				}
+
+				done := make(chan struct{})
+
+				go func() {
+					h.WaitForClear("local")
+					close(done)
+				}()
+
+				synctest.Wait()
+
+				if !h.IsInvisible("local") || !h.IsInvisible("bridge") {
+					t.Fatal("merged entries became visible before the fallback deadline")
+				}
+
+				time.Sleep(500 * time.Millisecond)
+				synctest.Wait()
+
+				if !h.Empty() {
+					// Release the waiter even when testing a broken implementation.
+					h.MakeVisible("local")
+					t.Fatal("merged group remained invisible after the original fallback deadline")
+				}
+
+				select {
+				case <-done:
+				default:
+					t.Fatal("fallback did not release the merged group's waiter")
+				}
+			})
+		})
+	}
+}
+
+func TestHorizonSet_FallbackSurvivesSchedulingEntryAbort(t *testing.T) {
+	e := newHorizonTestEngine()
+	fireTimer := installFakeTimers(e.horizon)
+	bind := testBind([]*pb.EffectRef{{NodeId: 1, Offset: 10}}, &pb.EffectRef{NodeId: 1, Offset: 20})
+	e.horizon.Add("remote", Tip{1, 30}, bind)
+	e.horizon.Add("local", Tip{1, 40}, bind)
+	e.horizon.ScheduleMakeVisible("remote", time.Second)
+	e.horizon.Abort("remote")
+	fireTimer()
+
+	if !e.horizon.Empty() {
+		t.Fatal("aborting the scheduling entry disabled the group's fallback")
+	}
+}
+
+func TestHorizonSet_FallbackIgnoresStoppedCallbacks(t *testing.T) {
+	e := newHorizonTestEngine()
+	h := e.horizon
+
+	var callbacks []func()
+
+	h.afterFunc = func(_ time.Duration, f func()) *time.Timer {
+		callbacks = append(callbacks, f)
+
+		return time.NewTimer(time.Hour)
+	}
+	bind := testBind([]*pb.EffectRef{{NodeId: 1, Offset: 10}}, &pb.EffectRef{NodeId: 1, Offset: 20})
+	h.Add("remote", Tip{1, 30}, bind)
+	h.ScheduleMakeVisible("remote", time.Second)
+	h.ScheduleMakeVisible("remote", 2*time.Second)
+
+	// A stopped timer's callback may already be waiting for the lifecycle lock.
+	callbacks[0]()
+
+	if !h.IsInvisible("remote") {
+		t.Fatal("replaced timer made the group visible before the extended deadline")
+	}
+
+	callbacks[1]()
+
+	if !h.Empty() {
+		t.Fatal("replacement timer did not make the group visible")
+	}
+
+	h.Add("remote", Tip{1, 30}, bind)
+	callbacks[1]()
+
+	if !h.IsInvisible("remote") {
+		t.Fatal("completed group's timer made a redelivered transaction visible")
+	}
+
+	h.Abort("remote")
 }
