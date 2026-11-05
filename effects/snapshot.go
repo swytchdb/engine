@@ -1783,6 +1783,18 @@ func (e *Engine) losersOnKeyAt(key string, tips, extraTips []Tip, snapshotVerdic
 		candidates = append(candidates, b)
 	}
 
+	// Sequential history cannot introduce any new losers. Prove this with
+	// one DAG walk before building a separate ancestor closure for every
+	// candidate and comparing every pair. Preserve explicit LOST verdicts.
+	candidateTips := make([]Tip, len(candidates))
+	for i, b := range candidates {
+		candidateTips[i] = b.newTip
+	}
+
+	if e.tipsOnCausalPath(key, candidateTips) {
+		return losers, walked
+	}
+
 	// Ancestor closures computed lazily on first reach query. Cached so
 	// each bind's parent DAG is walked at most once across all pairs.
 	// Fetches via e.getEffect (CloxCache-backed) instead of holding a
