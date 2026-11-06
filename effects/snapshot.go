@@ -24,6 +24,7 @@
 package effects
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -38,6 +39,7 @@ import (
 	"unsafe"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
+	"github.com/swytchdb/engine/keytrie"
 	"github.com/swytchdb/engine/memsize"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -209,6 +211,50 @@ func (e *Engine) installBoundSubdags(root *dag) {
 
 	seen := make(map[branch]bool)
 
+	// A hot key can expose hundreds of historical binds for the same
+	// associated frontier. Walk that frontier once, rather than normalizing
+	// every already-covered bind against the same history independently.
+	type frontierAncestry struct {
+		tips *keytrie.TipSet
+		seen map[Tip]bool
+	}
+
+	ancestry := make(map[string]frontierAncestry)
+	covered := func(key string, tips *keytrie.TipSet, bind Tip) bool {
+		if cached, ok := ancestry[key]; ok && cached.tips == tips {
+			return cached.seen[bind]
+		}
+
+		visited := make(map[Tip]bool)
+
+		stack := append([]Tip(nil), tips.Tips()...)
+		for len(stack) > 0 {
+			cur := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+
+			if visited[cur] {
+				continue
+			}
+
+			visited[cur] = true
+
+			eff, err := e.getEffect(key, cur)
+			if err != nil {
+				// Preserve normalization's error/retry behavior. An incomplete
+				// walk is never retained as proof for another candidate.
+				return false
+			}
+
+			for dep := range keyDeps(key, eff) {
+				stack = append(stack, r(dep))
+			}
+		}
+
+		ancestry[key] = frontierAncestry{tips: tips, seen: visited}
+
+		return visited[bind]
+	}
+
 	queue := []*dag{root}
 	for len(queue) > 0 {
 		d := queue[len(queue)-1]
@@ -245,6 +291,10 @@ func (e *Engine) installBoundSubdags(root *dag) {
 						tipsEqual(cs.tips, tips.Tips()) && slices.Contains(cs.topoOrder, offset) {
 						continue
 					}
+				}
+
+				if covered(key, tips, offset) {
+					continue
 				}
 				// Do not add a redundant ancestor to a live frontier: a
 				// transaction can capture it before the next read prunes it,
@@ -1783,61 +1833,22 @@ func (e *Engine) losersOnKeyAt(key string, tips, extraTips []Tip, snapshotVerdic
 		candidates = append(candidates, b)
 	}
 
-	// Sequential history cannot introduce any new losers. Prove this with
-	// one DAG walk before building a separate ancestor closure for every
-	// candidate and comparing every pair. Preserve explicit LOST verdicts.
+	if len(candidates) < 2 {
+		return losers, walked
+	}
+
+	// Discover stronger competitors first so unreported losers can stop
+	// after the first real conflict. Losing candidates remain competitors:
+	// removing them would change the existing fork-choice semantics.
+	slices.SortFunc(candidates, func(a, b seenBind) int { return bytes.Compare(a.hash, b.hash) })
+
 	candidateTips := make([]Tip, len(candidates))
 	for i, b := range candidates {
 		candidateTips[i] = b.newTip
 	}
 
-	if e.tipsOnCausalPath(key, candidateTips) {
-		return losers, walked
-	}
-
-	// Ancestor closures computed lazily on first reach query. Cached so
-	// each bind's parent DAG is walked at most once across all pairs.
-	// Fetches via e.getEffect (CloxCache-backed) instead of holding a
-	// separate nodes map during discovery.
-	ancestorsOf := make(map[Tip]map[Tip]struct{})
-	reaches := func(from, target Tip) bool {
-		if from == target {
-			return true
-		}
-
-		seen, cached := ancestorsOf[from]
-		if !cached {
-			seen = make(map[Tip]struct{})
-			seen[from] = struct{}{}
-
-			stack := []Tip{from}
-			for len(stack) > 0 {
-				cur := stack[len(stack)-1]
-				stack = stack[:len(stack)-1]
-
-				eff, err := e.getEffect(key, cur)
-				if err != nil {
-					continue
-				}
-
-				for _, dep := range eff.GetDeps() {
-					dt := r(dep)
-					if _, dup := seen[dt]; dup {
-						continue
-					}
-
-					seen[dt] = struct{}{}
-					stack = append(stack, dt)
-				}
-			}
-
-			ancestorsOf[from] = seen
-		}
-
-		_, found := seen[target]
-
-		return found
-	}
+	ancestry := newCausalIndex(e, key)
+	ancestry.add(candidateTips...)
 
 	// Check reporting eligibility once per envelope for this scan, and defer
 	// document reads and effects until adjudication is complete.
@@ -1846,7 +1857,7 @@ func (e *Engine) losersOnKeyAt(key string, tips, extraTips []Tip, snapshotVerdic
 		reportable = make(map[Tip]bool, len(candidates))
 		for _, b := range candidates {
 			if verdicts[b.txnID].verdict == pb.Verdict_WON {
-				reportable[b.bindOffset] = e.unresolvedConflictTip(key, b.bindOffset, startTips, reaches)
+				reportable[b.bindOffset] = e.unresolvedConflictTip(key, b.bindOffset, startTips, ancestry.reaches)
 			}
 		}
 	}
@@ -1860,55 +1871,80 @@ func (e *Engine) losersOnKeyAt(key string, tips, extraTips []Tip, snapshotVerdic
 
 	seenConflicts := make(map[[2]string]struct{})
 
-	// Pairwise fork choice over all candidates, including snapshot winners.
+	// Evidence belongs to a candidate, not a pair. Collect it at most once
+	// in this read, including when many concurrent candidates are disjoint.
+	type evidence struct {
+		obs []*pb.ObservationEffect
+		rw  []*pb.RowWriteEffect
+	}
+
+	proofs := make([]*evidence, len(candidates))
+	proof := func(i int) *evidence {
+		if proofs[i] == nil {
+			b := candidates[i]
+			obs, rw := e.collectTxnEffectsOnKey(b.txnID, key, b.newTip)
+			proofs[i] = &evidence{obs: obs, rw: rw}
+		}
+
+		return proofs[i]
+	}
+
+	chains := ancestry.candidateChains(candidateTips)
+
+	// Only concurrent intervals can compete. Sequential prefixes and suffixes
+	// are skipped even when other writers have forked elsewhere in history.
+candidateLoop:
 	for i := range candidates {
 		b := &candidates[i]
-		for j := range candidates {
-			if i == j {
-				continue
-			}
-
-			other := &candidates[j]
-			if reaches(b.newTip, other.newTip) || reaches(other.newTip, b.newTip) {
-				continue
-			}
-
-			if !ForkChoiceLess(other.hash, b.hash) {
-				continue
-			}
-
-			if other.txnID != "" && b.txnID != "" {
-				conflict, bothHadEvidence := e.hasPredicateConflict(
-					other.txnID, b.txnID, key,
-					[]Tip{other.newTip}, []Tip{b.newTip})
-				if bothHadEvidence && !conflict {
+		for _, chain := range chains {
+			first, last := ancestry.concurrentRange(b.newTip, chain, candidateTips)
+			for _, j := range chain[first:last] {
+				if i == j {
 					continue
 				}
-			}
 
-			losers[b.txnID] = struct{}{}
-
-			canReport := reportable[b.bindOffset]
-			if canReport && reportable[other.bindOffset] {
-				pair := [2]string{b.txnID, other.txnID}
-				if pair[1] < pair[0] {
-					pair[0], pair[1] = pair[1], pair[0]
+				other := &candidates[j]
+				if ancestry.cyclic && (ancestry.reaches(b.newTip, other.newTip) || ancestry.reaches(other.newTip, b.newTip)) {
+					continue
 				}
 
-				if _, seen := seenConflicts[pair]; !seen {
-					seenConflicts[pair] = struct{}{}
-
-					conflicts = append(conflicts, conflictPair{
-						binds: [2]Tip{b.bindOffset, other.bindOffset},
-						txns:  [2]string{b.txnID, other.txnID},
-					})
+				if !ForkChoiceLess(other.hash, b.hash) {
+					continue
 				}
-			}
 
-			// Reporting needs every competing WON pair, even after this
-			// candidate has already lost to another transaction.
-			if !canReport {
-				break
+				if other.txnID != "" && b.txnID != "" {
+					otherProof, ourProof := proof(j), proof(i)
+
+					conflict, bothHadEvidence := predicateEvidenceConflict(otherProof.obs, otherProof.rw, ourProof.obs, ourProof.rw)
+					if bothHadEvidence && !conflict {
+						continue
+					}
+				}
+
+				losers[b.txnID] = struct{}{}
+
+				canReport := reportable[b.bindOffset]
+				if canReport && reportable[other.bindOffset] {
+					pair := [2]string{b.txnID, other.txnID}
+					if pair[1] < pair[0] {
+						pair[0], pair[1] = pair[1], pair[0]
+					}
+
+					if _, seen := seenConflicts[pair]; !seen {
+						seenConflicts[pair] = struct{}{}
+
+						conflicts = append(conflicts, conflictPair{
+							binds: [2]Tip{b.bindOffset, other.bindOffset},
+							txns:  [2]string{b.txnID, other.txnID},
+						})
+					}
+				}
+
+				// Reporting needs every competing WON pair, even after this
+				// candidate has already lost to another transaction.
+				if !canReport {
+					continue candidateLoop
+				}
 			}
 		}
 	}
