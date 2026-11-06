@@ -133,6 +133,12 @@ func (e *Engine) hasPredicateConflict(
 	ourObs, ourRW := e.collectTxnEffectsOnKey(ourTxnID, key, ourStartTips...)
 	theirObs, theirRW := e.collectTxnEffectsOnKey(theirTxnID, key, theirStartTips...)
 
+	return predicateEvidenceConflict(ourObs, ourRW, theirObs, theirRW)
+}
+
+func predicateEvidenceConflict(ourObs []*pb.ObservationEffect, ourRW []*pb.RowWriteEffect,
+	theirObs []*pb.ObservationEffect, theirRW []*pb.RowWriteEffect,
+) (conflict bool, bothSidesHadEvidence bool) {
 	if !hasPredicateEvidence(ourObs, ourRW) || !hasPredicateEvidence(theirObs, theirRW) {
 		return false, false
 	}

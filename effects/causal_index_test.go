@@ -31,14 +31,14 @@ import (
 	pb "github.com/swytchdb/engine/cluster/proto"
 )
 
-func TestTipsOnCausalPath_AllSmallDAGs(t *testing.T) {
-	// Enumerate every four-vertex DAG in one topological ordering and every
-	// subset of target tips. The independent oracle computes transitive
-	// closure and checks pairwise comparability, including forks and merges.
-	const vertices = 4
+func TestCausalIndex_AllSmallDAGs(t *testing.T) {
+	// Enumerate every five-vertex DAG. An independent transitive-closure
+	// oracle checks both reachability and the candidate intervals, including
+	// diamonds, merges, disconnected components, duplicate tips, and ties.
+	const vertices = 5
 	for edges := range 1 << (vertices * (vertices - 1) / 2) {
 		log := newSnapshotLog()
-		e := newSnapshotEngine(log)
+		e := &Engine{effectCache: log.effectCache}
 
 		var tips [vertices]Tip
 
@@ -58,10 +58,16 @@ func TestTipsOnCausalPath_AllSmallDAGs(t *testing.T) {
 				bit++
 			}
 
-			tips[i] = log.putEffect(&pb.Effect{
-				Key: []byte("k"), NodeId: 1, Hlc: sTs(int64(i)), Deps: deps,
+			// Decreasing offsets and repeated node IDs must not imply order.
+			tips[i] = Tip{uint64(i%2 + 1), uint64(100 - i*3)}
+			if err := log.effectCache.Put(tips[i], &pb.Effect{
+				Key: []byte("k"), NodeId: tips[i][0], Hlc: sTs(int64(i)), Deps: deps,
 				Kind: &pb.Effect_Data{Data: scalarInsertRaw([]byte("v"))},
-			})
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			reaches[i][i] = true
 		}
 
 		for k := range vertices {
@@ -72,36 +78,49 @@ func TestTipsOnCausalPath_AllSmallDAGs(t *testing.T) {
 			}
 		}
 
-		for subset := range 1 << vertices {
-			var selected []Tip
+		selected := append(slices.Clone(tips[:]), tips[0], tips[2])
 
-			want := true
+		for range 2 {
+			index := newCausalIndex(e, "k")
+			before := e.effectCache.hits.Load()
+			chains := index.candidateChains(selected)
 
-			for i := range vertices {
-				if subset&(1<<i) == 0 {
-					continue
+			for i, from := range tips {
+				for j, target := range tips {
+					if got := index.reaches(from, target); got != reaches[i][j] {
+						t.Fatalf("edges=%b %v -> %v: got %v, want %v", edges, from, target, got, reaches[i][j])
+					}
 				}
 
-				selected = append(selected, tips[i], tips[i]) // duplicate bind tips
-				for j := range i {
-					if subset&(1<<j) != 0 && !reaches[i][j] && !reaches[j][i] {
-						want = false
+				concurrent := make(map[int]bool)
+
+				for _, chain := range chains {
+					first, last := index.concurrentRange(from, chain, selected)
+					for _, candidate := range chain[first:last] {
+						concurrent[candidate] = true
+					}
+				}
+
+				for candidate, target := range selected {
+					j := slices.Index(tips[:], target)
+
+					want := !reaches[i][j] && !reaches[j][i]
+					if concurrent[candidate] != want {
+						t.Fatalf("edges=%b concurrent %v/%v: got %v, want %v", edges, from, target, concurrent[candidate], want)
 					}
 				}
 			}
 
-			for range 2 {
-				if got := e.tipsOnCausalPath("k", selected); got != want {
-					t.Fatalf("edges=%b subset=%b tips=%v: got %v, want %v", edges, subset, selected, got, want)
-				}
-
-				slices.Reverse(selected)
+			if got := e.effectCache.hits.Load() - before; got != vertices {
+				t.Fatalf("fetched %d vertices, want exactly %d", got, vertices)
 			}
+
+			slices.Reverse(selected)
 		}
 	}
 }
 
-func TestTipsOnCausalPath_IncompleteOrCyclicHistory(t *testing.T) {
+func TestCausalIndex_IncompleteOrCyclicHistory(t *testing.T) {
 	for _, cycle := range []bool{false, true} {
 		t.Run(fmt.Sprintf("cycle=%v", cycle), func(t *testing.T) {
 			log := newSnapshotLog()
@@ -118,10 +137,60 @@ func TestTipsOnCausalPath_IncompleteOrCyclicHistory(t *testing.T) {
 				}
 			}
 
-			if e.tipsOnCausalPath("k", []Tip{first, second}) {
-				t.Fatal("incomplete or cyclic history must use the general resolver")
+			index := newCausalIndex(e, "k")
+			if !index.reaches(first, second) || index.reaches(second, first) != cycle {
+				t.Fatal("missing history or cycle changed reachability")
+			}
+
+			if index.reaches(first, Tip{2, 100}) || index.reaches(second, Tip{2, 100}) {
+				t.Fatal("invented ancestry through a missing effect or a cycle")
+			}
+
+			if index.cyclic != cycle {
+				t.Fatalf("cycle fallback=%v, want %v", index.cyclic, cycle)
 			}
 		})
+	}
+}
+
+func TestCausalIndex_ExtendsForConflictReporting(t *testing.T) {
+	log := newSnapshotLog()
+	e := newSnapshotEngine(log)
+	a := closureBind(log, "a", 1, []string{"winner"}, nil)
+	b := closureBind(log, "b", 2, []string{"winner"}, nil)
+	index := newCausalIndex(e, "winner")
+	tips := []Tip{a, b}
+	chains := index.candidateChains(tips)
+	// Reporting may discover a head from another key after candidate indexing.
+	head := closureBind(log, "later", 3, []string{"elsewhere"}, map[string]Tip{"elsewhere": a})
+	if !index.reaches(head, a) || index.reaches(a, head) || index.reaches(head, b) {
+		t.Fatal("late reporting head has incorrect ancestry")
+	}
+
+	var got []int
+
+	for _, chain := range chains {
+		first, last := index.concurrentRange(a, chain, tips)
+		got = append(got, chain[first:last]...)
+	}
+
+	if !slices.Equal(got, []int{1}) {
+		t.Fatalf("late head changed candidate intervals: %v", got)
+	}
+}
+
+func TestCausalIndex_MergesReuseChains(t *testing.T) {
+	const writers = 128
+
+	e, tips := concurrentHistory(100, writers, 8, true)
+
+	index := newCausalIndex(e, "winner")
+	if !index.add(tips...) {
+		t.Fatal("acyclic history used fallback")
+	}
+
+	if len(index.heads) > writers {
+		t.Fatalf("chain count grew past writer concurrency: %d", len(index.heads))
 	}
 }
 
