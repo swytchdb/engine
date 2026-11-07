@@ -1429,9 +1429,14 @@ func (c *Context) flushTx() error {
 		bindDeps = append(bindDeps, kb.GetNewTip())
 	}
 
-	// Pre-emission check: a bind that completed its horizon wait is a
-	// committed transaction. If a visible competing bind shares our causal
-	// base on any key, our snapshot is stale — abort without emitting.
+	// Serialize the final conflict check, publication on every key, and pending
+	// registration with incoming bind responses. Earlier preflight checks alone
+	// cannot protect this boundary: a peer may have received our response since.
+	nodeLock := c.takeNodeLock()
+	defer nodeLock.release()
+
+	// Every previously ingested structural competitor counts, including binds
+	// still in the horizon. We cannot publish after promising not to compete.
 	if conflict := c.engine.checkCompetingBinds(bind, c.txnID); conflict != "" {
 		slog.Debug("flushTx: competing bind found, aborting before emission",
 			"competing_txn", conflict)
@@ -1526,6 +1531,7 @@ func (c *Context) flushTx() error {
 	}
 
 	c.engine.pendingTxns.Store(bindOffset, ptxn)
+	nodeLock.release()
 
 	// Step 5: Gather subscribers and replicate bind
 
