@@ -82,7 +82,7 @@ func keyDeps(key string, eff *pb.Effect) iter.Seq[*pb.EffectRef] {
 // normalizeTipCandidates removes candidates named by the key-scoped ancestry
 // of other candidates or additional roots. Only candidates can be removed.
 // A nil effect or failed load is a gap: retain unresolved candidates rather than
-// infer edges. Continue other branches and return all load errors alongside the
+// infer edges. Continue other branches and return load errors alongside the
 // partial proof. The caller decides whether incomplete history prevents its
 // operation; it does not change the walk or discard successful ancestry proof.
 func normalizeTipCandidates(key string, candidates, roots []Tip, load func(Tip) (*pb.Effect, error)) (realTips, superseded []Tip, err error) {
@@ -275,17 +275,35 @@ func (d *dag) bfs(tips []Tip, lcaTip *Tip) error {
 }
 
 // walkKeyHistory is the shared dependency walk for replay and tip normalization.
-// Missing nodes remain on the dependency frontier and all load errors are
-// returned, so an exhausted queue cannot disguise an unresolved branch. State
-// snapshots stop traversal only at convergence; their folded history need not
-// remain available. Callers decide how to use partial nodes when errors occur.
+// Missing nodes remain on the dependency frontier, so an exhausted queue cannot
+// disguise an unresolved branch. Non-missing load errors take precedence over
+// confirmed missing blobs: joining both would let errors.Is classify a transport
+// failure as a recoverable hole. State snapshots stop traversal only at
+// convergence; their folded history need not remain available. Callers decide
+// how to use partial nodes when errors occur.
 func walkKeyHistory(key string, tips []Tip, load func(Tip) (*pb.Effect, error)) (map[Tip]*pb.Effect, Tip, error) {
 	nodes := make(map[Tip]*pb.Effect, len(tips)*8)
 
 	var (
-		lcaTip     Tip
-		loadErrors []error
+		lcaTip        Tip
+		loadErrors    []error
+		missingErrors []error
 	)
+
+	recordError := func(err error) {
+		if errors.Is(err, ErrCDNBlobMissing) {
+			missingErrors = append(missingErrors, err)
+		} else {
+			loadErrors = append(loadErrors, err)
+		}
+	}
+	walkError := func() error {
+		if len(loadErrors) > 0 {
+			return errors.Join(loadErrors...)
+		}
+
+		return errors.Join(missingErrors...)
+	}
 
 	queue := make([]Tip, 0, len(tips)*2)
 	queuePos := 0
@@ -310,7 +328,7 @@ func walkKeyHistory(key string, tips []Tip, load func(Tip) (*pb.Effect, error)) 
 		if err != nil {
 			nodes[t] = nil
 
-			loadErrors = append(loadErrors, err)
+			recordError(err)
 
 			continue
 		}
@@ -350,7 +368,7 @@ func walkKeyHistory(key string, tips []Tip, load func(Tip) (*pb.Effect, error)) 
 		if snap := eff.GetSnapshot(); snap != nil && snap.GetState() != nil && len(frontier) == 1 {
 			lcaTip = cur
 
-			return nodes, lcaTip, errors.Join(loadErrors...)
+			return nodes, lcaTip, walkError()
 		}
 
 		// Roots finish queued work without resolving their dependency path.
@@ -377,7 +395,7 @@ func walkKeyHistory(key string, tips []Tip, load func(Tip) (*pb.Effect, error)) 
 			if err != nil {
 				nodes[dt] = nil
 
-				loadErrors = append(loadErrors, err)
+				recordError(err)
 
 				continue
 			}
@@ -401,7 +419,7 @@ func walkKeyHistory(key string, tips []Tip, load func(Tip) (*pb.Effect, error)) 
 		}
 	}
 
-	return nodes, lcaTip, errors.Join(loadErrors...)
+	return nodes, lcaTip, walkError()
 }
 
 // trimAncestorsOfLCA removes from d.nodes every node in the transitive
