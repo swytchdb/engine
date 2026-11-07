@@ -225,7 +225,9 @@ type Engine struct {
 	// cloud durability: exactly the locally-authored DAG, never a peer's
 	// effects and never wire-only probes (discovery subscriptions, ephemeral
 	// pub/sub, PUBLISH payloads — those bypass the mint path entirely). Called
-	// synchronously on the emit path; implementations must not block.
+	// synchronously on the emit path; implementations must not block. Bind
+	// emission holds the node publication lock: hooks must not flush a
+	// transaction, ingest a remote bind, or wait for work that does either.
 	localEffectMu sync.RWMutex
 	OnLocalEffect func(offset Tip, eff *pb.Effect)
 
@@ -248,6 +250,7 @@ type Engine struct {
 	// supplements the structural preflight and checkCompetingBinds walk.
 	spokenBinds   *clox.CloxCache[Tip, *spokenBindHistory]
 	spokenBindsMu sync.Mutex // serializes append-only history updates
+	nodeMu        sync.Mutex // bind publication / response ordering; see takeNodeLock
 
 	// Anti-entropy
 	antiEntropyStop chan struct{}
@@ -597,62 +600,14 @@ var ErrCDNBlobMissing = errors.New("cdn blob missing")
 // ancestry names it. Any missing candidate that cannot be so proven remains a
 // real tip and the caller's classification decides what to do with it.
 func NormalizeCloudTipCandidates(key string, candidates, localRoots []Tip, load func(Tip) (*pb.Effect, error)) (realTips, superseded []Tip, err error) {
-	candidateSet := make(map[Tip]struct{}, len(candidates))
-
-	unique := make([]Tip, 0, len(candidates))
-	for _, candidate := range candidates {
-		if _, exists := candidateSet[candidate]; exists {
-			continue
+	return normalizeTipCandidates(key, candidates, localRoots, func(tip Tip) (*pb.Effect, error) {
+		eff, loadErr := load(tip)
+		if errors.Is(loadErr, ErrCDNBlobMissing) {
+			return nil, nil
 		}
 
-		candidateSet[candidate] = struct{}{}
-		unique = append(unique, candidate)
-	}
-
-	supersededSet := make(map[Tip]struct{}, len(unique))
-	visited := make(map[Tip]struct{}, (len(unique)+len(localRoots))*8)
-	queue := make([]Tip, 0, len(unique)+len(localRoots))
-	queue = append(queue, unique...)
-
-	queue = append(queue, localRoots...)
-	for len(queue) > 0 {
-		cur := queue[0]
-		queue = queue[1:]
-
-		if _, seen := visited[cur]; seen {
-			continue
-		}
-
-		visited[cur] = struct{}{}
-
-		eff, loadErr := load(cur)
-		if loadErr != nil {
-			if errors.Is(loadErr, ErrCDNBlobMissing) {
-				continue
-			}
-
-			return nil, nil, loadErr
-		}
-
-		for ref := range keyDeps(key, eff) {
-			dep := r(ref)
-			if _, candidate := candidateSet[dep]; candidate && dep != cur {
-				supersededSet[dep] = struct{}{}
-			}
-
-			queue = append(queue, dep)
-		}
-	}
-
-	for _, candidate := range unique {
-		if _, stale := supersededSet[candidate]; stale {
-			superseded = append(superseded, candidate)
-		} else {
-			realTips = append(realTips, candidate)
-		}
-	}
-
-	return realTips, superseded, nil
+		return eff, loadErr
+	})
 }
 
 // hydrateFromCloud is the tiered-storage rehydrate on a read-miss: it asks
@@ -907,7 +862,8 @@ func (e *Engine) fireLocalEffect(offset Tip, eff *pb.Effect) {
 
 // SetOnLocalEffect replaces the local-mint hook. It waits for callbacks already
 // in flight, which gives lifecycle owners a clean boundary before draining or
-// tearing down the hook's resources.
+// tearing down the hook's resources. Hooks must obey OnLocalEffect's nonblocking,
+// non-reentrant contract, including the node-lock restrictions on bind emission.
 func (e *Engine) SetOnLocalEffect(hook func(offset Tip, eff *pb.Effect)) {
 	e.localEffectMu.Lock()
 	e.OnLocalEffect = hook
@@ -1355,6 +1311,14 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 		return nil, fmt.Errorf("fork_choice_hash missing or mismatch for offset %v", notify.GetOrigin())
 	}
 
+	// Bind ingestion and its response must observe one side of the local
+	// check-and-publication boundary. Fetching/decoding above needs no lock.
+	var nodeLock *nodeLockGuard
+	if eff.GetTxnBind() != nil {
+		nodeLock = e.takeNodeLock()
+		defer nodeLock.release()
+	}
+
 	// Cache deserialized effect — owned if we serve its key, reclaimable cache
 	// (no creation ref) if we only need it to read through (e.g. cross-key).
 	if err := e.putIngested(r(notify.GetOrigin()), eff, len(protoData)); err != nil {
@@ -1403,22 +1367,9 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 
 	_, canonicalIndexable := e.subscriptions.Load(key)
 
-	// Consume deps: any dep that is a current tip becomes an ancestor.
-	deps := eff.GetDeps()
-	if bind := eff.GetTxnBind(); bind != nil {
-		for _, kb := range bind.GetKeys() {
-			if string(kb.GetKey()) == key {
-				deps = []*pb.EffectRef{kb.GetNewTip()}
-
-				break
-			}
-		}
-	}
-
 	indexed := canonicalIndexable
 	if canonicalIndexable {
-		// Consume deps and add the new tip in a single index transition.
-		e.updateIndex(key, keytrie.NewTipSet(fromPbRefs(deps)...), r(notify.GetOrigin()))
+		e.installIngestedTips(key, r(notify.GetOrigin()))
 	}
 
 	if bind := eff.GetTxnBind(); bind != nil {
@@ -1442,7 +1393,7 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 			slog.Debug("HandleRemote: indexing bind for additional key (before)",
 				"key", kbKey, "bind_offset", notify.GetOrigin(),
 				"pre_tips", preOffsets)
-			e.updateIndex(kbKey, nil, r(notify.GetOrigin()))
+			e.installIngestedTips(kbKey, r(notify.GetOrigin()))
 
 			indexed = true
 			postTips := e.index.Contains(kbKey)
@@ -1548,6 +1499,10 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 		nacks = append(nacks, e.buildEnrichedNack(key, notify.GetOrigin(), tipOffsets))
 	}
 
+	// The bind and its promise are installed, and the response is fixed.
+	// Wake application waiters and apply deferred memory pacing outside the lock.
+	nodeLock.release()
+
 	// Fire notification callbacks for remote effects
 	if eff.GetTxnId() != "" && eff.GetTxnBind() == nil {
 		// In-progress transactional effect — skip notification until bind
@@ -1603,6 +1558,13 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 // HorizonSet.Add for an already-visible txn, which is non-idempotent and
 // makes the bind invisible again until the next timer fires.
 func (e *Engine) handleBackfill(notify *pb.OffsetNotify) error {
+	return e.ingestBackfill(notify, nil)
+}
+
+// historyKey defers this key's frontier publication to the caller, which is
+// collecting an entire recovery walk. Other keys touched by binds still need
+// their own frontier updates. A nil key leaves standalone backfill unchanged.
+func (e *Engine) ingestBackfill(notify *pb.OffsetNotify, historyKey *string) error {
 	if notify == nil || notify.GetOrigin() == nil {
 		return nil
 	}
@@ -1616,9 +1578,9 @@ func (e *Engine) handleBackfill(notify *pb.OffsetNotify) error {
 	if len(effectData) == 0 {
 		// Already resident? Skip the network FetchFromAny — this runs inside
 		// the synchronous NACK-ingest loop that gates commit/abort, and the
-		// effect is immutable so the cached bytes are identical. Backfill's
-		// index/bind/pendingTxTips tail is idempotent, so re-running it on the
-		// cached effect is safe.
+		// effect is immutable so the cached bytes are identical. Frontier
+		// installation below checks ancestry even for cached effects: replay
+		// must not promote an ancestor that an existing descendant covers.
 		if e.effectCache != nil {
 			if cached, ok := e.effectCache.Get(r(notify.GetOrigin())); ok {
 				eff, fromCache = cached, true
@@ -1705,27 +1667,14 @@ func (e *Engine) handleBackfill(notify *pb.OffsetNotify) error {
 	key := string(eff.GetKey())
 	_, canonicalIndexable := e.subscriptions.Load(key)
 
-	deps := eff.GetDeps()
-	if bind := eff.GetTxnBind(); bind != nil {
-		for _, kb := range bind.GetKeys() {
-			if string(kb.GetKey()) == key {
-				deps = []*pb.EffectRef{kb.GetNewTip()}
-
-				break
-			}
-		}
-	}
-
-	if canonicalIndexable {
-		// Single index transition (consume deps + add arrival) so the tip
-		// refcount stays balanced — see HandleRemote.
-		e.updateIndex(key, keytrie.NewTipSet(fromPbRefs(deps)...), r(notify.GetOrigin()))
+	if canonicalIndexable && (historyKey == nil || key != *historyKey) {
+		e.installIngestedTips(key, r(notify.GetOrigin()))
 	}
 
 	if bind := eff.GetTxnBind(); bind != nil {
 		for _, kb := range bind.GetKeys() {
 			kbKey := string(kb.GetKey())
-			if kbKey == key {
+			if kbKey == key || (historyKey != nil && kbKey == *historyKey) {
 				continue
 			}
 
@@ -1733,7 +1682,7 @@ func (e *Engine) handleBackfill(notify *pb.OffsetNotify) error {
 				continue
 			}
 
-			e.updateIndex(kbKey, nil, r(notify.GetOrigin()))
+			e.installIngestedTips(kbKey, r(notify.GetOrigin()))
 		}
 	}
 
@@ -2268,6 +2217,8 @@ func (e *Engine) ingestNackTips(nack *pb.NackNotify) {
 		return
 	}
 
+	key := string(nack.GetKey())
+
 	if len(nack.GetCausalChain()) > 0 {
 		go e.ingestCausalChain(nack)
 	}
@@ -2299,7 +2250,7 @@ func (e *Engine) ingestNackTips(nack *pb.NackNotify) {
 			Origin: toPbRef(off),
 			Key:    nack.GetKey(),
 		}
-		if err := e.handleBackfill(notify); err != nil {
+		if err := e.ingestBackfill(notify, &key); err != nil {
 			slog.Debug("ingestNackTips: handleBackfill failed",
 				"ref", off, "error", err)
 
@@ -2353,6 +2304,25 @@ func (e *Engine) ingestNackTips(nack *pb.NackNotify) {
 			}
 
 			enqueue(r(ref), false)
+		}
+	}
+
+	// History was cached without publishing each ancestor as an arrival.
+	// Merge the successfully ingested advertised tips in one transition,
+	// after the walk has supplied the ancestry needed to compare them with
+	// our existing frontier (which may have advanced during recovery).
+	if _, subscribed := e.subscriptions.Load(key); subscribed {
+		var tips []Tip
+
+		for _, detail := range nack.GetTipDetails() {
+			tip := r(detail.GetRef())
+			if nodes[tip] != nil {
+				tips = append(tips, tip)
+			}
+		}
+
+		if len(tips) > 0 {
+			e.installIngestedTips(key, tips...)
 		}
 	}
 }

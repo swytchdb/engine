@@ -26,6 +26,7 @@ package effects
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"iter"
 	"log/slog"
@@ -76,6 +77,48 @@ func keyDeps(key string, eff *pb.Effect) iter.Seq[*pb.EffectRef] {
 			}
 		}
 	}
+}
+
+// normalizeTipCandidates removes candidates named by the key-scoped ancestry
+// of other candidates or additional roots. Only candidates can be removed.
+// A nil effect or failed load is a gap: retain unresolved candidates rather than
+// infer edges. Continue other branches and return all load errors alongside the
+// partial proof. The caller decides whether incomplete history prevents its
+// operation; it does not change the walk or discard successful ancestry proof.
+func normalizeTipCandidates(key string, candidates, roots []Tip, load func(Tip) (*pb.Effect, error)) (realTips, superseded []Tip, err error) {
+	candidateSet := make(map[Tip]struct{}, len(candidates))
+
+	unique := make([]Tip, 0, len(candidates))
+	for _, candidate := range candidates {
+		if _, exists := candidateSet[candidate]; exists {
+			continue
+		}
+
+		candidateSet[candidate] = struct{}{}
+		unique = append(unique, candidate)
+	}
+
+	supersededSet := make(map[Tip]struct{}, len(unique))
+
+	nodes, _, err := walkKeyHistory(key, slices.Concat(unique, roots), load)
+	for cur, eff := range nodes {
+		for ref := range keyDeps(key, eff) {
+			dep := r(ref)
+			if _, candidate := candidateSet[dep]; candidate && dep != cur {
+				supersededSet[dep] = struct{}{}
+			}
+		}
+	}
+
+	for _, candidate := range unique {
+		if _, stale := supersededSet[candidate]; stale {
+			superseded = append(superseded, candidate)
+		} else {
+			realTips = append(realTips, candidate)
+		}
+	}
+
+	return realTips, superseded, err
 }
 
 type dag struct {
@@ -138,7 +181,6 @@ func (d *dag) walk(tips []Tip, processor func(*pb.Effect) error) error {
 func (d *dag) prepare(tips []Tip) error {
 	d.lcaTip = Tip{}
 	d.topoOrder = nil
-	d.nodes = make(map[Tip]*pb.Effect, len(tips)*8)
 
 	if err := d.bfs(tips, &d.lcaTip); err != nil {
 		return err
@@ -223,6 +265,28 @@ func (d *dag) shouldEmit(t Tip, eff *pb.Effect) bool {
 // any other effect. Treating them as LCAs would leave reconstruct with a
 // single dead-end tip and no way to recover the underlying chain.
 func (d *dag) bfs(tips []Tip, lcaTip *Tip) error {
+	nodes, lca, err := walkKeyHistory(d.key, tips, func(tip Tip) (*pb.Effect, error) {
+		return d.engine.getEffect(d.key, tip)
+	})
+	d.nodes = nodes
+	*lcaTip = lca
+
+	return err
+}
+
+// walkKeyHistory is the shared dependency walk for replay and tip normalization.
+// Missing nodes remain on the dependency frontier and all load errors are
+// returned, so an exhausted queue cannot disguise an unresolved branch. State
+// snapshots stop traversal only at convergence; their folded history need not
+// remain available. Callers decide how to use partial nodes when errors occur.
+func walkKeyHistory(key string, tips []Tip, load func(Tip) (*pb.Effect, error)) (map[Tip]*pb.Effect, Tip, error) {
+	nodes := make(map[Tip]*pb.Effect, len(tips)*8)
+
+	var (
+		lcaTip     Tip
+		loadErrors []error
+	)
+
 	queue := make([]Tip, 0, len(tips)*2)
 	queuePos := 0
 	snapshots := make([]Tip, 0, len(tips))
@@ -236,20 +300,29 @@ func (d *dag) bfs(tips []Tip, lcaTip *Tip) error {
 	}
 
 	for _, t := range tips {
-		if _, seen := d.nodes[t]; seen {
+		if _, seen := nodes[t]; seen {
 			continue
 		}
 
-		eff, err := d.engine.getEffect(d.key, t)
+		frontier[t] = struct{}{}
+
+		eff, err := load(t)
 		if err != nil {
-			return err
+			nodes[t] = nil
+
+			loadErrors = append(loadErrors, err)
+
+			continue
 		}
 
-		d.nodes[t] = eff
+		nodes[t] = eff
+		if eff == nil {
+			continue
+		}
 		// A standalone subscription tip carries no data ancestry. If another
 		// path later references it, it becomes part of that path's frontier.
-		if eff.GetSubscription() == nil || len(eff.GetDeps()) > 0 {
-			frontier[t] = struct{}{}
+		if eff.GetSubscription() != nil && len(eff.GetDeps()) == 0 {
+			delete(frontier, t)
 		}
 
 		enqueue(t, eff)
@@ -272,17 +345,17 @@ func (d *dag) bfs(tips []Tip, lcaTip *Tip) error {
 			snapshots = snapshots[1:]
 		}
 
-		eff := d.nodes[cur]
+		eff := nodes[cur]
 
 		if snap := eff.GetSnapshot(); snap != nil && snap.GetState() != nil && len(frontier) == 1 {
-			*lcaTip = cur
+			lcaTip = cur
 
-			return nil
+			return nodes, lcaTip, errors.Join(loadErrors...)
 		}
 
 		// Roots finish queued work without resolving their dependency path.
 		first := true
-		for ref := range keyDeps(d.key, eff) {
+		for ref := range keyDeps(key, eff) {
 			if first {
 				delete(frontier, cur)
 
@@ -290,7 +363,7 @@ func (d *dag) bfs(tips []Tip, lcaTip *Tip) error {
 			}
 
 			dt := r(ref)
-			if dep, seen := d.nodes[dt]; seen {
+			if dep, seen := nodes[dt]; seen {
 				if dep.GetSubscription() != nil && len(dep.GetDeps()) == 0 {
 					frontier[dt] = struct{}{}
 				}
@@ -298,13 +371,22 @@ func (d *dag) bfs(tips []Tip, lcaTip *Tip) error {
 				continue
 			}
 
-			depEff, err := d.engine.getEffect(d.key, dt)
+			frontier[dt] = struct{}{}
+
+			depEff, err := load(dt)
 			if err != nil {
-				return err
+				nodes[dt] = nil
+
+				loadErrors = append(loadErrors, err)
+
+				continue
 			}
 
-			d.nodes[dt] = depEff
-			frontier[dt] = struct{}{}
+			nodes[dt] = depEff
+			if depEff == nil {
+				continue
+			}
+
 			enqueue(dt, depEff)
 		}
 	}
@@ -313,13 +395,13 @@ func (d *dag) bfs(tips []Tip, lcaTip *Tip) error {
 	// it. Its frontier entry survives even though its queue entry is gone.
 	if len(frontier) == 1 {
 		for t := range frontier {
-			if snap := d.nodes[t].GetSnapshot(); snap != nil && snap.GetState() != nil {
-				*lcaTip = t
+			if snap := nodes[t].GetSnapshot(); snap != nil && snap.GetState() != nil {
+				lcaTip = t
 			}
 		}
 	}
 
-	return nil
+	return nodes, lcaTip, errors.Join(loadErrors...)
 }
 
 // trimAncestorsOfLCA removes from d.nodes every node in the transitive
