@@ -123,8 +123,8 @@ func TestDAGSnapshotDependencyFrontier(t *testing.T) {
 						}
 
 						if subscription != (Tip{}) {
-							// A subscription first seen as a standalone tip must
-							// become a frontier entry when A references it.
+							// Advertising subscription metadata separately must not
+							// hide A's independent data path around S.
 							tips = append([]Tip{subscription}, tips...)
 						}
 

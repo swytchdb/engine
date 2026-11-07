@@ -142,7 +142,7 @@ type cloudEffectLoader func(effects.Tip) (*pb.Effect, error)
 func reduceDiscoveredTips(initialTips []effects.Tip, load cloudEffectLoader) (*pb.ReducedEffect, error) {
 	visited := map[effects.Tip]bool{}
 
-	var queue []effects.Tip
+	var queue, snapshots []effects.Tip
 
 	enqueue := func(t effects.Tip) {
 		if !visited[t] {
@@ -182,23 +182,44 @@ func reduceDiscoveredTips(initialTips []effects.Tip, load cloudEffectLoader) (*p
 	lastProgress := walkStarted
 	progressed := false
 
-	for len(queue) > 0 {
-		tip := queue[0]
-		queue = queue[1:]
-
-		eff, err := load(tip)
-		if err != nil {
-			// A skipped fetch drops the tip's whole dep subtree, which is
-			// the same partial-ancestry reduce as a truncated walk. Fail
-			// instead; the caller retries with backoff.
-			return nil, fmt.Errorf("cloud discover: fetch %v: %w", tip, err)
+	for len(queue) > 0 || len(snapshots) > 0 {
+		var tip effects.Tip
+		if len(queue) > 0 {
+			tip, queue = queue[0], queue[1:]
+		} else {
+			tip, snapshots = snapshots[0], snapshots[1:]
 		}
 
-		fetched[tip] = eff
-		if snap := eff.GetSnapshot(); snap != nil && snap.GetState() != nil && len(queue) == 0 {
-			lcaTip, lcaFound = tip, true
+		eff, cached := fetched[tip]
+		if !cached {
+			var err error
 
-			break
+			eff, err = load(tip)
+			if err != nil {
+				// A skipped fetch drops the tip's whole dep subtree, which is
+				// the same partial-ancestry reduce as a truncated walk. Fail
+				// instead; the caller retries with backoff.
+				return nil, fmt.Errorf("cloud discover: fetch %v: %w", tip, err)
+			}
+
+			fetched[tip] = eff
+		}
+
+		if snap := eff.GetSnapshot(); snap != nil && snap.GetState() != nil {
+			// Resolve subscription observations (including unsubscribe deps)
+			// before deciding whether to expand folded history. A metadata
+			// effect queued after this snapshot cannot create a data branch.
+			if len(queue) > 0 {
+				snapshots = append(snapshots, tip)
+
+				continue
+			}
+
+			if len(snapshots) == 0 {
+				lcaTip, lcaFound = tip, true
+
+				break
+			}
 		}
 
 		for _, dep := range eff.GetDeps() {
