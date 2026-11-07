@@ -274,6 +274,56 @@ func (d *dag) bfs(tips []Tip, lcaTip *Tip) error {
 	return err
 }
 
+// An empty subscription records no observed data. Referencing it records an
+// observation of metadata, not another data branch. Subscription membership is
+// maintained separately; keep the effect for causal bookkeeping only.
+func emptySubscription(eff *pb.Effect) bool {
+	return eff.GetSubscription() != nil && len(eff.GetDeps()) == 0
+}
+
+// visitDataDeps loads causal dependencies while treating subscription metadata
+// as transparent. An unsubscribe can carry observed data deps: follow those,
+// without making the subscription itself a data root. A chain containing only
+// subscription observations has the same data ancestry as no dependencies.
+// Missing effects remain unresolved data dependencies, never assumed metadata.
+func visitDataDeps(key string, eff *pb.Effect, visit func(Tip) *pb.Effect) bool {
+	pending := []*pb.Effect{eff}
+
+	var subscriptions map[Tip]bool
+
+	hasDataDeps := false
+
+	for len(pending) > 0 {
+		cur := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+
+		for ref := range keyDeps(key, cur) {
+			tip := r(ref)
+
+			dep := visit(tip)
+			if dep.GetSubscription() == nil {
+				hasDataDeps = true
+
+				continue
+			}
+
+			if emptySubscription(dep) || subscriptions[tip] {
+				continue
+			}
+
+			if subscriptions == nil {
+				subscriptions = make(map[Tip]bool)
+			}
+
+			subscriptions[tip] = true
+
+			pending = append(pending, dep)
+		}
+	}
+
+	return hasDataDeps
+}
+
 // walkKeyHistory is the shared dependency walk for replay and tip normalization.
 // Missing nodes remain on the dependency frontier, so an exhausted queue cannot
 // disguise an unresolved branch. Non-missing load errors take precedence over
@@ -310,6 +360,12 @@ func walkKeyHistory(key string, tips []Tip, load func(Tip) (*pb.Effect, error)) 
 	snapshots := make([]Tip, 0, len(tips))
 	frontier := make(map[Tip]struct{}, len(tips))
 	enqueue := func(t Tip, eff *pb.Effect) {
+		if eff.GetSubscription() != nil {
+			delete(frontier, t)
+
+			return
+		}
+
 		if snap := eff.GetSnapshot(); snap != nil && snap.GetState() != nil {
 			snapshots = append(snapshots, t)
 		} else {
@@ -317,9 +373,9 @@ func walkKeyHistory(key string, tips []Tip, load func(Tip) (*pb.Effect, error)) 
 		}
 	}
 
-	for _, t := range tips {
-		if _, seen := nodes[t]; seen {
-			continue
+	visit := func(t Tip) *pb.Effect {
+		if eff, seen := nodes[t]; seen {
+			return eff
 		}
 
 		frontier[t] = struct{}{}
@@ -330,20 +386,23 @@ func walkKeyHistory(key string, tips []Tip, load func(Tip) (*pb.Effect, error)) 
 
 			recordError(err)
 
-			continue
+			return nil
 		}
 
 		nodes[t] = eff
 		if eff == nil {
-			continue
-		}
-		// A standalone subscription tip carries no data ancestry. If another
-		// path later references it, it becomes part of that path's frontier.
-		if eff.GetSubscription() != nil && len(eff.GetDeps()) == 0 {
-			delete(frontier, t)
+			return nil
 		}
 
 		enqueue(t, eff)
+
+		return eff
+	}
+
+	for _, t := range tips {
+		if eff := visit(t); eff.GetSubscription() != nil {
+			visitDataDeps(key, eff, visit)
+		}
 	}
 
 	for len(queue) > 0 || len(snapshots) > 0 {
@@ -371,41 +430,11 @@ func walkKeyHistory(key string, tips []Tip, load func(Tip) (*pb.Effect, error)) 
 			return nodes, lcaTip, walkError()
 		}
 
-		// Roots finish queued work without resolving their dependency path.
-		first := true
-		for ref := range keyDeps(key, eff) {
-			if first {
-				delete(frontier, cur)
-
-				first = false
-			}
-
-			dt := r(ref)
-			if dep, seen := nodes[dt]; seen {
-				if dep.GetSubscription() != nil && len(dep.GetDeps()) == 0 {
-					frontier[dt] = struct{}{}
-				}
-
-				continue
-			}
-
-			frontier[dt] = struct{}{}
-
-			depEff, err := load(dt)
-			if err != nil {
-				nodes[dt] = nil
-
-				recordError(err)
-
-				continue
-			}
-
-			nodes[dt] = depEff
-			if depEff == nil {
-				continue
-			}
-
-			enqueue(dt, depEff)
+		// A data effect with only subscription observations is a data root,
+		// exactly as if those metadata references had not been attached.
+		hasDataDeps := visitDataDeps(key, eff, visit)
+		if hasDataDeps {
+			delete(frontier, cur)
 		}
 	}
 

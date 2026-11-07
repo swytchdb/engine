@@ -2136,18 +2136,16 @@ func (e *Engine) collectCausalChain(key string, tips []keytrie.EffectRef) []*pb.
 
 	var chain []*pb.EffectRef
 
-	enqueue := func(tp Tip, standalone bool) {
+	// Keep subscription refs in the advertised causal history. visitDataDeps
+	// distinguishes those observations from the data ancestry they carry.
+	enqueue := func(tp Tip) *pb.Effect {
 		if tp == zero {
-			return
+			return nil
 		}
 
 		eff, ok := e.effectCache.Get(tp)
 		if visited[tp] {
-			if !standalone && ok && eff.GetSubscription() != nil && len(eff.GetDeps()) == 0 {
-				frontier[tp] = struct{}{}
-			}
-
-			return
+			return eff
 		}
 
 		visited[tp] = true
@@ -2155,11 +2153,13 @@ func (e *Engine) collectCausalChain(key string, tips []keytrie.EffectRef) []*pb.
 		chain = append(chain, toPbRef(tp))
 
 		if !ok {
-			return
+			return nil
 		}
 
-		if standalone && eff.GetSubscription() != nil && len(eff.GetDeps()) == 0 {
+		if eff.GetSubscription() != nil {
 			delete(frontier, tp)
+
+			return eff
 		}
 
 		if snap := eff.GetSnapshot(); snap != nil && snap.GetState() != nil {
@@ -2167,10 +2167,14 @@ func (e *Engine) collectCausalChain(key string, tips []keytrie.EffectRef) []*pb.
 		} else {
 			queue = append(queue, tp)
 		}
+
+		return eff
 	}
 
 	for _, tp := range tips {
-		enqueue(tp, true)
+		if eff := enqueue(tp); eff.GetSubscription() != nil {
+			visitDataDeps(key, eff, enqueue)
+		}
 	}
 
 	for len(queue) > 0 || len(snapshots) > 0 {
@@ -2190,15 +2194,9 @@ func (e *Engine) collectCausalChain(key string, tips []keytrie.EffectRef) []*pb.
 			break
 		}
 
-		first := true
-		for ref := range keyDeps(key, eff) {
-			if first {
-				delete(frontier, cur)
-
-				first = false
-			}
-
-			enqueue(r(ref), false)
+		hasDataDeps := visitDataDeps(key, eff, enqueue)
+		if hasDataDeps {
+			delete(frontier, cur)
 		}
 	}
 
@@ -2230,17 +2228,15 @@ func (e *Engine) ingestNackTips(nack *pb.NackNotify) {
 	snapshots := make([]Tip, 0, len(nack.GetTipDetails()))
 	frontier := make(map[Tip]struct{}, len(nack.GetTipDetails()))
 	nodes := make(map[Tip]*pb.Effect)
-	enqueue := func(off Tip, standalone bool) {
+	// Ingest subscription observations normally; only their data ancestry
+	// participates in the snapshot stopping rule.
+	enqueue := func(off Tip) *pb.Effect {
 		if off == zero {
-			return
+			return nil
 		}
 
 		if visited[off] {
-			if eff := nodes[off]; !standalone && eff.GetSubscription() != nil && len(eff.GetDeps()) == 0 {
-				frontier[off] = struct{}{}
-			}
-
-			return
+			return nodes[off]
 		}
 
 		visited[off] = true
@@ -2254,21 +2250,23 @@ func (e *Engine) ingestNackTips(nack *pb.NackNotify) {
 			slog.Debug("ingestNackTips: handleBackfill failed",
 				"ref", off, "error", err)
 
-			return
+			return nil
 		}
 
 		if e.effectCache == nil {
-			return
+			return nil
 		}
 
 		eff, ok := e.effectCache.Get(off)
 		if !ok {
-			return
+			return nil
 		}
 
 		nodes[off] = eff
-		if standalone && eff.GetSubscription() != nil && len(eff.GetDeps()) == 0 {
+		if eff.GetSubscription() != nil {
 			delete(frontier, off)
+
+			return eff
 		}
 
 		if snap := eff.GetSnapshot(); snap != nil && snap.GetState() != nil {
@@ -2276,10 +2274,14 @@ func (e *Engine) ingestNackTips(nack *pb.NackNotify) {
 		} else {
 			queue = append(queue, off)
 		}
+
+		return eff
 	}
 
 	for _, detail := range nack.GetTipDetails() {
-		enqueue(r(detail.GetRef()), true)
+		if eff := enqueue(r(detail.GetRef())); eff.GetSubscription() != nil {
+			visitDataDeps(key, eff, enqueue)
+		}
 	}
 
 	for len(queue) > 0 || len(snapshots) > 0 {
@@ -2295,15 +2297,9 @@ func (e *Engine) ingestNackTips(nack *pb.NackNotify) {
 			break
 		}
 
-		first := true
-		for ref := range keyDeps(string(nack.GetKey()), eff) {
-			if first {
-				delete(frontier, cur)
-
-				first = false
-			}
-
-			enqueue(r(ref), false)
+		hasDataDeps := visitDataDeps(key, eff, enqueue)
+		if hasDataDeps {
+			delete(frontier, cur)
 		}
 	}
 
