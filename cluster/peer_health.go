@@ -42,6 +42,19 @@ type PeerHealth struct {
 	// clock holds the per-peer measurement windows (offsets, inter-arrival)
 	// and derives RTT_min / skew / inter-arrival statistics from them.
 	clock *peerClockStats
+
+	// Each direction has the two counters carried by a heartbeat. Membership
+	// owns their lifetime; a new node identity starts without prior evidence.
+	sent, processed         atomic.Uint64
+	peerSent, peerProcessed atomic.Uint64
+}
+
+func advanceEffectCounter(counter *atomic.Uint64, value uint64) {
+	for old := counter.Load(); value > old; old = counter.Load() {
+		if counter.CompareAndSwap(old, value) {
+			return
+		}
+	}
 }
 
 // IsReplicationTarget returns true if this peer is both alive and has a

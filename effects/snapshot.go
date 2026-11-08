@@ -52,6 +52,11 @@ import (
 // post-resolution state.
 var errHorizonRetryNeeded = errors.New("reconstruct: horizon ancestor resolved, retry")
 
+const compactionInterval = 5 * time.Second
+
+// Elapsed time is used only to pace local maintenance, never to order effects.
+var compactionEpoch = time.Now()
+
 // leafState is the per-key payload attached to each critbit leaf (the trie's
 // T). It carries the cached subdag for the key so reads reuse the prepared
 // structure instead of rebuilding it. It is created once per key and mutated
@@ -59,6 +64,9 @@ var errHorizonRetryNeeded = errors.New("reconstruct: horizon ancestor resolved, 
 // the subdag, which is why this is a struct rather than a bare subdag pointer.
 type leafState struct {
 	subdag atomic.Pointer[cachedDag]
+	// Monotonic nanoseconds since compactionEpoch (+1 reserves zero for an
+	// unused leaf). Claiming before emission also paces aborted attempts.
+	lastCompaction atomic.Int64
 	// cloudConsulted marks that the Cloud read-miss backstop has received one
 	// complete answer for this key during this leaf's residency. It turns a
 	// nil reduction from "not known — ask Cloud" into "authoritatively
@@ -100,6 +108,15 @@ type leafState struct {
 	subMu           sync.Mutex
 	subscribers     []pb.NodeID
 	subscriberBytes int64
+}
+
+func (ls *leafState) claimCompaction(now int64) bool {
+	previous := ls.lastCompaction.Load()
+	if previous != 0 && now-previous < int64(compactionInterval) {
+		return false
+	}
+
+	return ls.lastCompaction.CompareAndSwap(previous, now)
 }
 
 // cachedDag is the reusable output of dag.prepare for a specific tip set: the
@@ -173,6 +190,7 @@ func (e *Engine) prepareDag(d *dag, key string, tips []Tip) error {
 			d.nodes = nodes
 			d.topoOrder = cs.topoOrder
 			d.lcaTip = cs.lcaTip
+			d.recordHistoryProcessed()
 
 			if d.activeTxnID == "" {
 				e.installBoundSubdags(d)
@@ -182,6 +200,7 @@ func (e *Engine) prepareDag(d *dag, key string, tips []Tip) error {
 		}
 	}
 
+	d.compact = d.activeTxnID == ""
 	if err := d.prepare(tips); err != nil {
 		return err
 	}

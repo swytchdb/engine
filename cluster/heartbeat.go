@@ -54,12 +54,12 @@ const (
 	livenessCheckFloor = 10 * time.Millisecond
 	livenessCheckCeil  = 500 * time.Millisecond
 
-	clockTickVersion byte = 1
+	clockTickVersion byte = 2
 
 	// tickHeaderSize = type(1) + version(1) + nodeID(8) + seq(8) +
-	// wallClock(8) + jumpNs(8) + count(2) = 36 bytes.
+	// wallClock(8) + jumpNs(8) + count(2) + effect counters(16) = 52 bytes.
 	// (Noise AEAD tag is added externally by the transport layer.)
-	tickHeaderSize = 36
+	tickHeaderSize = 52
 
 	// observedTickSize = node(8) + seq(8) + observedAt(8) = 24 bytes.
 	observedTickSize = 24
@@ -101,6 +101,12 @@ type ClockTick struct {
 	// origin: its wall clock stepped, so accumulated skew samples are stale.
 	JumpNs int64
 
+	// Effect counters are per recipient and independent of clock measurements.
+	// MyCount includes relevant local publications while the peer was away.
+	// YourCount names an effect from the recipient whose ancestry we processed;
+	// it is a witness, not a promise of delivery on unrelated keys below it.
+	MyCount, YourCount uint64
+
 	Observed []ObservedTick
 }
 
@@ -127,6 +133,9 @@ type HeartbeatManager struct {
 
 	// sendFunc transmits a tick packet to a peer via the QUIC transport.
 	sendFunc func(peerID NodeId, data []byte) error
+	// Installed before Start. The engine applies transaction overlays without
+	// changing the authoritative counters held by peer health.
+	constrainProgress func(NodeId, uint64, uint64) (uint64, uint64)
 
 	cancel chan struct{}
 	wg     sync.WaitGroup
@@ -204,6 +213,14 @@ func (hm *HeartbeatManager) SendTickTo(peerID NodeId) {
 	hm.ownTicks.put(tick.Seq, tick.WallClock)
 	hm.mu.Unlock()
 
+	if ph := hm.healthTable.Get(peerID); ph != nil {
+		tick.MyCount, tick.YourCount = ph.sent.Load(), ph.processed.Load()
+	}
+
+	if hm.constrainProgress != nil {
+		tick.MyCount, tick.YourCount = hm.constrainProgress(peerID, tick.MyCount, tick.YourCount)
+	}
+
 	if err := hm.sendFunc(peerID, MarshalClockTick(tick)); err != nil {
 		slog.Debug("immediate clock tick send failed", "peer", peerID, "error", err)
 	}
@@ -230,6 +247,8 @@ func (hm *HeartbeatManager) ProcessInboundTick(peerID NodeId, tick *ClockTick) {
 
 	now := time.Now()
 	ph := hm.healthTable.GetOrCreate(peerID)
+	advanceEffectCounter(&ph.peerSent, tick.MyCount)
+	advanceEffectCounter(&ph.peerProcessed, tick.YourCount)
 	RecordClockTickReceived(peerID)
 
 	if tick.JumpNs != 0 {
@@ -368,7 +387,8 @@ func (hm *HeartbeatManager) livenessCadence() time.Duration {
 
 // sendTick emits the next clock tick to every registered peer: one sequence
 // number, one wall-clock reading, the drained observation set, marshaled
-// once and fanned out — every peer sees the same clock-DAG entry.
+// once, then extended with each recipient's effect counters. Every peer sees
+// the same clock-DAG entry, but its own replication evidence.
 func (hm *HeartbeatManager) sendTick() {
 	now := time.Now()
 	wall := now.UnixNano()
@@ -413,7 +433,19 @@ func (hm *HeartbeatManager) sendTick() {
 	}
 
 	for _, peerID := range peerIDs {
-		if err := hm.sendFunc(peerID, packet); err != nil {
+		peerPacket := slices.Clone(packet)
+
+		if ph := hm.healthTable.Get(peerID); ph != nil {
+			my, your := ph.sent.Load(), ph.processed.Load()
+			if hm.constrainProgress != nil {
+				my, your = hm.constrainProgress(peerID, my, your)
+			}
+
+			binary.LittleEndian.PutUint64(peerPacket[36:44], my)
+			binary.LittleEndian.PutUint64(peerPacket[44:52], your)
+		}
+
+		if err := hm.sendFunc(peerID, peerPacket); err != nil {
 			slog.Debug("clock tick send failed", "peer", peerID, "error", err)
 
 			continue
@@ -520,7 +552,7 @@ func (r *tickRing) get(seq uint64) (int64, bool) {
 
 // MarshalClockTick builds a clock tick plaintext body:
 // [1:type][1:version][8:nodeID LE][8:seq LE][8:wallClock LE][8:jumpNs LE]
-// [2:count LE] + count × [8:node LE][8:seq LE][8:observedAt LE]
+// [2:count LE][8:myCount LE][8:yourCount LE] + count × [8:node LE][8:seq LE][8:observedAt LE]
 // Encryption (Noise AEAD) is applied by the transport layer.
 func MarshalClockTick(tick *ClockTick) []byte {
 	buf := make([]byte, tickHeaderSize+len(tick.Observed)*observedTickSize)
@@ -531,6 +563,8 @@ func MarshalClockTick(tick *ClockTick) []byte {
 	binary.LittleEndian.PutUint64(buf[18:26], uint64(tick.WallClock))
 	binary.LittleEndian.PutUint64(buf[26:34], uint64(tick.JumpNs))
 	binary.LittleEndian.PutUint16(buf[34:36], uint16(len(tick.Observed)))
+	binary.LittleEndian.PutUint64(buf[36:44], tick.MyCount)
+	binary.LittleEndian.PutUint64(buf[44:52], tick.YourCount)
 
 	off := tickHeaderSize
 	for _, obs := range tick.Observed {
@@ -545,16 +579,22 @@ func MarshalClockTick(tick *ClockTick) []byte {
 
 // ParseClockTick parses a clock tick plaintext body (already Noise-decrypted).
 func ParseClockTick(body []byte) (*ClockTick, error) {
-	if len(body) < tickHeaderSize {
-		return nil, fmt.Errorf("clock tick too short: %d < %d", len(body), tickHeaderSize)
+	const legacyHeaderSize = 36
+	if len(body) < legacyHeaderSize {
+		return nil, fmt.Errorf("clock tick too short: %d < %d", len(body), legacyHeaderSize)
 	}
 
-	if body[1] != clockTickVersion {
+	if body[1] != clockTickVersion && body[1] != 1 {
 		return nil, fmt.Errorf("unsupported clock tick version: %d", body[1])
 	}
 
+	headerSize := tickHeaderSize
+	if body[1] == 1 {
+		headerSize = legacyHeaderSize // Legacy peers supply no reclamation evidence.
+	}
+
 	count := int(binary.LittleEndian.Uint16(body[34:36]))
-	if want := tickHeaderSize + count*observedTickSize; len(body) != want {
+	if want := headerSize + count*observedTickSize; len(body) != want {
 		return nil, fmt.Errorf("clock tick length %d does not match %d observations (want %d)",
 			len(body), count, want)
 	}
@@ -565,10 +605,15 @@ func ParseClockTick(body []byte) (*ClockTick, error) {
 		WallClock: int64(binary.LittleEndian.Uint64(body[18:26])),
 		JumpNs:    int64(binary.LittleEndian.Uint64(body[26:34])),
 	}
+	if body[1] == clockTickVersion {
+		tick.MyCount = binary.LittleEndian.Uint64(body[36:44])
+		tick.YourCount = binary.LittleEndian.Uint64(body[44:52])
+	}
+
 	if count > 0 {
 		tick.Observed = make([]ObservedTick, count)
 
-		off := tickHeaderSize
+		off := headerSize
 		for i := range tick.Observed {
 			tick.Observed[i] = ObservedTick{
 				NodeID:     NodeId(binary.LittleEndian.Uint64(body[off : off+8])),

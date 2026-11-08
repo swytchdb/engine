@@ -34,6 +34,7 @@ import (
 	"slices"
 	"sort"
 	"sync"
+	"time"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
 	"github.com/swytchdb/engine/keytrie"
@@ -64,7 +65,8 @@ type Context struct {
 	keys        map[string]*contextKey
 	watchedKeys map[string]*watchedKeyState // keys registered via Watch with WATCH-time state
 	txSnapshot  *transactionSnapshot        // compact boundary and lazily captured causal history
-	readErr     error                       // failed transactional reads must not flush queued writes
+	history     historyOverlay
+	readErr     error // failed transactional reads must not flush queued writes
 
 	// readOnly marks a context used only for read-only, non-transactional
 	// commands. Such a context may answer a read-miss from the cluster key
@@ -288,6 +290,13 @@ func (c *Context) getSnapshot(key string) (*pb.ReducedEffect, []Tip, error) {
 		}
 
 		if !c.readOnly && result != nil && chainLen >= compactThreshold {
+			ls := c.engine.index.LoadData(key)
+
+			stamp := time.Since(compactionEpoch).Nanoseconds() + 1
+			if ls == nil || !ls.claimCompaction(stamp) {
+				return filterSnapshot(result), tips, nil
+			}
+
 			slog.Debug("compaction: emitting snapshot",
 				"key", key,
 				"chainLen", chainLen,
@@ -324,6 +333,7 @@ func (c *Context) getSnapshot(key string) (*pb.ReducedEffect, []Tip, error) {
 				Key:  []byte(key),
 				Kind: &pb.Effect_Snapshot{Snapshot: snapEff},
 			}, tips); err != nil {
+				ls.lastCompaction.CompareAndSwap(stamp, 0)
 				slog.Error("compaction: snapshot emit failed",
 					"key", key,
 					"chainLen", chainLen,
@@ -590,6 +600,8 @@ func (c *Context) BeginTx() {
 		return // nested transaction inherits outer
 	}
 
+	c.engine.pinHistory(&c.history)
+
 	c.inTx = true
 	// A prior WATCH may have already materialized our txn id; reuse it
 	// so the WATCH noop and the MULTI/EXEC effects share one tx.
@@ -610,6 +622,7 @@ func (c *Context) BeginTx() {
 // Returns false if any watched key was modified — the caller should abort
 // the transaction and return a null array to the client.
 func (c *Context) CheckWatches() bool {
+	c.engine.pinHistory(&c.history)
 	// BeginTx already captured the SSI snapshot at txn start. Cover the
 	// case where CheckWatches is called without a prior BeginTx (no
 	// transactional emits before EXEC).
@@ -638,6 +651,7 @@ func (c *Context) CheckWatches() bool {
 		c.inTx = false
 		c.txnID = ""
 		c.txSnapshot = nil
+		c.engine.unpinHistory(&c.history)
 
 		return false
 	}
@@ -656,6 +670,7 @@ func (c *Context) CheckWatches() bool {
 			c.inTx = false
 			c.txnID = ""
 			c.txSnapshot = nil
+			c.engine.unpinHistory(&c.history)
 
 			return false
 		}
@@ -692,6 +707,8 @@ func (c *Context) Abort() {
 // tips the handler actually read, not whatever the index contains now.
 // Pure writes (SET, LPUSH) omit snapshotTips and Emit reads the index.
 func (c *Context) Emit(eff *pb.Effect, snapshotTips ...[]Tip) error {
+	c.engine.pinHistory(&c.history)
+
 	if c.readErr != nil {
 		return c.readErr
 	}
@@ -984,6 +1001,8 @@ func (c *Context) rawEmit(eff *pb.Effect) (Tip, *pb.OffsetNotify, error) {
 // Flush updates the index for all touched keys and broadcasts all
 // notifications per key for durability, then resets the context for reuse.
 func (c *Context) Flush() error {
+	defer c.engine.unpinHistory(&c.history)
+
 	if c.readErr != nil {
 		err := c.readErr
 		c.Abort()
@@ -1861,6 +1880,7 @@ func (c *Context) emitSerializationEffect(key string) {
 
 // reset clears the context for reuse.
 func (c *Context) reset() {
+	c.engine.unpinHistory(&c.history)
 	// Reuse small command maps, but let an unusually large transaction's map
 	// go: clear alone retains its buckets for the lifetime of the context.
 	if len(c.keys) > 16 {

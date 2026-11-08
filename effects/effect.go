@@ -118,6 +118,9 @@ type Engine struct {
 	// In-memory offset generator (no durable log)
 	nextOff atomic.Uint64
 
+	historyMu       sync.Mutex
+	historyOverlays *historyOverlay
+
 	subscriptions *xsync.Map[string, *subscriptionState]
 
 	safety atomic.Pointer[safetyMap]
@@ -851,6 +854,7 @@ func (e *Engine) mintLocalEffect(key string, currentSet *keytrie.TipSet, eff *pb
 // fireLocalEffect invokes OnLocalEffect for a freshly-minted persisted effect.
 func (e *Engine) fireLocalEffect(offset Tip, eff *pb.Effect) {
 	e.observeTemporal(offset, eff, false)
+	e.recordHistorySent(offset, eff)
 
 	e.localEffectMu.RLock()
 	defer e.localEffectMu.RUnlock()

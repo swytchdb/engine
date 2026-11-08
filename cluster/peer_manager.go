@@ -252,6 +252,12 @@ func (pm *PeerManager) Start(ctx context.Context) error {
 
 		// Start heartbeat manager
 		pm.heartbeat = NewHeartbeatManager(pm.config.NodeID, pm.healthTable, pm.config.Clock)
+		if handler, ok := pm.handler.(interface {
+			ConstrainHistoryProgress(NodeId, uint64, uint64) (uint64, uint64)
+		}); ok {
+			pm.heartbeat.constrainProgress = handler.ConstrainHistoryProgress
+		}
+
 		pm.heartbeat.Start(func(peerID NodeId, data []byte) error {
 			return pm.quicTransport.SendDirect(peerID, data)
 		})
@@ -521,6 +527,35 @@ func (pm *PeerManager) PeerIDs() []NodeId {
 	}
 
 	return ids
+}
+
+func (pm *PeerManager) HistoryProgress() []effects.HistoryProgress {
+	peers := pm.PeerIDs()
+
+	result := make([]effects.HistoryProgress, 0, len(peers))
+	for _, peer := range peers {
+		p := effects.HistoryProgress{Node: uint64(peer)}
+		if ph := pm.healthTable.Get(peer); ph != nil {
+			p.Minted, p.Processed = ph.peerSent.Load(), ph.peerProcessed.Load()
+			p.Received = ph.processed.Load()
+		}
+
+		result = append(result, p)
+	}
+
+	return result
+}
+
+func (pm *PeerManager) RecordHistorySent(peer NodeId, counter uint64) {
+	if ph := pm.healthTable.Get(peer); ph != nil {
+		advanceEffectCounter(&ph.sent, counter)
+	}
+}
+
+func (pm *PeerManager) RecordHistoryProcessed(peer NodeId, counter uint64) {
+	if ph := pm.healthTable.Get(peer); ph != nil {
+		advanceEffectCounter(&ph.processed, counter)
+	}
 }
 
 // SetForwardHandler sets the handler for forwarded transactions (adaptive serialization).

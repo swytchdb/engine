@@ -48,6 +48,14 @@ func NewEngineEffectHandler(engine *effects.Engine) *EngineEffectHandler {
 	return &EngineEffectHandler{engine: engine}
 }
 
+func (h *EngineEffectHandler) ConstrainHistoryProgress(peer NodeId, my, your uint64) (uint64, uint64) {
+	if h.engine == nil {
+		return 0, 0
+	}
+
+	return h.engine.ConstrainHistoryProgress(peer, my, your)
+}
+
 // HandleOffsetNotify delegates to the engine's HandleRemote. The
 // engine handles log storage, keytrie update, cache invalidation, NACK
 // generation, and notification callbacks.

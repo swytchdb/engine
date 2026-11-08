@@ -134,6 +134,7 @@ type dag struct {
 	// invisibility propagation in reconstruct) read this between
 	// prepare and iterate.
 	topoOrder []Tip
+	compact   bool // only a live frontier may release folded history
 }
 
 // dagTip carries the effect while sorting, avoiding map lookups per comparison.
@@ -196,7 +197,7 @@ func (d *dag) prepare(tips []Tip) error {
 	// Those nodes are already represented in the snapshot's reduced state;
 	// leaving them in d.nodes makes ReduceChain process the same data
 	// effects twice — duplicates in list reads, double-counts in scalars.
-	d.trimAncestorsOfLCA()
+	d.trimAncestorsOfLCA(tips)
 
 	if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
 		slog.Debug("dag.walk", "key", d.key, "nodes", len(d.nodes),
@@ -219,6 +220,8 @@ func (d *dag) prepare(tips []Tip) error {
 	for _, entry := range sortedTips {
 		d.topoCollect(entry.tip, topoVisited)
 	}
+
+	d.recordHistoryProcessed()
 
 	return nil
 }
@@ -457,10 +460,11 @@ func walkKeyHistory(key string, tips []Tip, load func(Tip) (*pb.Effect, error)) 
 // double-count their data effects (the symptom is duplicate elements in
 // a list-append read).
 //
-// Only nodes already in d.nodes are removed — we don't fetch additional
-// effects from the engine. The bfs that populated d.nodes is the only
-// source of folded-ancestor entries we need to clear.
-func (d *dag) trimAncestorsOfLCA() {
+// For a live frontier, the same traversal also visits resident folded history.
+// Subscriber evidence and transaction overlays select a retained snapshot cut;
+// only creation ownership below that snapshot is released. Reads and frontier
+// normalization never fetch below the LCA to perform reclamation.
+func (d *dag) trimAncestorsOfLCA(tips []Tip) {
 	var zero Tip
 	if d.lcaTip == zero {
 		return
@@ -471,26 +475,83 @@ func (d *dag) trimAncestorsOfLCA() {
 		return
 	}
 
-	stack := make([]Tip, 0, len(lcaEff.GetDeps()))
-	for _, dep := range lcaEff.GetDeps() {
-		stack = append(stack, r(dep))
+	var boundary *historyBoundary
+
+	if d.compact && !isSystemKey([]byte(d.key)) {
+		d.engine.historyMu.Lock()
+		defer d.engine.historyMu.Unlock()
+
+		if tipsEqual(d.engine.index.Contains(d.key).Tips(), tips) {
+			boundary = d.engine.historyBoundary(d.key)
+		}
 	}
 
+	type visit struct {
+		tip     Tip
+		known   []bool
+		release bool
+	}
+
+	first := visit{tip: d.lcaTip}
+	if boundary != nil {
+		first.known = make([]bool, len(boundary.peers))
+	}
+
+	stack := []visit{first}
+	visited := make(map[Tip]bool)
+
 	for len(stack) > 0 {
-		cur := stack[len(stack)-1]
+		entry := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
 
-		eff, ok := d.nodes[cur]
-		if !ok {
+		cur := entry.tip
+		if visited[cur] {
 			continue
 		}
 
-		// Removing a node also marks it visited, so shared ancestors need no
-		// separate set and are expanded only once.
-		delete(d.nodes, cur)
+		visited[cur] = true
+
+		eff := d.nodes[cur]
+		if cur != d.lcaTip {
+			delete(d.nodes, cur)
+		}
+
+		if eff == nil && boundary != nil {
+			eff, _ = d.engine.effectCache.Get(cur)
+		}
+
+		if eff == nil {
+			continue // Unknown ancestry supplies no proof; never fetch it here.
+		}
+
+		if boundary != nil {
+			copied := false
+
+			for i, peer := range boundary.peers {
+				if !entry.known[i] && ((cur[0] == peer.Node && cur[1] <= peer.Minted) ||
+					(cur[0] == uint64(d.engine.nodeID) && cur[1] == peer.Processed)) {
+					if !copied {
+						entry.known = slices.Clone(entry.known)
+						copied = true
+					}
+
+					entry.known[i] = true
+				}
+			}
+
+			if entry.release {
+				d.engine.effectCache.decrefChainNode(d.key, cur)
+			} else if cur != d.lcaTip && eff.GetSnapshot().GetState() != nil &&
+				!slices.Contains(entry.known, false) && boundary.beforeOverlays(cur) {
+				// Keep the live LCA and at least one older state snapshot on
+				// each path, including the history between them. Overlays and
+				// missing subscriber evidence can move this cut further back.
+				entry.release = true
+			}
+		}
 
 		for dep := range keyDeps(d.key, eff) {
-			stack = append(stack, r(dep))
+			stack = append(stack, visit{tip: r(dep), known: entry.known, release: entry.release})
 		}
 	}
 }

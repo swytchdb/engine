@@ -22,6 +22,8 @@ func (e *Engine) installIngestedTips(key string, arrivals ...Tip) {
 		candidates := keytrie.NewTipSet(slices.Concat(current.Tips(), arrivals)...)
 
 		tips := candidates.Tips()
+		complete := false
+
 		if len(tips) > 1 {
 			live, _, err := normalizeTipCandidates(key, tips, nil, func(tip Tip) (*pb.Effect, error) {
 				return e.getEffect(key, tip)
@@ -30,7 +32,22 @@ func (e *Engine) installIngestedTips(key string, arrivals ...Tip) {
 				slog.Warn("frontier normalization incomplete; retaining unresolved tips", "key", key, "error", err)
 			}
 
+			complete = err == nil
+
 			candidates = keytrie.NewTipSet(live...)
+		}
+
+		recordProgress := func() {
+			if candidates.Len() != 1 {
+				return // A witness on one fork cannot certify the other forks.
+			}
+
+			tip := candidates.Tips()[0]
+
+			eff, _ := e.effectCache.Get(tip)
+			if eff != nil && (complete || (len(tips) == 1 && (eff.GetSnapshot().GetState() != nil || len(eff.GetDeps()) == 0))) {
+				e.recordHistoryProcessed(tip, eff)
+			}
 		}
 
 		// Preserve index identity for an unchanged frontier. Readers use that
@@ -38,6 +55,8 @@ func (e *Engine) installIngestedTips(key string, arrivals ...Tip) {
 		// invalidate their snapshots.
 		if current.Len() == candidates.Len() && current.ContainsAll(candidates.Tips()) {
 			if e.index.Contains(key) == current {
+				recordProgress()
+
 				return
 			}
 
@@ -45,6 +64,7 @@ func (e *Engine) installIngestedTips(key string, arrivals ...Tip) {
 		}
 
 		if _, ok := e.index.Insert(key, current, candidates); ok {
+			recordProgress()
 			e.notifyKeyChanged(key)
 
 			return
