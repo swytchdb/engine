@@ -202,7 +202,15 @@ func (e *Engine) prepareDag(d *dag, key string, tips []Tip) error {
 
 	d.compact = d.activeTxnID == ""
 	if err := d.prepare(tips); err != nil {
-		return err
+		if !errors.Is(err, errEffectNotResident) {
+			return err
+		}
+		// Failed ingestion can leave an unresolved frontier installed. Retry
+		// closure only for an actually missing reconstruction dependency;
+		// normal reads and reclaimed history never enter the fetch path.
+		if err := d.ingest(tips); err != nil {
+			return err
+		}
 	}
 
 	// A transaction reads its captured frontier. Installing historical tips
@@ -1148,7 +1156,7 @@ func (e *Engine) seedSubscribersFromDag(key string) {
 func (e *Engine) walkAndInstall(key string, tips []Tip) (installed, skipped int) {
 	for _, tipOff := range tips {
 		rd := newDag(e, key, "")
-		if walkErr := rd.walk([]Tip{tipOff}, func(*pb.Effect) error { return nil }); walkErr != nil {
+		if walkErr := rd.ingest([]Tip{tipOff}); walkErr != nil {
 			slog.Debug("walkAndInstall: skipping unreachable tip",
 				"key", key, "tip", tipOff, "error", walkErr)
 

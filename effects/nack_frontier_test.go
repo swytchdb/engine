@@ -40,14 +40,15 @@ type nackFrontierNode struct {
 }
 
 type nackFrontierCase struct {
-	name     string
-	nodes    []nackFrontierNode
-	tips     []string
-	lca      string
-	value    int64
-	missing  bool
-	required []string // refs needed even when another branch cannot be resolved
-	skipped  []string // history behind a valid common snapshot, or another key
+	name      string
+	nodes     []nackFrontierNode
+	tips      []string
+	lca       string
+	value     int64
+	missing   bool
+	required  []string // refs needed even when another branch cannot be resolved
+	skipped   []string // references outside this key's dependency graph
+	exhausted []string // absent ancestry below the reconstruction boundary
 }
 
 type frontierBroadcaster struct {
@@ -56,10 +57,14 @@ type frontierBroadcaster struct {
 	fetched map[Tip]bool
 }
 
-func (b *frontierBroadcaster) FetchFromAny(ref *pb.EffectRef, hint FetchHint) ([]byte, error) {
+func (b *frontierBroadcaster) FetchFromAny(ref *pb.EffectRef, _ FetchHint) ([]byte, error) {
 	b.fetched[r(ref)] = true
 
-	return b.selectiveBroadcaster.FetchFromAny(ref, hint)
+	if data := b.fetchable[r(ref)]; data != nil {
+		return data, nil
+	}
+
+	return nil, ErrEffectNotFound
 }
 
 // Replay answers what state is visible; collection advertises fetchable ancestry;
@@ -135,7 +140,7 @@ func TestNackWalkersDependencyFrontier(t *testing.T) {
 				{"r", "data", []string{"s"}, 1},
 				{"m", "data", []string{"l", "r"}, 1},
 			},
-			tips: []string{"s", "m"}, lca: "s", value: 13, skipped: []string{"pruned"},
+			tips: []string{"s", "m"}, lca: "s", value: 13, exhausted: []string{"pruned"},
 		},
 		{
 			name: "verdict-only-snapshot",
@@ -160,7 +165,7 @@ func TestNackWalkersDependencyFrontier(t *testing.T) {
 			nodes: []nackFrontierNode{
 				{"sub", "subscription", nil, 0}, {"s", "snapshot", []string{"pruned"}, 10},
 			},
-			tips: []string{"sub", "s"}, lca: "s", value: 10, skipped: []string{"pruned"},
+			tips: []string{"sub", "s"}, lca: "s", value: 10, exhausted: []string{"pruned"},
 		},
 		{
 			name: "referenced-subscription",
@@ -335,7 +340,20 @@ func checkNackFrontier(t *testing.T, tc nackFrontierCase, reverseTips, reverseDe
 		}
 	}
 
-	// Disable fetching so replay cannot silently repair incomplete ingestion.
+	for _, name := range tc.exhausted {
+		tip := ref(name)
+		if advertised[tip] || !bc.fetched[tip] {
+			t.Errorf("closure boundary %s: advertised=%t fetched=%t", name, advertised[tip], bc.fetched[tip])
+		}
+
+		if _, resident := remote.effectCache.Get(tip); resident {
+			t.Errorf("absent boundary %s unexpectedly became resident", name)
+		}
+	}
+
+	// Disable fetching so reconstruction cannot silently repair ingestion or
+	// depend on history below the common snapshot. Closure has exhausted those
+	// boundaries; their payloads deliberately remain unavailable.
 	remote.broadcaster = nil
 	for _, engine := range []*Engine{local, remote} {
 		d := newDag(engine, "k", "")

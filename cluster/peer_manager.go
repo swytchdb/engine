@@ -742,7 +742,11 @@ func (pm *PeerManager) fetchFromConns(ctx context.Context, offset *pb.EffectRef,
 	for range conns {
 		r := <-ch
 		if r.err != nil {
-			lastErr = r.err
+			// Absence is definitive only when every responding connection was
+			// missing. Never let a later empty reply mask a transport failure.
+			if lastErr == nil || errors.Is(lastErr, errFetchNotFound) || !errors.Is(r.err, errFetchNotFound) {
+				lastErr = r.err
+			}
 
 			continue
 		}

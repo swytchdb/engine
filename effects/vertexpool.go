@@ -58,6 +58,13 @@ type vertex struct {
 	creationMu    sync.Mutex
 	creationKeys  []string // sorted, unique; usually just the effect's own key
 	creationBytes int64
+	// Reverse navigation is not ownership. Identities do not pin descendant
+	// payloads, and this storage disappears with the ancestor. creationMu
+	// protects the slice and its memory accounting, not descendant lifetimes.
+	parents []struct {
+		tip Tip
+		key string
+	}
 }
 
 // VertexPool is the engine's deserialized effect store: a map from Tip to
@@ -133,6 +140,57 @@ func (p *VertexPool) Get(tip Tip) (*pb.Effect, bool) {
 	p.hits.Add(1)
 
 	return v.eff, true
+}
+
+func (p *VertexPool) getVertex(tip Tip) *vertex {
+	v, ok := p.m.Load(tip)
+	if !ok || v.refs.Load() < 0 {
+		p.misses.Add(1)
+
+		return nil
+	}
+
+	p.hits.Add(1)
+
+	return v
+}
+
+func (p *VertexPool) addParent(v *vertex, parent Tip, key string) {
+	v.creationMu.Lock()
+	defer v.creationMu.Unlock()
+
+	if v.refs.Load() < 0 {
+		return
+	}
+
+	for _, link := range v.parents {
+		if link.tip == parent && link.key == key {
+			return
+		}
+	}
+	// Reclamation removes payloads, not evidence of an established join.
+	// Keep the key as well: a shared bind can have parents on different keys,
+	// and the parent's payload may be gone when this edge is traversed.
+	v.parents = append(v.parents, struct {
+		tip Tip
+		key string
+	}{parent, key})
+	p.accountCreation(v)
+}
+
+// firstParent follows one established chain; cut discovery never enumerates
+// all reverse paths. A reclaimed parent's identity remains valid join evidence.
+func (v *vertex) firstParent(key string) (Tip, bool) {
+	v.creationMu.Lock()
+	defer v.creationMu.Unlock()
+
+	for _, link := range v.parents {
+		if link.key == key {
+			return link.tip, true
+		}
+	}
+
+	return Tip{}, false
 }
 
 // Put stores eff at tip and accounts for its resident protobuf allocations.
@@ -382,6 +440,10 @@ func (p *VertexPool) claimAndDelete(tip Tip, v *vertex) int64 {
 		return 0
 	}
 
+	// Finish navigation/accounting updates before retiring their storage.
+	v.creationMu.Lock()
+	defer v.creationMu.Unlock()
+
 	if !v.refs.CompareAndSwap(0, vertexTombstone) {
 		return 0
 	}
@@ -482,9 +544,13 @@ func (p *VertexPool) Bytes() int64 {
 
 // Call with creationMu held, or before publishing a new vertex.
 func (p *VertexPool) accountCreation(v *vertex) {
-	cost := memsize.Alloc(int64(cap(v.creationKeys)) * 16)
+	cost := memsize.Alloc(int64(cap(v.creationKeys))*16) + memsize.Alloc(int64(cap(v.parents))*int64(unsafe.Sizeof(v.parents[0])))
 	for _, key := range v.creationKeys {
 		cost += memsize.Alloc(int64(len(key)))
+	}
+
+	for _, link := range v.parents {
+		cost += memsize.Alloc(int64(len(link.key)))
 	}
 
 	p.vertexBytes.Add(cost - v.creationBytes)

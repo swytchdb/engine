@@ -587,6 +587,10 @@ var ErrCloudUnavailable = errors.New("cloud unavailable")
 // Cloud's own billing sweep is what eventually heals or prunes the marker.
 var ErrCDNBlobMissing = errors.New("cdn blob missing")
 
+// ErrEffectNotFound is a peer's definitive empty fetch response. An unreachable
+// peer must return a transport error instead; closure cannot exhaust that path.
+var ErrEffectNotFound = errors.New("effect not found on peer")
+
 // NormalizeCloudTipCandidates reduces Cloud's marker candidates to the
 // maximal tips of the effect DAG. Cloud's tips directory is an index: stale
 // markers can remain after a newer effect has dep-referenced them, so callers
@@ -792,7 +796,7 @@ func (e *Engine) classifyCloudTips(key string, tips []Tip, sidecar []CloudEffect
 	// insufficient to prove the whole frontier installable together.
 	rd := newDag(e, key, "")
 
-	walkErr := rd.walk(stateTips, func(*pb.Effect) error { return nil })
+	walkErr := rd.ingest(stateTips)
 	switch {
 	case walkErr == nil:
 		classification.install = append(classification.install, stateTips...)
@@ -808,7 +812,7 @@ func (e *Engine) classifyCloudTips(key string, tips []Tip, sidecar []CloudEffect
 	for _, tip := range stateTips {
 		rd := newDag(e, key, "")
 
-		walkErr := rd.walk([]Tip{tip}, func(*pb.Effect) error { return nil })
+		walkErr := rd.ingest([]Tip{tip})
 		switch {
 		case walkErr == nil:
 			classification.install = append(classification.install, tip)
@@ -2336,10 +2340,8 @@ func (e *Engine) ingestCausalChain(nack *pb.NackNotify) {
 }
 
 // prefetchEffects fetches every listed ref not already resident in parallel
-// and caches the deserialized effects, so a subsequent dag.bfs finds
-// everything locally instead of doing sequential FetchFromAny calls. Purely a
-// cache warmer: it installs no tips, and a failed fetch is skipped — the walk
-// that follows fetches stragglers itself.
+// and caches the deserialized effects for synchronous ingestion. It installs
+// no tips; ingestion resolves dependencies omitted by a failed prefetch.
 func (e *Engine) prefetchEffects(refs []Tip) {
 	if e.effectCache == nil || len(refs) == 0 {
 		return
