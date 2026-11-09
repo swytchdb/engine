@@ -43,6 +43,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/semaphore"
+	"golang.org/x/sync/singleflight"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -107,9 +108,10 @@ type Engine struct {
 	// which carries the cached subdag (and, later, eviction metadata) for
 	// each key — one structure, the trie, owns both the tips and the
 	// derived read cache.
-	index       *keytrie.Critbit[leafState]
-	broadcaster Broadcaster // nil for standalone
-	cloudReader CloudReader // nil when no cloud is configured (standalone/dev)
+	index         *keytrie.Critbit[leafState]
+	broadcaster   Broadcaster        // nil for standalone
+	cloudReader   CloudReader        // nil when no cloud is configured (standalone/dev)
+	ancestryLoads singleflight.Group // active per-key downloads; no completed-result cache
 
 	nodeID   pb.NodeID
 	clock    *crdt.HLC
@@ -211,6 +213,10 @@ type Engine struct {
 
 	// Striped locks for per-key atomic operations
 	locks [4096]sync.Mutex
+
+	// Closure admission is separate from command locks, which callers may
+	// already hold. One active walk per shard bounds traversal allocations.
+	closureLocks [64]sync.Mutex
 
 	// FlushGeneration is incremented on each FlushIndex call.
 	// Used by WATCH to detect FLUSHALL/FLUSHDB between WATCH and EXEC.

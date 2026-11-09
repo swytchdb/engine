@@ -51,6 +51,8 @@ func handleStream(stream *quic.Stream, logReader LogReader, forwardHandler Forwa
 	switch typeBuf[0] {
 	case streamTypeFetch:
 		handleFetchStream(stream, logReader)
+	case streamTypeAncestry:
+		handleAncestryStream(stream, logReader)
 	case streamTypeForward:
 		handleForwardStream(stream, forwardHandler)
 	default:

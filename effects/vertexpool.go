@@ -50,6 +50,10 @@ type vertex struct {
 	eff  *pb.Effect
 	size int64
 	refs atomic.Int32
+	// isRoot means missing ancestry beyond this vertex need not be fetched.
+	// Resident dependencies still participate in traversal and consumption.
+	// Protected by creationMu.
+	isRoot bool
 	// Temporal completion belongs to this resident copy, so eviction also
 	// discards the bookkeeping. Bits are set only after evidence publication.
 	temporal atomic.Uint32
@@ -153,6 +157,20 @@ func (p *VertexPool) getVertex(tip Tip) *vertex {
 	p.hits.Add(1)
 
 	return v
+}
+
+func (v *vertex) root() bool {
+	v.creationMu.Lock()
+	defer v.creationMu.Unlock()
+
+	return v.isRoot
+}
+
+func (v *vertex) markRoot() {
+	v.creationMu.Lock()
+	defer v.creationMu.Unlock()
+
+	v.isRoot = true
 }
 
 func (p *VertexPool) addParent(v *vertex, parent Tip, key string) {

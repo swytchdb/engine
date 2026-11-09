@@ -1,0 +1,24 @@
+syntax = "proto3";
+package swytch.cluster.v1;
+
+option go_package = "github.com/swytchdb/engine/cluster/proto";
+
+import "cluster/proto/replication.proto";
+
+// A streaming resident ancestry transfer. Dependencies are scoped to key using
+// the same rules as ingestion. Snapshots do not terminate the transfer.
+message AncestryRequest {
+  string key = 1;
+  EffectRef root = 2;
+}
+
+// One effect or peer-local missing boundary. A clean transfer ends with done;
+// EOF/reset without done is a transport failure, never evidence of absence.
+message AncestryResponse {
+  EffectRef ref = 1;
+  bytes effect_data = 2;
+  bool done = 3;
+  string error = 4;
+  // History beyond this vertex has been culled, regardless of its effect deps.
+  bool is_root = 5;
+}

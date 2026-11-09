@@ -7,14 +7,27 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"sync"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/swytchdb/engine/keytrie"
 )
+
+// closureLock must be acquired before allocating traversal state. Keep at
+// most one shard held, including for multi-key binds. When nodeMu is needed,
+// it is acquired first; closure must never acquire it or reenter ingestion.
+func (e *Engine) closureLock(key string) *sync.Mutex {
+	return &e.closureLocks[xxhash.Sum64String(key)%uint64(len(e.closureLocks))]
+}
 
 // installIngestedTips reconciles the incoming and existing causal regions.
 // Closure discovers graph relationships, not values: snapshots have the same
 // dependency semantics as any other vertex here.
 func (e *Engine) installIngestedTips(key string, arrivals ...Tip) {
+	mu := e.closureLock(key)
+	mu.Lock()
+	defer mu.Unlock()
+
 	// Payloads remain in the vertex pool. Only fetch outcomes survive a failed
 	// publication CAS, so retries do not repeat unavailable boundary requests.
 	attempted := make(map[Tip]error)
@@ -22,7 +35,7 @@ func (e *Engine) installIngestedTips(key string, arrivals ...Tip) {
 	for {
 		current := e.index.Contains(key)
 		tips := keytrie.NewTipSet(slices.Concat(current.Tips(), arrivals)...).Tips()
-		live, complete, err := e.closeIngestedFrontier(key, tips, attempted)
+		live, complete, err := e.closeIngestedFrontierLocked(key, tips, attempted)
 		next := keytrie.NewTipSet(live...)
 
 		if current.Len() == next.Len() && current.ContainsAll(live) {
@@ -55,6 +68,17 @@ func (e *Engine) installIngestedTips(key string, arrivals ...Tip) {
 }
 
 func (e *Engine) closeIngestedFrontier(key string, supplied []Tip, attempted map[Tip]error) ([]Tip, bool, error) {
+	mu := e.closureLock(key)
+	mu.Lock()
+	defer mu.Unlock()
+
+	return e.closeIngestedFrontierLocked(key, supplied, attempted)
+}
+
+// closeIngestedFrontierLocked requires the key's closure shard. Ingestion
+// retains it across frontier publication and CAS retries; recovery uses the
+// wrapper above and releases it before reconstruction.
+func (e *Engine) closeIngestedFrontierLocked(key string, supplied []Tip, attempted map[Tip]error) ([]Tip, bool, error) {
 	// These are connected cuts of the discovered graph, not a second graph.
 	// Membership never establishes dominance or implies downward expansion.
 	type cut struct {
@@ -68,6 +92,7 @@ func (e *Engine) closeIngestedFrontier(key string, supplied []Tip, attempted map
 	live := make(map[Tip]struct{})
 	expanded := make(map[Tip]bool) // absent: unscheduled; false: queued; true: expanded
 	pending := make(map[Tip][]Tip) // missing boundary -> downward parents awaiting its payload
+	noFetch := make(map[Tip]bool)  // ancestry below a reclamation boundary
 
 	var queue []Tip
 
@@ -230,6 +255,12 @@ func (e *Engine) closeIngestedFrontier(key string, supplied []Tip, attempted map
 
 			v := resident(tip)
 			if v == nil {
+				if noFetch[tip] {
+					delete(pending, tip)
+
+					continue
+				}
+
 				if _, exists := pending[tip]; !exists {
 					pending[tip] = nil
 				}
@@ -251,6 +282,10 @@ func (e *Engine) closeIngestedFrontier(key string, supplied []Tip, attempted map
 
 			expanded[tip] = true
 
+			if v.root() {
+				noFetch[tip] = true
+			}
+
 			for ref := range keyDeps(key, v.eff) {
 				dep := r(ref)
 				if dep == (Tip{}) || dep == tip {
@@ -258,6 +293,17 @@ func (e *Engine) closeIngestedFrontier(key string, supplied []Tip, attempted map
 				}
 				// Only this genuine downward edge establishes consumption.
 				delete(live, dep)
+
+				if noFetch[tip] && !noFetch[dep] {
+					noFetch[dep] = true
+					// Another path may have expanded this vertex first. Pass
+					// the newly discovered fetch boundary through its resident
+					// ancestry too; each vertex can gain this evidence once.
+					if expanded[dep] {
+						expanded[dep] = false
+						queue = append(queue, dep)
+					}
+				}
 
 				dv := resident(dep)
 				if known := owners[dep]; known != nil {
@@ -293,6 +339,12 @@ func (e *Engine) closeIngestedFrontier(key string, supplied []Tip, attempted map
 		for tip := range pending {
 			if resident(tip) != nil {
 				queue = append(queue, tip)
+
+				continue
+			}
+
+			if noFetch[tip] {
+				delete(pending, tip)
 
 				continue
 			}
@@ -344,7 +396,11 @@ func (e *Engine) closeIngestedFrontier(key string, supplied []Tip, attempted map
 			}
 		}
 
-		_, err := e.getEffect(key, best)
+		missing, err := e.fetchFrontierAncestry(key, best)
+		for _, tip := range missing {
+			attempted[tip] = ErrEffectNotFound
+		}
+
 		if err == nil && resident(best) == nil {
 			err = fmt.Errorf("effect %v reclaimed during frontier closure", best)
 		}
