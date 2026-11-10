@@ -124,10 +124,8 @@ func (cs *CloudSync) CloudTips(ctx context.Context, key string) ([]effects.Tip, 
 	return tips, sidecar, missing, nil
 }
 
-// MarkPending implements effects.CloudReader: it records a key whose Cloud
-// frontier has a durable hole (or whose read was served outbox-only during a
-// cloud outage), pending a re-consult by reconcileLoop. The caller logs the
-// reason; this just tracks it.
+// MarkPending schedules a re-consult when the outbox was served without a
+// complete GetTips response. It does not classify the graph's reconstructability.
 func (cs *CloudSync) MarkPending(key string) {
 	cs.mu.Lock()
 	if cs.reconcile == nil {
@@ -197,12 +195,9 @@ func (cs *CloudSync) reconcileLoop() {
 	}
 }
 
-// reconcileBatch re-consults GetTips for a batch of keys in one RPC and merges
-// each returned frontier into the DAG. A key is cleared from the pending set
-// only when the cloud gave a complete answer for it and its frontier installed
-// with nothing left pending; anything else (install error, or a durable hole
-// InstallCloudTips reports back as still-pending) leaves it pending for the
-// next tick. The whole RPC failing (cloud still unreachable) clears nothing.
+// reconcileBatch re-consults GetTips and ingests the returned closure. Transport
+// failures leave the key scheduled for retry. Definitive absence is an exhausted
+// closure boundary; whether a read needs that history belongs to reconstruction.
 func (cs *CloudSync) reconcileBatch(keys []string) {
 	names := make([][]byte, len(keys))
 
@@ -235,15 +230,8 @@ func (cs *CloudSync) reconcileBatch(keys []string) {
 			continue
 		}
 
-		pending, err := cs.engine.InstallCloudTips(key, tips, cs.appendSidecar(nil, kt), cloudTips(kt.GetMissing()))
-		if err != nil {
+		if err := cs.engine.InstallCloudTips(key, tips, cs.appendSidecar(nil, kt)); err != nil {
 			slog.Warn("cloud reconcile: install failed; will retry", "key", key, "error", err)
-
-			continue
-		}
-
-		if len(pending) > 0 {
-			slog.Warn("cloud reconcile: frontier partially holed; leaving pending", "key", key, "pending", pending)
 
 			continue
 		}

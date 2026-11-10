@@ -30,6 +30,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -584,13 +585,9 @@ const cloudTipsBackstop = 60 * time.Second
 // indistinguishable from data loss.
 var ErrCloudUnavailable = errors.New("cloud unavailable")
 
-// ErrCDNBlobMissing marks a CDN fetch that answered 404: the blob is provably
-// absent from cloud storage, as opposed to the cloud being unreachable. Cloud
-// tip markers are candidates, never an authoritative frontier — a node builds
-// its own truth by walking the DAG it can actually read — so a hole under
-// this sentinel is not this engine's to repair. classifyCloudTips reports the
-// holed tip as pending; the cluster layer's reconcile loop retries it, and
-// Cloud's own billing sweep is what eventually heals or prunes the marker.
+// ErrCDNBlobMissing marks a definitive CDN 404, not a transport failure.
+// Closure exhausts that boundary. Reconstruction separately determines whether
+// the absent history is needed to produce a value.
 var ErrCDNBlobMissing = errors.New("cdn blob missing")
 
 // ErrEffectNotFound is a peer's definitive empty fetch response. An unreachable
@@ -623,214 +620,80 @@ func NormalizeCloudTipCandidates(key string, candidates, localRoots []Tip, load 
 	})
 }
 
-// hydrateFromCloud is the tiered-storage rehydrate on a read-miss: it asks
-// Cloud for key's candidate tip frontier and installs whatever portion of it
-// is locally walkable (pulling blobs via FetchFromAny → CDN), so a subsequent
-// reconstruct finds that portion locally. installed reports whether the index
-// now holds anything for key (already-present tips count, so the caller
-// always re-tries reconstructLocal after a successful consult); consulted
-// reports whether Cloud's answer was fully resolved — no pending holes — so
-// GetSnapshot can mark the leaf authoritative and stop re-consulting for a key
-// whose state reduces to nil. A partially or wholly holed frontier is not an
-// error: the holed tips are reported to Cloud's reconcile loop via
-// MarkPending and retried there, on Cloud's own schedule, without blocking
-// this read.
-//
-// A transport error or timeout returns ErrCloudUnavailable — the read fails
-// rather than fabricating a miss for data Cloud may hold.
-func (e *Engine) hydrateFromCloud(key string) (installed, consulted bool, err error) {
+// hydrateFromCloud obtains Cloud's candidate tips and ingests their available
+// closure. Reconstruction remains responsible for deciding whether that graph
+// can produce a value. Transport failures surface as ErrCloudUnavailable.
+func (e *Engine) hydrateFromCloud(key string) (installed bool, err error) {
 	if e.cloudReader == nil {
-		return false, false, nil
+		return false, nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), cloudTipsBackstop)
 	defer cancel()
 
-	tips, sidecar, missing, err := e.cloudReader.CloudTips(ctx, key)
+	tips, sidecar, _, err := e.cloudReader.CloudTips(ctx, key)
 	if err != nil {
 		slog.Warn("cloud read-miss backstop: get tips failed; failing read", "key", key, "error", err)
 
-		return false, false, fmt.Errorf("%w: get tips for %q: %w", ErrCloudUnavailable, key, err)
+		return false, fmt.Errorf("%w: get tips for %q: %w", ErrCloudUnavailable, key, err)
 	}
 
 	if len(tips) == 0 {
-		return false, true, nil // Cloud holds nothing either: an authoritative miss.
+		return false, nil // Cloud holds nothing either: an authoritative miss.
 	}
 
-	pending, err := e.InstallCloudTips(key, tips, sidecar, missing)
-	if err != nil {
-		return false, false, err
+	if err := e.InstallCloudTips(key, tips, sidecar); err != nil {
+		return false, err
 	}
 
-	if len(pending) > 0 {
-		e.cloudReader.MarkPending(key)
-		slog.Warn("cloud read-miss backstop: frontier partially holed; serving readable subset, leaving the rest pending for reconcile",
-			"key", key, "pending", pending)
-	}
-
-	return e.index.Contains(key) != nil, len(pending) == 0, nil
+	return e.index.Contains(key) != nil, nil
 }
 
-// InstallCloudTips classifies Cloud-provided marker candidates into the
-// subset that is locally walkable (install) and the subset still holed
-// (pending), merges the walkable subset into the index alongside whatever is
-// already there, and returns the holed subset for the caller to track. Besides
-// the read-miss rehydrate it serves the cloud-sync reconcile path: a read
-// served from the outbox during a Cloud outage re-installs the missed Cloud
-// frontier here once Cloud answers again.
-//
-// It never mints and never consumes local tips: Cloud's tips directory is a
-// candidate index, not authoritative state, so nothing here may supersede
-// local ancestry. A hole is not this engine's to repair — see ErrCDNBlobMissing.
-func (e *Engine) InstallCloudTips(key string, tips []Tip, sidecar []CloudEffect, missing []Tip) (pending []Tip, err error) {
-	classification, err := e.classifyCloudTips(key, tips, sidecar, missing)
-	if err != nil {
-		return nil, err
+// InstallCloudTips supplies Cloud's candidates and inline effects to the same
+// closure walk as peer ingestion. It publishes graph relationships without
+// selecting snapshots, reconstructing values, or filtering unreadable branches.
+// Missing reports from GetTips describe only Cloud's storage; closure may still
+// obtain that history from peers through the existing fetch path.
+func (e *Engine) InstallCloudTips(key string, tips []Tip, sidecar []CloudEffect) error {
+	// Closure may discover a bind even when the supplied tip is ordinary data.
+	// Preserve its publication ordering with local commits, before the key lock.
+	nodeLock := e.takeNodeLock()
+	defer nodeLock.release()
+
+	mu := e.closureLock(key)
+	mu.Lock()
+	defer mu.Unlock()
+
+	for _, ce := range sidecar {
+		if err := e.putIngested(ce.Tip, ce.Eff, ce.ProtoLen); err != nil {
+			return err
+		}
 	}
 
-	if len(classification.install) > 0 {
-		slog.Debug("cloud tips: installing readable frontier", "key", key, "tips", classification.install)
-		e.installTips(key, classification.install)
-	}
+	attempted := make(map[Tip]error)
+	for {
+		current := e.index.Contains(key)
+		candidates := keytrie.NewTipSet(slices.Concat(current.Tips(), tips)...).Tips()
+		live, _, err := e.closeIngestedFrontierLocked(key, candidates, attempted)
+		if err != nil {
+			return fmt.Errorf("%w: close cloud frontier for %q: %w", ErrCloudUnavailable, key, err)
+		}
 
-	if len(classification.dropped) > 0 {
-		slog.Debug("cloud tips: dropped candidate markers superseded by ancestry", "key", key, "tips", classification.dropped)
-	}
-
-	if len(classification.pending) > 0 {
-		slog.Debug("cloud tips: tips left pending on a hole", "key", key, "tips", classification.pending)
-	}
-
-	return classification.pending, nil
-}
-
-type cloudTipClassification struct {
-	install []Tip
-	pending []Tip
-	dropped []Tip
-}
-
-// classifyCloudTips splits Cloud's candidate tips for key into three sets:
-// install (readable state tips plus dependency-less subscription metadata),
-// pending (tips whose ancestry hits ErrCDNBlobMissing somewhere in the walk —
-// a durable hole, not a transport failure), and dropped (candidates
-// NormalizeCloudTipCandidates proved non-maximal). A transport error or
-// timeout anywhere in the walk returns ErrCloudUnavailable instead of
-// classifying anything, since that failure mode is retryable and must not be
-// confused with a durable hole.
-//
-// missing is GetTips' own report of refs its closure walk found reachable but
-// whose blobs it does not hold — stated as fact by the storage side. Tips
-// named there classify pending without paying a redundant CDN round trip to
-// re-learn the same 404; anything the walk discovers missing on its own still
-// gets the network round trip, since Cloud's declared list is a hint, not a
-// complete inventory of every hole beneath the frontier.
-func (e *Engine) classifyCloudTips(key string, tips []Tip, sidecar []CloudEffect, missing []Tip) (cloudTipClassification, error) {
-	// Warm the cache with the closure effects GetTips delivered inline, so the
-	// walk below runs locally instead of one WAN fetch per dep (n+1). Same
-	// owned-vs-cache routing as every other ingest path; stragglers the
-	// sidecar didn't carry are pulled by the walk itself.
-	if e.effectCache != nil {
-		for _, ce := range sidecar {
-			if _, ok := e.effectCache.Get(ce.Tip); ok {
+		next := keytrie.NewTipSet(live...)
+		if current.Len() == next.Len() && current.ContainsAll(live) {
+			if e.index.Contains(key) != current {
 				continue
 			}
-
-			if err := e.putIngested(ce.Tip, ce.Eff, ce.ProtoLen); err != nil {
-				return cloudTipClassification{}, err
+		} else if _, ok := e.index.Insert(key, current, next); !ok {
+			if e.index.Closed() {
+				return fmt.Errorf("%w: engine closed", ErrCloudUnavailable)
 			}
+			continue
+		} else {
+			e.notifyKeyChanged(key)
 		}
+		return nil
 	}
-
-	missingSet := make(map[Tip]struct{}, len(missing))
-	for _, t := range missing {
-		missingSet[t] = struct{}{}
-	}
-
-	load := func(tip Tip) (*pb.Effect, error) {
-		if _, known := missingSet[tip]; known {
-			return nil, ErrCDNBlobMissing
-		}
-
-		return e.getEffect(key, tip)
-	}
-
-	var localRoots []Tip
-	if currentSet := e.index.Contains(key); currentSet != nil {
-		localRoots = currentSet.Tips()
-	}
-
-	var classification cloudTipClassification
-
-	realTips, superseded, err := NormalizeCloudTipCandidates(key, tips, localRoots, load)
-	if err != nil {
-		return classification, fmt.Errorf("normalize cloud candidates for %q: %w", key, err)
-	}
-
-	classification.dropped = superseded
-
-	// Dependency-less subscriptions are frontier metadata, not state
-	// branches: they install unconditionally, since they carry no ancestry
-	// for a hole to hide in. State tips still need walk validation below.
-	stateTips := make([]Tip, 0, len(realTips))
-	for _, tip := range realTips {
-		eff, getErr := load(tip)
-		switch {
-		case getErr == nil:
-			if eff.GetSubscription() != nil && len(eff.GetDeps()) == 0 {
-				classification.install = append(classification.install, tip)
-
-				continue
-			}
-
-			stateTips = append(stateTips, tip)
-		case errors.Is(getErr, ErrCDNBlobMissing):
-			classification.pending = append(classification.pending, tip)
-		default:
-			return cloudTipClassification{}, fmt.Errorf("%w: cloud tip %v unreachable for %q: %w",
-				ErrCloudUnavailable, tip, key, getErr)
-		}
-	}
-
-	if len(stateTips) == 0 {
-		return classification, nil
-	}
-
-	// Validate the joint frontier first. Each sibling branch can be
-	// independently readable while their union descends beneath both into a
-	// shared hole below their LCA, so per-tip validation alone is
-	// insufficient to prove the whole frontier installable together.
-	rd := newDag(e, key, "")
-
-	walkErr := rd.ingest(stateTips)
-	switch {
-	case walkErr == nil:
-		classification.install = append(classification.install, stateTips...)
-
-		return classification, nil
-	case errors.Is(walkErr, ErrCDNBlobMissing):
-		// Fall through: split per-tip below.
-	default:
-		return cloudTipClassification{}, fmt.Errorf("%w: real frontier for %q unreachable: %w",
-			ErrCloudUnavailable, key, walkErr)
-	}
-
-	for _, tip := range stateTips {
-		rd := newDag(e, key, "")
-
-		walkErr := rd.ingest([]Tip{tip})
-		switch {
-		case walkErr == nil:
-			classification.install = append(classification.install, tip)
-		case errors.Is(walkErr, ErrCDNBlobMissing):
-			classification.pending = append(classification.pending, tip)
-		default:
-			return cloudTipClassification{}, fmt.Errorf("%w: tip %v unreachable for %q: %w",
-				ErrCloudUnavailable, tip, key, walkErr)
-		}
-	}
-
-	return classification, nil
 }
 
 // mintLocalEffect persists a fully-built effect as a local mint: marshal,

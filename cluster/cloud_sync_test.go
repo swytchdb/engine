@@ -725,12 +725,9 @@ func (c *sequencedTipsClient) GetTips(context.Context, *dp.GetTipsRequest, ...gr
 	return resp, nil
 }
 
-// TestReconcileKeepsKeyPendingUntilHoleHeals: a key with a durable hole in its
-// Cloud frontier must stay in the reconcile set across a tick that still
-// reports the hole, and only clear once Cloud's own billing sweep prunes the
-// orphaned marker and a later tick sees nothing left to reconcile — reconcile
-// never repairs the hole itself, it only waits it out.
-func TestReconcileKeepsKeyPendingUntilHoleHeals(t *testing.T) {
+// With no fetch source, closure cannot establish availability. Keep the key
+// scheduled until GetTips supplies a complete response that requires no fetch.
+func TestReconcileRetriesUnavailableClosure(t *testing.T) {
 	engine := effects.NewEngine(effects.EngineConfig{NodeID: 1})
 	defer func() {
 		if err := engine.Close(); err != nil {
@@ -757,13 +754,13 @@ func TestReconcileKeepsKeyPendingUntilHoleHeals(t *testing.T) {
 	cs.reconcileBatch([]string{"k"})
 
 	if got := cs.reconcileKeys(); !slices.Equal(got, []string{"k"}) {
-		t.Fatalf("reconcile set after a still-holed tick = %v, want [k]", got)
+		t.Fatalf("reconcile set after an unavailable closure = %v, want [k]", got)
 	}
 
 	cs.reconcileBatch([]string{"k"})
 
 	if got := cs.reconcileKeys(); got != nil {
-		t.Fatalf("reconcile set after the hole healed = %v, want empty", got)
+		t.Fatalf("reconcile set after a complete empty response = %v, want empty", got)
 	}
 }
 

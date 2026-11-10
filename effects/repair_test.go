@@ -24,6 +24,7 @@
 package effects
 
 import (
+	"errors"
 	"fmt"
 	"slices"
 	"testing"
@@ -99,11 +100,8 @@ func (b *holedFetchBroadcaster) FetchFromAny(ref *pb.EffectRef, _ FetchHint) ([]
 	return nil, fmt.Errorf("cdn fetch %v: %w", r(ref), ErrCDNBlobMissing)
 }
 
-// TestInstallCloudTipsNeverMints: a cloud frontier tip whose walk fails with
-// the CDN-404 sentinel must not be repaired with a synthesized snapshot —
-// InstallCloudTips never mints and never touches local ancestry. The holed
-// tip is reported back as pending for the caller to hand to Cloud's reconcile
-// loop, and the engine's own local state is left exactly as it was.
+// Cloud ingestion retains unresolved tips without minting a replacement value
+// or discarding existing local history. Reconstruction reports missing data.
 func TestInstallCloudTipsNeverMints(t *testing.T) {
 	e := newTxnTestEngine(&holedFetchBroadcaster{})
 	defer func() { _ = e.Close() }()
@@ -118,39 +116,36 @@ func TestInstallCloudTipsNeverMints(t *testing.T) {
 	}
 
 	before := e.index.Contains("k").Tips()
+	beforeOffset := e.nextOff.Load()
 
 	holedTip := Tip{12345, 7}
 
-	pending, err := e.InstallCloudTips("k", []Tip{holedTip}, nil, nil)
+	err := e.InstallCloudTips("k", []Tip{holedTip}, nil)
 	if err != nil {
 		t.Fatalf("install over holed frontier: %v", err)
 	}
 
-	if !slices.Equal(pending, []Tip{holedTip}) {
-		t.Fatalf("pending = %v, want [%v]", pending, holedTip)
+	if e.nextOff.Load() != beforeOffset {
+		t.Fatal("cloud ingestion minted a local effect")
 	}
-
 	after := e.index.Contains("k").Tips()
-	if !slices.Equal(before, after) {
-		t.Fatalf("local tips changed from %v to %v: install must never mint over a hole", before, after)
+	if len(after) != len(before)+1 || !slices.Contains(after, holedTip) {
+		t.Fatalf("frontier = %v, want local tips %v plus %v", after, before, holedTip)
+	}
+	for _, tip := range before {
+		if !slices.Contains(after, tip) {
+			t.Fatalf("lost local tip %v from %v", tip, after)
+		}
 	}
 
-	result, _, _, err := e.GetSnapshot("k")
-	if err != nil {
-		t.Fatalf("post-install read: %v", err)
-	}
-
-	if result == nil || result.GetScalar() == nil || string(result.GetScalar().GetRaw()) != "local" {
-		t.Fatalf("post-install state = %v, want scalar %q", result, "local")
+	if _, _, _, err := e.GetSnapshot("k"); !errors.Is(err, errEffectNotResident) {
+		t.Fatalf("reconstruction must report the unavailable branch, got %v", err)
 	}
 }
 
-// TestInstallCloudTipsPreservesReadableSiblings: when only part of Cloud's
-// frontier sits above a hole, the readable tip must still install and serve
-// on its own — a hole in one candidate is not grounds to withhold the rest of
-// the frontier — while the holed tip is reported pending instead of blocking
-// the install.
-func TestInstallCloudTipsPreservesReadableSiblings(t *testing.T) {
+// A readable sibling cannot justify dropping an unavailable branch from the
+// closure frontier. Value reconstruction must see both.
+func TestInstallCloudTipsPreservesAllSiblings(t *testing.T) {
 	e := newTxnTestEngine(&holedFetchBroadcaster{})
 	defer func() { _ = e.Close() }()
 
@@ -171,13 +166,9 @@ func TestInstallCloudTipsPreservesReadableSiblings(t *testing.T) {
 
 	sidecar := []CloudEffect{{Tip: readableTip, Eff: readableEff, ProtoLen: proto.Size(readableEff)}}
 
-	pending, err := e.InstallCloudTips("k", []Tip{readableTip, holedTip}, sidecar, nil)
+	err := e.InstallCloudTips("k", []Tip{readableTip, holedTip}, sidecar)
 	if err != nil {
 		t.Fatalf("install over partially holed frontier: %v", err)
-	}
-
-	if !slices.Equal(pending, []Tip{holedTip}) {
-		t.Fatalf("pending = %v, want [%v]", pending, holedTip)
 	}
 
 	ts := e.index.Contains("k")
@@ -185,16 +176,11 @@ func TestInstallCloudTipsPreservesReadableSiblings(t *testing.T) {
 		t.Fatalf("post-install tips = %v, want the readable tip installed", ts.Tips())
 	}
 
-	if slices.Contains(ts.Tips(), holedTip) {
-		t.Fatalf("post-install tips = %v, holed tip must never be installed", ts.Tips())
+	if !slices.Contains(ts.Tips(), holedTip) {
+		t.Fatalf("post-install tips = %v, missing branch must remain installed", ts.Tips())
 	}
 
-	result, _, _, err := e.GetSnapshot("k")
-	if err != nil {
-		t.Fatalf("post-install read: %v", err)
-	}
-
-	if result == nil || result.GetScalar() == nil || string(result.GetScalar().GetRaw()) != "cloud" {
-		t.Fatalf("post-install state = %v, want the readable sibling's scalar %q", result, "cloud")
+	if _, _, _, err := e.GetSnapshot("k"); !errors.Is(err, errEffectNotResident) {
+		t.Fatalf("reconstruction must not serve just the readable sibling: %v", err)
 	}
 }

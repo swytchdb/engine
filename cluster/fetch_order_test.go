@@ -174,7 +174,7 @@ func TestFetchFromAnyPreferPeersMissStillTriesCDN(t *testing.T) {
 // TestFetchFromAnyCDN404NotMaskedByPeerError: under PreferPeers, when both
 // legs fail, a durable CDN 404 must still surface as ErrCDNBlobMissing —
 // not be swallowed by whichever peer error happened to run first — since
-// classifyCloudTips keys its pending-vs-install split on errors.Is against
+// Closure distinguishes definitive absence using errors.Is against
 // the sentinel. The peer error's text must still be present for diagnosis.
 func TestFetchFromAnyCDN404NotMaskedByPeerError(t *testing.T) {
 	pm := newFetchTestPM(t)
