@@ -26,7 +26,6 @@ package effects
 import (
 	"context"
 	"errors"
-	"maps"
 	"slices"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
@@ -127,6 +126,10 @@ func (v *snapshotReadView) valid() bool {
 // discover applies the same closure and arbitration rules to live and historical
 // frontiers. Historical views never report conflicts or consult live visibility.
 func (v *snapshotReadView) discover(keys []string, frontier func(string) ([]Tip, error)) error {
+	return v.discoverWithEvidence(keys, frontier, nil)
+}
+
+func (v *snapshotReadView) discoverWithEvidence(keys []string, frontier func(string) ([]Tip, error), live *snapshotReadView) error {
 	var err error
 
 	v.anchors, v.verdicts, err = v.engine.bindKeyClosureFrom(keys, frontier, true)
@@ -134,25 +137,39 @@ func (v *snapshotReadView) discover(keys []string, frontier func(string) ([]Tip,
 		return err
 	}
 
-	for txn, entry := range v.verdicts {
-		if entry.verdict == pb.Verdict_LOST {
-			if v.lost == nil {
-				v.lost = make(map[string]struct{})
-			}
-
-			v.lost[txn] = struct{}{}
+	anchors, verdicts := v.anchors, v.verdicts
+	tipsFor := func(key string) []Tip {
+		return v.frontiers[key].resolved
+	}
+	if live != nil {
+		// Temporal selection limits values, not the evidence needed to decide
+		// whether an included bind survives. Keep the live competition across
+		// all closure keys, including competitors of competitors. These tips
+		// must never enter v.frontiers or v.anchors: reconstruction uses those.
+		anchors = make(map[string][]Tip, len(v.anchors)+len(live.anchors))
+		for key, tips := range v.anchors {
+			anchors[key] = tips
 		}
+		for key, tips := range live.anchors {
+			anchors[key] = slices.Concat(anchors[key], tips)
+		}
+		tipsFor = func(key string) []Tip {
+			return slices.Concat(v.frontiers[key].resolved, live.frontiers[key].resolved)
+		}
+		verdicts = make(verdictMap, len(live.verdicts)+len(v.verdicts))
+		for txn, entry := range live.verdicts {
+			verdicts[txn] = entry
+		}
+		for txn, entry := range v.verdicts {
+			verdicts.retain(txn, entry)
+		}
+		v.verdicts = verdicts
 	}
 
-	for key := range v.anchors {
-		losers, walked := v.engine.losersOnKeyAt(key, v.frontiers[key].resolved, v.anchors[key], v.verdicts, v.isInvisible, !v.historical)
-
+	var walkedByKey map[string]int
+	v.lost, walkedByKey = v.engine.losersOnKeysAt(anchors, tipsFor, verdicts, v.isInvisible, !v.historical)
+	for _, walked := range walkedByKey {
 		v.walked += walked
-		if v.lost == nil {
-			v.lost = losers
-		} else {
-			maps.Copy(v.lost, losers)
-		}
 	}
 
 	return nil

@@ -146,14 +146,14 @@ func TestIsRealConflict_NoopKey_AnyWriteConflicts(t *testing.T) {
 	}
 }
 
-func TestIsRealConflict_DependentEffect_NotConflict(t *testing.T) {
+func TestIsRealConflict_DependsOnUnboundEffect_Conflict(t *testing.T) {
 	ptxn := newTestPendingTxn(pendingTxnKey{
 		key:        "k",
 		newTip:     Tip{1, 500},
 		collection: pb.CollectionKind_SCALAR,
 	})
 
-	// The competing effect depends on our tx tip → sequential, not concurrent
+	// Observing a pre-bind effect does not observe our commit.
 	detail := &pb.NackTipDetail{
 		Ref:        &pb.EffectRef{NodeId: 1, Offset: 600},
 		Hlc:        tTs(110),
@@ -162,8 +162,8 @@ func TestIsRealConflict_DependentEffect_NotConflict(t *testing.T) {
 		Deps:       []*pb.EffectRef{{NodeId: 1, Offset: 500}}, // depends on our newTip
 	}
 
-	if testIsRealConflict(t, ptxn, detail) {
-		t.Fatal("effect that depends on our tx should not be a real conflict")
+	if !testIsRealConflict(t, ptxn, detail) {
+		t.Fatal("effect that observes only our pre-bind tip must still conflict")
 	}
 }
 
@@ -446,11 +446,9 @@ func TestDefeatedCompetitor_TheirBindReachableViaDeps_NotDefeated(t *testing.T) 
 	}
 }
 
-// Symmetric reachability case mirroring TestIsRealConflict_DependentEffect_NotConflict:
-// the foreign bind's own Deps reference one of our pending tx's tips,
-// so the foreign bind is causally-after us. Not concurrent — must not
-// be marked defeated regardless of hash.
-func TestDefeatedCompetitor_DetailDepsReferenceOurNewTip_NotDefeated(t *testing.T) {
+// Referencing a pending transaction's NewTip observes its effects, not its
+// commit. The two bind envelopes are still concurrent and use fork choice.
+func TestDefeatedCompetitor_DetailDepsReferenceOurNewTip_StillCompetes(t *testing.T) {
 	e := newTxnTestEngine(nil)
 
 	theirTxnID := "their-tx"
@@ -498,8 +496,8 @@ func TestDefeatedCompetitor_DetailDepsReferenceOurNewTip_NotDefeated(t *testing.
 		},
 	}
 
-	if _, defeated := e.classifyNackTip(ptxn, "k", detail); defeated != "" {
-		t.Fatalf("bind whose deps reference our newTip is causally-after us, not defeated; got %q", defeated)
+	if _, defeated := e.classifyNackTip(ptxn, "k", detail); defeated != theirTxnID {
+		t.Fatalf("observing our pre-bind tip must not exempt the competing bind; defeated=%q", defeated)
 	}
 }
 

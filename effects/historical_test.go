@@ -68,7 +68,7 @@ func historicalTestRead(t *testing.T, e *Engine, at time.Time, keys ...string) [
 		})
 	}
 
-	v, err := e.historicalReadView(ctx, keys, frontier)
+	v, err := e.historicalReadView(ctx, keys, frontier, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

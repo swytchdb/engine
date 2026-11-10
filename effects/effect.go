@@ -937,13 +937,9 @@ func fromPbRefs(refs []*pb.EffectRef) []Tip {
 	return tips
 }
 
-// resolveTipDeps walks each tip back through pendingTxTips until it
-// lands on a committed ancestor (a bind or a non-tx effect). SSI
-// requires that every dep we hand a new effect references state that
-// has already been committed somewhere in the cluster — never a tip
-// belonging to a foreign in-flight transaction. Single-level
-// substitution would leave us pointing at another tx-tipped offset of
-// the same in-flight txn, which is what we're trying to avoid.
+// resolveTipDeps excludes tentative writes from the value base. Observations
+// remain causal dependencies even when their transaction has not bound: seeing
+// a NOOP does not make that transaction committed or its future bind an ancestor.
 func (e *Engine) resolveTipDeps(tips []Tip) []Tip {
 	// Nearly every read is already at a committed frontier. Avoid allocating
 	// the recursive walk's closure, seen set, and output slice until at least
@@ -1079,57 +1075,6 @@ func (e *Engine) applySnapshotVerdicts(eff *pb.Effect) {
 	for txnID := range snap.GetTxnVerdicts() {
 		e.horizon.MakeVisible(txnID)
 	}
-}
-
-// lookupSnapshotVerdict walks the snapshot chain on `key` for `txnID`'s
-// adjudication outcome. Used by arrival-time fork-choice sites to skip a
-// competing bind a prior snapshot already locked in as LOST.
-func (e *Engine) lookupSnapshotVerdict(key, txnID string) (pb.Verdict, bool) {
-	tipSet := e.index.Contains(key)
-	if tipSet == nil {
-		return pb.Verdict_VERDICT_UNSPECIFIED, false
-	}
-
-	visited := make(map[Tip]bool)
-
-	stack := append([]Tip(nil), tipSet.Tips()...)
-	for len(stack) > 0 {
-		t := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-
-		if visited[t] {
-			continue
-		}
-
-		visited[t] = true
-
-		eff, err := e.getEffect(key, t)
-		if err != nil {
-			continue
-		}
-
-		if snap := eff.GetSnapshot(); snap != nil {
-			if v, ok := snap.GetTxnVerdicts()[txnID]; ok && v != pb.Verdict_VERDICT_UNSPECIFIED {
-				return v, true
-			}
-
-			if snap.GetPrevSnapshot() != nil {
-				stack = append(stack, r(snap.GetPrevSnapshot()))
-			}
-
-			for _, dep := range eff.GetDeps() {
-				stack = append(stack, r(dep))
-			}
-
-			continue
-		}
-
-		for dep := range keyDeps(key, eff) {
-			stack = append(stack, r(dep))
-		}
-	}
-
-	return pb.Verdict_VERDICT_UNSPECIFIED, false
 }
 
 // HandleRemote processes a remote effect notification: stores the effect
@@ -1359,8 +1304,9 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 		}
 	}
 
-	// Track in-progress transactional tips
-	if eff.GetTxnId() != "" && eff.GetTxnBind() == nil {
+	// Track tentative transaction effects. NOOPs carry observations, not
+	// tentative values, and remain consumable before their transaction binds.
+	if eff.GetTxnId() != "" && eff.GetTxnBind() == nil && eff.GetNoop() == nil {
 		slog.Debug("HandleRemote: tracking pending tx tip", "offset", notify.GetOrigin(), "deps", eff.GetDeps())
 		e.pendingTxTips.Store(r(notify.GetOrigin()), fromPbRefs(eff.GetDeps()))
 	}
@@ -1513,9 +1459,14 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 		nacks = append(nacks, e.buildEnrichedNack(key, notify.GetOrigin(), tipOffsets))
 	}
 
-	// The bind and its promise are installed, and the response is fixed.
-	// Wake application waiters and apply deferred memory pacing outside the lock.
+	var prior []*pendingTxn
+	if eff.GetTxnBind() != nil {
+		prior = e.priorityPredecessors(r(notify.GetOrigin()), eff)
+	}
+	// The bind and its promise are installed. Priority waiting must release
+	// nodeMu so higher-priority binds and their evidence can arrive.
 	nodeLock.release()
+	nacks = e.finishPriorityResponse(notify.GetOrigin(), nacks, prior)
 
 	// Fire notification callbacks for remote effects
 	if eff.GetTxnId() != "" && eff.GetTxnBind() == nil {
@@ -1668,7 +1619,7 @@ func (e *Engine) ingestBackfill(notify *pb.OffsetNotify, historyKey *string) err
 	// Verdict-snapshot arrival ends horizon wait for every txn it adjudicates.
 	e.applySnapshotVerdicts(eff)
 
-	if eff.GetTxnId() != "" && eff.GetTxnBind() == nil {
+	if eff.GetTxnId() != "" && eff.GetTxnBind() == nil && eff.GetNoop() == nil {
 		e.pendingTxTips.Store(r(notify.GetOrigin()), fromPbRefs(eff.GetDeps()))
 	}
 
@@ -1721,24 +1672,10 @@ func (e *Engine) handleRemoteBind(bind *pb.TransactionalBindEffect, bindOffset T
 		}
 	}
 
-	// Process abort_deps: remove those offsets and abort any local pending txn
-	for _, abortedOffset := range bind.GetAbortDeps() {
-		aborted := r(abortedOffset)
-		e.pendingTxTips.Delete(aborted)
-
-		// Check if any local pending txn has this offset → abort it
-		e.pendingTxns.Range(func(_ Tip, ptxn *pendingTxn) bool {
-			for _, pk := range ptxn.keys {
-				if pk.newTip == aborted {
-					ptxn.finish(txnStateAborted)
-
-					return false // stop ranging
-				}
-			}
-
-			return true
-		})
-	}
+	// Ignore legacy abort_deps. A tentative tip does not establish a losing
+	// bind; aborting by offset here can contradict fork choice and expose an
+	// aborted transaction during reconstruction. Peer conflict responses decide
+	// published binds, while the node-locked preflight protects unpublished ones.
 
 	// Retain each consuming bind, not just a boolean for its shared base.
 	// flushTx must prove those binds are ancestors before reusing that base.
@@ -1763,7 +1700,7 @@ func (e *Engine) handleRemoteBind(bind *pb.TransactionalBindEffect, bindOffset T
 }
 
 // checkCompetingBinds walks the DAG fragment for each key the bind touches
-// and returns the txnID of any bind whose NewTip on that key is not a
+// and returns the txnID of any bind whose envelope is not a
 // structural ancestor of our ConsumedTips — i.e., a bind we know about
 // that's space-like concurrent with our forthcoming bind. Returns "" if
 // no such bind exists.
@@ -1802,7 +1739,8 @@ func (e *Engine) checkCompetingBinds(bind *pb.TransactionalBindEffect, txnID str
 		}
 
 		// Ancestor closure of our consumed tips on this key. A bind whose
-		// NewTip on `k` lands in this set is structurally in our past.
+		// envelope lands in this set is structurally in our past. Observing its
+		// NewTip alone does not establish that it has bound.
 		ourAncestors := make(map[Tip]struct{}, len(consumedTips)*8)
 
 		ancestorStack := make([]Tip, 0, len(consumedTips))
@@ -1824,7 +1762,7 @@ func (e *Engine) checkCompetingBinds(bind *pb.TransactionalBindEffect, txnID str
 				continue
 			}
 
-			for _, dep := range eff.GetDeps() {
+			for dep := range keyDeps(k, eff) {
 				dt := r(dep)
 				if _, dup := ourAncestors[dt]; dup {
 					continue
@@ -1854,13 +1792,21 @@ func (e *Engine) checkCompetingBinds(bind *pb.TransactionalBindEffect, txnID str
 			}
 
 			if otherBind := eff.GetTxnBind(); otherBind != nil {
+				if eff.GetTxnId() == txnID {
+					for dep := range keyDeps(k, eff) {
+						walkStack = append(walkStack, r(dep))
+					}
+
+					continue
+				}
+
 				for _, okb := range otherBind.GetKeys() {
 					if string(okb.GetKey()) != k {
 						continue
 					}
 
 					theirNewTip := r(okb.GetNewTip())
-					if _, inAncestors := ourAncestors[theirNewTip]; inAncestors {
+					if _, inAncestors := ourAncestors[t]; inAncestors {
 						walkStack = append(walkStack, theirNewTip)
 
 						break
@@ -1888,124 +1834,13 @@ func (e *Engine) checkCompetingBinds(bind *pb.TransactionalBindEffect, txnID str
 				walkStack = append(walkStack, r(snap.GetPrevSnapshot()))
 			}
 
-			for _, dep := range eff.GetDeps() {
+			for dep := range keyDeps(k, eff) {
 				walkStack = append(walkStack, r(dep))
 			}
 		}
 	}
 
 	return ""
-}
-
-// evaluateBindForkChoice returns true if the bind would lose at the
-// originator's commit point against any existing competitor on its keys
-// (hash-based fork choice with predicate-refinement and shared-base
-// gating) or against a concurrent non-tx data effect (SSI). flushTx
-// uses this to abort before emitting.
-func (e *Engine) evaluateBindForkChoice(bind *pb.TransactionalBindEffect, bindOffset Tip, bindHash []byte, txnID string) bool {
-	for _, kb := range bind.GetKeys() {
-		k := string(kb.GetKey())
-
-		tips := e.index.Contains(k)
-		if tips == nil {
-			continue
-		}
-
-		for _, tipOff := range tips.Tips() {
-			if tipOff == bindOffset {
-				continue
-			}
-
-			eff, err := e.getEffect(k, tipOff)
-			if err != nil {
-				continue
-			}
-
-			// Competing bind: fork-choice determines winner
-			if otherBind := eff.GetTxnBind(); otherBind != nil {
-				if eff.GetTxnId() == txnID {
-					continue // same transaction
-				}
-				// Already adjudicated as LOST by a snapshot? skip
-				if v, ok := e.lookupSnapshotVerdict(k, eff.GetTxnId()); ok && v == pb.Verdict_LOST {
-					continue
-				}
-
-				if bindsShareBase(bind, otherBind) {
-					var theirTip Tip
-
-					for _, otherKey := range otherBind.GetKeys() {
-						if bytes.Equal(kb.GetKey(), otherKey.GetKey()) {
-							theirTip = r(otherKey.GetNewTip())
-						}
-					}
-					// Predicate refinement: suppress the fork-choice
-					// when both txs carry obs/row-write evidence on
-					// this key and their predicates don't intersect
-					// the other's writes. Fallback to shared-base
-					// conflict when either side lacks evidence
-					// (schema-only mutations, non-SQL binds, etc.).
-					conflict, bothHadEvidence := e.hasPredicateConflict(
-						txnID, eff.GetTxnId(), k,
-						[]Tip{r(kb.GetNewTip()), bindOffset},
-						[]Tip{theirTip, tipOff})
-					if bothHadEvidence && !conflict {
-						continue
-					}
-
-					if !ForkChoiceLess(bindHash, eff.GetForkChoiceHash()) {
-						return true
-					}
-				}
-			}
-
-			// Non-transactional data effect: SSI invalidation
-			if eff.GetTxnId() == "" && eff.GetData() != nil {
-				// Check if this effect is concurrent with our bind on this key:
-				// not in the ancestor set of our consumed tips for this key.
-				if !refsContain(kb.GetConsumedTips(), tipOff) {
-					// Not a consumed tip — could be concurrent.
-					// Check if it's a descendant of our bind (depends on us).
-					// If it depends on our NewTip or bindOffset, it's sequential.
-					isDescendant := false
-					// Walk backward from the non-tx effect to see if it reaches our bind
-					visited := make(map[Tip]bool)
-					stack := []Tip{tipOff}
-					zero := Tip{0, 0}
-
-					for len(stack) > 0 {
-						off := stack[len(stack)-1]
-						stack = stack[:len(stack)-1]
-
-						if off == bindOffset || off == r(kb.GetNewTip()) {
-							isDescendant = true
-
-							break
-						}
-
-						if visited[off] || off == zero {
-							continue
-						}
-
-						visited[off] = true
-
-						depEff, err := e.getEffect(k, off)
-						if err != nil {
-							continue
-						}
-
-						stack = appendRefs(stack, depEff.GetDeps())
-					}
-
-					if !isDescendant {
-						return true
-					}
-				}
-			}
-		}
-	}
-
-	return false
 }
 
 // HandleNack processes a NACK from a remote peer.
@@ -2030,36 +1865,9 @@ func (e *Engine) HandleNack(nack *pb.NackNotify) error {
 	// anything else. The NACK is informational; we must consume it.
 	e.ingestNackTips(nack)
 
-	// Check if this NACK is for a transactional key
-	var matchedTxn *pendingTxn
-
-	e.pendingTxns.Range(func(_ Tip, ptxn *pendingTxn) bool {
-		for _, pk := range ptxn.keys {
-			if pk.key == string(nack.GetKey()) {
-				matchedTxn = ptxn
-
-				return false
-			}
-		}
-
-		return true
-	})
-
-	if matchedTxn == nil {
-		slog.Debug("HandleNack: non-transactional, ignoring", "key", nack.GetKey())
-
-		return nil
-	}
-
-	slog.Debug("HandleNack: transactional conflict check", "key", nack.GetKey(), "bind_offset", matchedTxn.bindOffset)
-	// Transactional NACK: smart conflict detection across all keys in the tx
-	for _, detail := range nack.GetTipDetails() {
-		if e.isRealConflict(matchedTxn, string(nack.GetKey()), detail) {
-			matchedTxn.finish(txnStateAborted)
-
-			return nil
-		}
-	}
+	// Asynchronous NACKs carry history, not permission to evaluate a bind.
+	// flushTx collects the tracked responses from every subscriber before
+	// evaluating in priority order. An early NACK cannot abort it here.
 
 	return nil
 }

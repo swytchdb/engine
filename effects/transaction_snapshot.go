@@ -298,7 +298,7 @@ func (s *transactionSnapshot) prepare(ctx context.Context, requested []string) e
 		return s.engine.historicalFrontier(ctx, key, tips, func(t Tip, eff *pb.Effect) (bool, error) {
 			return s.member(ctx, t, eff, visiting)
 		})
-	})
+	}, live)
 	if err != nil {
 		return err
 	}

@@ -30,6 +30,7 @@ import (
 	"time"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
+	"google.golang.org/protobuf/proto"
 )
 
 // ErrTxnAborted is returned by Flush when a transaction loses FWW or
@@ -76,11 +77,13 @@ type pendingTxn struct {
 	txnID          string // transaction ID (matches TxnId on emitted effects)
 	txnHLC         time.Time
 	originNode     pb.NodeID
-	forkChoiceHash []byte          // precomputed ForkChoiceHash(originNode, txnHLC)
-	bindOffset     Tip             // offset of the TransactionalBindEffect
-	keys           []pendingTxnKey // read-only after creation
-	state          atomic.Uint32   // txnState*
-	done           chan struct{}   // closed on decision
+	forkChoiceHash []byte           // precomputed ForkChoiceHash(originNode, txnHLC)
+	bindOffset     Tip              // offset of the TransactionalBindEffect
+	keys           []pendingTxnKey  // read-only after creation
+	state          atomic.Uint32    // txnState*
+	done           chan struct{}    // closed on decision
+	resolved       chan struct{}    // closed after evaluation and evidence publication
+	responses      []*pb.NackNotify // immutable once resolved closes
 }
 
 type pendingTxnKey struct {
@@ -92,13 +95,86 @@ type pendingTxnKey struct {
 	elementIDs   [][]byte          // element IDs our tx touches on this key
 }
 
+// hasWritesSince validates an observation against the current key history.
+// NOOPs and snapshots can replace the observed tips without changing the value.
+// Tentative effects do not write a value until their bind arrives. Follow these
+// wrappers to find actual writes, stopping at the observed causal boundary.
+func (e *Engine) hasWritesSince(key string, observed []Tip, txnID string) bool {
+	seen := make(map[Tip]bool, len(observed))
+	base := &pendingTxn{}
+
+	for _, tip := range observed {
+		seen[tip] = true
+		base.keys = append(base.keys, pendingTxnKey{key: key, newTip: tip})
+	}
+
+	current := e.index.Contains(key).Tips()
+	if len(current) == 0 && len(observed) != 0 {
+		return true
+	}
+
+	stack := append([]Tip(nil), current...)
+	for len(stack) > 0 {
+		tip := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+
+		if seen[tip] {
+			continue
+		}
+
+		seen[tip] = true
+
+		eff, err := e.getEffect(key, tip)
+		if err != nil {
+			if e.reachesFromTxOnKey(base, &key, tip) {
+				continue
+			}
+
+			return true
+		}
+
+		if eff.GetTxnId() != txnID || txnID == "" {
+			writes := eff.GetTxnId() == "" && (eff.GetData() != nil || eff.GetMeta() != nil)
+			if eff.GetTxnBind() != nil {
+				// The bind, not its pre-bind effects, must be in our past.
+				if e.reachesFromTxOnKey(base, &key, tip) {
+					continue
+				}
+
+				effects, err := e.collectBindEffects(eff, key)
+				if err != nil {
+					return true
+				}
+
+				for _, bound := range effects {
+					writes = writes || bound.GetData() != nil || bound.GetMeta() != nil || bound.GetRowWrite() != nil
+				}
+			}
+
+			if writes {
+				if !e.reachesFromTxOnKey(base, &key, tip) {
+					return true
+				}
+
+				continue
+			}
+		}
+
+		for dep := range keyDeps(key, eff) {
+			stack = append(stack, r(dep))
+		}
+	}
+
+	return false
+}
+
 // isRealConflict determines whether a NACK Tip represents a real conflict
 // with our pending transaction on the given key.
 //
 // NACK itself only says "peer's tips diverged from your bind's
 // ConsumedTips". Whether that divergence is a real conflict is a
 // deterministic function of (our effects, their effects, predicate
-// rules) — the same function evaluateBindForkChoice runs on every
+// rules) — the same predicate and ancestry rules used on every
 // node. All call sites must reach the same answer so the client's
 // abort/commit signal matches the cluster's view of the bind.
 func (e *Engine) isRealConflict(ptxn *pendingTxn, key string, detail *pb.NackTipDetail) bool {
@@ -113,59 +189,188 @@ func (e *Engine) isRealConflict(ptxn *pendingTxn, key string, detail *pb.NackTip
 // cannot authorize a commit. Keep the defeated bind anchors from the same pass
 // so flushTx publishes the same decisions for wrapped and unwrapped competitors.
 func (e *Engine) checkNackConflict(ptxn *pendingTxn, key string, detail *pb.NackTipDetail) (bool, map[string]Tip) {
-	queue := []*pb.NackTipDetail{detail}
-	visited := make(map[Tip]bool)
-
+	candidates, _, err := e.nackCandidates(ptxn, key, []*pb.NackTipDetail{detail})
+	if err != nil {
+		return true, nil
+	}
 	var defeated map[string]Tip
+	for _, cur := range candidates {
+		conflict, txn := e.classifyNackTip(ptxn, key, cur)
+		if conflict {
+			return true, nil
+		}
+		if txn != "" {
+			if defeated == nil {
+				defeated = make(map[string]Tip)
+			}
+			defeated[txn] = r(cur.GetRef())
+		}
+	}
+	return false, defeated
+}
 
+// nackCandidates discovers competing envelopes and cached fork-choice evidence.
+// Discovery does not decide winners. Unrelated keys can supply evidence without
+// subscribing to them or treating their effects as conflicts with our transaction.
+func (e *Engine) nackCandidates(ptxn *pendingTxn, key string, details []*pb.NackTipDetail) ([]*pb.NackTipDetail, verdictMap, error) {
+	queue := append([]*pb.NackTipDetail(nil), details...)
+	visited := make(map[Tip]bool)
+	verdicts := make(verdictMap)
+	var candidates []*pb.NackTipDetail
 	for len(queue) > 0 {
-		cur := queue[0]
-		queue = queue[1:]
+		cur := queue[len(queue)-1]
+		queue = queue[:len(queue)-1]
 		tip := r(cur.GetRef())
-
 		if visited[tip] {
 			continue
 		}
-
 		visited[tip] = true
-
 		if cur.GetIsData() || cur.GetIsBind() {
-			conflict, txn := e.classifyNackTip(ptxn, key, cur)
-			if conflict {
-				return true, nil
-			}
-
-			if txn != "" {
-				if defeated == nil {
-					defeated = make(map[string]Tip)
-				}
-
-				defeated[txn] = tip
-			}
-
+			candidates = append(candidates, cur)
 			continue
 		}
-
+		deps := cur.GetDeps()
+		if eff, err := e.getEffect(key, tip); err == nil {
+			if snap := eff.GetSnapshot(); snap != nil {
+				verdicts.harvest(tip, snap)
+				if snap.GetPrevSnapshot() != nil {
+					deps = append(append([]*pb.EffectRef(nil), deps...), snap.GetPrevSnapshot())
+				}
+			}
+		}
 		if tip != (Tip{}) && e.reachesFromTxOnKey(ptxn, &key, tip) {
 			continue
 		}
-
-		for _, dep := range cur.GetDeps() {
+		for _, dep := range deps {
 			dt := r(dep)
 			if visited[dt] || e.reachesFromTxOnKey(ptxn, &key, dt) {
 				continue
 			}
-
 			eff, err := e.getEffect(key, dt)
 			if err != nil {
-				return true, nil
+				if findPendingKey(ptxn, key) != nil {
+					return nil, nil, ErrTxnAmbiguous
+				}
+				continue
 			}
-
 			queue = append(queue, nackTipDetail(dt, eff))
 		}
 	}
+	return candidates, verdicts, nil
+}
 
-	return false, defeated
+// evaluateNacks runs only after every subscriber has responded. First collect
+// ALL evidence: a later response can resolve a bind named by an earlier NACK.
+// A better hash grants priority, not victory. Without its resolution the
+// published transaction remains ambiguous, rather than reporting a false abort.
+func (e *Engine) evaluateNacks(ptxn *pendingTxn, nacks []*pb.NackNotify) (map[string]Tip, error) {
+	type candidate struct {
+		key    string
+		detail *pb.NackTipDetail
+		txn    string
+	}
+	var candidates []candidate
+	verdicts := make(verdictMap)
+	for _, nack := range nacks {
+		key := string(nack.GetKey())
+		tips, evidence, err := e.nackCandidates(ptxn, key, nack.GetTipDetails())
+		if err != nil {
+			return nil, err
+		}
+		for txn, entry := range evidence {
+			if prior, ok := verdicts[txn]; ok && prior.verdict != entry.verdict {
+				return nil, ErrTxnAmbiguous
+			}
+			verdicts[txn] = entry
+		}
+		if findPendingKey(ptxn, key) == nil {
+			continue
+		}
+		for _, tip := range tips {
+			c := candidate{key: key, detail: tip}
+			if tip.GetIsBind() {
+				eff, err := e.getEffect(key, r(tip.GetRef()))
+				if err != nil || eff.GetTxnBind() == nil {
+					return nil, ErrTxnAmbiguous
+				}
+				c.txn = eff.GetTxnId()
+			}
+			candidates = append(candidates, c)
+		}
+	}
+	// Establish priority before evaluating ANY candidate.
+	for _, c := range candidates {
+		if c.detail.GetIsBind() && c.txn != ptxn.txnID &&
+			ForkChoiceLess(c.detail.GetBindForkChoiceHash(), ptxn.forkChoiceHash) &&
+			!e.nackTipOrdered(ptxn, c.key, c.detail) && verdicts[c.txn].verdict == pb.Verdict_VERDICT_UNSPECIFIED {
+			return nil, ErrTxnAmbiguous
+		}
+	}
+	defeated := make(map[string]Tip)
+	for _, c := range candidates {
+		if verdicts[c.txn].verdict == pb.Verdict_LOST {
+			continue
+		}
+		conflict, txn := e.classifyNackTip(ptxn, c.key, c.detail)
+		if conflict {
+			return nil, ErrTxnAborted
+		}
+		if txn != "" {
+			defeated[txn] = r(c.detail.GetRef())
+		}
+	}
+	return defeated, nil
+}
+
+// priorityPredecessors is called at the bind ingestion/publication boundary.
+// Only local origins defer responses: every origin is a subscriber of its own
+// keys, so the sender must receive their response before evaluating. Other
+// subscribers can answer immediately. All waits point toward a smaller hash.
+func (e *Engine) priorityPredecessors(ref Tip, eff *pb.Effect) []*pendingTxn {
+	var prior []*pendingTxn
+	detail := nackTipDetail(ref, eff)
+	e.pendingTxns.Range(func(_ Tip, txn *pendingTxn) bool {
+		if txn.resolved == nil || !ForkChoiceLess(txn.forkChoiceHash, detail.GetBindForkChoiceHash()) {
+			return true
+		}
+		for _, kb := range eff.GetTxnBind().GetKeys() {
+			key := string(kb.GetKey())
+			if findPendingKey(txn, key) != nil && !e.nackTipOrdered(txn, key, detail) {
+				prior = append(prior, txn)
+				break
+			}
+		}
+		return true
+	})
+	return prior
+}
+
+// finishPriorityResponse waits without nodeMu, then forwards the evidence the
+// predecessor used, including keys the requester need not subscribe to. A
+// bounded wait without evidence leaves the original unresolved NACK intact;
+// evaluateNacks will return an ambiguous result, never infer an abort.
+func (e *Engine) finishPriorityResponse(ref *pb.EffectRef, nacks []*pb.NackNotify, prior []*pendingTxn) []*pb.NackNotify {
+	if len(prior) == 0 {
+		return nacks
+	}
+	timer := time.NewTimer(horizonFallbackWait)
+	defer timer.Stop()
+	for _, txn := range prior {
+		select {
+		case <-txn.resolved:
+		case <-timer.C:
+			return nacks
+		}
+		for _, response := range txn.responses {
+			forwarded := proto.Clone(response).(*pb.NackNotify)
+			forwarded.Conflicting = ref
+			nacks = append(nacks, forwarded)
+		}
+		for _, pk := range txn.keys {
+			nacks = append(nacks, e.buildEnrichedNack(pk.key, ref, e.index.Contains(pk.key).Tips()))
+		}
+	}
+	return nacks
 }
 
 // nackTipOrdered proves that a data effect or bind is causally ordered with our
@@ -176,12 +381,6 @@ func (e *Engine) nackTipOrdered(ptxn *pendingTxn, key string, detail *pb.NackTip
 	for _, dep := range detail.GetDeps() {
 		if r(dep) == ptxn.bindOffset {
 			return true
-		}
-
-		for _, pk := range ptxn.keys {
-			if pk.key == key && r(dep) == pk.newTip {
-				return true
-			}
 		}
 	}
 
@@ -201,17 +400,7 @@ func (e *Engine) nackTipOrdered(ptxn *pendingTxn, key string, detail *pb.NackTip
 		theirs.keys = append(theirs.keys, pendingTxnKey{key: key, newTip: r(dep)})
 	}
 
-	if e.reachesFromTxOnKey(&theirs, &key, ptxn.bindOffset) {
-		return true
-	}
-
-	for _, pk := range ptxn.keys {
-		if pk.key == key && e.reachesFromTxOnKey(&theirs, &key, pk.newTip) {
-			return true
-		}
-	}
-
-	return false
+	return e.reachesFromTxOnKey(&theirs, &key, ptxn.bindOffset)
 }
 
 // classifyNackTip decides both sides of fork choice in one pass. Ordered or

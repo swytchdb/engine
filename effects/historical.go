@@ -93,14 +93,15 @@ func (e *Engine) historicalFrontier(ctx context.Context, key string, tips []Tip,
 }
 
 // historicalReadView applies the existing bind closure and fork choice to
-// selected historical frontiers. The caller supplies the same fixed cut for
-// every key. It must establish completeness before exposing interactive reads;
+// selected historical frontiers, retaining live competition as evidence only.
+// The caller supplies the same fixed cut for every key. It must establish
+// completeness before exposing interactive reads;
 // this helper does not claim that currently available tips are complete.
-func (e *Engine) historicalReadView(ctx context.Context, keys []string, frontier func(string) ([]Tip, error)) (*snapshotReadView, error) {
+func (e *Engine) historicalReadView(ctx context.Context, keys []string, frontier func(string) ([]Tip, error), live *snapshotReadView) (*snapshotReadView, error) {
 	v := newSnapshotReadView(e, ctx)
 	v.historical = true
 
-	err := v.discover(keys, func(key string) ([]Tip, error) {
+	err := v.discoverWithEvidence(keys, func(key string) ([]Tip, error) {
 		if captured, ok := v.frontiers[key]; ok {
 			return captured.resolved, nil
 		}
@@ -111,7 +112,7 @@ func (e *Engine) historicalReadView(ctx context.Context, keys []string, frontier
 		}
 
 		return tips, err
-	})
+	}, live)
 	if err != nil {
 		return nil, err
 	}
