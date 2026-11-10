@@ -26,6 +26,7 @@ package effects
 import (
 	"context"
 	"errors"
+	"maps"
 	"slices"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
@@ -147,9 +148,7 @@ func (v *snapshotReadView) discoverWithEvidence(keys []string, frontier func(str
 		// all closure keys, including competitors of competitors. These tips
 		// must never enter v.frontiers or v.anchors: reconstruction uses those.
 		anchors = make(map[string][]Tip, len(v.anchors)+len(live.anchors))
-		for key, tips := range v.anchors {
-			anchors[key] = tips
-		}
+		maps.Copy(anchors, v.anchors)
 		for key, tips := range live.anchors {
 			anchors[key] = slices.Concat(anchors[key], tips)
 		}
@@ -157,9 +156,7 @@ func (v *snapshotReadView) discoverWithEvidence(keys []string, frontier func(str
 			return slices.Concat(v.frontiers[key].resolved, live.frontiers[key].resolved)
 		}
 		verdicts = make(verdictMap, len(live.verdicts)+len(v.verdicts))
-		for txn, entry := range live.verdicts {
-			verdicts[txn] = entry
-		}
+		maps.Copy(verdicts, live.verdicts)
 		for txn, entry := range v.verdicts {
 			verdicts.retain(txn, entry)
 		}

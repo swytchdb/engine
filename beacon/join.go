@@ -151,7 +151,7 @@ func (b *Beacon) exchangeMembership(ctx context.Context, peers []cluster.NodeId)
 			return fmt.Errorf("membership tip %v unavailable", tip)
 		}
 
-		wire, err := effects.MarshalEffect(eff)
+		wire, err := b.engine.EffectCache().MarshalEffect(eff)
 		if err != nil {
 			return err
 		}

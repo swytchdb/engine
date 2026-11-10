@@ -988,7 +988,7 @@ func (c *Context) rawEmit(eff *pb.Effect) (Tip, *pb.OffsetNotify, error) {
 		return offset, nil, nil
 	}
 
-	data, err := MarshalEffect(eff)
+	data, err := c.engine.effectCache.MarshalEffect(eff)
 	if err != nil {
 		return Tip{}, nil, err
 	}
@@ -1513,33 +1513,27 @@ func (c *Context) flushTx() error {
 				c.engine.ingestNackTips(nack)
 			}
 			var defeatedSet map[string]Tip
-			if responseCount < len(subscribers) {
-				ptxn.finish(txnStateAmbiguous)
-			} else {
+			var proof *pb.BindEvidence
+			decision := txnStateAmbiguous
+			if responseCount == len(subscribers) {
 				var err error
 				defeatedSet, err = c.engine.evaluateNacks(ptxn, ptxn.responses)
+				if err == nil {
+					proof, err = c.engine.bindProof(bindOffset, defeatedSet, ptxn.proofSources)
+					defer func() { c.engine.effectCache.releaseEvidence(evidenceTips(proof)) }()
+				}
 				switch {
 				case errors.Is(err, ErrTxnAborted):
-					ptxn.finish(txnStateAborted)
+					decision = txnStateAborted
 				case err != nil:
-					ptxn.finish(txnStateAmbiguous)
+					decision = txnStateAmbiguous
 				default:
-					ptxn.finish(txnStateCommitted)
+					decision = txnStateCommitted
 				}
-				slog.Debug("flushTx: priority evaluation", "bind_offset", bindOffset, "state", ptxn.state.Load(), "error", err)
+				slog.Debug("flushTx: priority evaluation", "bind_offset", bindOffset, "state", decision, "error", err)
 			}
 
-			// Publish visibility only after priority-gated evaluation.
-
-			if c.engine.horizon != nil {
-				if ptxn.state.Load() != txnStateCommitted {
-					c.engine.horizon.Abort(c.txnID)
-				} else {
-					c.engine.horizon.MakeVisible(c.txnID)
-				}
-			}
-
-			if ptxn.state.Load() == txnStateCommitted {
+			if decision == txnStateCommitted {
 				verdicts := make(map[string]pb.Verdict, 1+len(defeatedSet))
 				verdicts[c.txnID] = pb.Verdict_WON
 
@@ -1582,12 +1576,23 @@ func (c *Context) flushTx() error {
 				}
 
 				for key := range emitKeys {
-					if err := c.engine.emitSnapshot(key, verdicts); err != nil {
+					if err := c.engine.emitSnapshot(key, verdicts, proof); err != nil {
+						decision = txnStateAmbiguous
 						slog.Warn("flushTx: emitSnapshot for verdict failed",
 							"key", key,
 							"bind_offset", bindOffset,
 							"error", err)
 					}
+				}
+			}
+			// Evidence ownership must be published before local completion and
+			// before deferred priority responses can use this outcome.
+			ptxn.finish(decision)
+			if c.engine.horizon != nil {
+				if decision == txnStateCommitted {
+					c.engine.horizon.MakeVisible(c.txnID)
+				} else {
+					c.engine.horizon.Abort(c.txnID)
 				}
 			}
 		}

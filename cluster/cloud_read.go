@@ -48,7 +48,11 @@ func (cs *CloudSync) FetchFromCDN(ctx context.Context, ref *pb.EffectRef) ([]byt
 		return nil, err
 	}
 
-	return MarshalEffectWire(eff)
+	var pool *effects.VertexPool
+	if cs.engine != nil {
+		pool = cs.engine.EffectCache()
+	}
+	return MarshalEffectWire(eff, pool)
 }
 
 // MayHold implements effects.CloudReader: the free, no-RPC filter gate the

@@ -281,12 +281,30 @@ func missingCreationKeys(eff *pb.Effect, existing []string, owns func([]byte) bo
 // put owns persistence, publication, and accounting for both owned and cache-only
 // effects. Creation references are initialized before a vertex is published.
 func (p *VertexPool) put(tip Tip, eff *pb.Effect, takeOwnership bool, owns func([]byte) bool) error {
-	if p.mirror != nil {
+	return p.putWithPin(tip, eff, takeOwnership, owns, false)
+}
+
+// pin reserves an independent reference before a new vertex is visible. Proof
+// package installation uses it to protect cache-only records until their owner
+// has acquired its references, even with reclamation running concurrently.
+func (p *VertexPool) putWithPin(tip Tip, eff *pb.Effect, takeOwnership bool, owns func([]byte) bool, pin bool) error {
+	if len(eff.GetEvidencePackage()) != 0 {
+		clean, release, err := p.installEvidencePackage(tip, eff)
+		if err != nil {
+			return err
+		}
+		defer release()
+		eff = clean
+	}
+	// Package members are durable inside their owning snapshot. Writing them
+	// as independent records would promote proof-only history into key
+	// frontiers during restart. An ordinary ingestion persists them normally.
+	if p.mirror != nil && !pin {
 		lock := &p.mirrorLocks[(tip[0]^tip[1])%256]
 		lock.Lock()
 		defer lock.Unlock()
 
-		data, err := MarshalEffect(eff)
+		data, err := p.MarshalEffect(eff)
 		if err != nil {
 			return err
 		}
@@ -298,12 +316,19 @@ func (p *VertexPool) put(tip Tip, eff *pb.Effect, takeOwnership bool, owns func(
 
 	v, loaded := p.m.Load(tip)
 	if !loaded {
+		evidence, err := p.pinEvidence(tip, eff)
+		if err != nil {
+			return err
+		}
 		nv := &vertex{eff: eff, size: vertexOverhead}
 		if takeOwnership {
 			nv.creationKeys = missingCreationKeys(eff, nil, owns)
 		}
 
 		owners := len(nv.creationKeys)
+		if pin {
+			owners++
+		}
 		nv.refs.Store(int32(owners))
 		p.owned.change(eff, 1)
 		p.vertexBytes.Add(nv.size)
@@ -311,6 +336,7 @@ func (p *VertexPool) put(tip Tip, eff *pb.Effect, takeOwnership bool, owns func(
 
 		v, loaded = p.m.LoadOrStore(tip, nv)
 		if loaded {
+			p.releaseEvidence(evidence)
 			p.owned.change(eff, -1)
 			p.vertexBytes.Add(-nv.size - nv.creationBytes)
 		} else if owners == 0 {
@@ -318,22 +344,32 @@ func (p *VertexPool) put(tip Tip, eff *pb.Effect, takeOwnership bool, owns func(
 		}
 	}
 
-	if loaded && takeOwnership {
+	if loaded && (takeOwnership || pin) {
 		v.creationMu.Lock()
 		defer v.creationMu.Unlock()
 
-		keys := missingCreationKeys(eff, v.creationKeys, owns)
-		if len(keys) == 0 {
+		var keys []string
+		if takeOwnership {
+			keys = missingCreationKeys(eff, v.creationKeys, owns)
+		}
+		added := len(keys)
+		if pin {
+			added++
+		}
+		if added == 0 {
 			return nil
 		}
 
 		for {
 			n := v.refs.Load()
 			if n < 0 {
+				if pin {
+					return fmt.Errorf("pin effect %v: reclamation already claimed it", tip)
+				}
 				return nil // reclaim already claimed this vertex; do not resurrect it
 			}
 
-			if v.refs.CompareAndSwap(n, n+int32(len(keys))) {
+			if v.refs.CompareAndSwap(n, n+int32(added)) {
 				break
 			}
 		}
@@ -396,6 +432,9 @@ func (p *VertexPool) delete(tip Tip) int64 {
 	// CAS therefore publishes the final accounting and prevents further writes.
 	p.vertexBytes.Add(-prev.size - prev.creationBytes)
 	p.owned.change(prev.eff, -1)
+	// Each snapshot vertex owns its proof once, independently of the number
+	// of keys, read DAGs, or outbox entries holding the snapshot itself.
+	p.releaseEvidence(uniqueEvidence(prev.eff))
 
 	return prev.size
 }

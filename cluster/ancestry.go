@@ -33,7 +33,7 @@ func (r *EngineLogReader) ReadAncestry(key string, root effects.Tip, send func(*
 	r.effectCache.VisitAncestry(key, root, func(tip effects.Tip, eff *pb.Effect, isRoot bool) bool {
 		resp := &pb.AncestryResponse{Ref: &pb.EffectRef{NodeId: tip[0], Offset: tip[1]}, IsRoot: isRoot}
 		if eff != nil {
-			resp.EffectData, sendErr = MarshalEffectWire(eff)
+			resp.EffectData, sendErr = MarshalEffectWire(eff, r.effectCache)
 			if sendErr != nil {
 				return false
 			}

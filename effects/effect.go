@@ -30,7 +30,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -274,10 +273,12 @@ type Engine struct {
 // subscriptionState tracks a subscription's readiness.
 // The ready channel is closed once bootstrapping completes.
 type subscriptionState struct {
-	ownedKey   bool
-	ready      chan struct{}
-	incomplete atomic.Bool // true if bootstrap saw unreachable effects
-	closeOnce  sync.Once   // guards close(ready)
+	bootstrapMu  sync.Mutex       // serializes setup and upgrade from an async announcement
+	announcement *pb.OffsetNotify // non-nil until a blocking caller starts discovery
+	ownedKey     bool
+	ready        chan struct{}
+	incomplete   atomic.Bool // true if bootstrap saw unreachable effects
+	closeOnce    sync.Once   // guards close(ready)
 }
 
 // markReady unblocks any waiters on this subscription state. Safe to
@@ -660,40 +661,18 @@ func (e *Engine) InstallCloudTips(key string, tips []Tip, sidecar []CloudEffect)
 	nodeLock := e.takeNodeLock()
 	defer nodeLock.release()
 
-	mu := e.closureLock(key)
-	mu.Lock()
-	defer mu.Unlock()
-
 	for _, ce := range sidecar {
 		if err := e.putIngested(ce.Tip, ce.Eff, ce.ProtoLen); err != nil {
 			return err
 		}
 	}
 
-	attempted := make(map[Tip]error)
-	for {
-		current := e.index.Contains(key)
-		candidates := keytrie.NewTipSet(slices.Concat(current.Tips(), tips)...).Tips()
-		live, _, err := e.closeIngestedFrontierLocked(key, candidates, attempted)
-		if err != nil {
-			return fmt.Errorf("%w: close cloud frontier for %q: %w", ErrCloudUnavailable, key, err)
-		}
-
-		next := keytrie.NewTipSet(live...)
-		if current.Len() == next.Len() && current.ContainsAll(live) {
-			if e.index.Contains(key) != current {
-				continue
-			}
-		} else if _, ok := e.index.Insert(key, current, next); !ok {
-			if e.index.Closed() {
-				return fmt.Errorf("%w: engine closed", ErrCloudUnavailable)
-			}
-			continue
-		} else {
-			e.notifyKeyChanged(key)
-		}
-		return nil
+	op := newClosureOperation(e, make(map[Tip]error))
+	defer op.release()
+	if _, _, err := op.publish(key, tips, true); err != nil {
+		return fmt.Errorf("%w: close cloud frontier for %q: %w", ErrCloudUnavailable, key, err)
 	}
+	return nil
 }
 
 // mintLocalEffect persists a fully-built effect as a local mint: marshal,
@@ -701,7 +680,7 @@ func (e *Engine) InstallCloudTips(key string, tips []Tip, sidecar []CloudEffect)
 // durability hook, broadcast. The effect must already carry its key, HLC,
 // fork-choice hash, and deps.
 func (e *Engine) mintLocalEffect(key string, currentSet *keytrie.TipSet, eff *pb.Effect) (Tip, error) {
-	data, err := MarshalEffect(eff)
+	data, err := e.effectCache.MarshalEffect(eff)
 	if err != nil {
 		return Tip{}, err
 	}
@@ -873,7 +852,7 @@ func (e *Engine) resolveTipDeps(tips []Tip) []Tip {
 // via prev_snapshot to the latest existing snapshot tip. Deps are the
 // current tips with pending-tx tips substituted; the index is updated
 // and the effect is broadcast.
-func (e *Engine) emitSnapshot(key string, verdicts map[string]pb.Verdict) error {
+func (e *Engine) emitSnapshot(key string, verdicts map[string]pb.Verdict, evidence ...*pb.BindEvidence) error {
 	hlc := timestamppb.New(e.clock.Now())
 	eff := &pb.Effect{
 		Key:            []byte(key),
@@ -883,6 +862,10 @@ func (e *Engine) emitSnapshot(key string, verdicts map[string]pb.Verdict) error 
 		Kind: &pb.Effect_Snapshot{Snapshot: &pb.SnapshotEffect{
 			TxnVerdicts: verdicts,
 		}},
+	}
+
+	if len(evidence) != 0 {
+		eff.GetSnapshot().Evidence = evidence[0]
 	}
 
 	currentSet := e.index.Contains(key)
@@ -2409,7 +2392,7 @@ func (e *Engine) probeAndFetchKey(key string) {
 		}},
 	}
 
-	data, err := MarshalEffect(eff)
+	data, err := e.effectCache.MarshalEffect(eff)
 	if err != nil {
 		return
 	}

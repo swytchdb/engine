@@ -84,6 +84,7 @@ type pendingTxn struct {
 	done           chan struct{}    // closed on decision
 	resolved       chan struct{}    // closed after evaluation and evidence publication
 	responses      []*pb.NackNotify // immutable once resolved closes
+	proofSources   []Tip            // predecessor snapshots actually used in resolution
 }
 
 type pendingTxnKey struct {
@@ -232,7 +233,9 @@ func (e *Engine) nackCandidates(ptxn *pendingTxn, key string, details []*pb.Nack
 		deps := cur.GetDeps()
 		if eff, err := e.getEffect(key, tip); err == nil {
 			if snap := eff.GetSnapshot(); snap != nil {
-				verdicts.harvest(tip, snap)
+				if err := e.harvestProofVerdicts(tip, eff, verdicts); err != nil {
+					return nil, nil, err
+				}
 				if snap.GetPrevSnapshot() != nil {
 					deps = append(append([]*pb.EffectRef(nil), deps...), snap.GetPrevSnapshot())
 				}
@@ -264,6 +267,7 @@ func (e *Engine) nackCandidates(ptxn *pendingTxn, key string, details []*pb.Nack
 // A better hash grants priority, not victory. Without its resolution the
 // published transaction remains ambiguous, rather than reporting a false abort.
 func (e *Engine) evaluateNacks(ptxn *pendingTxn, nacks []*pb.NackNotify) (map[string]Tip, error) {
+	ptxn.proofSources = nil
 	type candidate struct {
 		key    string
 		detail *pb.NackTipDetail
@@ -309,6 +313,7 @@ func (e *Engine) evaluateNacks(ptxn *pendingTxn, nacks []*pb.NackNotify) (map[st
 	defeated := make(map[string]Tip)
 	for _, c := range candidates {
 		if verdicts[c.txn].verdict == pb.Verdict_LOST {
+			ptxn.proofSources = append(ptxn.proofSources, verdicts[c.txn].snapshotTip)
 			continue
 		}
 		conflict, txn := e.classifyNackTip(ptxn, c.key, c.detail)

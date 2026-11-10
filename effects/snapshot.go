@@ -424,6 +424,7 @@ func (e *Engine) publishSubdag(ls *leafState, d *dag, tips []Tip) {
 type verdictEntry struct {
 	verdict     pb.Verdict
 	snapshotTip Tip
+	proven      bool // derived from retained proof, not merely a cached label
 }
 
 // verdictMap accumulates snapshot-supplied verdicts during a walk. Recorded
@@ -451,6 +452,13 @@ func (v verdictMap) retain(txnID string, entry verdictEntry) {
 	}
 
 	existing, ok := v[txnID]
+	if entry.proven && !existing.proven {
+		v[txnID] = entry
+		return
+	}
+	if existing.proven && !entry.proven {
+		return
+	}
 	if !ok {
 		v[txnID] = entry
 		return
@@ -641,7 +649,7 @@ func (e *Engine) GetSnapshot(key string) (*pb.ReducedEffect, []Tip, int, error) 
 // by a failure path (markFailed) rather than a successful bootstrap — the
 // closeOnce + Store-before-close in markFailed ensures the re-load sees the
 // up-to-date value.
-func (e *Engine) awaitSubscription(existing *subscriptionState, unsafe bool) error {
+func (e *Engine) awaitSubscription(existing *subscriptionState, unsafe, allowAsync bool) error {
 	if existing.incomplete.Load() {
 		if unsafe {
 			return nil
@@ -650,7 +658,25 @@ func (e *Engine) awaitSubscription(existing *subscriptionState, unsafe bool) err
 		return ErrBootstrapIncomplete
 	}
 
-	<-existing.ready
+	select {
+	case <-existing.ready:
+	default:
+		// An async announcement installs local authority, but does not prove
+		// discovery complete. Upgrade it once when a transaction needs peers.
+		existing.bootstrapMu.Lock()
+		if notify := existing.announcement; notify != nil {
+			if allowAsync {
+				existing.bootstrapMu.Unlock()
+				return nil
+			}
+			existing.announcement = nil
+			existing.bootstrapMu.Unlock()
+			// Retry work may outlive this caller's borrowed key buffer.
+			return e.bootstrapSubscription(string(notify.GetKey()), existing, notify, unsafe)
+		}
+		existing.bootstrapMu.Unlock()
+		<-existing.ready
+	}
 
 	if existing.incomplete.Load() {
 		if unsafe {
@@ -817,7 +843,7 @@ func (e *Engine) ensureSubscribedMode(key string, allowAsync bool) error {
 	// already-subscribed case must not pay the state+channel allocation the
 	// LoadOrStore below needs.
 	if existing, ok := e.subscriptions.Load(key); ok {
-		return e.awaitSubscription(existing, isUnsafe)
+		return e.awaitSubscription(existing, isUnsafe, allowAsync)
 	}
 	// Callers on the Redis hot path may borrow key from a pooled command
 	// buffer. A new subscription outlives that command, so own the map/trie key
@@ -826,22 +852,17 @@ func (e *Engine) ensureSubscribedMode(key string, allowAsync bool) error {
 	ownedKey := e.retainKey(key)
 
 	state := &subscriptionState{ready: make(chan struct{}), ownedKey: true}
+	state.bootstrapMu.Lock()
 	if existing, loaded := e.subscriptions.LoadOrStore(ownedKey, state); loaded {
+		state.bootstrapMu.Unlock()
 		e.releaseKey(ownedKey)
 
-		return e.awaitSubscription(existing, isUnsafe)
+		return e.awaitSubscription(existing, isUnsafe, allowAsync)
 	}
 
 	if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
 		slog.Debug("ensureSubscribed: bootstrapping", "key", ownedKey)
 	}
-
-	succeeded := false
-	defer func() {
-		if succeeded {
-			state.markReady()
-		}
-	}()
 
 	hlc := timestamppb.New(e.clock.Now())
 	eff := &pb.Effect{
@@ -854,12 +875,13 @@ func (e *Engine) ensureSubscribedMode(key string, allowAsync bool) error {
 		}},
 	}
 
-	data, err := MarshalEffect(eff)
+	data, err := e.effectCache.MarshalEffect(eff)
 	if err != nil {
 		// Marshal failure is a code bug; remove state so a fresh call
 		// retries from scratch and concurrent waiters re-bootstrap.
 		e.dropSubscription(ownedKey)
 		state.markFailed()
+		state.bootstrapMu.Unlock()
 
 		return err
 	}
@@ -870,6 +892,7 @@ func (e *Engine) ensureSubscribedMode(key string, allowAsync bool) error {
 		if err := e.effectCache.PutSized(offset, eff, len(data)); err != nil {
 			e.dropSubscription(ownedKey)
 			state.markFailed()
+			state.bootstrapMu.Unlock()
 
 			return err
 		}
@@ -879,34 +902,43 @@ func (e *Engine) ensureSubscribedMode(key string, allowAsync bool) error {
 	e.fireLocalEffect(offset, eff)
 
 	if e.broadcaster == nil {
-		succeeded = true
+		state.markReady()
+		state.bootstrapMu.Unlock()
 
 		return nil
 	}
 
 	notify := BuildOffsetNotify(e.nodeID, offset, eff, data, nil)
 
-	// Async-announce fast path: when no peer in the cluster holds this key
-	// (authoritative while we're in the majority partition) there is no prior
-	// state to bootstrap — the blocking rounds below would collect nothing. We
-	// still MUST announce the subscription so future peer writes route to us
-	// (skipping it splits brain), but we can fire-and-forget: QUIC delivers
-	// reliably on a live connection, and peer-recovery re-announce
-	// (pubsub_router.OnPeerAdded) heals any peer whose connection was down.
-	// Never skip the announce; only skip the wait. The local install above is
-	// synchronous (so a subsequent Emit dep-references our SubscriptionEffect),
-	// but the network send is off the critical path: fire it in the background
-	// so the calling SET/GET returns immediately. A connected peer whose bulk
-	// filter hasn't arrived yet forces clusterMaybeHasKey true, so a fresh
-	// node always takes the blocking bootstrap below.
+	// Ordinary accesses can announce asynchronously when peer filters report
+	// no holder. Concurrent peers may still subscribe: the announcement is
+	// not completed discovery, and a later transaction must run the blocking
+	// rounds. Local installation stays synchronous so Emit can depend on our
+	// SubscriptionEffect. Missing peer filters force the blocking path below.
 	if allowAsync &&
 		(e.inMajorityPartition() || isUnsafe) && !e.clusterMaybeHasKey(ownedKey) {
+		// Keep ready open: a later blocking caller must perform discovery,
+		// even if this announcement has already been delivered.
+		state.announcement = notify
 		go e.broadcaster.BroadcastWithData(notify, notify.GetEffectData())
-
-		succeeded = true
-
+		state.bootstrapMu.Unlock()
 		return nil
 	}
+
+	state.bootstrapMu.Unlock()
+	return e.bootstrapSubscription(ownedKey, state, notify, isUnsafe)
+}
+
+// bootstrapSubscription runs the same discovery for a new blocking subscription
+// and an upgrade from an async announcement. Other callers wait on state.ready;
+// no subscription lock is held during network or ancestry work.
+func (e *Engine) bootstrapSubscription(ownedKey string, state *subscriptionState, notify *pb.OffsetNotify, isUnsafe bool) error {
+	succeeded := false
+	defer func() {
+		if succeeded {
+			state.markReady()
+		}
+	}()
 
 	// Register bootstrap collector before broadcasting so NACKs aren't missed
 	collector := &bootstrapCollector{
@@ -1666,8 +1698,25 @@ func (e *Engine) bindKeyClosureFrom(startKeys []string, tipsFor func(string) ([]
 			return nil, nil, err
 		}
 
+		var discovered []Tip
+		var proofErr error
 		err = e.walkBindEvidence(k, slices.Concat(frontier, bindsByKey[k]), func(t Tip, eff *pb.Effect) {
-			if bind := eff.GetTxnBind(); bind != nil {
+			if eff.GetTxnBind() != nil {
+				discovered = append(discovered, t)
+			}
+			if eff.GetSnapshot() != nil {
+				proofErr = errors.Join(proofErr, e.harvestProofVerdicts(t, eff, verdicts))
+			}
+		})
+		if proofErr != nil {
+			return nil, nil, proofErr
+		}
+		for _, t := range discovered {
+			eff, _ := e.effectCache.Get(t)
+			// An owned proof supplies the historical cross-key outcome without
+			// reopening another key's compacted value DAG. Bare cached labels
+			// retain the legacy discovery path.
+			if bind := eff.GetTxnBind(); bind != nil && !verdicts[eff.GetTxnId()].proven {
 				for _, kb := range bind.GetKeys() {
 					other := string(kb.GetKey())
 					anchor := location{other, t}
@@ -1682,10 +1731,7 @@ func (e *Engine) bindKeyClosureFrom(startKeys []string, tipsFor func(string) ([]
 					}
 				}
 			}
-			if snap := eff.GetSnapshot(); snap != nil {
-				verdicts.harvest(t, snap)
-			}
-		})
+		}
 		if err != nil && strict {
 			return nil, nil, err
 		}
@@ -1719,14 +1765,14 @@ func (e *Engine) losersOnKeyAt(key string, tips, extraTips []Tip, snapshotVerdic
 // then resolves them in hash priority across the whole transaction closure.
 // A bind that loses on one key cannot eliminate another bind on a different
 // key. Cached verdicts skip work; they do not change this ordering.
-func (e *Engine) losersOnKeysAt(anchors map[string][]Tip, tipsFor func(string) []Tip, verdicts verdictMap, isInvisible func(string) bool, report bool) (map[string]struct{}, map[string]int) {
+func (e *Engine) losersOnKeysAt(anchors map[string][]Tip, tipsFor func(string) []Tip, verdicts verdictMap, isInvisible func(string) bool, report bool, packaged ...map[Tip]*pb.Effect) (map[string]struct{}, map[string]int) {
 	competitors := make(map[string][]string)
 	walked := make(map[string]int, len(anchors))
 	losses := make(map[string]bool)
 	for key, extra := range anchors {
 		_, count, observed := e.forkChoicesOnKeyAt(key, tipsFor(key), extra, verdicts, isInvisible, report, func(winner, loser string) {
 			competitors[loser] = append(competitors[loser], winner)
-		})
+		}, packaged...)
 		walked[key] = count
 		// Indexes may advance after closure discovery. Preserve cached losses
 		// found by this walk, without retaining its provisional pairwise losers.
@@ -1771,7 +1817,7 @@ func (e *Engine) losersOnKeysAt(anchors map[string][]Tip, tipsFor func(string) [
 	return losers, walked
 }
 
-func (e *Engine) forkChoicesOnKeyAt(key string, tips, extraTips []Tip, snapshotVerdicts verdictMap, isInvisible func(string) bool, reportConflicts bool, compete func(winner, loser string)) (map[string]struct{}, int, verdictMap) {
+func (e *Engine) forkChoicesOnKeyAt(key string, tips, extraTips []Tip, snapshotVerdicts verdictMap, isInvisible func(string) bool, reportConflicts bool, compete func(winner, loser string), packaged ...map[Tip]*pb.Effect) (map[string]struct{}, int, verdictMap) {
 	losers := make(map[string]struct{})
 
 	startTips := append([]Tip(nil), tips...)
@@ -1813,10 +1859,10 @@ func (e *Engine) forkChoicesOnKeyAt(key string, tips, extraTips []Tip, snapshotV
 
 	walked := 0
 	// Preserve this caller's tolerant handling of unavailable evidence.
-	_ = e.walkBindEvidence(key, startTips, func(t Tip, eff *pb.Effect) {
+	visit := func(t Tip, eff *pb.Effect) {
 		walked++
-		if snap := eff.GetSnapshot(); snap != nil {
-			verdicts.harvest(t, snap)
+		if snap := eff.GetSnapshot(); snap != nil && len(packaged) == 0 {
+			_ = e.harvestProofVerdicts(t, eff, verdicts)
 		}
 		if bind := eff.GetTxnBind(); bind != nil && (isInvisible == nil || !isInvisible(eff.GetTxnId())) {
 			for _, kb := range bind.GetKeys() {
@@ -1831,7 +1877,18 @@ func (e *Engine) forkChoicesOnKeyAt(key string, tips, extraTips []Tip, snapshotV
 				}
 			}
 		}
-	})
+	}
+	load := func(t Tip) (*pb.Effect, error) { return e.getEffect(key, t) }
+	if len(packaged) != 0 {
+		// Explicit proof membership, not a value frontier. Never expand data
+		// ancestry or trust the cached labels when recomputing this proof.
+		load = func(t Tip) (*pb.Effect, error) { return packaged[0][t], nil }
+		for _, t := range startTips {
+			visit(t, packaged[0][t])
+		}
+	} else {
+		_ = e.walkBindEvidence(key, startTips, visit)
+	}
 
 	type bindWithSource struct {
 		seenBind
@@ -1875,6 +1932,7 @@ func (e *Engine) forkChoicesOnKeyAt(key string, tips, extraTips []Tip, snapshotV
 	}
 
 	ancestry := newCausalIndex(e, key)
+	ancestry.load = load
 	ancestry.add(candidateTips...)
 
 	// Check reporting eligibility once per envelope for this scan, and defer
@@ -1909,7 +1967,7 @@ func (e *Engine) forkChoicesOnKeyAt(key string, tips, extraTips []Tip, snapshotV
 	proof := func(i int) *evidence {
 		if proofs[i] == nil {
 			b := candidates[i]
-			obs, rw := e.collectTxnEffectsOnKey(b.txnID, key, b.newTip)
+			obs, rw := collectTxnEffects(b.txnID, key, load, b.newTip)
 			proofs[i] = &evidence{obs: obs, rw: rw}
 		}
 

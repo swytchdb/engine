@@ -1069,6 +1069,16 @@ func TestFlushTx_VerdictSnapshotEmittedOnLoserOnlyKeys(t *testing.T) {
 		t.Fatalf("Put: %v", err)
 	}
 
+	// A recomputable verdict owns the losing transaction's payloads, not
+	// just its envelope. Supply the effects referenced by this fixture.
+	for tip, key := range map[Tip]string{loserDataShared: sharedKey, loserDataLoserOnly: loserOnlyKey} {
+		eff := dataEffect(key)
+		eff.TxnId = loserTxnID
+		if err := e.effectCache.Put(tip, eff); err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	// Subscribe peer 99 to the shared key so flushTx replicates our
 	// bind to peer 99 and processes its NACK response.
 	subCtx := e.NewContext()
@@ -1133,6 +1143,11 @@ func TestFlushTx_VerdictSnapshotEmittedOnLoserOnlyKeys(t *testing.T) {
 		if v != pb.Verdict_LOST {
 			t.Fatalf("verdict snapshot on %q records loser %q as %v, want LOST",
 				loserOnlyKey, loserTxnID, v)
+		}
+
+		derived, err := e.proofVerdicts(tip, eff)
+		if err != nil || derived[loserTxnID].verdict != pb.Verdict_LOST {
+			t.Fatalf("loser-only proof: verdicts=%v error=%v", derived, err)
 		}
 
 		foundLoserOnlyVerdict = true

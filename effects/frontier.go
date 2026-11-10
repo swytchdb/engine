@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	"github.com/cespare/xxhash/v2"
+	pb "github.com/swytchdb/engine/cluster/proto"
 	"github.com/swytchdb/engine/keytrie"
 )
 
@@ -25,55 +26,167 @@ func (e *Engine) closureLock(key string) *sync.Mutex {
 // Closure discovers graph relationships, not values: snapshots have the same
 // dependency semantics as any other vertex here.
 func (e *Engine) installIngestedTips(key string, arrivals ...Tip) {
+	op := newClosureOperation(e, make(map[Tip]error))
+	defer op.release()
+	_, _, err := op.publish(key, arrivals, false)
+	if err != nil {
+		slog.Warn("frontier closure incomplete; retaining unresolved tips", "key", key, "error", err)
+	}
+}
+
+// closureOperation owns discovery through publication. Cloud and notification
+// ingestion share the publisher; recovery uses the same discovery without
+// publishing. Optional observation and an explicit CAS let regressions count
+// actual graph work and force contention without timing-dependent goroutines.
+type closureOperation struct {
+	engine    *Engine
+	attempted map[Tip]error
+	work      map[string]*closureWork
+	observe   func(Tip, *pb.EffectRef) // nil ref: vertex expansion; otherwise: dependency edge
+	cas       func(string, *keytrie.TipSet, *keytrie.TipSet) (*keytrie.TipSet, bool)
+}
+
+func newClosureOperation(e *Engine, attempted map[Tip]error) *closureOperation {
+	return &closureOperation{
+		engine: e, attempted: attempted, work: make(map[string]*closureWork),
+		cas: e.index.Insert,
+	}
+}
+
+func (op *closureOperation) release() {
+	for _, w := range op.work {
+		w.release()
+	}
+	clear(op.work)
+}
+
+func (op *closureOperation) publish(key string, arrivals []Tip, failOnError bool) ([]Tip, bool, error) {
+	return op.run(key, arrivals, true, failOnError)
+}
+
+func (e *Engine) closeIngestedFrontier(key string, supplied []Tip, attempted map[Tip]error) ([]Tip, bool, error) {
+	op := newClosureOperation(e, attempted)
+	defer op.release()
+	return op.run(key, supplied, false, false)
+}
+
+// run keeps discovery alive through the CAS. Same-key work and publication use
+// one shard hold; only associated-key discovery releases it, before taking any
+// other shard. Each key keeps its own cuts and consumption relationships.
+func (op *closureOperation) run(key string, supplied []Tip, publish, failOnError bool) ([]Tip, bool, error) {
+	e := op.engine
+	type branch struct {
+		key string
+		tip Tip
+	}
+	seen := make(map[branch]bool)
+	pending := make(map[string][]Tip)
+	var queue []string
+	walk := func(key string, tips []Tip) []Tip {
+		return op.walk(key, tips, func(tip Tip, bind *pb.TransactionalBindEffect) {
+			for _, kb := range bind.GetKeys() {
+				other := string(kb.GetKey())
+				b := branch{other, tip}
+				if seen[b] || !e.isServed(kb.GetKey()) {
+					continue
+				}
+				seen[b] = true
+				if other != key {
+					if _, queued := pending[other]; !queued {
+						queue = append(queue, other)
+					}
+					pending[other] = append(pending[other], tip)
+				}
+			}
+		})
+	}
+
 	mu := e.closureLock(key)
 	mu.Lock()
-	defer mu.Unlock()
-
-	// Payloads remain in the vertex pool. Only fetch outcomes survive a failed
-	// publication CAS, so retries do not repeat unavailable boundary requests.
-	attempted := make(map[Tip]error)
-
+	locked := true
+	defer func() {
+		if locked {
+			mu.Unlock()
+		}
+	}()
+	retry := false
 	for {
 		current := e.index.Contains(key)
-		tips := keytrie.NewTipSet(slices.Concat(current.Tips(), arrivals)...).Tips()
-		live, complete, err := e.closeIngestedFrontierLocked(key, tips, attempted)
+		tips := supplied
+		if publish {
+			tips = slices.Concat(current.Tips(), supplied)
+		}
+		if retry {
+			// Associated frontiers and unresolved boundaries may also have
+			// advanced. Extend their existing cuts without repeating history.
+			for other := range op.work {
+				if other != key {
+					pending[other] = nil
+					queue = append(queue, other)
+				}
+			}
+			slices.Sort(queue)
+			retry = false
+		}
+		live := walk(key, tips)
+		if len(queue) != 0 {
+			locked = false
+			mu.Unlock()
+			for next := 0; next < len(queue); next++ {
+				other := queue[next]
+				func() {
+					otherMu := e.closureLock(other)
+					otherMu.Lock()
+					defer otherMu.Unlock()
+					// Associated branches supply closure, not an index update on
+					// another key. Ingestion still owns bind publication ordering.
+					tips := slices.Concat(e.index.Contains(other).Tips(), pending[other])
+					delete(pending, other)
+					walk(other, tips)
+				}()
+			}
+			queue = queue[:0]
+			mu.Lock()
+			locked = true
+			// Incorporate local publications made while another key was
+			// being explored before trying to publish this key's frontier.
+			continue
+		}
+
+		var err error
+		for _, w := range op.work {
+			for _, failure := range w.failures {
+				err = errors.Join(err, failure)
+			}
+		}
+		complete := err == nil
+		if !publish || failOnError && err != nil {
+			return live, complete, err
+		}
 		next := keytrie.NewTipSet(live...)
-
+		if e.index.Contains(key) != current {
+			retry = true
+			continue
+		}
 		if current.Len() == next.Len() && current.ContainsAll(live) {
-			if e.index.Contains(key) != current {
-				continue
-			}
-		} else if _, ok := e.index.Insert(key, current, next); !ok {
+		} else if _, ok := op.cas(key, current, next); !ok {
 			if e.index.Closed() {
-				return
+				return nil, false, errors.Join(err, errors.New("engine closed"))
 			}
-
+			retry = true
 			continue
 		} else {
 			e.notifyKeyChanged(key)
 		}
-
-		if complete && next.Len() == 1 && e.effectCache != nil {
+		// Notification ingestion records processing only after publication,
+		// under the same shard as before. Cloud retains its existing policy.
+		if !failOnError && complete && len(live) == 1 && e.effectCache != nil {
 			tip := live[0]
-
 			eff, _ := e.effectCache.Get(tip)
 			e.recordHistoryProcessed(tip, eff)
 		}
-
-		if err != nil {
-			slog.Warn("frontier closure incomplete; retaining unresolved tips", "key", key, "error", err)
-		}
-
-		return
+		return live, complete, err
 	}
-}
-
-func (e *Engine) closeIngestedFrontier(key string, supplied []Tip, attempted map[Tip]error) ([]Tip, bool, error) {
-	mu := e.closureLock(key)
-	mu.Lock()
-	defer mu.Unlock()
-
-	return e.closeIngestedFrontierLocked(key, supplied, attempted)
 }
 
 // closureVisit keeps the per-invocation state of an identity in one place.
@@ -105,10 +218,12 @@ type closureCut struct {
 // lookup separate from the dense state array makes queue processing hash-free.
 // A randomized hash avoids depending on origin/offset distributions.
 type closureWork struct {
-	seed   maphash.Seed
-	slots  []int
-	visits []closureVisit
-	queue  []int
+	seed     maphash.Seed
+	slots    []int
+	visits   []closureVisit
+	queue    []int
+	pending  map[int][]Tip
+	failures map[int]error
 }
 
 var closureWorkPool = sync.Pool{New: func() any {
@@ -155,22 +270,28 @@ func (w *closureWork) release() {
 		return
 	}
 	clear(w.visits)
+	clear(w.pending)
+	clear(w.failures)
 	clear(w.slots)
 	w.visits = w.visits[:0]
 	w.queue = w.queue[:0]
 	closureWorkPool.Put(w)
 }
 
-// closeIngestedFrontierLocked requires the key's closure shard. Ingestion
-// retains it across frontier publication and CAS retries; recovery uses the
-// wrapper above and releases it before reconstruction.
-func (e *Engine) closeIngestedFrontierLocked(key string, supplied []Tip, attempted map[Tip]error) ([]Tip, bool, error) {
-	w := closureWorkPool.Get().(*closureWork)
-	defer w.release()
-
-	// Missing boundaries are uncommon and retain their downward parent IDs
-	// only until the payload is available. They never own vertex lifetimes.
-	pending := make(map[int][]Tip)
+// walk extends this operation's per-key cuts under the key's closure shard.
+// New seeds add work; established consumption and expanded ancestry survive CAS
+// retries. Cross-key branches are queued rather than taking a second shard.
+func (op *closureOperation) walk(key string, supplied []Tip, visitBind func(Tip, *pb.TransactionalBindEffect)) []Tip {
+	e, attempted := op.engine, op.attempted
+	w := op.work[key]
+	if w == nil {
+		w = closureWorkPool.Get().(*closureWork)
+		if w.pending == nil {
+			w.pending = make(map[int][]Tip)
+		}
+		op.work[key] = w
+	}
+	pending := w.pending
 	resident := func(i int) *vertex {
 		v := w.visits[i].vertex
 		if v != nil && v.refs.Load() >= 0 {
@@ -285,11 +406,18 @@ func (e *Engine) closeIngestedFrontierLocked(key string, supplied []Tip, attempt
 	slices.SortFunc(seeds, compare)
 
 	for _, tip := range seeds {
-		c := &closureCut{first: tip, ranges: make(map[uint64][2]uint64)}
 		i := w.intern(tip)
+		if w.visits[i].owner != nil {
+			// In particular, do not make a previously consumed seed live.
+			// An unresolved identity may have become resident in the meantime.
+			if w.visits[i].flags&closureExpanded == 0 {
+				w.queue = append(w.queue, i)
+			}
+			continue
+		}
+		c := &closureCut{first: tip, ranges: make(map[uint64][2]uint64)}
 		claim(i, c)
 		w.visits[i].flags |= closureLive
-
 		enqueue(i)
 	}
 
@@ -335,8 +463,6 @@ func (e *Engine) closeIngestedFrontierLocked(key string, supplied []Tip, attempt
 		}
 	}
 
-	var loadErr error
-
 	for {
 		// 3. Drain resident downward work before requesting any boundary.
 		for next := 0; next < len(w.queue); next++ {
@@ -372,17 +498,27 @@ func (e *Engine) closeIngestedFrontierLocked(key string, supplied []Tip, attempt
 			}
 
 			delete(pending, i)
+			delete(w.failures, i)
 
 			w.visits[i].flags |= closureExpanded
+			if bind := v.eff.GetTxnBind(); bind != nil {
+				visitBind(tip, bind)
+			}
 
 			if v.root() {
 				w.visits[i].flags |= closureNoFetch
 			}
 
+			if op.observe != nil {
+				op.observe(tip, nil)
+			}
 			for ref := range keyDeps(key, v.eff) {
 				dep := r(ref)
 				if dep == (Tip{}) || dep == tip {
 					continue
+				}
+				if op.observe != nil {
+					op.observe(tip, ref)
 				}
 				j := w.intern(dep)
 				// Only this genuine downward edge establishes consumption.
@@ -421,7 +557,7 @@ func (e *Engine) closeIngestedFrontierLocked(key string, supplied []Tip, attempt
 		w.queue = w.queue[:0]
 
 		if len(pending) == 0 {
-			return result(), loadErr == nil, loadErr
+			return result()
 		}
 
 		// 4. Resolve each boundary once. Exhaustion and failed availability
@@ -450,10 +586,13 @@ func (e *Engine) closeIngestedFrontierLocked(key string, supplied []Tip, attempt
 				}
 
 				if !errors.Is(err, ErrEffectNotFound) && !errors.Is(err, ErrCDNBlobMissing) {
-					loadErr = errors.Join(loadErr, err)
+					if w.failures == nil {
+						w.failures = make(map[int]error)
+					}
+					w.failures[i] = err
+				} else {
+					delete(pending, i)
 				}
-
-				delete(pending, i)
 			} else {
 				roots = append(roots, i)
 			}
@@ -464,7 +603,7 @@ func (e *Engine) closeIngestedFrontierLocked(key string, supplied []Tip, attempt
 		}
 
 		if len(roots) == 0 {
-			return result(), loadErr == nil, loadErr
+			return result()
 		}
 
 		// 5. Counter ranges prioritize cuts; they never establish dominance.
@@ -495,7 +634,11 @@ func (e *Engine) closeIngestedFrontierLocked(key string, supplied []Tip, attempt
 		}
 
 		if err == nil && resident(best) == nil {
-			err = fmt.Errorf("effect %v reclaimed during frontier closure", w.visits[best].tip)
+			if absent := attempted[w.visits[best].tip]; errors.Is(absent, ErrEffectNotFound) {
+				err = absent
+			} else {
+				err = fmt.Errorf("effect %v reclaimed during frontier closure", w.visits[best].tip)
+			}
 		}
 
 		attempted[w.visits[best].tip] = err
