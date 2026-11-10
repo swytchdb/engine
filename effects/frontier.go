@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"log/slog"
 	"slices"
 	"sync"
@@ -75,41 +76,128 @@ func (e *Engine) closeIngestedFrontier(key string, supplied []Tip, attempted map
 	return e.closeIngestedFrontierLocked(key, supplied, attempted)
 }
 
+// closureVisit keeps the per-invocation state of an identity in one place.
+// Indices, rather than pointers into visits, survive table and slice growth.
+// Cached vertices are only navigation hints: every reuse checks reclamation.
+type closureVisit struct {
+	tip    Tip
+	vertex *vertex
+	owner  *closureCut
+	flags  uint8
+}
+
+const (
+	closureScheduled uint8 = 1 << iota
+	closureExpanded
+	closureNoFetch
+	closureLive
+)
+
+// Cuts express connected membership, never dominance or downward expansion.
+type closureCut struct {
+	parent *closureCut
+	first  Tip
+	ranges map[uint64][2]uint64
+	size   int
+}
+
+// The table stores index+1, with zero denoting an empty slot. Keeping identity
+// lookup separate from the dense state array makes queue processing hash-free.
+// A randomized hash avoids depending on origin/offset distributions.
+type closureWork struct {
+	seed   maphash.Seed
+	slots  []int
+	visits []closureVisit
+	queue  []int
+}
+
+var closureWorkPool = sync.Pool{New: func() any {
+	return &closureWork{seed: maphash.MakeSeed(), slots: make([]int, 128)}
+}}
+
+func (w *closureWork) grow() {
+	w.slots = make([]int, len(w.slots)*2)
+	mask := uint64(len(w.slots) - 1)
+	for i := range w.visits {
+		slot := maphash.Comparable(w.seed, w.visits[i].tip) & mask
+		for w.slots[slot] != 0 {
+			slot = (slot + 1) & mask
+		}
+		w.slots[slot] = i + 1
+	}
+}
+
+func (w *closureWork) intern(tip Tip) int {
+	if (len(w.visits)+1)*4 >= len(w.slots)*3 {
+		w.grow()
+	}
+	mask := uint64(len(w.slots) - 1)
+	slot := maphash.Comparable(w.seed, tip) & mask
+	for {
+		entry := w.slots[slot]
+		if entry == 0 {
+			i := len(w.visits)
+			w.visits = append(w.visits, closureVisit{tip: tip})
+			w.slots[slot] = i + 1
+			return i
+		}
+		if w.visits[entry-1].tip == tip {
+			return entry - 1
+		}
+		slot = (slot + 1) & mask
+	}
+}
+
+func (w *closureWork) release() {
+	// No graph, key, cut, or error references survive the invocation. Large
+	// exceptional walks are discarded rather than retaining their peak size.
+	if cap(w.visits) > 32768 || cap(w.queue) > 65536 {
+		return
+	}
+	clear(w.visits)
+	clear(w.slots)
+	w.visits = w.visits[:0]
+	w.queue = w.queue[:0]
+	closureWorkPool.Put(w)
+}
+
 // closeIngestedFrontierLocked requires the key's closure shard. Ingestion
 // retains it across frontier publication and CAS retries; recovery uses the
 // wrapper above and releases it before reconstruction.
 func (e *Engine) closeIngestedFrontierLocked(key string, supplied []Tip, attempted map[Tip]error) ([]Tip, bool, error) {
-	// These are connected cuts of the discovered graph, not a second graph.
-	// Membership never establishes dominance or implies downward expansion.
-	type cut struct {
-		parent *cut
-		first  Tip
-		ranges map[uint64][2]uint64
-		size   int
-	}
+	w := closureWorkPool.Get().(*closureWork)
+	defer w.release()
 
-	owners := make(map[Tip]*cut)
-	live := make(map[Tip]struct{})
-	expanded := make(map[Tip]bool) // absent: unscheduled; false: queued; true: expanded
-	pending := make(map[Tip][]Tip) // missing boundary -> downward parents awaiting its payload
-	noFetch := make(map[Tip]bool)  // ancestry below a reclamation boundary
-
-	var queue []Tip
-
-	resident := func(tip Tip) *vertex {
+	// Missing boundaries are uncommon and retain their downward parent IDs
+	// only until the payload is available. They never own vertex lifetimes.
+	pending := make(map[int][]Tip)
+	resident := func(i int) *vertex {
+		v := w.visits[i].vertex
+		if v != nil && v.refs.Load() >= 0 {
+			return v
+		}
 		if e.effectCache == nil {
 			return nil
 		}
-
+		v = e.effectCache.getVertex(w.visits[i].tip)
+		w.visits[i].vertex = v
+		return v
+	}
+	// Comparison is rare (seeds, cut joins, and fetch scheduling), and uses
+	// current pool residency just as publication-order selection always has.
+	compareVertex := func(tip Tip) *vertex {
+		if e.effectCache == nil {
+			return nil
+		}
 		return e.effectCache.getVertex(tip)
 	}
 	compare := func(a, b Tip) int {
 		var ah, bh []byte
-		if v := resident(a); v != nil {
+		if v := compareVertex(a); v != nil {
 			ah = v.eff.GetForkChoiceHash()
 		}
 
-		if v := resident(b); v != nil {
+		if v := compareVertex(b); v != nil {
 			bh = v.eff.GetForkChoiceHash()
 		}
 
@@ -124,16 +212,18 @@ func (e *Engine) closeIngestedFrontierLocked(key string, supplied []Tip, attempt
 		return cmp.Compare(a[1], b[1])
 	}
 	result := func() []Tip {
-		tips := make([]Tip, 0, len(live))
-		for tip := range live {
-			tips = append(tips, tip)
+		var tips []Tip
+		for i := range w.visits {
+			if w.visits[i].flags&closureLive != 0 {
+				tips = append(tips, w.visits[i].tip)
+			}
 		}
 
 		slices.SortFunc(tips, compare)
 
 		return tips
 	}
-	root := func(c *cut) *cut {
+	root := func(c *closureCut) *closureCut {
 		for c.parent != nil {
 			if c.parent.parent != nil {
 				c.parent = c.parent.parent
@@ -144,7 +234,7 @@ func (e *Engine) closeIngestedFrontierLocked(key string, supplied []Tip, attempt
 
 		return c
 	}
-	observe := func(c *cut, tip Tip) {
+	observe := func(c *closureCut, tip Tip) {
 		r, ok := c.ranges[tip[0]]
 		if !ok {
 			r = [2]uint64{tip[1], tip[1]}
@@ -154,7 +244,7 @@ func (e *Engine) closeIngestedFrontierLocked(key string, supplied []Tip, attempt
 
 		c.ranges[tip[0]] = r
 	}
-	join := func(a, b *cut) {
+	join := func(a, b *closureCut) {
 		a, b = root(a), root(b)
 		if a == b {
 			return
@@ -176,16 +266,16 @@ func (e *Engine) closeIngestedFrontierLocked(key string, supplied []Tip, attempt
 			observe(a, Tip{node, r[1]})
 		}
 	}
-	claim := func(tip Tip, c *cut) {
+	claim := func(i int, c *closureCut) {
 		c = root(c)
-		owners[tip] = c
+		w.visits[i].owner = c
 		c.size++
-		observe(c, tip)
+		observe(c, w.visits[i].tip)
 	}
-	enqueue := func(tip Tip) {
-		if _, scheduled := expanded[tip]; !scheduled {
-			expanded[tip] = false
-			queue = append(queue, tip)
+	enqueue := func(i int) {
+		if w.visits[i].flags&closureScheduled == 0 {
+			w.visits[i].flags |= closureScheduled
+			w.queue = append(w.queue, i)
 		}
 	}
 
@@ -195,33 +285,35 @@ func (e *Engine) closeIngestedFrontierLocked(key string, supplied []Tip, attempt
 	slices.SortFunc(seeds, compare)
 
 	for _, tip := range seeds {
-		c := &cut{first: tip, ranges: make(map[uint64][2]uint64)}
-		claim(tip, c)
-		live[tip] = struct{}{}
+		c := &closureCut{first: tip, ranges: make(map[uint64][2]uint64)}
+		i := w.intern(tip)
+		claim(i, c)
+		w.visits[i].flags |= closureLive
 
-		enqueue(tip)
+		enqueue(i)
 	}
 
 	// 2. A preexisting reverse link identifies established history. Follow
 	// one chain to its cut BEFORE installing the newly discovered incoming
 	// edge. Record membership along the chain so another join stops there.
 	// This never consumes tips and never marks a vertex expanded downward.
-	ascend := func(v *vertex, c *cut) {
+	ascend := func(v *vertex, c *closureCut) {
 		for {
 			parent, ok := v.firstParent(key)
 			if !ok {
 				return // the downward edge is already consuming this dependency
 			}
 
-			if known := owners[parent]; known != nil {
+			i := w.intern(parent)
+			if known := w.visits[i].owner; known != nil {
 				join(c, known)
 
 				return
 			}
 
-			claim(parent, c)
+			claim(i, c)
 
-			v = resident(parent)
+			v = resident(i)
 			if v == nil {
 				// The retained link proves a join to a reclaimed cut. The
 				// missing parent is neither a new tip nor a fetch obligation.
@@ -229,14 +321,14 @@ func (e *Engine) closeIngestedFrontierLocked(key string, supplied []Tip, attempt
 			}
 
 			if _, hasParent := v.firstParent(key); !hasParent {
-				live[parent] = struct{}{}
+				w.visits[i].flags |= closureLive
 
 				c = root(c)
 				if compare(parent, c.first) < 0 {
 					c.first = parent
 				}
 
-				enqueue(parent)
+				enqueue(i)
 
 				return
 			}
@@ -247,43 +339,44 @@ func (e *Engine) closeIngestedFrontierLocked(key string, supplied []Tip, attempt
 
 	for {
 		// 3. Drain resident downward work before requesting any boundary.
-		for i := 0; i < len(queue); i++ {
-			tip := queue[i]
-			if expanded[tip] {
+		for next := 0; next < len(w.queue); next++ {
+			i := w.queue[next]
+			tip := w.visits[i].tip
+			if w.visits[i].flags&closureExpanded != 0 {
 				continue
 			}
 
-			v := resident(tip)
+			v := resident(i)
 			if v == nil {
-				if noFetch[tip] {
-					delete(pending, tip)
+				if w.visits[i].flags&closureNoFetch != 0 {
+					delete(pending, i)
 
 					continue
 				}
 
-				if _, exists := pending[tip]; !exists {
-					pending[tip] = nil
+				if _, exists := pending[i]; !exists {
+					pending[i] = nil
 				}
 
 				continue
 			}
 
-			if parents := pending[tip]; len(parents) != 0 {
+			if parents := pending[i]; len(parents) != 0 {
 				// A fetched dependency may now connect to established local
 				// history. Its incoming edges must not mask those older links.
-				ascend(v, owners[tip])
+				ascend(v, w.visits[i].owner)
 
 				for _, parent := range parents {
 					e.effectCache.addParent(v, parent, key)
 				}
 			}
 
-			delete(pending, tip)
+			delete(pending, i)
 
-			expanded[tip] = true
+			w.visits[i].flags |= closureExpanded
 
 			if v.root() {
-				noFetch[tip] = true
+				w.visits[i].flags |= closureNoFetch
 			}
 
 			for ref := range keyDeps(key, v.eff) {
@@ -291,42 +384,41 @@ func (e *Engine) closeIngestedFrontierLocked(key string, supplied []Tip, attempt
 				if dep == (Tip{}) || dep == tip {
 					continue
 				}
+				j := w.intern(dep)
 				// Only this genuine downward edge establishes consumption.
-				delete(live, dep)
+				w.visits[j].flags &^= closureLive
 
-				if noFetch[tip] && !noFetch[dep] {
-					noFetch[dep] = true
-					// Another path may have expanded this vertex first. Pass
-					// the newly discovered fetch boundary through its resident
-					// ancestry too; each vertex can gain this evidence once.
-					if expanded[dep] {
-						expanded[dep] = false
-						queue = append(queue, dep)
+				if w.visits[i].flags&closureNoFetch != 0 && w.visits[j].flags&closureNoFetch == 0 {
+					w.visits[j].flags |= closureNoFetch
+					// Newly discovered boundary evidence still propagates
+					// through ancestry that another path expanded earlier.
+					if w.visits[j].flags&closureExpanded != 0 {
+						w.visits[j].flags &^= closureExpanded
+						w.queue = append(w.queue, j)
 					}
 				}
 
-				dv := resident(dep)
-				if known := owners[dep]; known != nil {
-					join(owners[tip], known)
+				dv := resident(j)
+				if known := w.visits[j].owner; known != nil {
+					join(w.visits[i].owner, known)
 				} else {
-					claim(dep, owners[tip])
-
+					claim(j, w.visits[i].owner)
 					if dv != nil {
-						ascend(dv, owners[dep])
+						ascend(dv, w.visits[j].owner)
 					}
 				}
 
 				if dv != nil {
 					e.effectCache.addParent(dv, tip, key)
-				} else if !expanded[dep] {
-					pending[dep] = append(pending[dep], tip)
+				} else if w.visits[j].flags&closureExpanded == 0 {
+					pending[j] = append(pending[j], tip)
 				}
 
-				enqueue(dep)
+				enqueue(j)
 			}
 		}
 
-		queue = queue[:0]
+		w.queue = w.queue[:0]
 
 		if len(pending) == 0 {
 			return result(), loadErr == nil, loadErr
@@ -334,17 +426,18 @@ func (e *Engine) closeIngestedFrontierLocked(key string, supplied []Tip, attempt
 
 		// 4. Resolve each boundary once. Exhaustion and failed availability
 		// are different outcomes even though neither produces runnable work.
-		var roots []Tip
+		var roots []int
 
-		for tip := range pending {
-			if resident(tip) != nil {
-				queue = append(queue, tip)
+		for i := range pending {
+			tip := w.visits[i].tip
+			if resident(i) != nil {
+				w.queue = append(w.queue, i)
 
 				continue
 			}
 
-			if noFetch[tip] {
-				delete(pending, tip)
+			if w.visits[i].flags&closureNoFetch != 0 {
+				delete(pending, i)
 
 				continue
 			}
@@ -360,13 +453,13 @@ func (e *Engine) closeIngestedFrontierLocked(key string, supplied []Tip, attempt
 					loadErr = errors.Join(loadErr, err)
 				}
 
-				delete(pending, tip)
+				delete(pending, i)
 			} else {
-				roots = append(roots, tip)
+				roots = append(roots, i)
 			}
 		}
 
-		if len(queue) != 0 {
+		if len(w.queue) != 0 {
 			continue
 		}
 
@@ -377,11 +470,11 @@ func (e *Engine) closeIngestedFrontierLocked(key string, supplied []Tip, attempt
 		// 5. Counter ranges prioritize cuts; they never establish dominance.
 		// Pairwise range preferences need not be transitive, so use a stable
 		// scan rather than passing them to a sorting comparator.
-		slices.SortFunc(roots, compare)
+		slices.SortFunc(roots, func(a, b int) int { return compare(w.visits[a].tip, w.visits[b].tip) })
 
 		best := roots[0]
 		for _, candidate := range roots[1:] {
-			a, b := root(owners[candidate]), root(owners[best])
+			a, b := root(w.visits[candidate].owner), root(w.visits[best].owner)
 			newer, older := false, false
 
 			for node, ar := range a.ranges {
@@ -396,18 +489,18 @@ func (e *Engine) closeIngestedFrontierLocked(key string, supplied []Tip, attempt
 			}
 		}
 
-		missing, err := e.fetchFrontierAncestry(key, best)
+		missing, err := e.fetchFrontierAncestry(key, w.visits[best].tip)
 		for _, tip := range missing {
 			attempted[tip] = ErrEffectNotFound
 		}
 
 		if err == nil && resident(best) == nil {
-			err = fmt.Errorf("effect %v reclaimed during frontier closure", best)
+			err = fmt.Errorf("effect %v reclaimed during frontier closure", w.visits[best].tip)
 		}
 
-		attempted[best] = err
+		attempted[w.visits[best].tip] = err
 		if err == nil {
-			queue = append(queue, best)
+			w.queue = append(w.queue, best)
 		}
 	}
 }

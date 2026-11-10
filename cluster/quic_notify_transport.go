@@ -30,6 +30,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/quic-go/quic-go"
 	pb "github.com/swytchdb/engine/cluster/proto"
 	"github.com/swytchdb/engine/effects"
@@ -54,6 +55,10 @@ const (
 type QUICNotifyTransport struct {
 	nodeID  NodeId
 	handler PacketHandler
+
+	// Active notifications, keyed by sender and request ID. Retries are shed
+	// until the original handler finishes its ACK/NACK send attempt.
+	activeNotifies *xsync.Map[[2]uint64, struct{}]
 
 	// connFunc returns the QUIC connection for a given peer.
 	// Set by PeerManager to look up PeerConn connections.
@@ -82,6 +87,7 @@ func NewQUICNotifyTransport(
 	return &QUICNotifyTransport{
 		nodeID:           nodeID,
 		handler:          handler,
+		activeNotifies:   xsync.NewMap[[2]uint64, struct{}](),
 		connFunc:         connFunc,
 		onPeerIdentified: onPeerIdentified,
 		stopCh:           make(chan struct{}),
@@ -260,7 +266,23 @@ func (t *QUICNotifyTransport) dispatchPlaintext(peerID NodeId, plaintext []byte)
 		}
 
 		if t.handler != nil {
-			go t.handler.HandleNotify(peerID, requestID, notify)
+			// One-way notifications all use zero; they are distinct messages.
+			if requestID == 0 {
+				go t.handler.HandleNotify(peerID, requestID, notify)
+				return
+			}
+
+			key := [2]uint64{uint64(peerID), requestID}
+			if _, loaded := t.activeNotifies.LoadOrStore(key, struct{}{}); loaded {
+				return
+			}
+
+			go func() {
+				// Keep no completed response cache: a retry after a lost ACK/NACK
+				// must be able to execute again.
+				defer t.activeNotifies.Delete(key)
+				t.handler.HandleNotify(peerID, requestID, notify)
+			}()
 		}
 
 	case PacketTypeNotifyACK:
