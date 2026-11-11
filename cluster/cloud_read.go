@@ -52,6 +52,7 @@ func (cs *CloudSync) FetchFromCDN(ctx context.Context, ref *pb.EffectRef) ([]byt
 	if cs.engine != nil {
 		pool = cs.engine.EffectCache()
 	}
+
 	return MarshalEffectWire(eff, pool)
 }
 

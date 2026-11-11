@@ -308,12 +308,15 @@ func TestReadMissDoesNotServeReadableSubset(t *testing.T) {
 			t.Fatalf("read must report required missing history, got result=%v err=%v", result, err)
 		}
 	}
+
 	if fake.calls != 1 {
 		t.Fatalf("expected one Cloud consult, got %d", fake.calls)
 	}
+
 	if len(fake.pending) != 0 {
 		t.Fatalf("ingestion classified history for reconstruction: %v", fake.pending)
 	}
+
 	if !e.index.Contains(key).ContainsAll([]Tip{reachable, holed}) {
 		t.Fatalf("cloud closure lost a branch: %v", e.index.Contains(key).Tips())
 	}

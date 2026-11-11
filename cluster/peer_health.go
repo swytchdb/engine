@@ -43,6 +43,11 @@ type PeerHealth struct {
 	// and derives RTT_min / skew / inter-arrival statistics from them.
 	clock *peerClockStats
 
+	// Wire version learned from inbound ticks. Unknown peers are probed with
+	// the current version; v1 peers select the legacy layout on first contact.
+	// Membership owns this state so a new incarnation negotiates independently.
+	tickVersion atomic.Uint32
+
 	// Each direction has the two counters carried by a heartbeat. Membership
 	// owns their lifetime; a new node identity starts without prior evidence.
 	sent, processed         atomic.Uint64

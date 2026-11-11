@@ -781,6 +781,7 @@ func (cs *CloudSync) buildEnvelope(tip effects.Tip, eff *pb.Effect) (*dp.Effect,
 	if cs.engine != nil {
 		pool = cs.engine.EffectCache()
 	}
+
 	raw, err := pool.MarshalEffect(eff)
 	if err != nil {
 		return nil, fmt.Errorf("marshal: %w", err)

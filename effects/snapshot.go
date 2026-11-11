@@ -454,13 +454,17 @@ func (v verdictMap) retain(txnID string, entry verdictEntry) {
 	existing, ok := v[txnID]
 	if entry.proven && !existing.proven {
 		v[txnID] = entry
+
 		return
 	}
+
 	if existing.proven && !entry.proven {
 		return
 	}
+
 	if !ok {
 		v[txnID] = entry
+
 		return
 	}
 
@@ -667,8 +671,10 @@ func (e *Engine) awaitSubscription(existing *subscriptionState, unsafe, allowAsy
 		if notify := existing.announcement; notify != nil {
 			if allowAsync {
 				existing.bootstrapMu.Unlock()
+
 				return nil
 			}
+
 			existing.announcement = nil
 			existing.bootstrapMu.Unlock()
 			// Retry work may outlive this caller's borrowed key buffer.
@@ -922,10 +928,12 @@ func (e *Engine) ensureSubscribedMode(key string, allowAsync bool) error {
 		state.announcement = notify
 		go e.broadcaster.BroadcastWithData(notify, notify.GetEffectData())
 		state.bootstrapMu.Unlock()
+
 		return nil
 	}
 
 	state.bootstrapMu.Unlock()
+
 	return e.bootstrapSubscription(ownedKey, state, notify, isUnsafe)
 }
 
@@ -1272,7 +1280,9 @@ func (e *Engine) reconstructWithView(key string, tips []Tip, txID string, waitFo
 			if e.horizon != nil && !e.horizon.Empty() {
 				invisible = e.horizon.IsInvisible
 			}
+
 			var walkedByKey map[string]int
+
 			atomicallyLost, walkedByKey = e.losersOnKeysAt(bindsByKey, func(k string) []Tip {
 				return e.index.Contains(k).Tips()
 			}, snapshotVerdicts, invisible, true)
@@ -1281,7 +1291,6 @@ func (e *Engine) reconstructWithView(key string, tips []Tip, txID string, waitFo
 					crossKeyWalked += walked
 				}
 			}
-
 		}
 
 		if slog.Default().Enabled(context.Background(), slog.LevelDebug) &&
@@ -1548,24 +1557,30 @@ func (e *Engine) walkBindEvidence(key string, tips []Tip, visit func(Tip, *pb.Ef
 		if eff := d.nodes[t]; eff != nil {
 			return eff
 		}
+
 		if _, attempted := failed[t]; attempted {
 			return nil
 		}
+
 		eff, err := e.getEffect(key, t)
 		if err != nil {
 			failed[t] = err
 		}
+
 		return eff
 	}
+
 	for {
 		d.nodes = make(map[Tip]*pb.Effect)
 		d.topoOrder = nil
 		d.lcaTip = Tip{}
+
 		paths, err := d.topoCollect(tips, true)
 		if err != nil {
 			// Tolerant callers historically inspect cyclic evidence. Without
 			// a proven common snapshot, no snapshot can stop the walk.
 			d.lcaTip = Tip{}
+
 			break
 		}
 		// Ingestion normally supplies the resident graph. If required effects
@@ -1575,12 +1590,15 @@ func (e *Engine) walkBindEvidence(key string, tips []Tip, visit func(Tip, *pb.Ef
 		if d.lcaTip != (Tip{}) {
 			start = paths[d.lcaTip].order
 		}
+
 		loaded := false
+
 		for _, t := range d.topoOrder[start:] {
 			if d.nodes[t] == nil && load(t) != nil {
 				loaded = true
 			}
 		}
+
 		if !loaded {
 			break
 		}
@@ -1588,49 +1606,65 @@ func (e *Engine) walkBindEvidence(key string, tips []Tip, visit func(Tip, *pb.Ef
 
 	seen := make(map[Tip]bool)
 	stack := slices.Clone(tips)
+
 	var snapshots []Tip
+
 	for len(stack) > 0 {
 		t := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
+
 		if seen[t] {
 			continue
 		}
+
 		seen[t] = true
+
 		eff := load(t)
 		if eff == nil {
 			continue
 		}
+
 		visit(t, eff)
+
 		if prev := eff.GetSnapshot().GetPrevSnapshot(); prev != nil {
 			snapshots = append(snapshots, r(prev))
 		}
+
 		if t != d.lcaTip {
 			for dep := range keyDeps(key, eff) {
 				stack = append(stack, r(dep))
 			}
 		}
 	}
+
 	for len(snapshots) > 0 {
 		t := snapshots[len(snapshots)-1]
 		snapshots = snapshots[:len(snapshots)-1]
+
 		if seen[t] {
 			continue
 		}
+
 		seen[t] = true
+
 		eff := load(t)
 		if snap := eff.GetSnapshot(); snap != nil {
 			visit(t, eff)
+
 			if prev := snap.GetPrevSnapshot(); prev != nil {
 				snapshots = append(snapshots, r(prev))
 			}
 		}
 	}
+
 	var failures []error
+
 	for t, err := range failed {
 		if seen[t] {
 			failures = append(failures, err)
 		}
 	}
+
 	return errors.Join(failures...)
 }
 
@@ -1685,6 +1719,7 @@ func (e *Engine) bindKeyClosureFrom(startKeys []string, tipsFor func(string) ([]
 		key string
 		tip Tip
 	}
+
 	anchored := make(map[location]bool)
 	verdicts := make(verdictMap)
 
@@ -1698,19 +1733,25 @@ func (e *Engine) bindKeyClosureFrom(startKeys []string, tipsFor func(string) ([]
 			return nil, nil, err
 		}
 
-		var discovered []Tip
-		var proofErr error
+		var (
+			discovered []Tip
+			proofErr   error
+		)
+
 		err = e.walkBindEvidence(k, slices.Concat(frontier, bindsByKey[k]), func(t Tip, eff *pb.Effect) {
 			if eff.GetTxnBind() != nil {
 				discovered = append(discovered, t)
 			}
+
 			if eff.GetSnapshot() != nil {
 				proofErr = errors.Join(proofErr, e.harvestProofVerdicts(t, eff, verdicts))
 			}
 		})
+
 		if proofErr != nil {
 			return nil, nil, proofErr
 		}
+
 		for _, t := range discovered {
 			eff, _ := e.effectCache.Get(t)
 			// An owned proof supplies the historical cross-key outcome without
@@ -1719,10 +1760,12 @@ func (e *Engine) bindKeyClosureFrom(startKeys []string, tipsFor func(string) ([]
 			if bind := eff.GetTxnBind(); bind != nil && !verdicts[eff.GetTxnId()].proven {
 				for _, kb := range bind.GetKeys() {
 					other := string(kb.GetKey())
+
 					anchor := location{other, t}
 					if other != k && !anchored[anchor] {
 						// Start at the envelope, not its NewTip ancestor.
 						anchored[anchor] = true
+
 						bindsByKey[other] = append(bindsByKey[other], t)
 						if !queued[other] {
 							queue = append(queue, other)
@@ -1732,6 +1775,7 @@ func (e *Engine) bindKeyClosureFrom(startKeys []string, tipsFor func(string) ([]
 				}
 			}
 		}
+
 		if err != nil && strict {
 			return nil, nil, err
 		}
@@ -1758,6 +1802,7 @@ func (e *Engine) losersOnKey(key string, extraTips []Tip, snapshotVerdicts verdi
 
 func (e *Engine) losersOnKeyAt(key string, tips, extraTips []Tip, snapshotVerdicts verdictMap, isInvisible func(string) bool, reportConflicts bool) (map[string]struct{}, int) {
 	losers, walked, _ := e.forkChoicesOnKeyAt(key, tips, extraTips, snapshotVerdicts, isInvisible, reportConflicts, nil)
+
 	return losers, walked
 }
 
@@ -1769,6 +1814,7 @@ func (e *Engine) losersOnKeysAt(anchors map[string][]Tip, tipsFor func(string) [
 	competitors := make(map[string][]string)
 	walked := make(map[string]int, len(anchors))
 	losses := make(map[string]bool)
+
 	for key, extra := range anchors {
 		_, count, observed := e.forkChoicesOnKeyAt(key, tipsFor(key), extra, verdicts, isInvisible, report, func(winner, loser string) {
 			competitors[loser] = append(competitors[loser], winner)
@@ -1782,12 +1828,15 @@ func (e *Engine) losersOnKeysAt(anchors map[string][]Tip, tipsFor func(string) [
 			}
 		}
 	}
+
 	for txn, entry := range verdicts {
 		if entry.verdict == pb.Verdict_LOST {
 			losses[txn] = true
 		}
 	}
+
 	var loses func(string) bool
+
 	loses = func(txn string) bool {
 		if lost, known := losses[txn]; known {
 			return lost
@@ -1796,24 +1845,31 @@ func (e *Engine) losersOnKeysAt(anchors map[string][]Tip, tipsFor func(string) [
 		// recursion is acyclic. Each transaction is evaluated once, after all
 		// higher-priority competitors it needs have been evaluated.
 		lost := false
+
 		for _, other := range competitors[txn] {
 			if !loses(other) {
 				lost = true
+
 				break
 			}
 		}
+
 		losses[txn] = lost
+
 		return lost
 	}
 	losers := make(map[string]struct{})
+
 	for txn := range competitors {
 		loses(txn)
 	}
+
 	for txn, lost := range losses {
 		if lost {
 			losers[txn] = struct{}{}
 		}
 	}
+
 	return losers, walked
 }
 
@@ -1861,9 +1917,11 @@ func (e *Engine) forkChoicesOnKeyAt(key string, tips, extraTips []Tip, snapshotV
 	// Preserve this caller's tolerant handling of unavailable evidence.
 	visit := func(t Tip, eff *pb.Effect) {
 		walked++
+
 		if snap := eff.GetSnapshot(); snap != nil && len(packaged) == 0 {
 			_ = e.harvestProofVerdicts(t, eff, verdicts)
 		}
+
 		if bind := eff.GetTxnBind(); bind != nil && (isInvisible == nil || !isInvisible(eff.GetTxnId())) {
 			for _, kb := range bind.GetKeys() {
 				if string(kb.GetKey()) == key && r(kb.GetNewTip()) != (Tip{}) {
@@ -1873,16 +1931,23 @@ func (e *Engine) forkChoicesOnKeyAt(key string, tips, extraTips []Tip, snapshotV
 						newTip:     r(kb.GetNewTip()),
 						hash:       eff.GetForkChoiceHash(),
 					})
+
 					break
 				}
 			}
 		}
 	}
-	load := func(t Tip) (*pb.Effect, error) { return e.getEffect(key, t) }
+
+	load := func(t Tip) (*pb.Effect, error) {
+		if len(packaged) != 0 {
+			return packaged[0][t], nil
+		}
+
+		return e.getEffect(key, t)
+	}
 	if len(packaged) != 0 {
 		// Explicit proof membership, not a value frontier. Never expand data
 		// ancestry or trust the cached labels when recomputing this proof.
-		load = func(t Tip) (*pb.Effect, error) { return packaged[0][t], nil }
 		for _, t := range startTips {
 			visit(t, packaged[0][t])
 		}
@@ -1993,9 +2058,10 @@ candidateLoop:
 				otherLost = otherLost && compete == nil
 				// Conflict diagnostics still report every incompatible pair
 				// with cached WON evidence, even if one is now eliminated.
-				if otherLost && !(reportable[b.bindOffset] && reportable[other.bindOffset]) {
+				if otherLost && (!reportable[b.bindOffset] || !reportable[other.bindOffset]) {
 					continue
 				}
+
 				if ancestry.cyclic && (ancestry.reaches(b.bindOffset, other.bindOffset) || ancestry.reaches(other.bindOffset, b.bindOffset)) {
 					continue
 				}
@@ -2016,6 +2082,7 @@ candidateLoop:
 				if compete != nil {
 					compete(other.txnID, b.txnID)
 				}
+
 				if !otherLost {
 					losers[b.txnID] = struct{}{}
 				}

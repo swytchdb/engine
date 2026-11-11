@@ -17,6 +17,7 @@ func TestBindEvidence_CompetitorBelowSnapshot(t *testing.T) {
 		if snapshotFirst {
 			name = "snapshot-first"
 		}
+
 		t.Run(name, func(t *testing.T) {
 			log := newSnapshotLog()
 			e := newSnapshotEngine(log)
@@ -46,6 +47,7 @@ func TestBindEvidence_CompetitorBelowSnapshot(t *testing.T) {
 				if err := d.prepare(tc.tips); err != nil {
 					t.Fatal(err)
 				}
+
 				if d.lcaTip != tc.lca {
 					t.Fatalf("tips %v: LCA = %v, want %v", tc.tips, d.lcaTip, tc.lca)
 				}
@@ -56,34 +58,42 @@ func TestBindEvidence_CompetitorBelowSnapshot(t *testing.T) {
 				"payout:alice": {alice},
 				"payout:bob":   {bob},
 			}
+
 			keys := []string{"winner", "payout:bob"}
 			if snapshotFirst {
 				// bindKeyClosureFrom processes its key queue from the end.
 				slices.Reverse(keys)
 			}
+
 			anchors, verdicts, err := e.bindKeyClosureFrom(keys, func(key string) ([]Tip, error) {
 				return frontiers[key], nil
 			}, true)
 			if err != nil {
 				t.Fatal(err)
 			}
+
 			if !slices.Contains(anchors["payout:alice"], alice) {
 				t.Errorf("did not discover Alice below the former LCA: anchors=%v", anchors)
 			}
+
 			if len(verdicts) != 0 {
 				t.Fatalf("fixture unexpectedly supplies cached verdicts: %v", verdicts)
 			}
+
 			lost, _ := e.losersOnKeysAt(anchors, func(key string) []Tip {
 				return frontiers[key]
 			}, verdicts, nil, false)
 			if _, ok := lost["bob"]; !ok || len(lost) != 1 {
 				t.Errorf("fork choice = %v, want only Bob to lose", lost)
 			}
+
 			view := &snapshotReadView{anchors: anchors, verdicts: verdicts, lost: lost, historical: true}
+
 			result, _, err := e.reconstructWithView("payout:bob", []Tip{bob}, "", false, view)
 			if err != nil {
 				t.Fatal(err)
 			}
+
 			if result != nil {
 				t.Errorf("reconstructed losing transaction's payout: %v", result)
 			}
@@ -107,6 +117,7 @@ func TestBindEvidence_ConcurrentSnapshots(t *testing.T) {
 			base := state(Tip{99, 1}) // reclaimed history
 			alice := closureBind(log, "alice", 1, []string{"winner"}, map[string]Tip{"winner": base})
 			bob := closureBind(log, "bob", 2, []string{"winner"}, map[string]Tip{"winner": base})
+
 			branch := state(alice, bob)
 			if cached {
 				branch = log.putEffect(&pb.Effect{
@@ -117,22 +128,27 @@ func TestBindEvidence_ConcurrentSnapshots(t *testing.T) {
 					}},
 				})
 			}
+
 			noop := log.putEffect(&pb.Effect{
 				Key: []byte("winner"), Deps: toPbRefs([]Tip{branch}),
 				Kind: &pb.Effect_Noop{Noop: &pb.NoopEffect{}},
 			})
 			tips := []Tip{state(noop), state(base)}
+
 			anchors, verdicts, err := e.bindKeyClosureFrom([]string{"winner"}, func(string) ([]Tip, error) {
 				return tips, nil
 			}, true)
 			if err != nil {
 				t.Fatal(err)
 			}
+
 			lost, _ := e.losersOnKeysAt(anchors, func(string) []Tip { return tips }, verdicts, nil, false)
 			if _, ok := lost["bob"]; !ok || len(lost) != 1 {
 				t.Fatalf("losers=%v, want only Bob", lost)
 			}
+
 			view := &snapshotReadView{anchors: anchors, verdicts: verdicts, lost: lost, historical: true}
+
 			result, _, err := e.reconstructWithView("winner", tips, "", false, view)
 			if err != nil || string(result.GetScalar().GetRaw()) != "alice" {
 				t.Fatalf("reconstructed %v, error=%v; want Alice", result, err)
@@ -159,15 +175,19 @@ func TestBindEvidence_VerdictShortcutDoesNotExpandFoldedData(t *testing.T) {
 				}},
 			}
 			putCutEffects(t, e, map[Tip]*pb.Effect{verdict: metadata})
+
 			if resident {
 				putCutEffects(t, e, map[Tip]*pb.Effect{snapshot: state})
 			}
+
 			e.broadcaster = &cutBroadcaster{load: func(tip Tip) ([]byte, error) {
 				if tip != snapshot {
 					t.Fatalf("fetched folded data at %v", tip)
 				}
+
 				return wireEffect(state), nil
 			}}
+
 			_, verdicts, err := e.bindKeyClosureFrom([]string{"k"}, func(string) ([]Tip, error) {
 				return []Tip{snapshot}, nil
 			}, true)

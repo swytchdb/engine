@@ -28,6 +28,7 @@ func (e *Engine) closureLock(key string) *sync.Mutex {
 func (e *Engine) installIngestedTips(key string, arrivals ...Tip) {
 	op := newClosureOperation(e, make(map[Tip]error))
 	defer op.release()
+
 	_, _, err := op.publish(key, arrivals, false)
 	if err != nil {
 		slog.Warn("frontier closure incomplete; retaining unresolved tips", "key", key, "error", err)
@@ -57,6 +58,7 @@ func (op *closureOperation) release() {
 	for _, w := range op.work {
 		w.release()
 	}
+
 	clear(op.work)
 }
 
@@ -67,6 +69,7 @@ func (op *closureOperation) publish(key string, arrivals []Tip, failOnError bool
 func (e *Engine) closeIngestedFrontier(key string, supplied []Tip, attempted map[Tip]error) ([]Tip, bool, error) {
 	op := newClosureOperation(e, attempted)
 	defer op.release()
+
 	return op.run(key, supplied, false, false)
 }
 
@@ -75,26 +78,34 @@ func (e *Engine) closeIngestedFrontier(key string, supplied []Tip, attempted map
 // other shard. Each key keeps its own cuts and consumption relationships.
 func (op *closureOperation) run(key string, supplied []Tip, publish, failOnError bool) ([]Tip, bool, error) {
 	e := op.engine
+
 	type branch struct {
 		key string
 		tip Tip
 	}
+
 	seen := make(map[branch]bool)
 	pending := make(map[string][]Tip)
+
 	var queue []string
+
 	walk := func(key string, tips []Tip) []Tip {
 		return op.walk(key, tips, func(tip Tip, bind *pb.TransactionalBindEffect) {
 			for _, kb := range bind.GetKeys() {
 				other := string(kb.GetKey())
+
 				b := branch{other, tip}
 				if seen[b] || !e.isServed(kb.GetKey()) {
 					continue
 				}
+
 				seen[b] = true
+
 				if other != key {
 					if _, queued := pending[other]; !queued {
 						queue = append(queue, other)
 					}
+
 					pending[other] = append(pending[other], tip)
 				}
 			}
@@ -103,19 +114,24 @@ func (op *closureOperation) run(key string, supplied []Tip, publish, failOnError
 
 	mu := e.closureLock(key)
 	mu.Lock()
+
 	locked := true
 	defer func() {
 		if locked {
 			mu.Unlock()
 		}
 	}()
+
 	retry := false
+
 	for {
 		current := e.index.Contains(key)
+
 		tips := supplied
 		if publish {
 			tips = slices.Concat(current.Tips(), supplied)
 		}
+
 		if retry {
 			// Associated frontiers and unresolved boundaries may also have
 			// advanced. Extend their existing cuts without repeating history.
@@ -125,15 +141,21 @@ func (op *closureOperation) run(key string, supplied []Tip, publish, failOnError
 					queue = append(queue, other)
 				}
 			}
+
 			slices.Sort(queue)
+
 			retry = false
 		}
+
 		live := walk(key, tips)
+
 		if len(queue) != 0 {
 			locked = false
 			mu.Unlock()
+
 			for next := 0; next < len(queue); next++ {
 				other := queue[next]
+
 				func() {
 					otherMu := e.closureLock(other)
 					otherMu.Lock()
@@ -145,7 +167,9 @@ func (op *closureOperation) run(key string, supplied []Tip, publish, failOnError
 					walk(other, tips)
 				}()
 			}
+
 			queue = queue[:0]
+
 			mu.Lock()
 			locked = true
 			// Incorporate local publications made while another key was
@@ -154,26 +178,34 @@ func (op *closureOperation) run(key string, supplied []Tip, publish, failOnError
 		}
 
 		var err error
+
 		for _, w := range op.work {
 			for _, failure := range w.failures {
 				err = errors.Join(err, failure)
 			}
 		}
+
 		complete := err == nil
 		if !publish || failOnError && err != nil {
 			return live, complete, err
 		}
+
 		next := keytrie.NewTipSet(live...)
+
 		if e.index.Contains(key) != current {
 			retry = true
+
 			continue
 		}
+
 		if current.Len() == next.Len() && current.ContainsAll(live) {
 		} else if _, ok := op.cas(key, current, next); !ok {
 			if e.index.Closed() {
 				return nil, false, errors.Join(err, errors.New("engine closed"))
 			}
+
 			retry = true
+
 			continue
 		} else {
 			e.notifyKeyChanged(key)
@@ -185,6 +217,7 @@ func (op *closureOperation) run(key string, supplied []Tip, publish, failOnError
 			eff, _ := e.effectCache.Get(tip)
 			e.recordHistoryProcessed(tip, eff)
 		}
+
 		return live, complete, err
 	}
 }
@@ -232,12 +265,14 @@ var closureWorkPool = sync.Pool{New: func() any {
 
 func (w *closureWork) grow() {
 	w.slots = make([]int, len(w.slots)*2)
+
 	mask := uint64(len(w.slots) - 1)
 	for i := range w.visits {
 		slot := maphash.Comparable(w.seed, w.visits[i].tip) & mask
 		for w.slots[slot] != 0 {
 			slot = (slot + 1) & mask
 		}
+
 		w.slots[slot] = i + 1
 	}
 }
@@ -246,7 +281,9 @@ func (w *closureWork) intern(tip Tip) int {
 	if (len(w.visits)+1)*4 >= len(w.slots)*3 {
 		w.grow()
 	}
+
 	mask := uint64(len(w.slots) - 1)
+
 	slot := maphash.Comparable(w.seed, tip) & mask
 	for {
 		entry := w.slots[slot]
@@ -254,11 +291,14 @@ func (w *closureWork) intern(tip Tip) int {
 			i := len(w.visits)
 			w.visits = append(w.visits, closureVisit{tip: tip})
 			w.slots[slot] = i + 1
+
 			return i
 		}
+
 		if w.visits[entry-1].tip == tip {
 			return entry - 1
 		}
+
 		slot = (slot + 1) & mask
 	}
 }
@@ -269,6 +309,7 @@ func (w *closureWork) release() {
 	if cap(w.visits) > 32768 || cap(w.queue) > 65536 {
 		return
 	}
+
 	clear(w.visits)
 	clear(w.pending)
 	clear(w.failures)
@@ -283,25 +324,31 @@ func (w *closureWork) release() {
 // retries. Cross-key branches are queued rather than taking a second shard.
 func (op *closureOperation) walk(key string, supplied []Tip, visitBind func(Tip, *pb.TransactionalBindEffect)) []Tip {
 	e, attempted := op.engine, op.attempted
+
 	w := op.work[key]
 	if w == nil {
 		w = closureWorkPool.Get().(*closureWork)
 		if w.pending == nil {
 			w.pending = make(map[int][]Tip)
 		}
+
 		op.work[key] = w
 	}
+
 	pending := w.pending
 	resident := func(i int) *vertex {
 		v := w.visits[i].vertex
 		if v != nil && v.refs.Load() >= 0 {
 			return v
 		}
+
 		if e.effectCache == nil {
 			return nil
 		}
+
 		v = e.effectCache.getVertex(w.visits[i].tip)
 		w.visits[i].vertex = v
+
 		return v
 	}
 	// Comparison is rare (seeds, cut joins, and fetch scheduling), and uses
@@ -310,6 +357,7 @@ func (op *closureOperation) walk(key string, supplied []Tip, visitBind func(Tip,
 		if e.effectCache == nil {
 			return nil
 		}
+
 		return e.effectCache.getVertex(tip)
 	}
 	compare := func(a, b Tip) int {
@@ -334,6 +382,7 @@ func (op *closureOperation) walk(key string, supplied []Tip, visitBind func(Tip,
 	}
 	result := func() []Tip {
 		var tips []Tip
+
 		for i := range w.visits {
 			if w.visits[i].flags&closureLive != 0 {
 				tips = append(tips, w.visits[i].tip)
@@ -413,8 +462,10 @@ func (op *closureOperation) walk(key string, supplied []Tip, visitBind func(Tip,
 			if w.visits[i].flags&closureExpanded == 0 {
 				w.queue = append(w.queue, i)
 			}
+
 			continue
 		}
+
 		c := &closureCut{first: tip, ranges: make(map[uint64][2]uint64)}
 		claim(i, c)
 		w.visits[i].flags |= closureLive
@@ -467,6 +518,7 @@ func (op *closureOperation) walk(key string, supplied []Tip, visitBind func(Tip,
 		// 3. Drain resident downward work before requesting any boundary.
 		for next := 0; next < len(w.queue); next++ {
 			i := w.queue[next]
+
 			tip := w.visits[i].tip
 			if w.visits[i].flags&closureExpanded != 0 {
 				continue
@@ -501,6 +553,7 @@ func (op *closureOperation) walk(key string, supplied []Tip, visitBind func(Tip,
 			delete(w.failures, i)
 
 			w.visits[i].flags |= closureExpanded
+
 			if bind := v.eff.GetTxnBind(); bind != nil {
 				visitBind(tip, bind)
 			}
@@ -512,14 +565,17 @@ func (op *closureOperation) walk(key string, supplied []Tip, visitBind func(Tip,
 			if op.observe != nil {
 				op.observe(tip, nil)
 			}
+
 			for ref := range keyDeps(key, v.eff) {
 				dep := r(ref)
 				if dep == (Tip{}) || dep == tip {
 					continue
 				}
+
 				if op.observe != nil {
 					op.observe(tip, ref)
 				}
+
 				j := w.intern(dep)
 				// Only this genuine downward edge establishes consumption.
 				w.visits[j].flags &^= closureLive
@@ -539,6 +595,7 @@ func (op *closureOperation) walk(key string, supplied []Tip, visitBind func(Tip,
 					join(w.visits[i].owner, known)
 				} else {
 					claim(j, w.visits[i].owner)
+
 					if dv != nil {
 						ascend(dv, w.visits[j].owner)
 					}
@@ -589,6 +646,7 @@ func (op *closureOperation) walk(key string, supplied []Tip, visitBind func(Tip,
 					if w.failures == nil {
 						w.failures = make(map[int]error)
 					}
+
 					w.failures[i] = err
 				} else {
 					delete(pending, i)

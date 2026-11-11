@@ -20,15 +20,20 @@ func TestHistoricalMembershipConsultsFrozenEvidence(t *testing.T) {
 		t.Run(evidence, func(t *testing.T) {
 			log := newSnapshotLog()
 			e := newSnapshotEngine(log)
+
 			t.Cleanup(func() { _ = e.Close() })
+
 			bind := closureBind(log, "old", 1, []string{"a", "b"}, nil)
+
 			proof, err := e.bindProof(bind, nil, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
+
 			owner := log.putEffect(bindEvidenceSnapshot("a", proof))
 			e.effectCache.releaseEvidence(evidenceTips(proof))
 			ownerEffect, _ := e.effectCache.Get(owner)
+
 			verdicts, err := e.proofVerdicts(owner, ownerEffect)
 			if err != nil || !verdicts["old"].proven {
 				t.Fatalf("expected evaluated proof: %v, %v", verdicts, err)
@@ -42,23 +47,28 @@ func TestHistoricalMembershipConsultsFrozenEvidence(t *testing.T) {
 				Kind: &pb.Effect_Snapshot{Snapshot: &pb.SnapshotEffect{State: &pb.ReducedEffect{}}},
 			})
 			frontier := state
+
 			if evidence != "live-only" {
 				// Make the proof source part of the selected value history.
 				snapshot := bindEvidenceSnapshot("a", proof)
 				snapshot.Deps = toPbRefs([]Tip{state})
 				owner = log.putEffect(snapshot)
 				ownerEffect, _ = e.effectCache.Get(owner)
+
 				verdicts, err = e.proofVerdicts(owner, ownerEffect)
 				if err != nil {
 					t.Fatal(err)
 				}
+
 				frontier = owner
 			}
+
 			if evidence == "cached-label" {
 				entry := verdicts["old"]
 				entry.proven = false
 				verdicts["old"] = entry
 			}
+
 			view := newSnapshotReadView(e, context.Background())
 			view.frontiers["a"] = snapshotFrontier{resolved: []Tip{frontier}}
 			view.verdicts = verdicts
@@ -67,6 +77,7 @@ func TestHistoricalMembershipConsultsFrozenEvidence(t *testing.T) {
 				decided: make(map[Tip]bool),
 			}
 			eff, _ := e.effectCache.Get(bind)
+
 			included, err := s.member(context.Background(), bind, eff, make(map[Tip]bool))
 			if evidence == "frozen" {
 				if err != nil || !included {
@@ -95,16 +106,20 @@ func TestHistoricalReadRetainsLiveCompetition(t *testing.T) {
 				e := newSnapshotEngine(log)
 				preSubscribe(e, "winner")
 				preSubscribe(e, "other")
+
 				root := scalarSet("winner", "base")
 				root.NodeId, root.Hlc = 1, sTs(0)
 				base := log.putEffect(root)
 				log.nodeID = 2
 				a := closureBind(log, "A", 3, []string{"winner"}, map[string]Tip{"winner": base})
+
 				var b, excluded Tip
+
 				frontiers := make(map[string][]Tip)
 				verdicts := map[string]pb.Verdict{"A": pb.Verdict_LOST, "B": pb.Verdict_WON}
 				loser, wantValue, verdictKey := "A", "base", "winner"
 				boundary := int64(450)
+
 				if chain {
 					// A conflicts with B, B conflicts with C, A and C are
 					// disjoint. C's higher priority eliminates B, allowing A.
@@ -120,6 +135,7 @@ func TestHistoricalReadRetainsLiveCompetition(t *testing.T) {
 					b = closureBind(log, "B", 1, []string{"winner"}, map[string]Tip{"winner": base})
 					excluded = b
 				}
+
 				frontiers["winner"] = []Tip{a, b}
 				if cached {
 					v := log.putEffect(&pb.Effect{
@@ -129,9 +145,11 @@ func TestHistoricalReadRetainsLiveCompetition(t *testing.T) {
 					})
 					frontiers[verdictKey] = []Tip{v}
 				}
+
 				for key, tips := range frontiers {
 					e.index.Insert(key, nil, keytrie.NewTipSet(tips...))
 				}
+
 				s := &transactionSnapshot{
 					engine: e, at: stn.Sample{Domain: 1, Tick: boundary},
 					expiryAt: time.Now(), clocks: e.clockEvidence(),
@@ -139,19 +157,24 @@ func TestHistoricalReadRetainsLiveCompetition(t *testing.T) {
 				if err := s.prepare(context.Background(), []string{"winner"}); err != nil {
 					t.Fatal(err)
 				}
+
 				if !s.decided[a] || s.decided[excluded] {
 					t.Fatalf("fixture must select A and exclude its local competitor: A=%v excluded=%v", s.decided[a], s.decided[excluded])
 				}
+
 				v := s.views["winner"]
 				if _, lost := v.lost[loser]; !lost || len(v.lost) != 1 {
 					t.Errorf("lost=%v, want only %s", v.lost, loser)
 				}
+
 				for key := range v.anchors {
 					if slices.Contains(v.frontiers[key].resolved, excluded) || slices.Contains(v.anchors[key], excluded) {
 						t.Errorf("live competitor leaked into historical value history on %q", key)
 					}
 				}
+
 				tips := slices.Concat(v.frontiers["winner"].resolved, v.anchors["winner"])
+
 				result, _, err := e.reconstructWithView("winner", tips, "reader", true, v)
 				if err != nil || string(result.GetScalar().GetRaw()) != wantValue {
 					t.Fatalf("value=%q error=%v, want %q", result.GetScalar().GetRaw(), err, wantValue)

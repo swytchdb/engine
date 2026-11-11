@@ -194,19 +194,24 @@ func (e *Engine) checkNackConflict(ptxn *pendingTxn, key string, detail *pb.Nack
 	if err != nil {
 		return true, nil
 	}
+
 	var defeated map[string]Tip
+
 	for _, cur := range candidates {
 		conflict, txn := e.classifyNackTip(ptxn, key, cur)
 		if conflict {
 			return true, nil
 		}
+
 		if txn != "" {
 			if defeated == nil {
 				defeated = make(map[string]Tip)
 			}
+
 			defeated[txn] = r(cur.GetRef())
 		}
 	}
+
 	return false, defeated
 }
 
@@ -217,48 +222,63 @@ func (e *Engine) nackCandidates(ptxn *pendingTxn, key string, details []*pb.Nack
 	queue := append([]*pb.NackTipDetail(nil), details...)
 	visited := make(map[Tip]bool)
 	verdicts := make(verdictMap)
+
 	var candidates []*pb.NackTipDetail
+
 	for len(queue) > 0 {
 		cur := queue[len(queue)-1]
 		queue = queue[:len(queue)-1]
+
 		tip := r(cur.GetRef())
 		if visited[tip] {
 			continue
 		}
+
 		visited[tip] = true
+
 		if cur.GetIsData() || cur.GetIsBind() {
 			candidates = append(candidates, cur)
+
 			continue
 		}
+
 		deps := cur.GetDeps()
+
 		if eff, err := e.getEffect(key, tip); err == nil {
 			if snap := eff.GetSnapshot(); snap != nil {
 				if err := e.harvestProofVerdicts(tip, eff, verdicts); err != nil {
 					return nil, nil, err
 				}
+
 				if snap.GetPrevSnapshot() != nil {
 					deps = append(append([]*pb.EffectRef(nil), deps...), snap.GetPrevSnapshot())
 				}
 			}
 		}
+
 		if tip != (Tip{}) && e.reachesFromTxOnKey(ptxn, &key, tip) {
 			continue
 		}
+
 		for _, dep := range deps {
 			dt := r(dep)
 			if visited[dt] || e.reachesFromTxOnKey(ptxn, &key, dt) {
 				continue
 			}
+
 			eff, err := e.getEffect(key, dt)
 			if err != nil {
 				if findPendingKey(ptxn, key) != nil {
 					return nil, nil, ErrTxnAmbiguous
 				}
+
 				continue
 			}
+
 			queue = append(queue, nackTipDetail(dt, eff))
 		}
 	}
+
 	return candidates, verdicts, nil
 }
 
@@ -268,28 +288,37 @@ func (e *Engine) nackCandidates(ptxn *pendingTxn, key string, details []*pb.Nack
 // published transaction remains ambiguous, rather than reporting a false abort.
 func (e *Engine) evaluateNacks(ptxn *pendingTxn, nacks []*pb.NackNotify) (map[string]Tip, error) {
 	ptxn.proofSources = nil
+
 	type candidate struct {
 		key    string
 		detail *pb.NackTipDetail
 		txn    string
 	}
+
 	var candidates []candidate
+
 	verdicts := make(verdictMap)
+
 	for _, nack := range nacks {
 		key := string(nack.GetKey())
+
 		tips, evidence, err := e.nackCandidates(ptxn, key, nack.GetTipDetails())
 		if err != nil {
 			return nil, err
 		}
+
 		for txn, entry := range evidence {
 			if prior, ok := verdicts[txn]; ok && prior.verdict != entry.verdict {
 				return nil, ErrTxnAmbiguous
 			}
+
 			verdicts[txn] = entry
 		}
+
 		if findPendingKey(ptxn, key) == nil {
 			continue
 		}
+
 		for _, tip := range tips {
 			c := candidate{key: key, detail: tip}
 			if tip.GetIsBind() {
@@ -297,8 +326,10 @@ func (e *Engine) evaluateNacks(ptxn *pendingTxn, nacks []*pb.NackNotify) (map[st
 				if err != nil || eff.GetTxnBind() == nil {
 					return nil, ErrTxnAmbiguous
 				}
+
 				c.txn = eff.GetTxnId()
 			}
+
 			candidates = append(candidates, c)
 		}
 	}
@@ -310,20 +341,26 @@ func (e *Engine) evaluateNacks(ptxn *pendingTxn, nacks []*pb.NackNotify) (map[st
 			return nil, ErrTxnAmbiguous
 		}
 	}
+
 	defeated := make(map[string]Tip)
+
 	for _, c := range candidates {
 		if verdicts[c.txn].verdict == pb.Verdict_LOST {
 			ptxn.proofSources = append(ptxn.proofSources, verdicts[c.txn].snapshotTip)
+
 			continue
 		}
+
 		conflict, txn := e.classifyNackTip(ptxn, c.key, c.detail)
 		if conflict {
 			return nil, ErrTxnAborted
 		}
+
 		if txn != "" {
 			defeated[txn] = r(c.detail.GetRef())
 		}
 	}
+
 	return defeated, nil
 }
 
@@ -333,20 +370,26 @@ func (e *Engine) evaluateNacks(ptxn *pendingTxn, nacks []*pb.NackNotify) (map[st
 // subscribers can answer immediately. All waits point toward a smaller hash.
 func (e *Engine) priorityPredecessors(ref Tip, eff *pb.Effect) []*pendingTxn {
 	var prior []*pendingTxn
+
 	detail := nackTipDetail(ref, eff)
+
 	e.pendingTxns.Range(func(_ Tip, txn *pendingTxn) bool {
 		if txn.resolved == nil || !ForkChoiceLess(txn.forkChoiceHash, detail.GetBindForkChoiceHash()) {
 			return true
 		}
+
 		for _, kb := range eff.GetTxnBind().GetKeys() {
 			key := string(kb.GetKey())
 			if findPendingKey(txn, key) != nil && !e.nackTipOrdered(txn, key, detail) {
 				prior = append(prior, txn)
+
 				break
 			}
 		}
+
 		return true
 	})
+
 	return prior
 }
 
@@ -358,23 +401,28 @@ func (e *Engine) finishPriorityResponse(ref *pb.EffectRef, nacks []*pb.NackNotif
 	if len(prior) == 0 {
 		return nacks
 	}
+
 	timer := time.NewTimer(horizonFallbackWait)
 	defer timer.Stop()
+
 	for _, txn := range prior {
 		select {
 		case <-txn.resolved:
 		case <-timer.C:
 			return nacks
 		}
+
 		for _, response := range txn.responses {
 			forwarded := proto.Clone(response).(*pb.NackNotify)
 			forwarded.Conflicting = ref
 			nacks = append(nacks, forwarded)
 		}
+
 		for _, pk := range txn.keys {
 			nacks = append(nacks, e.buildEnrichedNack(pk.key, ref, e.index.Contains(pk.key).Tips()))
 		}
 	}
+
 	return nacks
 }
 

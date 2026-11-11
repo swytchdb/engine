@@ -130,6 +130,7 @@ func MarshalEffectWire(eff *pb.Effect, pools ...*effects.VertexPool) ([]byte, er
 	if len(pools) != 0 {
 		pool = pools[0]
 	}
+
 	protoData, err := pool.MarshalEffect(eff)
 	if err != nil {
 		return nil, err

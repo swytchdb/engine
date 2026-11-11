@@ -142,6 +142,7 @@ func (v *snapshotReadView) discoverWithEvidence(keys []string, frontier func(str
 	tipsFor := func(key string) []Tip {
 		return v.frontiers[key].resolved
 	}
+
 	if live != nil {
 		// Temporal selection limits values, not the evidence needed to decide
 		// whether an included bind survives. Keep the live competition across
@@ -149,21 +150,26 @@ func (v *snapshotReadView) discoverWithEvidence(keys []string, frontier func(str
 		// must never enter v.frontiers or v.anchors: reconstruction uses those.
 		anchors = make(map[string][]Tip, len(v.anchors)+len(live.anchors))
 		maps.Copy(anchors, v.anchors)
+
 		for key, tips := range live.anchors {
 			anchors[key] = slices.Concat(anchors[key], tips)
 		}
+
 		tipsFor = func(key string) []Tip {
 			return slices.Concat(v.frontiers[key].resolved, live.frontiers[key].resolved)
 		}
 		verdicts = make(verdictMap, len(live.verdicts)+len(v.verdicts))
 		maps.Copy(verdicts, live.verdicts)
+
 		for txn, entry := range v.verdicts {
 			verdicts.retain(txn, entry)
 		}
+
 		v.verdicts = verdicts
 	}
 
 	var walkedByKey map[string]int
+
 	v.lost, walkedByKey = v.engine.losersOnKeysAt(anchors, tipsFor, verdicts, v.isInvisible, !v.historical)
 	for _, walked := range walkedByKey {
 		v.walked += walked

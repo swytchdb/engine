@@ -294,6 +294,7 @@ func (p *VertexPool) putWithPin(tip Tip, eff *pb.Effect, takeOwnership bool, own
 			return err
 		}
 		defer release()
+
 		eff = clean
 	}
 	// Package members are durable inside their owning snapshot. Writing them
@@ -320,6 +321,7 @@ func (p *VertexPool) putWithPin(tip Tip, eff *pb.Effect, takeOwnership bool, own
 		if err != nil {
 			return err
 		}
+
 		nv := &vertex{eff: eff, size: vertexOverhead}
 		if takeOwnership {
 			nv.creationKeys = missingCreationKeys(eff, nil, owns)
@@ -329,6 +331,7 @@ func (p *VertexPool) putWithPin(tip Tip, eff *pb.Effect, takeOwnership bool, own
 		if pin {
 			owners++
 		}
+
 		nv.refs.Store(int32(owners))
 		p.owned.change(eff, 1)
 		p.vertexBytes.Add(nv.size)
@@ -352,10 +355,12 @@ func (p *VertexPool) putWithPin(tip Tip, eff *pb.Effect, takeOwnership bool, own
 		if takeOwnership {
 			keys = missingCreationKeys(eff, v.creationKeys, owns)
 		}
+
 		added := len(keys)
 		if pin {
 			added++
 		}
+
 		if added == 0 {
 			return nil
 		}
@@ -366,6 +371,7 @@ func (p *VertexPool) putWithPin(tip Tip, eff *pb.Effect, takeOwnership bool, own
 				if pin {
 					return fmt.Errorf("pin effect %v: reclamation already claimed it", tip)
 				}
+
 				return nil // reclaim already claimed this vertex; do not resurrect it
 			}
 

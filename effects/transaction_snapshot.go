@@ -84,6 +84,7 @@ func (s *transactionSnapshot) contains(ctx context.Context, key string, target T
 
 	frontier := slices.Concat(v.frontiers[key].resolved, v.anchors[key])
 	seen := make(map[Tip]bool)
+
 	var proof verdictEntry
 	if eff, ok := s.engine.effectCache.Get(target); ok && eff.GetTxnBind() != nil {
 		proof = v.verdicts[eff.GetTxnId()]

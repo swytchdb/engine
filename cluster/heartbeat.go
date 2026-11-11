@@ -56,6 +56,8 @@ const (
 
 	clockTickVersion byte = 2
 
+	legacyTickHeaderSize = 36
+
 	// tickHeaderSize = type(1) + version(1) + nodeID(8) + seq(8) +
 	// wallClock(8) + jumpNs(8) + count(2) + effect counters(16) = 52 bytes.
 	// (Noise AEAD tag is added externally by the transport layer.)
@@ -92,6 +94,10 @@ type ObservedTick struct {
 // event. The implicit edge to the node's previous tick is Seq−1; the
 // cross-node edges are the Observed entries. See docs/design/clock.md.
 type ClockTick struct {
+	// Received wire version, used to select a compatible reply format.
+	// Zero denotes a locally constructed tick using the current version.
+	version byte
+
 	NodeID    NodeId
 	Seq       uint64
 	WallClock int64 // sender's wall clock, ns since epoch
@@ -215,6 +221,7 @@ func (hm *HeartbeatManager) SendTickTo(peerID NodeId) {
 
 	if ph := hm.healthTable.Get(peerID); ph != nil {
 		tick.MyCount, tick.YourCount = ph.sent.Load(), ph.processed.Load()
+		tick.version = byte(ph.tickVersion.Load())
 	}
 
 	if hm.constrainProgress != nil {
@@ -246,7 +253,14 @@ func (hm *HeartbeatManager) ProcessInboundTick(peerID NodeId, tick *ClockTick) {
 	}
 
 	now := time.Now()
+
 	ph := hm.healthTable.GetOrCreate(peerID)
+	for old := ph.tickVersion.Load(); uint32(tick.version) > old; old = ph.tickVersion.Load() {
+		if ph.tickVersion.CompareAndSwap(old, uint32(tick.version)) {
+			break
+		}
+	}
+
 	advanceEffectCounter(&ph.peerSent, tick.MyCount)
 	advanceEffectCounter(&ph.peerProcessed, tick.YourCount)
 	RecordClockTickReceived(peerID)
@@ -443,6 +457,10 @@ func (hm *HeartbeatManager) sendTick() {
 
 			binary.LittleEndian.PutUint64(peerPacket[36:44], my)
 			binary.LittleEndian.PutUint64(peerPacket[44:52], your)
+
+			if ph.tickVersion.Load() == 1 {
+				peerPacket = legacyClockTick(peerPacket)
+			}
 		}
 
 		if err := hm.sendFunc(peerID, peerPacket); err != nil {
@@ -574,14 +592,28 @@ func MarshalClockTick(tick *ClockTick) []byte {
 		off += observedTickSize
 	}
 
+	if tick.version == 1 {
+		return legacyClockTick(buf)
+	}
+
 	return buf
+}
+
+// legacyClockTick removes the v2 counters from an exclusively owned packet.
+// Unknown peers initially receive v2. A legacy peer always emits v1, so its
+// first inbound tick selects v1 for subsequent sends in both directions.
+// Receiving v1 carries no reclamation evidence; zero counters remain zero.
+func legacyClockTick(packet []byte) []byte {
+	packet[1] = 1
+	copy(packet[legacyTickHeaderSize:], packet[tickHeaderSize:])
+
+	return packet[:len(packet)-(tickHeaderSize-legacyTickHeaderSize)]
 }
 
 // ParseClockTick parses a clock tick plaintext body (already Noise-decrypted).
 func ParseClockTick(body []byte) (*ClockTick, error) {
-	const legacyHeaderSize = 36
-	if len(body) < legacyHeaderSize {
-		return nil, fmt.Errorf("clock tick too short: %d < %d", len(body), legacyHeaderSize)
+	if len(body) < legacyTickHeaderSize {
+		return nil, fmt.Errorf("clock tick too short: %d < %d", len(body), legacyTickHeaderSize)
 	}
 
 	if body[1] != clockTickVersion && body[1] != 1 {
@@ -590,7 +622,7 @@ func ParseClockTick(body []byte) (*ClockTick, error) {
 
 	headerSize := tickHeaderSize
 	if body[1] == 1 {
-		headerSize = legacyHeaderSize // Legacy peers supply no reclamation evidence.
+		headerSize = legacyTickHeaderSize // Legacy peers supply no reclamation evidence.
 	}
 
 	count := int(binary.LittleEndian.Uint16(body[34:36]))
@@ -600,6 +632,7 @@ func ParseClockTick(body []byte) (*ClockTick, error) {
 	}
 
 	tick := &ClockTick{
+		version:   body[1],
 		NodeID:    NodeId(binary.LittleEndian.Uint64(body[2:10])),
 		Seq:       binary.LittleEndian.Uint64(body[10:18]),
 		WallClock: int64(binary.LittleEndian.Uint64(body[18:26])),

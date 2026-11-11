@@ -669,9 +669,11 @@ func (e *Engine) InstallCloudTips(key string, tips []Tip, sidecar []CloudEffect)
 
 	op := newClosureOperation(e, make(map[Tip]error))
 	defer op.release()
+
 	if _, _, err := op.publish(key, tips, true); err != nil {
 		return fmt.Errorf("%w: close cloud frontier for %q: %w", ErrCloudUnavailable, key, err)
 	}
+
 	return nil
 }
 
@@ -1312,6 +1314,7 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 	// The bind and its promise are installed. Priority waiting must release
 	// nodeMu so higher-priority binds and their evidence can arrive.
 	nodeLock.release()
+
 	nacks = e.finishPriorityResponse(notify.GetOrigin(), nacks, prior)
 
 	// Fire notification callbacks for remote effects

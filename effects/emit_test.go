@@ -1073,6 +1073,7 @@ func TestFlushTx_VerdictSnapshotEmittedOnLoserOnlyKeys(t *testing.T) {
 	// just its envelope. Supply the effects referenced by this fixture.
 	for tip, key := range map[Tip]string{loserDataShared: sharedKey, loserDataLoserOnly: loserOnlyKey} {
 		eff := dataEffect(key)
+
 		eff.TxnId = loserTxnID
 		if err := e.effectCache.Put(tip, eff); err != nil {
 			t.Fatal(err)
@@ -1412,6 +1413,7 @@ func TestHandleRemoteBind_AbortDepsCannotOverrideForkChoice(t *testing.T) {
 
 				return bind, log.putEffect(bind), tip
 			}
+
 			localStamp, remoteStamp := int64(1), int64(2)
 			for ForkChoiceLess(ComputeForkChoiceHash(1, sTs(localStamp)), ComputeForkChoiceHash(2, sTs(remoteStamp))) != localWins {
 				remoteStamp++
@@ -1433,6 +1435,7 @@ func TestHandleRemoteBind_AbortDepsCannotOverrideForkChoice(t *testing.T) {
 			// published bind wins. Arrival alone cannot decide either outcome.
 			remote.GetTxnBind().AbortDeps = toPbRefs([]Tip{localTip})
 			e.handleRemoteBind(remote.GetTxnBind(), remoteBind, "remote")
+
 			if ptxn.state.Load() != txnStatePending {
 				t.Fatal("abort_deps decided the transaction before bind conflict classification")
 			}
@@ -1447,6 +1450,7 @@ func TestHandleRemoteBind_AbortDepsCannotOverrideForkChoice(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
+
 			if ptxn.state.Load() != txnStatePending {
 				t.Fatal("asynchronous NACK evaluated before priority was established")
 			}
@@ -1455,20 +1459,24 @@ func TestHandleRemoteBind_AbortDepsCannotOverrideForkChoice(t *testing.T) {
 			proof := log.putEffect(&pb.Effect{Key: []byte("k"), Kind: &pb.Effect_Snapshot{Snapshot: &pb.SnapshotEffect{
 				TxnVerdicts: map[string]pb.Verdict{"remote": pb.Verdict_WON},
 			}}})
+
 			nacks := []*pb.NackNotify{e.buildEnrichedNack("k", toPbRef(localBind), []Tip{remoteBind})}
 			if !localWins {
 				nacks = append(nacks, e.buildEnrichedNack("k", toPbRef(localBind), []Tip{proof}))
 			}
+
 			_, err := e.evaluateNacks(ptxn, nacks)
 			if aborted := errors.Is(err, ErrTxnAborted); aborted == localWins {
 				t.Fatalf("abort=%t, expected %t (error %v)", aborted, !localWins, err)
 			}
+
 			if err != nil && !errors.Is(err, ErrTxnAborted) {
 				t.Fatal(err)
 			}
 
 			e.pendingTxns.Delete(localBind)
 			e.pendingTxTips.Delete(localTip)
+
 			value, _, _, err := e.GetSnapshot("k")
 			if err != nil {
 				t.Fatal(err)
@@ -1478,6 +1486,7 @@ func TestHandleRemoteBind_AbortDepsCannotOverrideForkChoice(t *testing.T) {
 			if localWins {
 				want = "local"
 			}
+
 			if got := string(value.GetScalar().GetRaw()); got != want {
 				t.Fatalf("reconstruction returned %q, want %q", got, want)
 			}
@@ -1594,6 +1603,7 @@ func TestHandleNack_TransactionalKey_DefersEvaluation(t *testing.T) {
 	if ptxn.state.Load() != txnStatePending {
 		t.Fatal("asynchronous NACK must not evaluate before all subscriber responses")
 	}
+
 	if _, err := e.evaluateNacks(ptxn, []*pb.NackNotify{nack}); !errors.Is(err, ErrTxnAborted) {
 		t.Fatalf("completed responses must still detect the data conflict: %v", err)
 	}

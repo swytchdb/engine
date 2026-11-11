@@ -128,10 +128,12 @@ func TestInstallCloudTipsNeverMints(t *testing.T) {
 	if e.nextOff.Load() != beforeOffset {
 		t.Fatal("cloud ingestion minted a local effect")
 	}
+
 	after := e.index.Contains("k").Tips()
 	if len(after) != len(before)+1 || !slices.Contains(after, holedTip) {
 		t.Fatalf("frontier = %v, want local tips %v plus %v", after, before, holedTip)
 	}
+
 	for _, tip := range before {
 		if !slices.Contains(after, tip) {
 			t.Fatalf("lost local tip %v from %v", tip, after)

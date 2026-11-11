@@ -269,6 +269,7 @@ func (t *QUICNotifyTransport) dispatchPlaintext(peerID NodeId, plaintext []byte)
 			// One-way notifications all use zero; they are distinct messages.
 			if requestID == 0 {
 				go t.handler.HandleNotify(peerID, requestID, notify)
+
 				return
 			}
 
@@ -281,6 +282,7 @@ func (t *QUICNotifyTransport) dispatchPlaintext(peerID NodeId, plaintext []byte)
 				// Keep no completed response cache: a retry after a lost ACK/NACK
 				// must be able to execute again.
 				defer t.activeNotifies.Delete(key)
+
 				t.handler.HandleNotify(peerID, requestID, notify)
 			}()
 		}

@@ -1499,12 +1499,16 @@ func (c *Context) flushTx() error {
 			wg.Wait()
 
 			responseCount := 0
+
 			for _, res := range results {
 				if res.err != nil {
 					slog.Warn("flushTx: ReplicateTo failed", "bind_offset", bindOffset, "target", res.subID, "error", res.err)
+
 					continue
 				}
+
 				responseCount++
+
 				ptxn.responses = append(ptxn.responses, res.nacks...)
 			}
 			// Ingest all responses before evaluating: the origin of a better
@@ -1512,16 +1516,23 @@ func (c *Context) flushTx() error {
 			for _, nack := range ptxn.responses {
 				c.engine.ingestNackTips(nack)
 			}
-			var defeatedSet map[string]Tip
-			var proof *pb.BindEvidence
+
+			var (
+				defeatedSet map[string]Tip
+				proof       *pb.BindEvidence
+			)
+
 			decision := txnStateAmbiguous
+
 			if responseCount == len(subscribers) {
 				var err error
+
 				defeatedSet, err = c.engine.evaluateNacks(ptxn, ptxn.responses)
 				if err == nil {
 					proof, err = c.engine.bindProof(bindOffset, defeatedSet, ptxn.proofSources)
 					defer func() { c.engine.effectCache.releaseEvidence(evidenceTips(proof)) }()
 				}
+
 				switch {
 				case errors.Is(err, ErrTxnAborted):
 					decision = txnStateAborted
@@ -1530,6 +1541,7 @@ func (c *Context) flushTx() error {
 				default:
 					decision = txnStateCommitted
 				}
+
 				slog.Debug("flushTx: priority evaluation", "bind_offset", bindOffset, "state", decision, "error", err)
 			}
 
@@ -1578,6 +1590,7 @@ func (c *Context) flushTx() error {
 				for key := range emitKeys {
 					if err := c.engine.emitSnapshot(key, verdicts, proof); err != nil {
 						decision = txnStateAmbiguous
+
 						slog.Warn("flushTx: emitSnapshot for verdict failed",
 							"key", key,
 							"bind_offset", bindOffset,
@@ -1588,6 +1601,7 @@ func (c *Context) flushTx() error {
 			// Evidence ownership must be published before local completion and
 			// before deferred priority responses can use this outcome.
 			ptxn.finish(decision)
+
 			if c.engine.horizon != nil {
 				if decision == txnStateCommitted {
 					c.engine.horizon.MakeVisible(c.txnID)
@@ -1748,40 +1762,6 @@ func (e *Engine) updateIndex(key string, initialTips *keytrie.TipSet, lastOffset
 			// Insert fires the trie's refDelta hook (applyRefDelta), which
 			// increfs the added tips and decrefs the consumed ones — no manual
 			// refcount call here.
-			if current.Len() != newTips.Len() || !current.ContainsAll(newTips.Tips()) {
-				e.notifyKeyChanged(key)
-			}
-
-			return
-		}
-
-		if e.index.Closed() {
-			// Not a CAS race: Insert fails unconditionally on a closed trie,
-			// so retrying would spin forever during shutdown.
-			return
-		}
-	}
-}
-
-// installTips merges a whole tip frontier into the key's index in one CAS
-// transition, so a concurrent reader observes either the prior frontier or the
-// full merged one — never a partial install. Same accounting as updateIndex:
-// Insert fires the trie's refDelta hook for the diff, and NewTipSet dedupes
-// tips the index already holds.
-func (e *Engine) installTips(key string, tips []Tip) {
-	for attempt := 0; ; attempt++ {
-		if attempt > 0 {
-			slog.Debug("installTips: CAS retry", "key", key, "attempt", attempt)
-		}
-
-		current := e.index.Contains(key)
-		cur := current.Tips()
-		offsets := make([]Tip, 0, len(cur)+len(tips))
-		offsets = append(offsets, cur...)
-		offsets = append(offsets, tips...)
-
-		newTips := keytrie.NewTipSet(offsets...)
-		if _, ok := e.index.Insert(key, current, newTips); ok {
 			if current.Len() != newTips.Len() || !current.ContainsAll(newTips.Tips()) {
 				e.notifyKeyChanged(key)
 			}

@@ -259,6 +259,7 @@ func TestLosersOnKey_ConcurrentPredicatesMatchOracle(t *testing.T) {
 						if _, eliminated := want[b.txn]; eliminated {
 							continue
 						}
+
 						if b.round != a.round || b.hash >= a.hash || invisible[b.txn] || verdicts[b.txn].verdict == pb.Verdict_LOST {
 							continue
 						}
