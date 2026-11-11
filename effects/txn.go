@@ -303,7 +303,10 @@ func (e *Engine) nackCandidates(ptxn *pendingTxn, key string, details []*pb.Nack
 			continue
 		}
 
-		if err := e.harvestProofVerdicts(tip, eff, verdicts); err != nil {
+		// A cache-only predecessor can be reclaimed between loading it and
+		// pinning its proof. Its unavailability is still optional; malformed
+		// proofs and failures on the required-ancestry path remain errors.
+		if err := e.harvestProofVerdicts(tip, eff, verdicts); err != nil && !errors.Is(err, errEffectNotResident) {
 			return nil, nil, err
 		}
 
