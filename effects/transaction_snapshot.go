@@ -73,9 +73,9 @@ func (s *transactionSnapshot) tips(ctx context.Context, key string) (*keytrie.Ti
 	return keytrie.NewTipSet(tips...), nil
 }
 
-// contains uses the existing DAG walker. Only when a later-discovered effect
-// needs proof of membership behind a retained state snapshot do we continue
-// behind that snapshot. An unavailable required ancestor is an error, not nil.
+// contains first consults evaluated evidence carried by the frozen history.
+// Only when it does not account for the bind do we search older value ancestry.
+// An unavailable required ancestor is an error, not nil.
 func (s *transactionSnapshot) contains(ctx context.Context, key string, target Tip) (bool, error) {
 	v := s.views[key]
 	if v == nil {
@@ -84,6 +84,10 @@ func (s *transactionSnapshot) contains(ctx context.Context, key string, target T
 
 	frontier := slices.Concat(v.frontiers[key].resolved, v.anchors[key])
 	seen := make(map[Tip]bool)
+	var proof verdictEntry
+	if eff, ok := s.engine.effectCache.Get(target); ok && eff.GetTxnBind() != nil {
+		proof = v.verdicts[eff.GetTxnId()]
+	}
 
 	for len(frontier) != 0 {
 		if err := ctx.Err(); err != nil {
@@ -96,6 +100,13 @@ func (s *transactionSnapshot) contains(ctx context.Context, key string, target T
 		}
 
 		if _, ok := d.nodes[target]; ok {
+			return true, nil
+		}
+		// This history already accounts for the bind through retained proof;
+		// its old value-ancestry path need not still exist. A cached label is
+		// insufficient. Nor may live-only evidence extend a frozen view: its
+		// source snapshot must actually belong to the selected history.
+		if proof.proven && d.nodes[proof.snapshotTip] != nil {
 			return true, nil
 		}
 
@@ -169,7 +180,7 @@ func (s *transactionSnapshot) member(ctx context.Context, tip Tip, eff *pb.Effec
 	}
 
 	if knownPast {
-		return choose(true, "ancestor of frozen frontier"), nil
+		return choose(true, "accounted for by frozen history"), nil
 	}
 
 	lower, upper, err := s.clocks.Difference(s.at, effectSample(eff))

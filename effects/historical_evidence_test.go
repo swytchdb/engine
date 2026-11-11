@@ -2,6 +2,7 @@ package effects
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"testing"
@@ -11,6 +12,77 @@ import (
 	"github.com/swytchdb/engine/keytrie"
 	"github.com/swytchdb/engine/stn"
 )
+
+// A retained proof can account for a bind without retaining the old value
+// ancestry. Cached labels and proofs outside the frozen cut cannot do so.
+func TestHistoricalMembershipConsultsFrozenEvidence(t *testing.T) {
+	for _, evidence := range []string{"frozen", "cached-label", "live-only"} {
+		t.Run(evidence, func(t *testing.T) {
+			log := newSnapshotLog()
+			e := newSnapshotEngine(log)
+			t.Cleanup(func() { _ = e.Close() })
+			bind := closureBind(log, "old", 1, []string{"a", "b"}, nil)
+			proof, err := e.bindProof(bind, nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			owner := log.putEffect(bindEvidenceSnapshot("a", proof))
+			e.effectCache.releaseEvidence(evidenceTips(proof))
+			ownerEffect, _ := e.effectCache.Get(owner)
+			verdicts, err := e.proofVerdicts(owner, ownerEffect)
+			if err != nil || !verdicts["old"].proven {
+				t.Fatalf("expected evaluated proof: %v, %v", verdicts, err)
+			}
+
+			// Value reconstruction stops at this state snapshot. The missing
+			// connector models the already reclaimed path to the old bind.
+			missing := Tip{99, 99}
+			state := log.putEffect(&pb.Effect{
+				Key: []byte("a"), Deps: toPbRefs([]Tip{missing}),
+				Kind: &pb.Effect_Snapshot{Snapshot: &pb.SnapshotEffect{State: &pb.ReducedEffect{}}},
+			})
+			frontier := state
+			if evidence != "live-only" {
+				// Make the proof source part of the selected value history.
+				snapshot := bindEvidenceSnapshot("a", proof)
+				snapshot.Deps = toPbRefs([]Tip{state})
+				owner = log.putEffect(snapshot)
+				ownerEffect, _ = e.effectCache.Get(owner)
+				verdicts, err = e.proofVerdicts(owner, ownerEffect)
+				if err != nil {
+					t.Fatal(err)
+				}
+				frontier = owner
+			}
+			if evidence == "cached-label" {
+				entry := verdicts["old"]
+				entry.proven = false
+				verdicts["old"] = entry
+			}
+			view := newSnapshotReadView(e, context.Background())
+			view.frontiers["a"] = snapshotFrontier{resolved: []Tip{frontier}}
+			view.verdicts = verdicts
+			s := &transactionSnapshot{
+				engine: e, views: map[string]*snapshotReadView{"a": view},
+				decided: make(map[Tip]bool),
+			}
+			eff, _ := e.effectCache.Get(bind)
+			included, err := s.member(context.Background(), bind, eff, make(map[Tip]bool))
+			if evidence == "frozen" {
+				if err != nil || !included {
+					t.Fatalf("retained proof reopened reclaimed history: included=%t error=%v", included, err)
+				}
+				// Evidence must not reverse an earlier exclusion.
+				s.decided[bind] = false
+				if included, err := s.member(context.Background(), bind, eff, make(map[Tip]bool)); err != nil || included {
+					t.Fatalf("proof reversed frozen membership: included=%t error=%v", included, err)
+				}
+			} else if !errors.Is(err, errEffectNotResident) {
+				t.Fatalf("unusable proof bypassed the history check: included=%t error=%v", included, err)
+			}
+		})
+	}
+}
 
 // Historical membership can include an ambiguously timed remote bind while
 // excluding its local competitor. Value selection must not discard the live
