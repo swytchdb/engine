@@ -528,6 +528,7 @@ func (op *closureOperation) walk(key string, supplied []Tip, visitBind func(Tip,
 			if v == nil {
 				if w.visits[i].flags&closureNoFetch != 0 {
 					delete(pending, i)
+					delete(w.failures, i)
 
 					continue
 				}
@@ -631,6 +632,7 @@ func (op *closureOperation) walk(key string, supplied []Tip, visitBind func(Tip,
 
 			if w.visits[i].flags&closureNoFetch != 0 {
 				delete(pending, i)
+				delete(w.failures, i)
 
 				continue
 			}
@@ -650,6 +652,7 @@ func (op *closureOperation) walk(key string, supplied []Tip, visitBind func(Tip,
 					w.failures[i] = err
 				} else {
 					delete(pending, i)
+					delete(w.failures, i)
 				}
 			} else {
 				roots = append(roots, i)

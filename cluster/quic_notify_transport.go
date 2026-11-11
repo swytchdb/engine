@@ -58,6 +58,8 @@ type QUICNotifyTransport struct {
 
 	// Active notifications, keyed by sender and request ID. Retries are shed
 	// until the original handler finishes its ACK/NACK send attempt.
+	// The sender NodeID is its startup incarnation, not its address: restarts
+	// get a new NodeID, while reconnects preserve it and the request ID.
 	activeNotifies *xsync.Map[[2]uint64, struct{}]
 
 	// connFunc returns the QUIC connection for a given peer.

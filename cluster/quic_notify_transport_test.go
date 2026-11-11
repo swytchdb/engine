@@ -25,6 +25,7 @@ package cluster
 
 import (
 	"bytes"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -34,6 +35,133 @@ import (
 	"github.com/quic-go/quic-go"
 	pb "github.com/swytchdb/engine/cluster/proto"
 )
+
+type restartNotifyHandler struct {
+	recordingHandler
+
+	oldGate chan struct{}
+}
+
+func (h *restartNotifyHandler) HandleOffsetNotify(notify *pb.OffsetNotify) ([]*pb.NackNotify, error) {
+	h.count.Add(1)
+
+	if string(notify.GetKey()) == "old" {
+		<-h.oldGate
+	}
+
+	return nil, nil
+}
+
+func TestDispatchNotifyRequestAfterRestart(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		oldID, newID := pb.NewNodeID(), pb.NewNodeID()
+		if oldID == newID {
+			t.Fatal("restart reused a node incarnation")
+		}
+
+		handler := &restartNotifyHandler{oldGate: make(chan struct{})}
+		defer close(handler.oldGate)
+
+		receiver := NewReplicator(1, "local", NewPeerHealthTable(ClockConfig{}), nil, handler, time.Second)
+		transport := NewQUICNotifyTransport(1, &PeerManager{replicator: receiver}, nil, nil)
+		old := NewReplicator(oldID, "local", NewPeerHealthTable(ClockConfig{}), nil, nil, time.Second)
+
+		restarted := NewReplicator(newID, "local", NewPeerHealthTable(ClockConfig{}), nil, nil, time.Second)
+		defer restarted.Stop()
+
+		receiver.transport = notificationTransportFunc(func(peer NodeId, packet []byte) (int, error) {
+			from, request, status, credits, err := parseNotifyACKPacket(packet)
+			if err != nil {
+				return 0, err
+			}
+
+			if peer == newID {
+				restarted.HandleNotifyACK(from, request, status, credits)
+			} else {
+				old.HandleNotifyACK(from, request, status, credits)
+			}
+
+			return len(packet), nil
+		})
+
+		var oldPacket, newPacket []byte
+
+		old.transport = notificationTransportFunc(func(_ NodeId, packet []byte) (int, error) {
+			oldPacket = packet
+			transport.dispatchPlaintext(oldID, packet)
+
+			return len(packet), nil
+		})
+		oldDone := make(chan error, 1)
+
+		go func() {
+			_, err := old.ReplicateTo(&pb.OffsetNotify{Key: []byte("old")}, nil, 1)
+			oldDone <- err
+		}()
+
+		synctest.Wait()
+
+		// A replacement connection still delivers the same sender incarnation
+		// and request header. Its retries must not start another old handler.
+		old.transport = notificationTransportFunc(func(_ NodeId, packet []byte) (int, error) {
+			transport.dispatchPlaintext(oldID, packet)
+
+			return len(packet), nil
+		})
+		for range 4 {
+			_, _ = old.transport.Send(1, oldPacket)
+		}
+
+		synctest.Wait()
+
+		if handler.count.Load() != 1 {
+			t.Fatal("reconnect admitted duplicate active requests")
+		}
+
+		old.Stop()
+
+		if err := <-oldDone; !errors.Is(err, ErrReplicationTimeout) {
+			t.Fatalf("old sender shutdown: %v", err)
+		}
+
+		// The new sender's counter restarts at 1 while the old remote handler
+		// is still blocked. Only its NodeID distinguishes this new request.
+		restarted.transport = notificationTransportFunc(func(_ NodeId, packet []byte) (int, error) {
+			newPacket = packet
+			transport.dispatchPlaintext(newID, packet)
+
+			return len(packet), nil
+		})
+		newDone := make(chan error, 1)
+
+		go func() {
+			_, err := restarted.ReplicateTo(&pb.OffsetNotify{Key: []byte("new")}, nil, 1)
+			newDone <- err
+		}()
+
+		synctest.Wait()
+
+		select {
+		case err := <-newDone:
+			if err != nil {
+				t.Errorf("restarted sender did not receive its ACK: %v", err)
+			}
+		default:
+			t.Error("new request was shed behind the previous incarnation")
+		}
+
+		oldRequest, _, oldErr := parseNotifyPacket(oldPacket)
+
+		newRequest, _, newErr := parseNotifyPacket(newPacket)
+		if oldErr != nil || newErr != nil || oldRequest != 1 || newRequest != oldRequest {
+			t.Fatalf("test did not reuse the request ID: old=%d new=%d errors=%v,%v", oldRequest, newRequest, oldErr, newErr)
+		}
+
+		if handler.count.Load() != 2 || transport.activeNotifies.Size() != 1 {
+			t.Fatalf("handlers=%d active=%d; only the old handler should remain blocked", handler.count.Load(), transport.activeNotifies.Size())
+		}
+	})
+}
 
 // TestDispatchPlaintextEmptyPayload guards the remote-input path: a zstd
 // frame can decompress to zero bytes, which must not panic the dispatcher.
