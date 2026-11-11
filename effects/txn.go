@@ -332,11 +332,16 @@ func (e *Engine) evaluateNacks(ptxn *pendingTxn, nacks []*pb.NackNotify) (map[st
 			candidates = append(candidates, c)
 		}
 	}
-	// Establish priority before evaluating ANY candidate.
+	// Establish priority before evaluating competing candidates. Predicate-
+	// disjoint binds can coexist regardless of the other transaction's outcome.
 	for _, c := range candidates {
 		if c.detail.GetIsBind() && c.txn != ptxn.txnID &&
 			ForkChoiceLess(c.detail.GetBindForkChoiceHash(), ptxn.forkChoiceHash) &&
 			!e.nackTipOrdered(ptxn, c.key, c.detail) && verdicts[c.txn].verdict == pb.Verdict_VERDICT_UNSPECIFIED {
+			if e.bindPredicatesDisjoint(ptxn, c.key, c.txn, r(c.detail.GetRef())) {
+				continue
+			}
+
 			return nil, ErrTxnAmbiguous
 		}
 	}
@@ -489,16 +494,8 @@ func (e *Engine) classifyNackTip(ptxn *pendingTxn, key string, detail *pb.NackTi
 			return false, "" // our own bind
 		}
 
-		if ptxn.txnID != "" && theirTxnID != "" {
-			ourStart := collectOurBindTips(ptxn, key)
-
-			conflict, bothHadEvidence := e.hasPredicateConflict(
-				ptxn.txnID, theirTxnID, key,
-				ourStart,
-				[]Tip{theirBindOffset})
-			if bothHadEvidence && !conflict {
-				return false, "" // disjoint predicates — can coexist
-			}
+		if e.bindPredicatesDisjoint(ptxn, key, theirTxnID, theirBindOffset) {
+			return false, "" // disjoint predicates — can coexist
 		}
 
 		if ForkChoiceLess(detail.GetBindForkChoiceHash(), ptxn.forkChoiceHash) {
@@ -523,6 +520,20 @@ func (e *Engine) classifyNackTip(ptxn *pendingTxn, key string, detail *pb.NackTi
 	// reconstruction cannot derive that transaction loss from competing binds.
 	// Writes observed before publication are still checked by hasWritesSince.
 	return false, ""
+}
+
+// bindPredicatesDisjoint shares the per-key exemption between priority gating
+// and classification. Missing predicate evidence keeps the conservative fallback.
+func (e *Engine) bindPredicatesDisjoint(ptxn *pendingTxn, key, theirTxnID string, theirBindOffset Tip) bool {
+	if ptxn.txnID == "" || theirTxnID == "" {
+		return false
+	}
+
+	conflict, bothHadEvidence := e.hasPredicateConflict(
+		ptxn.txnID, theirTxnID, key,
+		collectOurBindTips(ptxn, key), []Tip{theirBindOffset})
+
+	return bothHadEvidence && !conflict
 }
 
 // reachesFromTx returns true if target is in the DAG ancestry of our
