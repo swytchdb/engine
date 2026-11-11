@@ -222,7 +222,10 @@ func (e *Engine) nackCandidates(ptxn *pendingTxn, key string, details []*pb.Nack
 	visited := make(map[Tip]bool)
 	verdicts := make(verdictMap)
 
-	var candidates []*pb.NackTipDetail
+	var (
+		candidates []*pb.NackTipDetail
+		snapshots  []Tip
+	)
 
 	for len(queue) > 0 {
 		cur := queue[len(queue)-1]
@@ -243,20 +246,24 @@ func (e *Engine) nackCandidates(ptxn *pendingTxn, key string, details []*pb.Nack
 
 		deps := cur.GetDeps()
 
+		var predecessor *pb.EffectRef
+
 		if eff, err := e.getEffect(key, tip); err == nil {
 			if snap := eff.GetSnapshot(); snap != nil {
 				if err := e.harvestProofVerdicts(tip, eff, verdicts); err != nil {
 					return nil, nil, err
 				}
 
-				if snap.GetPrevSnapshot() != nil {
-					deps = append(append([]*pb.EffectRef(nil), deps...), snap.GetPrevSnapshot())
-				}
+				predecessor = snap.GetPrevSnapshot()
 			}
 		}
 
 		if tip != (Tip{}) && e.reachesFromTxOnKey(ptxn, &key, tip) {
 			continue
+		}
+
+		if predecessor != nil {
+			snapshots = append(snapshots, r(predecessor))
 		}
 
 		for _, dep := range deps {
@@ -275,6 +282,33 @@ func (e *Engine) nackCandidates(ptxn *pendingTxn, key string, details []*pb.Nack
 			}
 
 			queue = append(queue, nackTipDetail(dt, eff))
+		}
+	}
+
+	// PrevSnapshot is a non-owning verdict shortcut. Visit required ancestry
+	// first so a shortcut cannot hide a missing ordinary dependency. Available
+	// predecessors supply verdicts, not another requirement for folded value history.
+	for len(snapshots) > 0 {
+		tip := snapshots[len(snapshots)-1]
+		snapshots = snapshots[:len(snapshots)-1]
+
+		if visited[tip] || e.reachesFromTxOnKey(ptxn, &key, tip) {
+			continue
+		}
+
+		visited[tip] = true
+
+		eff, err := e.getEffect(key, tip)
+		if err != nil || eff.GetSnapshot() == nil {
+			continue
+		}
+
+		if err := e.harvestProofVerdicts(tip, eff, verdicts); err != nil {
+			return nil, nil, err
+		}
+
+		if prev := eff.GetSnapshot().GetPrevSnapshot(); prev != nil {
+			snapshots = append(snapshots, r(prev))
 		}
 	}
 
