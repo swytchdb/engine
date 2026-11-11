@@ -49,7 +49,8 @@ var (
 
 // Retransmission constants.
 const (
-	sweepInterval = 250 * time.Millisecond // sweep tick rate — no point checking faster than rtoFloor/2
+	sweepInterval      = 250 * time.Millisecond // deadline and peer-liveness checks
+	retransmitInterval = 500 * time.Millisecond
 )
 
 // Replicator manages replication with first-ACK semantics for same-region
@@ -615,9 +616,9 @@ func (r *Replicator) sweepLoop() {
 // whose target has left the alive+symmetric set is given up — the peer is
 // declared dead, so we stop holding the write open and let the originator
 // fall back to local commit (it is now the last node standing on this key);
-// otherwise an unacked request is retransmitted. A request that ACKs is
-// removed from pending by the ACK handler, so only sends that never landed —
-// the peer's connection wasn't up at first attempt — keep reaching here.
+// otherwise an unacked request is retransmitted at retransmitInterval. Pending
+// requests may already be processing on the receiver; lack of an ACK does not
+// imply that the original notification never arrived.
 func (r *Replicator) sweep() {
 	now := time.Now().UnixNano()
 
@@ -652,7 +653,7 @@ func (r *Replicator) sweep() {
 			return true
 		}
 
-		if now-tr.lastSentAt.Load() < int64(sweepInterval) {
+		if now-tr.lastSentAt.Load() < int64(retransmitInterval) {
 			return true
 		}
 

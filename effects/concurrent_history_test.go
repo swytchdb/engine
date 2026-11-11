@@ -248,13 +248,18 @@ func TestLosersOnKey_ConcurrentPredicatesMatchOracle(t *testing.T) {
 
 				// The fixture's barriers order all different rounds. Within a
 				// round, use plain integer equality as an independent predicate
-				// oracle, including conservative legacy binds and LOST exclusion.
+				// oracle. Candidates are in ascending hash order within each round;
+				// only surviving predecessors can eliminate the next candidate.
 				for _, a := range candidates {
 					if invisible[a.txn] || verdicts[a.txn].verdict == pb.Verdict_LOST {
 						continue
 					}
 
 					for _, b := range candidates {
+						if _, eliminated := want[b.txn]; eliminated {
+							continue
+						}
+
 						if b.round != a.round || b.hash >= a.hash || invisible[b.txn] || verdicts[b.txn].verdict == pb.Verdict_LOST {
 							continue
 						}

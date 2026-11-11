@@ -51,6 +51,12 @@ import (
 func (e *Engine) collectTxnEffectsOnKey(txnID, key string, startTips ...Tip) (
 	obs []*pb.ObservationEffect, rw []*pb.RowWriteEffect,
 ) {
+	return collectTxnEffects(txnID, key, func(t Tip) (*pb.Effect, error) { return e.getEffect(key, t) }, startTips...)
+}
+
+func collectTxnEffects(txnID, key string, load func(Tip) (*pb.Effect, error), startTips ...Tip) (
+	obs []*pb.ObservationEffect, rw []*pb.RowWriteEffect,
+) {
 	var zero Tip
 
 	visited := make(map[Tip]bool, 16)
@@ -72,7 +78,7 @@ func (e *Engine) collectTxnEffectsOnKey(txnID, key string, startTips ...Tip) (
 
 		visited[off] = true
 
-		eff, err := e.getEffect(key, off)
+		eff, err := load(off)
 		if err != nil {
 			continue
 		}

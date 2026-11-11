@@ -201,6 +201,17 @@ message SnapshotEffect {
   // traverse historical adjudications via snapshots without consulting tips.
   // Zero-valued if no prior snapshot exists for this key.
   EffectRef prev_snapshot = 4;
+
+  // Owned proof references for the recorded bind outcomes. These are not
+  // value dependencies and do not participate in frontier or LCA selection.
+  BindEvidence evidence = 5;
+}
+
+// The evaluated binds are distinct from supporting ancestry. All references
+// own their vertices; neither kind is a value-DAG edge.
+message BindEvidence {
+  repeated EffectRef binds = 1; // includes subjects from predecessor proofs
+  repeated EffectRef deps = 2;
 }
 
 // TypedValue is a tagged literal used in Predicate comparisons and
@@ -322,6 +333,14 @@ message SerializationEffect {
   bool release = 2;  // false = request serialization, true = release
 }
 
+// Inline proof payload, encoded with the normal Effect wire encoding. Packages
+// are dependency-first and deduplicated; only explicit evidence edges are
+// followed, never the payloads' ordinary value ancestry.
+message EvidenceRecord {
+  EffectRef ref = 1;
+  bytes effect_data = 2;
+}
+
 // Effect is the top-level envelope stored in the log and sent over the wire.
 message Effect {
   // Identity & causality
@@ -332,6 +351,10 @@ message Effect {
   string txn_id = 5;              // transaction ID (empty = non-transactional)
   bytes fork_choice_hash = 6;     // SHA-256(node_id_LE8 || hlc_LE8), computed at emit time
   bytes virtual = 7;              // partition key WITHIN the key (empty = root partition); enables nested values
+
+  // Transport-only payloads for snapshot.evidence (including nested proofs).
+  // Receivers install these before the owner and strip this field in the pool.
+  repeated EvidenceRecord evidence_package = 8;
 
   // The effect payload — exactly one of these is set.
   oneof kind {

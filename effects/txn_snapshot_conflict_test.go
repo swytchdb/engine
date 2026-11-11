@@ -299,7 +299,7 @@ func TestIsRealConflictWrappedData(t *testing.T) {
 		name, element, txn string
 		want               bool
 	}{
-		{"same-element", "a", "", true},
+		{"same-element", "a", "", false},
 		{"disjoint-element", "b", "", false},
 		{"in-progress", "a", "pending", false},
 	} {

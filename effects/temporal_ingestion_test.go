@@ -118,10 +118,10 @@ func TestTemporalFetchedHistoryObservedOnce(t *testing.T) {
 	}
 
 	d := newDag(reader, key, "")
-	if err := d.prepare([]Tip{newest}); err != nil {
+	if err := d.ingest([]Tip{newest}); err != nil {
 		t.Fatal(err)
 	}
-	// Preparation fetches the absent parents. The explicit dependency pass
+	// Ingestion fetches the absent parents. The explicit dependency pass
 	// must finish the child's evidence without sampling another receipt.
 	beforeCompletion := clockReads.Load()
 

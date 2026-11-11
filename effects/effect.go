@@ -43,6 +43,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/semaphore"
+	"golang.org/x/sync/singleflight"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -107,9 +108,10 @@ type Engine struct {
 	// which carries the cached subdag (and, later, eviction metadata) for
 	// each key — one structure, the trie, owns both the tips and the
 	// derived read cache.
-	index       *keytrie.Critbit[leafState]
-	broadcaster Broadcaster // nil for standalone
-	cloudReader CloudReader // nil when no cloud is configured (standalone/dev)
+	index         *keytrie.Critbit[leafState]
+	broadcaster   Broadcaster        // nil for standalone
+	cloudReader   CloudReader        // nil when no cloud is configured (standalone/dev)
+	ancestryLoads singleflight.Group // active per-key downloads; no completed-result cache
 
 	nodeID   pb.NodeID
 	clock    *crdt.HLC
@@ -117,6 +119,9 @@ type Engine struct {
 
 	// In-memory offset generator (no durable log)
 	nextOff atomic.Uint64
+
+	historyMu       sync.Mutex
+	historyOverlays *historyOverlay
 
 	subscriptions *xsync.Map[string, *subscriptionState]
 
@@ -209,6 +214,10 @@ type Engine struct {
 	// Striped locks for per-key atomic operations
 	locks [4096]sync.Mutex
 
+	// Closure admission is separate from command locks, which callers may
+	// already hold. One active walk per shard bounds traversal allocations.
+	closureLocks [64]sync.Mutex
+
 	// FlushGeneration is incremented on each FlushIndex call.
 	// Used by WATCH to detect FLUSHALL/FLUSHDB between WATCH and EXEC.
 	flushGeneration atomic.Uint64
@@ -264,10 +273,12 @@ type Engine struct {
 // subscriptionState tracks a subscription's readiness.
 // The ready channel is closed once bootstrapping completes.
 type subscriptionState struct {
-	ownedKey   bool
-	ready      chan struct{}
-	incomplete atomic.Bool // true if bootstrap saw unreachable effects
-	closeOnce  sync.Once   // guards close(ready)
+	bootstrapMu  sync.Mutex       // serializes setup and upgrade from an async announcement
+	announcement *pb.OffsetNotify // non-nil until a blocking caller starts discovery
+	ownedKey     bool
+	ready        chan struct{}
+	incomplete   atomic.Bool // true if bootstrap saw unreachable effects
+	closeOnce    sync.Once   // guards close(ready)
 }
 
 // markReady unblocks any waiters on this subscription state. Safe to
@@ -575,14 +586,14 @@ const cloudTipsBackstop = 60 * time.Second
 // indistinguishable from data loss.
 var ErrCloudUnavailable = errors.New("cloud unavailable")
 
-// ErrCDNBlobMissing marks a CDN fetch that answered 404: the blob is provably
-// absent from cloud storage, as opposed to the cloud being unreachable. Cloud
-// tip markers are candidates, never an authoritative frontier — a node builds
-// its own truth by walking the DAG it can actually read — so a hole under
-// this sentinel is not this engine's to repair. classifyCloudTips reports the
-// holed tip as pending; the cluster layer's reconcile loop retries it, and
-// Cloud's own billing sweep is what eventually heals or prunes the marker.
+// ErrCDNBlobMissing marks a definitive CDN 404, not a transport failure.
+// Closure exhausts that boundary. Reconstruction separately determines whether
+// the absent history is needed to produce a value.
 var ErrCDNBlobMissing = errors.New("cdn blob missing")
+
+// ErrEffectNotFound is a peer's definitive empty fetch response. An unreachable
+// peer must return a transport error instead; closure cannot exhaust that path.
+var ErrEffectNotFound = errors.New("effect not found on peer")
 
 // NormalizeCloudTipCandidates reduces Cloud's marker candidates to the
 // maximal tips of the effect DAG. Cloud's tips directory is an index: stale
@@ -610,214 +621,60 @@ func NormalizeCloudTipCandidates(key string, candidates, localRoots []Tip, load 
 	})
 }
 
-// hydrateFromCloud is the tiered-storage rehydrate on a read-miss: it asks
-// Cloud for key's candidate tip frontier and installs whatever portion of it
-// is locally walkable (pulling blobs via FetchFromAny → CDN), so a subsequent
-// reconstruct finds that portion locally. installed reports whether the index
-// now holds anything for key (already-present tips count, so the caller
-// always re-tries reconstructLocal after a successful consult); consulted
-// reports whether Cloud's answer was fully resolved — no pending holes — so
-// GetSnapshot can mark the leaf authoritative and stop re-consulting for a key
-// whose state reduces to nil. A partially or wholly holed frontier is not an
-// error: the holed tips are reported to Cloud's reconcile loop via
-// MarkPending and retried there, on Cloud's own schedule, without blocking
-// this read.
-//
-// A transport error or timeout returns ErrCloudUnavailable — the read fails
-// rather than fabricating a miss for data Cloud may hold.
-func (e *Engine) hydrateFromCloud(key string) (installed, consulted bool, err error) {
+// hydrateFromCloud obtains Cloud's candidate tips and ingests their available
+// closure. Reconstruction remains responsible for deciding whether that graph
+// can produce a value. Transport failures surface as ErrCloudUnavailable.
+func (e *Engine) hydrateFromCloud(key string) (installed bool, err error) {
 	if e.cloudReader == nil {
-		return false, false, nil
+		return false, nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), cloudTipsBackstop)
 	defer cancel()
 
-	tips, sidecar, missing, err := e.cloudReader.CloudTips(ctx, key)
+	tips, sidecar, _, err := e.cloudReader.CloudTips(ctx, key)
 	if err != nil {
 		slog.Warn("cloud read-miss backstop: get tips failed; failing read", "key", key, "error", err)
 
-		return false, false, fmt.Errorf("%w: get tips for %q: %w", ErrCloudUnavailable, key, err)
+		return false, fmt.Errorf("%w: get tips for %q: %w", ErrCloudUnavailable, key, err)
 	}
 
 	if len(tips) == 0 {
-		return false, true, nil // Cloud holds nothing either: an authoritative miss.
+		return false, nil // Cloud holds nothing either: an authoritative miss.
 	}
 
-	pending, err := e.InstallCloudTips(key, tips, sidecar, missing)
-	if err != nil {
-		return false, false, err
+	if err := e.InstallCloudTips(key, tips, sidecar); err != nil {
+		return false, err
 	}
 
-	if len(pending) > 0 {
-		e.cloudReader.MarkPending(key)
-		slog.Warn("cloud read-miss backstop: frontier partially holed; serving readable subset, leaving the rest pending for reconcile",
-			"key", key, "pending", pending)
-	}
-
-	return e.index.Contains(key) != nil, len(pending) == 0, nil
+	return e.index.Contains(key) != nil, nil
 }
 
-// InstallCloudTips classifies Cloud-provided marker candidates into the
-// subset that is locally walkable (install) and the subset still holed
-// (pending), merges the walkable subset into the index alongside whatever is
-// already there, and returns the holed subset for the caller to track. Besides
-// the read-miss rehydrate it serves the cloud-sync reconcile path: a read
-// served from the outbox during a Cloud outage re-installs the missed Cloud
-// frontier here once Cloud answers again.
-//
-// It never mints and never consumes local tips: Cloud's tips directory is a
-// candidate index, not authoritative state, so nothing here may supersede
-// local ancestry. A hole is not this engine's to repair — see ErrCDNBlobMissing.
-func (e *Engine) InstallCloudTips(key string, tips []Tip, sidecar []CloudEffect, missing []Tip) (pending []Tip, err error) {
-	classification, err := e.classifyCloudTips(key, tips, sidecar, missing)
-	if err != nil {
-		return nil, err
-	}
+// InstallCloudTips supplies Cloud's candidates and inline effects to the same
+// closure walk as peer ingestion. It publishes graph relationships without
+// selecting snapshots, reconstructing values, or filtering unreadable branches.
+// Missing reports from GetTips describe only Cloud's storage; closure may still
+// obtain that history from peers through the existing fetch path.
+func (e *Engine) InstallCloudTips(key string, tips []Tip, sidecar []CloudEffect) error {
+	// Closure may discover a bind even when the supplied tip is ordinary data.
+	// Preserve its publication ordering with local commits, before the key lock.
+	nodeLock := e.takeNodeLock()
+	defer nodeLock.release()
 
-	if len(classification.install) > 0 {
-		slog.Debug("cloud tips: installing readable frontier", "key", key, "tips", classification.install)
-		e.installTips(key, classification.install)
-	}
-
-	if len(classification.dropped) > 0 {
-		slog.Debug("cloud tips: dropped candidate markers superseded by ancestry", "key", key, "tips", classification.dropped)
-	}
-
-	if len(classification.pending) > 0 {
-		slog.Debug("cloud tips: tips left pending on a hole", "key", key, "tips", classification.pending)
-	}
-
-	return classification.pending, nil
-}
-
-type cloudTipClassification struct {
-	install []Tip
-	pending []Tip
-	dropped []Tip
-}
-
-// classifyCloudTips splits Cloud's candidate tips for key into three sets:
-// install (readable state tips plus dependency-less subscription metadata),
-// pending (tips whose ancestry hits ErrCDNBlobMissing somewhere in the walk —
-// a durable hole, not a transport failure), and dropped (candidates
-// NormalizeCloudTipCandidates proved non-maximal). A transport error or
-// timeout anywhere in the walk returns ErrCloudUnavailable instead of
-// classifying anything, since that failure mode is retryable and must not be
-// confused with a durable hole.
-//
-// missing is GetTips' own report of refs its closure walk found reachable but
-// whose blobs it does not hold — stated as fact by the storage side. Tips
-// named there classify pending without paying a redundant CDN round trip to
-// re-learn the same 404; anything the walk discovers missing on its own still
-// gets the network round trip, since Cloud's declared list is a hint, not a
-// complete inventory of every hole beneath the frontier.
-func (e *Engine) classifyCloudTips(key string, tips []Tip, sidecar []CloudEffect, missing []Tip) (cloudTipClassification, error) {
-	// Warm the cache with the closure effects GetTips delivered inline, so the
-	// walk below runs locally instead of one WAN fetch per dep (n+1). Same
-	// owned-vs-cache routing as every other ingest path; stragglers the
-	// sidecar didn't carry are pulled by the walk itself.
-	if e.effectCache != nil {
-		for _, ce := range sidecar {
-			if _, ok := e.effectCache.Get(ce.Tip); ok {
-				continue
-			}
-
-			if err := e.putIngested(ce.Tip, ce.Eff, ce.ProtoLen); err != nil {
-				return cloudTipClassification{}, err
-			}
+	for _, ce := range sidecar {
+		if err := e.putIngested(ce.Tip, ce.Eff, ce.ProtoLen); err != nil {
+			return err
 		}
 	}
 
-	missingSet := make(map[Tip]struct{}, len(missing))
-	for _, t := range missing {
-		missingSet[t] = struct{}{}
+	op := newClosureOperation(e, make(map[Tip]error))
+	defer op.release()
+
+	if _, _, err := op.publish(key, tips, true); err != nil {
+		return fmt.Errorf("%w: close cloud frontier for %q: %w", ErrCloudUnavailable, key, err)
 	}
 
-	load := func(tip Tip) (*pb.Effect, error) {
-		if _, known := missingSet[tip]; known {
-			return nil, ErrCDNBlobMissing
-		}
-
-		return e.getEffect(key, tip)
-	}
-
-	var localRoots []Tip
-	if currentSet := e.index.Contains(key); currentSet != nil {
-		localRoots = currentSet.Tips()
-	}
-
-	var classification cloudTipClassification
-
-	realTips, superseded, err := NormalizeCloudTipCandidates(key, tips, localRoots, load)
-	if err != nil {
-		return classification, fmt.Errorf("normalize cloud candidates for %q: %w", key, err)
-	}
-
-	classification.dropped = superseded
-
-	// Dependency-less subscriptions are frontier metadata, not state
-	// branches: they install unconditionally, since they carry no ancestry
-	// for a hole to hide in. State tips still need walk validation below.
-	stateTips := make([]Tip, 0, len(realTips))
-	for _, tip := range realTips {
-		eff, getErr := load(tip)
-		switch {
-		case getErr == nil:
-			if eff.GetSubscription() != nil && len(eff.GetDeps()) == 0 {
-				classification.install = append(classification.install, tip)
-
-				continue
-			}
-
-			stateTips = append(stateTips, tip)
-		case errors.Is(getErr, ErrCDNBlobMissing):
-			classification.pending = append(classification.pending, tip)
-		default:
-			return cloudTipClassification{}, fmt.Errorf("%w: cloud tip %v unreachable for %q: %w",
-				ErrCloudUnavailable, tip, key, getErr)
-		}
-	}
-
-	if len(stateTips) == 0 {
-		return classification, nil
-	}
-
-	// Validate the joint frontier first. Each sibling branch can be
-	// independently readable while their union descends beneath both into a
-	// shared hole below their LCA, so per-tip validation alone is
-	// insufficient to prove the whole frontier installable together.
-	rd := newDag(e, key, "")
-
-	walkErr := rd.walk(stateTips, func(*pb.Effect) error { return nil })
-	switch {
-	case walkErr == nil:
-		classification.install = append(classification.install, stateTips...)
-
-		return classification, nil
-	case errors.Is(walkErr, ErrCDNBlobMissing):
-		// Fall through: split per-tip below.
-	default:
-		return cloudTipClassification{}, fmt.Errorf("%w: real frontier for %q unreachable: %w",
-			ErrCloudUnavailable, key, walkErr)
-	}
-
-	for _, tip := range stateTips {
-		rd := newDag(e, key, "")
-
-		walkErr := rd.walk([]Tip{tip}, func(*pb.Effect) error { return nil })
-		switch {
-		case walkErr == nil:
-			classification.install = append(classification.install, tip)
-		case errors.Is(walkErr, ErrCDNBlobMissing):
-			classification.pending = append(classification.pending, tip)
-		default:
-			return cloudTipClassification{}, fmt.Errorf("%w: tip %v unreachable for %q: %w",
-				ErrCloudUnavailable, tip, key, walkErr)
-		}
-	}
-
-	return classification, nil
+	return nil
 }
 
 // mintLocalEffect persists a fully-built effect as a local mint: marshal,
@@ -825,7 +682,7 @@ func (e *Engine) classifyCloudTips(key string, tips []Tip, sidecar []CloudEffect
 // durability hook, broadcast. The effect must already carry its key, HLC,
 // fork-choice hash, and deps.
 func (e *Engine) mintLocalEffect(key string, currentSet *keytrie.TipSet, eff *pb.Effect) (Tip, error) {
-	data, err := MarshalEffect(eff)
+	data, err := e.effectCache.MarshalEffect(eff)
 	if err != nil {
 		return Tip{}, err
 	}
@@ -851,6 +708,7 @@ func (e *Engine) mintLocalEffect(key string, currentSet *keytrie.TipSet, eff *pb
 // fireLocalEffect invokes OnLocalEffect for a freshly-minted persisted effect.
 func (e *Engine) fireLocalEffect(offset Tip, eff *pb.Effect) {
 	e.observeTemporal(offset, eff, false)
+	e.recordHistorySent(offset, eff)
 
 	e.localEffectMu.RLock()
 	defer e.localEffectMu.RUnlock()
@@ -923,13 +781,9 @@ func fromPbRefs(refs []*pb.EffectRef) []Tip {
 	return tips
 }
 
-// resolveTipDeps walks each tip back through pendingTxTips until it
-// lands on a committed ancestor (a bind or a non-tx effect). SSI
-// requires that every dep we hand a new effect references state that
-// has already been committed somewhere in the cluster — never a tip
-// belonging to a foreign in-flight transaction. Single-level
-// substitution would leave us pointing at another tx-tipped offset of
-// the same in-flight txn, which is what we're trying to avoid.
+// resolveTipDeps excludes tentative writes from the value base. Observations
+// remain causal dependencies even when their transaction has not bound: seeing
+// a NOOP does not make that transaction committed or its future bind an ancestor.
 func (e *Engine) resolveTipDeps(tips []Tip) []Tip {
 	// Nearly every read is already at a committed frontier. Avoid allocating
 	// the recursive walk's closure, seen set, and output slice until at least
@@ -1000,7 +854,7 @@ func (e *Engine) resolveTipDeps(tips []Tip) []Tip {
 // via prev_snapshot to the latest existing snapshot tip. Deps are the
 // current tips with pending-tx tips substituted; the index is updated
 // and the effect is broadcast.
-func (e *Engine) emitSnapshot(key string, verdicts map[string]pb.Verdict) error {
+func (e *Engine) emitSnapshot(key string, verdicts map[string]pb.Verdict, evidence ...*pb.BindEvidence) error {
 	hlc := timestamppb.New(e.clock.Now())
 	eff := &pb.Effect{
 		Key:            []byte(key),
@@ -1010,6 +864,10 @@ func (e *Engine) emitSnapshot(key string, verdicts map[string]pb.Verdict) error 
 		Kind: &pb.Effect_Snapshot{Snapshot: &pb.SnapshotEffect{
 			TxnVerdicts: verdicts,
 		}},
+	}
+
+	if len(evidence) != 0 {
+		eff.GetSnapshot().Evidence = evidence[0]
 	}
 
 	currentSet := e.index.Contains(key)
@@ -1065,57 +923,6 @@ func (e *Engine) applySnapshotVerdicts(eff *pb.Effect) {
 	for txnID := range snap.GetTxnVerdicts() {
 		e.horizon.MakeVisible(txnID)
 	}
-}
-
-// lookupSnapshotVerdict walks the snapshot chain on `key` for `txnID`'s
-// adjudication outcome. Used by arrival-time fork-choice sites to skip a
-// competing bind a prior snapshot already locked in as LOST.
-func (e *Engine) lookupSnapshotVerdict(key, txnID string) (pb.Verdict, bool) {
-	tipSet := e.index.Contains(key)
-	if tipSet == nil {
-		return pb.Verdict_VERDICT_UNSPECIFIED, false
-	}
-
-	visited := make(map[Tip]bool)
-
-	stack := append([]Tip(nil), tipSet.Tips()...)
-	for len(stack) > 0 {
-		t := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-
-		if visited[t] {
-			continue
-		}
-
-		visited[t] = true
-
-		eff, err := e.getEffect(key, t)
-		if err != nil {
-			continue
-		}
-
-		if snap := eff.GetSnapshot(); snap != nil {
-			if v, ok := snap.GetTxnVerdicts()[txnID]; ok && v != pb.Verdict_VERDICT_UNSPECIFIED {
-				return v, true
-			}
-
-			if snap.GetPrevSnapshot() != nil {
-				stack = append(stack, r(snap.GetPrevSnapshot()))
-			}
-
-			for _, dep := range eff.GetDeps() {
-				stack = append(stack, r(dep))
-			}
-
-			continue
-		}
-
-		for dep := range keyDeps(key, eff) {
-			stack = append(stack, r(dep))
-		}
-	}
-
-	return pb.Verdict_VERDICT_UNSPECIFIED, false
 }
 
 // HandleRemote processes a remote effect notification: stores the effect
@@ -1345,8 +1152,9 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 		}
 	}
 
-	// Track in-progress transactional tips
-	if eff.GetTxnId() != "" && eff.GetTxnBind() == nil {
+	// Track tentative transaction effects. NOOPs carry observations, not
+	// tentative values, and remain consumable before their transaction binds.
+	if eff.GetTxnId() != "" && eff.GetTxnBind() == nil && eff.GetNoop() == nil {
 		slog.Debug("HandleRemote: tracking pending tx tip", "offset", notify.GetOrigin(), "deps", eff.GetDeps())
 		e.pendingTxTips.Store(r(notify.GetOrigin()), fromPbRefs(eff.GetDeps()))
 	}
@@ -1499,9 +1307,15 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 		nacks = append(nacks, e.buildEnrichedNack(key, notify.GetOrigin(), tipOffsets))
 	}
 
-	// The bind and its promise are installed, and the response is fixed.
-	// Wake application waiters and apply deferred memory pacing outside the lock.
+	var prior []*pendingTxn
+	if eff.GetTxnBind() != nil {
+		prior = e.priorityPredecessors(r(notify.GetOrigin()), eff)
+	}
+	// The bind and its promise are installed. Priority waiting must release
+	// nodeMu so higher-priority binds and their evidence can arrive.
 	nodeLock.release()
+
+	nacks = e.finishPriorityResponse(notify.GetOrigin(), nacks, prior)
 
 	// Fire notification callbacks for remote effects
 	if eff.GetTxnId() != "" && eff.GetTxnBind() == nil {
@@ -1654,7 +1468,7 @@ func (e *Engine) ingestBackfill(notify *pb.OffsetNotify, historyKey *string) err
 	// Verdict-snapshot arrival ends horizon wait for every txn it adjudicates.
 	e.applySnapshotVerdicts(eff)
 
-	if eff.GetTxnId() != "" && eff.GetTxnBind() == nil {
+	if eff.GetTxnId() != "" && eff.GetTxnBind() == nil && eff.GetNoop() == nil {
 		e.pendingTxTips.Store(r(notify.GetOrigin()), fromPbRefs(eff.GetDeps()))
 	}
 
@@ -1707,24 +1521,10 @@ func (e *Engine) handleRemoteBind(bind *pb.TransactionalBindEffect, bindOffset T
 		}
 	}
 
-	// Process abort_deps: remove those offsets and abort any local pending txn
-	for _, abortedOffset := range bind.GetAbortDeps() {
-		aborted := r(abortedOffset)
-		e.pendingTxTips.Delete(aborted)
-
-		// Check if any local pending txn has this offset → abort it
-		e.pendingTxns.Range(func(_ Tip, ptxn *pendingTxn) bool {
-			for _, pk := range ptxn.keys {
-				if pk.newTip == aborted {
-					ptxn.finish(txnStateAborted)
-
-					return false // stop ranging
-				}
-			}
-
-			return true
-		})
-	}
+	// Ignore legacy abort_deps. A tentative tip does not establish a losing
+	// bind; aborting by offset here can contradict fork choice and expose an
+	// aborted transaction during reconstruction. Peer conflict responses decide
+	// published binds, while the node-locked preflight protects unpublished ones.
 
 	// Retain each consuming bind, not just a boolean for its shared base.
 	// flushTx must prove those binds are ancestors before reusing that base.
@@ -1749,7 +1549,7 @@ func (e *Engine) handleRemoteBind(bind *pb.TransactionalBindEffect, bindOffset T
 }
 
 // checkCompetingBinds walks the DAG fragment for each key the bind touches
-// and returns the txnID of any bind whose NewTip on that key is not a
+// and returns the txnID of any bind whose envelope is not a
 // structural ancestor of our ConsumedTips — i.e., a bind we know about
 // that's space-like concurrent with our forthcoming bind. Returns "" if
 // no such bind exists.
@@ -1788,7 +1588,8 @@ func (e *Engine) checkCompetingBinds(bind *pb.TransactionalBindEffect, txnID str
 		}
 
 		// Ancestor closure of our consumed tips on this key. A bind whose
-		// NewTip on `k` lands in this set is structurally in our past.
+		// envelope lands in this set is structurally in our past. Observing its
+		// NewTip alone does not establish that it has bound.
 		ourAncestors := make(map[Tip]struct{}, len(consumedTips)*8)
 
 		ancestorStack := make([]Tip, 0, len(consumedTips))
@@ -1810,7 +1611,7 @@ func (e *Engine) checkCompetingBinds(bind *pb.TransactionalBindEffect, txnID str
 				continue
 			}
 
-			for _, dep := range eff.GetDeps() {
+			for dep := range keyDeps(k, eff) {
 				dt := r(dep)
 				if _, dup := ourAncestors[dt]; dup {
 					continue
@@ -1840,13 +1641,21 @@ func (e *Engine) checkCompetingBinds(bind *pb.TransactionalBindEffect, txnID str
 			}
 
 			if otherBind := eff.GetTxnBind(); otherBind != nil {
+				if eff.GetTxnId() == txnID {
+					for dep := range keyDeps(k, eff) {
+						walkStack = append(walkStack, r(dep))
+					}
+
+					continue
+				}
+
 				for _, okb := range otherBind.GetKeys() {
 					if string(okb.GetKey()) != k {
 						continue
 					}
 
 					theirNewTip := r(okb.GetNewTip())
-					if _, inAncestors := ourAncestors[theirNewTip]; inAncestors {
+					if _, inAncestors := ourAncestors[t]; inAncestors {
 						walkStack = append(walkStack, theirNewTip)
 
 						break
@@ -1874,124 +1683,13 @@ func (e *Engine) checkCompetingBinds(bind *pb.TransactionalBindEffect, txnID str
 				walkStack = append(walkStack, r(snap.GetPrevSnapshot()))
 			}
 
-			for _, dep := range eff.GetDeps() {
+			for dep := range keyDeps(k, eff) {
 				walkStack = append(walkStack, r(dep))
 			}
 		}
 	}
 
 	return ""
-}
-
-// evaluateBindForkChoice returns true if the bind would lose at the
-// originator's commit point against any existing competitor on its keys
-// (hash-based fork choice with predicate-refinement and shared-base
-// gating) or against a concurrent non-tx data effect (SSI). flushTx
-// uses this to abort before emitting.
-func (e *Engine) evaluateBindForkChoice(bind *pb.TransactionalBindEffect, bindOffset Tip, bindHash []byte, txnID string) bool {
-	for _, kb := range bind.GetKeys() {
-		k := string(kb.GetKey())
-
-		tips := e.index.Contains(k)
-		if tips == nil {
-			continue
-		}
-
-		for _, tipOff := range tips.Tips() {
-			if tipOff == bindOffset {
-				continue
-			}
-
-			eff, err := e.getEffect(k, tipOff)
-			if err != nil {
-				continue
-			}
-
-			// Competing bind: fork-choice determines winner
-			if otherBind := eff.GetTxnBind(); otherBind != nil {
-				if eff.GetTxnId() == txnID {
-					continue // same transaction
-				}
-				// Already adjudicated as LOST by a snapshot? skip
-				if v, ok := e.lookupSnapshotVerdict(k, eff.GetTxnId()); ok && v == pb.Verdict_LOST {
-					continue
-				}
-
-				if bindsShareBase(bind, otherBind) {
-					var theirTip Tip
-
-					for _, otherKey := range otherBind.GetKeys() {
-						if bytes.Equal(kb.GetKey(), otherKey.GetKey()) {
-							theirTip = r(otherKey.GetNewTip())
-						}
-					}
-					// Predicate refinement: suppress the fork-choice
-					// when both txs carry obs/row-write evidence on
-					// this key and their predicates don't intersect
-					// the other's writes. Fallback to shared-base
-					// conflict when either side lacks evidence
-					// (schema-only mutations, non-SQL binds, etc.).
-					conflict, bothHadEvidence := e.hasPredicateConflict(
-						txnID, eff.GetTxnId(), k,
-						[]Tip{r(kb.GetNewTip()), bindOffset},
-						[]Tip{theirTip, tipOff})
-					if bothHadEvidence && !conflict {
-						continue
-					}
-
-					if !ForkChoiceLess(bindHash, eff.GetForkChoiceHash()) {
-						return true
-					}
-				}
-			}
-
-			// Non-transactional data effect: SSI invalidation
-			if eff.GetTxnId() == "" && eff.GetData() != nil {
-				// Check if this effect is concurrent with our bind on this key:
-				// not in the ancestor set of our consumed tips for this key.
-				if !refsContain(kb.GetConsumedTips(), tipOff) {
-					// Not a consumed tip — could be concurrent.
-					// Check if it's a descendant of our bind (depends on us).
-					// If it depends on our NewTip or bindOffset, it's sequential.
-					isDescendant := false
-					// Walk backward from the non-tx effect to see if it reaches our bind
-					visited := make(map[Tip]bool)
-					stack := []Tip{tipOff}
-					zero := Tip{0, 0}
-
-					for len(stack) > 0 {
-						off := stack[len(stack)-1]
-						stack = stack[:len(stack)-1]
-
-						if off == bindOffset || off == r(kb.GetNewTip()) {
-							isDescendant = true
-
-							break
-						}
-
-						if visited[off] || off == zero {
-							continue
-						}
-
-						visited[off] = true
-
-						depEff, err := e.getEffect(k, off)
-						if err != nil {
-							continue
-						}
-
-						stack = appendRefs(stack, depEff.GetDeps())
-					}
-
-					if !isDescendant {
-						return true
-					}
-				}
-			}
-		}
-	}
-
-	return false
 }
 
 // HandleNack processes a NACK from a remote peer.
@@ -2016,36 +1714,9 @@ func (e *Engine) HandleNack(nack *pb.NackNotify) error {
 	// anything else. The NACK is informational; we must consume it.
 	e.ingestNackTips(nack)
 
-	// Check if this NACK is for a transactional key
-	var matchedTxn *pendingTxn
-
-	e.pendingTxns.Range(func(_ Tip, ptxn *pendingTxn) bool {
-		for _, pk := range ptxn.keys {
-			if pk.key == string(nack.GetKey()) {
-				matchedTxn = ptxn
-
-				return false
-			}
-		}
-
-		return true
-	})
-
-	if matchedTxn == nil {
-		slog.Debug("HandleNack: non-transactional, ignoring", "key", nack.GetKey())
-
-		return nil
-	}
-
-	slog.Debug("HandleNack: transactional conflict check", "key", nack.GetKey(), "bind_offset", matchedTxn.bindOffset)
-	// Transactional NACK: smart conflict detection across all keys in the tx
-	for _, detail := range nack.GetTipDetails() {
-		if e.isRealConflict(matchedTxn, string(nack.GetKey()), detail) {
-			matchedTxn.finish(txnStateAborted)
-
-			return nil
-		}
-	}
+	// Asynchronous NACKs carry history, not permission to evaluate a bind.
+	// flushTx collects the tracked responses from every subscriber before
+	// evaluating in priority order. An early NACK cannot abort it here.
 
 	return nil
 }
@@ -2332,10 +2003,8 @@ func (e *Engine) ingestCausalChain(nack *pb.NackNotify) {
 }
 
 // prefetchEffects fetches every listed ref not already resident in parallel
-// and caches the deserialized effects, so a subsequent dag.bfs finds
-// everything locally instead of doing sequential FetchFromAny calls. Purely a
-// cache warmer: it installs no tips, and a failed fetch is skipped — the walk
-// that follows fetches stragglers itself.
+// and caches the deserialized effects for synchronous ingestion. It installs
+// no tips; ingestion resolves dependencies omitted by a failed prefetch.
 func (e *Engine) prefetchEffects(refs []Tip) {
 	if e.effectCache == nil || len(refs) == 0 {
 		return
@@ -2726,7 +2395,7 @@ func (e *Engine) probeAndFetchKey(key string) {
 		}},
 	}
 
-	data, err := MarshalEffect(eff)
+	data, err := e.effectCache.MarshalEffect(eff)
 	if err != nil {
 		return
 	}

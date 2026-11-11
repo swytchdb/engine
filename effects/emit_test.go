@@ -891,7 +891,7 @@ func TestFlushTx_NoNACKs_Commits(t *testing.T) {
 	}
 }
 
-func TestFlushTx_RealConflict_Aborts(t *testing.T) {
+func TestFlushTx_NonTransactionalNack_Commits(t *testing.T) {
 	bc := &txnMockBroadcaster{
 		replicateToResults: map[pb.NodeID]*pb.NackNotify{
 			99: {
@@ -934,9 +934,8 @@ func TestFlushTx_RealConflict_Aborts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := ctx.Flush()
-	if !errors.Is(err, ErrTxnAborted) {
-		t.Fatalf("expected ErrTxnAborted, got %v", err)
+	if err := ctx.Flush(); err != nil {
+		t.Fatalf("non-transactional NACK must not abort a published bind: %v", err)
 	}
 }
 
@@ -1069,6 +1068,17 @@ func TestFlushTx_VerdictSnapshotEmittedOnLoserOnlyKeys(t *testing.T) {
 		t.Fatalf("Put: %v", err)
 	}
 
+	// A recomputable verdict owns the losing transaction's payloads, not
+	// just its envelope. Supply the effects referenced by this fixture.
+	for tip, key := range map[Tip]string{loserDataShared: sharedKey, loserDataLoserOnly: loserOnlyKey} {
+		eff := dataEffect(key)
+
+		eff.TxnId = loserTxnID
+		if err := e.effectCache.Put(tip, eff); err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	// Subscribe peer 99 to the shared key so flushTx replicates our
 	// bind to peer 99 and processes its NACK response.
 	subCtx := e.NewContext()
@@ -1133,6 +1143,11 @@ func TestFlushTx_VerdictSnapshotEmittedOnLoserOnlyKeys(t *testing.T) {
 		if v != pb.Verdict_LOST {
 			t.Fatalf("verdict snapshot on %q records loser %q as %v, want LOST",
 				loserOnlyKey, loserTxnID, v)
+		}
+
+		derived, err := e.proofVerdicts(tip, eff)
+		if err != nil || derived[loserTxnID].verdict != pb.Verdict_LOST {
+			t.Fatalf("loser-only proof: verdicts=%v error=%v", derived, err)
 		}
 
 		foundLoserOnlyVerdict = true
@@ -1372,49 +1387,109 @@ func TestFlushTx_SerializationEscalation_AfterNAborts(t *testing.T) {
 	}
 }
 
-func TestHandleRemoteBind_AbortsLocalPendingTx(t *testing.T) {
-	e := newTxnTestEngine(nil)
+func TestHandleRemoteBind_AbortDepsCannotOverrideForkChoice(t *testing.T) {
+	for _, localWins := range []bool{true, false} {
+		t.Run(fmt.Sprintf("localWins=%t", localWins), func(t *testing.T) {
+			log := newSnapshotLog()
+			e := newSnapshotEngine(log)
+			base := log.putEffect(scalarSet("k", "base"))
+			makeBind := func(txn string, node pb.NodeID, stamp int64) (*pb.Effect, Tip, Tip) {
+				log.nodeID = uint64(node)
+				write := scalarSet("k", txn)
+				write.TxnId, write.Deps = txn, toPbRefs([]Tip{base})
+				write.NodeId = uint64(node)
+				tip := log.putEffect(write)
+				bind := &pb.Effect{
+					Key: []byte("k"), TxnId: txn, NodeId: uint64(node), Hlc: sTs(stamp),
+					ForkChoiceHash: ComputeForkChoiceHash(node, sTs(stamp)), Deps: toPbRefs([]Tip{tip}),
+					Kind: &pb.Effect_TxnBind{TxnBind: &pb.TransactionalBindEffect{
+						OriginatorNodeId: uint64(node), TxnHlc: sTs(stamp),
+						Keys: []*pb.TransactionalBindEffect_KeyBind{
+							{Key: []byte("k"), NewTip: toPbRef(tip), ConsumedTips: toPbRefs([]Tip{base})},
+						},
+					}},
+				}
 
-	// Set up a local pending txn
-	ptxn := &pendingTxn{
-		txnHLC:     time.Unix(0, 100),
-		originNode: 42,
-		bindOffset: Tip{42, 8888},
-		keys: []pendingTxnKey{
-			{key: "k", newTip: Tip{42, 500}},
-		},
-		done: make(chan struct{}),
-	}
-	e.pendingTxns.Store(Tip{42, 8888}, ptxn)
-	e.pendingTxTips.Store(Tip{42, 500}, []Tip{{42, 200}})
+				return bind, log.putEffect(bind), tip
+			}
 
-	// Remote bind arrives that aborts our offset 500
-	bind := &pb.TransactionalBindEffect{
-		TxnHlc:           timestamppb.New(time.Unix(0, 50)),
-		OriginatorNodeId: 99,
-		AbortDeps:        []*pb.EffectRef{{NodeId: 42, Offset: 500}},
-		Keys: []*pb.TransactionalBindEffect_KeyBind{
-			{Key: []byte("k"), NewTip: &pb.EffectRef{NodeId: 99, Offset: 600}},
-		},
-	}
+			localStamp, remoteStamp := int64(1), int64(2)
+			for ForkChoiceLess(ComputeForkChoiceHash(1, sTs(localStamp)), ComputeForkChoiceHash(2, sTs(remoteStamp))) != localWins {
+				remoteStamp++
+			}
 
-	e.handleRemoteBind(bind, Tip{99, 7777}, "99:50:1")
+			local, localBind, localTip := makeBind("local", 1, localStamp)
+			remote, remoteBind, _ := makeBind("remote", 2, remoteStamp)
+			ptxn := &pendingTxn{
+				txnID: "local", bindOffset: localBind, forkChoiceHash: local.GetForkChoiceHash(),
+				keys: []pendingTxnKey{{key: "k", newTip: localTip, consumedTips: []Tip{base}}},
+				done: make(chan struct{}),
+			}
+			e.pendingTxns.Store(localBind, ptxn)
+			e.pendingTxTips.Store(localTip, []Tip{base})
+			e.updateIndex("k", nil, localBind)
+			e.updateIndex("k", nil, remoteBind)
 
-	// Our pending txn should be aborted
-	if ptxn.state.Load() != txnStateAborted {
-		t.Fatal("expected pending txn to be aborted")
-	}
+			// Legacy senders may list our tentative tip even when our already
+			// published bind wins. Arrival alone cannot decide either outcome.
+			remote.GetTxnBind().AbortDeps = toPbRefs([]Tip{localTip})
+			e.handleRemoteBind(remote.GetTxnBind(), remoteBind, "remote")
 
-	// done channel should be closed
-	select {
-	case <-ptxn.done:
-	default:
-		t.Fatal("done channel should be closed")
-	}
+			if ptxn.state.Load() != txnStatePending {
+				t.Fatal("abort_deps decided the transaction before bind conflict classification")
+			}
 
-	// pendingTxTips should be cleaned up
-	if _, ok := e.pendingTxTips.Load(Tip{42, 500}); ok {
-		t.Fatal("pendingTxTips should be cleaned for aborted offset")
+			if _, ok := e.pendingTxTips.Load(localTip); !ok {
+				t.Fatal("abort_deps released another transaction's tentative tip")
+			}
+
+			if err := e.HandleNack(&pb.NackNotify{
+				Key: []byte("k"), Tips: toPbRefs([]Tip{remoteBind}),
+				TipDetails: []*pb.NackTipDetail{nackTipDetail(remoteBind, remote)},
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			if ptxn.state.Load() != txnStatePending {
+				t.Fatal("asynchronous NACK evaluated before priority was established")
+			}
+			// Supply the winner's evidence before evaluating the tracked
+			// response. A bare competing hash is only a priority relation.
+			proof := log.putEffect(&pb.Effect{Key: []byte("k"), Kind: &pb.Effect_Snapshot{Snapshot: &pb.SnapshotEffect{
+				TxnVerdicts: map[string]pb.Verdict{"remote": pb.Verdict_WON},
+			}}})
+
+			nacks := []*pb.NackNotify{e.buildEnrichedNack("k", toPbRef(localBind), []Tip{remoteBind})}
+			if !localWins {
+				nacks = append(nacks, e.buildEnrichedNack("k", toPbRef(localBind), []Tip{proof}))
+			}
+
+			_, err := e.evaluateNacks(ptxn, nacks)
+			if aborted := errors.Is(err, ErrTxnAborted); aborted == localWins {
+				t.Fatalf("abort=%t, expected %t (error %v)", aborted, !localWins, err)
+			}
+
+			if err != nil && !errors.Is(err, ErrTxnAborted) {
+				t.Fatal(err)
+			}
+
+			e.pendingTxns.Delete(localBind)
+			e.pendingTxTips.Delete(localTip)
+
+			value, _, _, err := e.GetSnapshot("k")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			want := "remote"
+			if localWins {
+				want = "local"
+			}
+
+			if got := string(value.GetScalar().GetRaw()); got != want {
+				t.Fatalf("reconstruction returned %q, want %q", got, want)
+			}
+		})
 	}
 }
 
@@ -1494,7 +1569,7 @@ func TestHandleNack_NonTransactional_NoOp(t *testing.T) {
 	}
 }
 
-func TestHandleNack_TransactionalKey_AbortsOnConflict(t *testing.T) {
+func TestHandleNack_TransactionalKey_DefersEvaluation(t *testing.T) {
 	e := newTxnTestEngine(nil)
 
 	ptxn := &pendingTxn{
@@ -1524,8 +1599,12 @@ func TestHandleNack_TransactionalKey_AbortsOnConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if ptxn.state.Load() != txnStateAborted {
-		t.Fatal("expected pending txn to be aborted by HandleNack")
+	if ptxn.state.Load() != txnStatePending {
+		t.Fatal("asynchronous NACK must not evaluate before all subscriber responses")
+	}
+
+	if _, err := e.evaluateNacks(ptxn, []*pb.NackNotify{nack}); err != nil {
+		t.Fatalf("completed responses must not treat non-transactional data as a defeated bind: %v", err)
 	}
 }
 
@@ -1710,7 +1789,7 @@ func TestSSI_ReadWriteConflict_Aborts(t *testing.T) {
 	}
 }
 
-func TestSSI_SubscriberNACK_AbortsLoser(t *testing.T) {
+func TestSSI_SubscriberNACK_UnresolvedPriorityIsAmbiguous(t *testing.T) {
 	// Use the smallest possible hash (all zeros) to guarantee FWW victory
 	// against any real SHA-256 hash the engine will compute.
 	theirNode := pb.NodeID(0)
@@ -1786,10 +1865,10 @@ func TestSSI_SubscriberNACK_AbortsLoser(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Flush — subscriber NACKs with a competing bind that wins FWW
+	// A bare competing hash cannot establish whether that bind survived.
 	err = ctx.Flush()
-	if !errors.Is(err, ErrTxnAborted) {
-		t.Fatalf("expected ErrTxnAborted from subscriber NACK, got %v", err)
+	if !errors.Is(err, ErrTxnAmbiguous) {
+		t.Fatalf("expected ErrTxnAmbiguous from unresolved subscriber NACK, got %v", err)
 	}
 }
 

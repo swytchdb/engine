@@ -281,13 +281,9 @@ func (b *partialHoleBroadcaster) FetchFromAny(ref *pb.EffectRef, _ FetchHint) ([
 	return nil, fmt.Errorf("cdn fetch %v: %w", r(ref), ErrCDNBlobMissing)
 }
 
-// TestReadMissServesReadableSubsetAndMarksPending: Cloud names a frontier we
-// can only partially fetch. The readable sibling is not this engine's hole to
-// repair and must install and serve on its own; the holed sibling is handed
-// to Cloud's reconcile loop via MarkPending instead of blocking the read. A
-// repeat read must not re-consult Cloud: the leaf's cloudPending marker caps
-// the WAN round-trips for the rest of its residency.
-func TestReadMissServesReadableSubsetAndMarksPending(t *testing.T) {
+// A missing sibling remains part of the installed frontier. Reconstruction
+// fails rather than returning only the available portion of the value.
+func TestReadMissDoesNotServeReadableSubset(t *testing.T) {
 	const key = "evicted"
 
 	reachable, wire := makeReachableEffect(t, key, 1)
@@ -306,38 +302,29 @@ func TestReadMissServesReadableSubsetAndMarksPending(t *testing.T) {
 
 	ctx := e.NewReadOnlyContext()
 
-	result, _, err := ctx.GetSnapshot(key)
-	if err != nil {
-		t.Fatalf("read of a partially holed frontier errored: %v", err)
-	}
-
-	if result == nil {
-		t.Fatal("expected the readable sibling's state, not a miss")
+	for range 2 {
+		result, _, err := ctx.GetSnapshot(key)
+		if !errors.Is(err, errEffectNotResident) || !errors.Is(err, ErrCDNBlobMissing) || result != nil {
+			t.Fatalf("read must report required missing history, got result=%v err=%v", result, err)
+		}
 	}
 
 	if fake.calls != 1 {
 		t.Fatalf("expected one Cloud consult, got %d", fake.calls)
 	}
 
-	if len(fake.pending) != 1 || fake.pending[0] != key {
-		t.Fatalf("expected the key marked pending once, got %v", fake.pending)
+	if len(fake.pending) != 0 {
+		t.Fatalf("ingestion classified history for reconstruction: %v", fake.pending)
 	}
 
-	if _, _, err := ctx.GetSnapshot(key); err != nil {
-		t.Fatalf("second read errored: %v", err)
-	}
-
-	if fake.calls != 1 {
-		t.Fatalf("Cloud was re-consulted on a repeat read of a pending key (%d calls)", fake.calls)
+	if !e.index.Contains(key).ContainsAll([]Tip{reachable, holed}) {
+		t.Fatalf("cloud closure lost a branch: %v", e.index.Contains(key).Tips())
 	}
 }
 
-// TestReadMissAllTipsPendingFailsRead: when nothing in Cloud's named frontier
-// is walkable, the read must fail with ErrCloudUnavailable rather than
-// fabricate a miss for data Cloud provably holds — but a repeat read must not
-// re-consult Cloud: the leaf's cloudPending marker caps the WAN round-trips
-// and leaves healing to the reconcile loop's own schedule.
-func TestReadMissAllTipsPendingFailsRead(t *testing.T) {
+// Definitive absence completes closure, but cannot turn an unavailable
+// frontier into a free miss. Subsequent reads retry through reconstruction.
+func TestReadMissAbsentFrontierFailsReconstruction(t *testing.T) {
 	const key = "evicted"
 
 	holed := Tip{9, 4}
@@ -353,17 +340,17 @@ func TestReadMissAllTipsPendingFailsRead(t *testing.T) {
 
 	ctx := e.NewReadOnlyContext()
 	for i := range 2 {
-		if _, _, err := ctx.GetSnapshot(key); !errors.Is(err, ErrCloudUnavailable) {
-			t.Fatalf("read %d: want ErrCloudUnavailable for a wholly holed frontier, got %v", i+1, err)
+		if _, _, err := ctx.GetSnapshot(key); !errors.Is(err, errEffectNotResident) || !errors.Is(err, ErrCDNBlobMissing) {
+			t.Fatalf("read %d: want missing reconstruction dependency, got %v", i+1, err)
 		}
 	}
 
 	if fake.calls != 1 {
-		t.Fatalf("expected one Cloud consult (cloudPending caps the rest), got %d", fake.calls)
+		t.Fatalf("expected one Cloud consult (frontier is already installed), got %d", fake.calls)
 	}
 
-	if len(fake.pending) != 1 || fake.pending[0] != key {
-		t.Fatalf("expected the key marked pending once, got %v", fake.pending)
+	if len(fake.pending) != 0 {
+		t.Fatalf("definitive absence must exhaust closure, got pending=%v", fake.pending)
 	}
 }
 

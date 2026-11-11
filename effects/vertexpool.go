@@ -50,6 +50,10 @@ type vertex struct {
 	eff  *pb.Effect
 	size int64
 	refs atomic.Int32
+	// isRoot means missing ancestry beyond this vertex need not be fetched.
+	// Resident dependencies still participate in traversal and consumption.
+	// Protected by creationMu.
+	isRoot bool
 	// Temporal completion belongs to this resident copy, so eviction also
 	// discards the bookkeeping. Bits are set only after evidence publication.
 	temporal atomic.Uint32
@@ -58,6 +62,13 @@ type vertex struct {
 	creationMu    sync.Mutex
 	creationKeys  []string // sorted, unique; usually just the effect's own key
 	creationBytes int64
+	// Reverse navigation is not ownership. Identities do not pin descendant
+	// payloads, and this storage disappears with the ancestor. creationMu
+	// protects the slice and its memory accounting, not descendant lifetimes.
+	parents []struct {
+		tip Tip
+		key string
+	}
 }
 
 // VertexPool is the engine's deserialized effect store: a map from Tip to
@@ -135,6 +146,71 @@ func (p *VertexPool) Get(tip Tip) (*pb.Effect, bool) {
 	return v.eff, true
 }
 
+func (p *VertexPool) getVertex(tip Tip) *vertex {
+	v, ok := p.m.Load(tip)
+	if !ok || v.refs.Load() < 0 {
+		p.misses.Add(1)
+
+		return nil
+	}
+
+	p.hits.Add(1)
+
+	return v
+}
+
+func (v *vertex) root() bool {
+	v.creationMu.Lock()
+	defer v.creationMu.Unlock()
+
+	return v.isRoot
+}
+
+func (v *vertex) markRoot() {
+	v.creationMu.Lock()
+	defer v.creationMu.Unlock()
+
+	v.isRoot = true
+}
+
+func (p *VertexPool) addParent(v *vertex, parent Tip, key string) {
+	v.creationMu.Lock()
+	defer v.creationMu.Unlock()
+
+	if v.refs.Load() < 0 {
+		return
+	}
+
+	for _, link := range v.parents {
+		if link.tip == parent && link.key == key {
+			return
+		}
+	}
+	// Reclamation removes payloads, not evidence of an established join.
+	// Keep the key as well: a shared bind can have parents on different keys,
+	// and the parent's payload may be gone when this edge is traversed.
+	v.parents = append(v.parents, struct {
+		tip Tip
+		key string
+	}{parent, key})
+	p.accountCreation(v)
+}
+
+// firstParent follows one established chain; cut discovery never enumerates
+// all reverse paths. A reclaimed parent's identity remains valid join evidence.
+func (v *vertex) firstParent(key string) (Tip, bool) {
+	v.creationMu.Lock()
+	defer v.creationMu.Unlock()
+
+	for _, link := range v.parents {
+		if link.key == key {
+			return link.tip, true
+		}
+	}
+
+	return Tip{}, false
+}
+
 // Put stores eff at tip and accounts for its resident protobuf allocations.
 //
 // A re-Put of an already-resident tip keeps the existing vertex so its
@@ -205,12 +281,31 @@ func missingCreationKeys(eff *pb.Effect, existing []string, owns func([]byte) bo
 // put owns persistence, publication, and accounting for both owned and cache-only
 // effects. Creation references are initialized before a vertex is published.
 func (p *VertexPool) put(tip Tip, eff *pb.Effect, takeOwnership bool, owns func([]byte) bool) error {
-	if p.mirror != nil {
+	return p.putWithPin(tip, eff, takeOwnership, owns, false)
+}
+
+// pin reserves an independent reference before a new vertex is visible. Proof
+// package installation uses it to protect cache-only records until their owner
+// has acquired its references, even with reclamation running concurrently.
+func (p *VertexPool) putWithPin(tip Tip, eff *pb.Effect, takeOwnership bool, owns func([]byte) bool, pin bool) error {
+	if len(eff.GetEvidencePackage()) != 0 {
+		clean, release, err := p.installEvidencePackage(tip, eff)
+		if err != nil {
+			return err
+		}
+		defer release()
+
+		eff = clean
+	}
+	// Package members are durable inside their owning snapshot. Writing them
+	// as independent records would promote proof-only history into key
+	// frontiers during restart. An ordinary ingestion persists them normally.
+	if p.mirror != nil && !pin {
 		lock := &p.mirrorLocks[(tip[0]^tip[1])%256]
 		lock.Lock()
 		defer lock.Unlock()
 
-		data, err := MarshalEffect(eff)
+		data, err := p.MarshalEffect(eff)
 		if err != nil {
 			return err
 		}
@@ -222,12 +317,21 @@ func (p *VertexPool) put(tip Tip, eff *pb.Effect, takeOwnership bool, owns func(
 
 	v, loaded := p.m.Load(tip)
 	if !loaded {
+		evidence, err := p.pinEvidence(tip, eff)
+		if err != nil {
+			return err
+		}
+
 		nv := &vertex{eff: eff, size: vertexOverhead}
 		if takeOwnership {
 			nv.creationKeys = missingCreationKeys(eff, nil, owns)
 		}
 
 		owners := len(nv.creationKeys)
+		if pin {
+			owners++
+		}
+
 		nv.refs.Store(int32(owners))
 		p.owned.change(eff, 1)
 		p.vertexBytes.Add(nv.size)
@@ -235,6 +339,7 @@ func (p *VertexPool) put(tip Tip, eff *pb.Effect, takeOwnership bool, owns func(
 
 		v, loaded = p.m.LoadOrStore(tip, nv)
 		if loaded {
+			p.releaseEvidence(evidence)
 			p.owned.change(eff, -1)
 			p.vertexBytes.Add(-nv.size - nv.creationBytes)
 		} else if owners == 0 {
@@ -242,22 +347,35 @@ func (p *VertexPool) put(tip Tip, eff *pb.Effect, takeOwnership bool, owns func(
 		}
 	}
 
-	if loaded && takeOwnership {
+	if loaded && (takeOwnership || pin) {
 		v.creationMu.Lock()
 		defer v.creationMu.Unlock()
 
-		keys := missingCreationKeys(eff, v.creationKeys, owns)
-		if len(keys) == 0 {
+		var keys []string
+		if takeOwnership {
+			keys = missingCreationKeys(eff, v.creationKeys, owns)
+		}
+
+		added := len(keys)
+		if pin {
+			added++
+		}
+
+		if added == 0 {
 			return nil
 		}
 
 		for {
 			n := v.refs.Load()
 			if n < 0 {
+				if pin {
+					return fmt.Errorf("pin effect %v: reclamation already claimed it", tip)
+				}
+
 				return nil // reclaim already claimed this vertex; do not resurrect it
 			}
 
-			if v.refs.CompareAndSwap(n, n+int32(len(keys))) {
+			if v.refs.CompareAndSwap(n, n+int32(added)) {
 				break
 			}
 		}
@@ -320,6 +438,9 @@ func (p *VertexPool) delete(tip Tip) int64 {
 	// CAS therefore publishes the final accounting and prevents further writes.
 	p.vertexBytes.Add(-prev.size - prev.creationBytes)
 	p.owned.change(prev.eff, -1)
+	// Each snapshot vertex owns its proof once, independently of the number
+	// of keys, read DAGs, or outbox entries holding the snapshot itself.
+	p.releaseEvidence(uniqueEvidence(prev.eff))
 
 	return prev.size
 }
@@ -381,6 +502,10 @@ func (p *VertexPool) claimAndDelete(tip Tip, v *vertex) int64 {
 	if v.eff != nil && isSystemKey(v.eff.GetKey()) {
 		return 0
 	}
+
+	// Finish navigation/accounting updates before retiring their storage.
+	v.creationMu.Lock()
+	defer v.creationMu.Unlock()
 
 	if !v.refs.CompareAndSwap(0, vertexTombstone) {
 		return 0
@@ -482,9 +607,13 @@ func (p *VertexPool) Bytes() int64 {
 
 // Call with creationMu held, or before publishing a new vertex.
 func (p *VertexPool) accountCreation(v *vertex) {
-	cost := memsize.Alloc(int64(cap(v.creationKeys)) * 16)
+	cost := memsize.Alloc(int64(cap(v.creationKeys))*16) + memsize.Alloc(int64(cap(v.parents))*int64(unsafe.Sizeof(v.parents[0])))
 	for _, key := range v.creationKeys {
 		cost += memsize.Alloc(int64(len(key)))
+	}
+
+	for _, link := range v.parents {
+		cost += memsize.Alloc(int64(len(link.key)))
 	}
 
 	p.vertexBytes.Add(cost - v.creationBytes)

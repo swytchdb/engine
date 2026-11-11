@@ -24,12 +24,12 @@
 package cluster
 
 import (
-	"fmt"
 	"io"
 	"log/slog"
 
 	"github.com/quic-go/quic-go"
 	pb "github.com/swytchdb/engine/cluster/proto"
+	"github.com/swytchdb/engine/effects"
 )
 
 // handleStream dispatches an incoming QUIC bidirectional stream based on its type prefix.
@@ -51,6 +51,8 @@ func handleStream(stream *quic.Stream, logReader LogReader, forwardHandler Forwa
 	switch typeBuf[0] {
 	case streamTypeFetch:
 		handleFetchStream(stream, logReader)
+	case streamTypeAncestry:
+		handleAncestryStream(stream, logReader)
 	case streamTypeForward:
 		handleForwardStream(stream, forwardHandler)
 	default:
@@ -146,4 +148,4 @@ func acceptStreams(conn *quic.Conn, logReader LogReader, forwardHandler ForwardH
 }
 
 // errFetchNotFound is returned when a fetch response contains no effect data.
-var errFetchNotFound = fmt.Errorf("effect not found on peer")
+var errFetchNotFound = effects.ErrEffectNotFound

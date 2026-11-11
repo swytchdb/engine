@@ -48,6 +48,14 @@ func NewEngineEffectHandler(engine *effects.Engine) *EngineEffectHandler {
 	return &EngineEffectHandler{engine: engine}
 }
 
+func (h *EngineEffectHandler) ConstrainHistoryProgress(peer NodeId, my, your uint64) (uint64, uint64) {
+	if h.engine == nil {
+		return 0, 0
+	}
+
+	return h.engine.ConstrainHistoryProgress(peer, my, your)
+}
+
 // HandleOffsetNotify delegates to the engine's HandleRemote. The
 // engine handles log storage, keytrie update, cache invalidation, NACK
 // generation, and notification callbacks.
@@ -110,15 +118,20 @@ func (r *EngineLogReader) ReadEffect(ref *pb.EffectRef) ([]byte, error) {
 		return nil, fmt.Errorf("effect not found at %v", ref)
 	}
 
-	return MarshalEffectWire(eff)
+	return MarshalEffectWire(eff, r.effectCache)
 }
 
 // MarshalEffectWire serializes an Effect to the peer-fetch wire format:
 // [4 bytes LE keyLen][key][proto-marshalled effect]. Exported so external
 // durability layers (the cloud dataplane's internal store) can produce blobs
 // the engine's fetch path parses directly.
-func MarshalEffectWire(eff *pb.Effect) ([]byte, error) {
-	protoData, err := effects.MarshalEffect(eff)
+func MarshalEffectWire(eff *pb.Effect, pools ...*effects.VertexPool) ([]byte, error) {
+	var pool *effects.VertexPool
+	if len(pools) != 0 {
+		pool = pools[0]
+	}
+
+	protoData, err := pool.MarshalEffect(eff)
 	if err != nil {
 		return nil, err
 	}

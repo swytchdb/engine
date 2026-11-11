@@ -38,6 +38,7 @@ import (
 type causalIndex struct {
 	engine *Engine
 	key    string
+	load   func(Tip) (*pb.Effect, error)
 	ids    map[Tip]int
 	nodes  []causalNode
 	heads  []int
@@ -54,7 +55,18 @@ type causalNode struct {
 }
 
 func newCausalIndex(e *Engine, key string) *causalIndex {
-	return &causalIndex{engine: e, key: key, ids: make(map[Tip]int)}
+	return &causalIndex{engine: e, key: key, ids: make(map[Tip]int), load: func(t Tip) (*pb.Effect, error) { return e.getEffect(key, t) }}
+}
+
+func (c *causalIndex) deps(eff *pb.Effect) []*pb.EffectRef {
+	for _, kb := range eff.GetTxnBind().GetKeys() {
+		if string(kb.GetKey()) == c.key {
+			return []*pb.EffectRef{kb.GetNewTip()}
+		}
+	}
+	// Conflict reporting can extend the index with an envelope from another
+	// key. Such an envelope has no per-key projection in this index.
+	return eff.GetDeps()
 }
 
 func (c *causalIndex) add(tips ...Tip) bool {
@@ -74,10 +86,10 @@ func (c *causalIndex) add(tips ...Tip) bool {
 		id := len(c.nodes)
 		c.ids[tip] = id
 		c.nodes = append(c.nodes, causalNode{})
-		eff, _ := c.engine.getEffect(c.key, tip)
+		eff, _ := c.load(tip)
 		// As in the original walk, a missing effect is reachable but its
 		// unavailable parents are not. Do not infer ancestry past the gap.
-		stack = append(stack, frame{id: id, deps: eff.GetDeps()})
+		stack = append(stack, frame{id: id, deps: c.deps(eff)})
 	}
 
 	for _, tip := range tips {
@@ -209,12 +221,12 @@ func (c *causalIndex) reachesCyclic(from, target Tip) bool {
 			cur := stack[len(stack)-1]
 			stack = stack[:len(stack)-1]
 
-			eff, err := c.engine.getEffect(c.key, cur)
+			eff, err := c.load(cur)
 			if err != nil {
 				continue
 			}
 
-			for _, dep := range eff.GetDeps() {
+			for _, dep := range c.deps(eff) {
 				tip := r(dep)
 				if _, visited := seen[tip]; !visited {
 					seen[tip] = struct{}{}

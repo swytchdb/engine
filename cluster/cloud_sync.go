@@ -777,7 +777,12 @@ func (f *ownFilter) has(h uint64) bool {
 // — so the cloud can bill the customer's data rather than the sealed blob it
 // stores or the writer's compression choices.
 func (cs *CloudSync) buildEnvelope(tip effects.Tip, eff *pb.Effect) (*dp.Effect, error) {
-	raw, err := effects.MarshalEffect(eff)
+	var pool *effects.VertexPool
+	if cs.engine != nil {
+		pool = cs.engine.EffectCache()
+	}
+
+	raw, err := pool.MarshalEffect(eff)
 	if err != nil {
 		return nil, fmt.Errorf("marshal: %w", err)
 	}

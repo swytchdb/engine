@@ -100,7 +100,7 @@ func normalizeTipCandidates(key string, candidates, roots []Tip, load func(Tip) 
 
 	supersededSet := make(map[Tip]struct{}, len(unique))
 
-	nodes, _, err := walkKeyHistory(key, slices.Concat(unique, roots), load)
+	nodes, err := walkKeyHistory(key, slices.Concat(unique, roots), load)
 	for cur, eff := range nodes {
 		for ref := range keyDeps(key, eff) {
 			dep := r(ref)
@@ -128,13 +128,16 @@ type dag struct {
 	nodes       map[Tip]*pb.Effect
 	lcaTip      Tip
 	// topoOrder is the post-order DFS sequence of every tip reached
-	// during phase 2, including tx-data effects that iterate filters
+	// during preparation, including tx-data effects that iterate filters
 	// out of the processor stream. Callers that need to propagate
 	// per-tip state along dependency edges (e.g. HorizonSet
 	// invisibility propagation in reconstruct) read this between
 	// prepare and iterate.
 	topoOrder []Tip
+	compact   bool // only a live frontier may release folded history
 }
+
+var errEffectNotResident = errors.New("required effect is not resident")
 
 // dagTip carries the effect while sorting, avoiding map lookups per comparison.
 type dagTip struct {
@@ -150,39 +153,15 @@ func newDag(engine *Engine, key string, activeTxnID string) *dag {
 	return &dag{engine: engine, key: key, activeTxnID: activeTxnID}
 }
 
-// walk performs a two-phase traversal of the effect graph:
-//
-//  1. BFS from tips following deps, tracking path convergence. Stops at the
-//     LCA snapshot (first snapshot where all paths have converged). Collects
-//     all nodes between tips and the LCA.
-//  2. Topological replay (DFS post-order) from tips within the collected set,
-//     ordered by fork choice hash at each fork. Calls processor in causal
-//     order (LCA snapshot → tips).
-//
-// Transactional effects (non-empty TxnId, not a bind) are skipped from the
-// processor output but their deps are still followed. Bind effects appear
-// in the sequence as envelopes.
-//
-// walk is a convenience wrapper over prepare + iterate; callers that need
-// to inspect d.topoOrder between BFS and the processor loop should call
-// prepare and iterate explicitly.
-func (d *dag) walk(tips []Tip, processor func(*pb.Effect) error) error {
-	if err := d.prepare(tips); err != nil {
-		return err
-	}
-
-	return d.iterate(func(_ Tip, eff *pb.Effect) error {
-		return processor(eff)
-	})
-}
-
-// prepare runs BFS + LCA trim and builds d.topoOrder. Safe to read
-// d.nodes and d.topoOrder after this returns successfully.
+// prepare builds the causal order directly from resident vertices. Safe to read
+// d.nodes and d.topoOrder after this returns successfully. Ingestion owns fetches;
+// iterate applies transaction and snapshot filtering to the resulting order.
 func (d *dag) prepare(tips []Tip) error {
 	d.lcaTip = Tip{}
 	d.topoOrder = nil
+	d.nodes = make(map[Tip]*pb.Effect)
 
-	if err := d.bfs(tips, &d.lcaTip); err != nil {
+	if _, err := d.topoCollect(tips, true); err != nil {
 		return err
 	}
 
@@ -190,37 +169,68 @@ func (d *dag) prepare(tips []Tip) error {
 		return nil
 	}
 
-	// Phase 1.5: trim nodes already folded into the LCA snapshot. BFS may
-	// have walked into the snapshot's dep chain (because the snapshot was
-	// dequeued with a non-empty queue, so it wasn't terminal at that point).
-	// Those nodes are already represented in the snapshot's reduced state;
-	// leaving them in d.nodes makes ReduceChain process the same data
-	// effects twice — duplicates in list reads, double-counts in scalars.
-	d.trimAncestorsOfLCA()
+	// Snapshot relationships were established from resident edges. Remove the
+	// folded ancestors from the output, retaining compaction's ownership checks.
+	if err := d.trimAncestorsOfLCA(tips); err != nil {
+		return err
+	}
+
+	order := d.topoOrder[:0]
+	for _, tip := range d.topoOrder {
+		eff, selected := d.nodes[tip]
+		if !selected {
+			continue
+		}
+
+		if eff == nil {
+			return fmt.Errorf("reconstruct %q: effect %v: %w", d.key, tip, errEffectNotResident)
+		}
+
+		order = append(order, tip)
+	}
+
+	d.topoOrder = order
 
 	if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
 		slog.Debug("dag.walk", "key", d.key, "nodes", len(d.nodes),
 			"lca", d.lcaTip, "encoded", d.encode(tips))
 	}
 
-	// Phase 2: topo-order via DFS post-order within collected nodes.
-	d.topoOrder = make([]Tip, 0, len(d.nodes))
-	topoVisited := make(map[Tip]bool, len(d.nodes))
-
-	sortedTips := make([]dagTip, 0, len(tips))
-	for _, tip := range tips {
-		if eff, ok := d.nodes[tip]; ok {
-			sortedTips = append(sortedTips, dagTip{tip, eff})
-		}
-	}
-
-	slices.SortFunc(sortedTips, compareDagTips)
-
-	for _, entry := range sortedTips {
-		d.topoCollect(entry.tip, topoVisited)
-	}
+	d.recordHistoryProcessed()
 
 	return nil
+}
+
+// ingest is used by recovery entry points, not by the resident graph traversal.
+// Preserve the fetch outcome when a definitively absent dependency is still
+// required for reconstruction; absence below the selected LCA is harmless.
+func (d *dag) ingest(tips []Tip) error {
+	attempted := make(map[Tip]error)
+	if _, _, err := d.engine.closeIngestedFrontier(d.key, tips, attempted); err != nil {
+		return err
+	}
+
+	err := d.prepare(tips)
+	if !errors.Is(err, errEffectNotResident) {
+		return err
+	}
+
+	var missing []error
+
+	for tip, eff := range d.nodes {
+		if eff != nil {
+			continue
+		}
+
+		failure := attempted[tip]
+		if !errors.Is(failure, ErrCDNBlobMissing) {
+			return errors.Join(err, failure)
+		}
+
+		missing = append(missing, failure)
+	}
+
+	return errors.Join(append(missing, err)...)
 }
 
 // iterate calls processor for each emitted tip in d.topoOrder, filtering
@@ -252,26 +262,6 @@ func (d *dag) shouldEmit(t Tip, eff *pb.Effect) bool {
 	}
 
 	return true
-}
-
-// bfs explores the graph from tips following deps. The dependency frontier
-// is separate from the queue: visiting a root finishes work, but does not
-// make that path converge with another path. A snapshot can terminate the
-// walk only when it is the sole remaining frontier entry.
-//
-// Only state-carrying snapshots terminate the walk. Verdict-only snapshots
-// (State == nil) are opaque markers for fork-choice adjudication; their
-// chain content is reachable only via their Deps, so we follow them like
-// any other effect. Treating them as LCAs would leave reconstruct with a
-// single dead-end tip and no way to recover the underlying chain.
-func (d *dag) bfs(tips []Tip, lcaTip *Tip) error {
-	nodes, lca, err := walkKeyHistory(d.key, tips, func(tip Tip) (*pb.Effect, error) {
-		return d.engine.getEffect(d.key, tip)
-	})
-	d.nodes = nodes
-	*lcaTip = lca
-
-	return err
 }
 
 // An empty subscription records no observed data. Referencing it records an
@@ -324,18 +314,17 @@ func visitDataDeps(key string, eff *pb.Effect, visit func(Tip) *pb.Effect) bool 
 	return hasDataDeps
 }
 
-// walkKeyHistory is the shared dependency walk for replay and tip normalization.
+// walkKeyHistory loads history for cloud tip normalization.
 // Missing nodes remain on the dependency frontier, so an exhausted queue cannot
 // disguise an unresolved branch. Non-missing load errors take precedence over
 // confirmed missing blobs: joining both would let errors.Is classify a transport
 // failure as a recoverable hole. State snapshots stop traversal only at
 // convergence; their folded history need not remain available. Callers decide
 // how to use partial nodes when errors occur.
-func walkKeyHistory(key string, tips []Tip, load func(Tip) (*pb.Effect, error)) (map[Tip]*pb.Effect, Tip, error) {
+func walkKeyHistory(key string, tips []Tip, load func(Tip) (*pb.Effect, error)) (map[Tip]*pb.Effect, error) {
 	nodes := make(map[Tip]*pb.Effect, len(tips)*8)
 
 	var (
-		lcaTip        Tip
 		loadErrors    []error
 		missingErrors []error
 	)
@@ -425,9 +414,7 @@ func walkKeyHistory(key string, tips []Tip, load func(Tip) (*pb.Effect, error)) 
 		eff := nodes[cur]
 
 		if snap := eff.GetSnapshot(); snap != nil && snap.GetState() != nil && len(frontier) == 1 {
-			lcaTip = cur
-
-			return nodes, lcaTip, walkError()
+			return nodes, walkError()
 		}
 
 		// A data effect with only subscription observations is a data root,
@@ -438,114 +425,255 @@ func walkKeyHistory(key string, tips []Tip, load func(Tip) (*pb.Effect, error)) 
 		}
 	}
 
-	// A root snapshot may have been processed before a longer path reached
-	// it. Its frontier entry survives even though its queue entry is gone.
-	if len(frontier) == 1 {
-		for t := range frontier {
-			if snap := nodes[t].GetSnapshot(); snap != nil && snap.GetState() != nil {
-				lcaTip = t
-			}
+	return nodes, walkError()
+}
+
+// trimAncestorsOfLCA removes folded history from reconstruction. Its existing
+// resident history walk also selects reclamation's boundary: keep the live LCA
+// and the preceding COMMON snapshot, moving further back for subscriber
+// witnesses or transaction overlays. A snapshot on one branch is not a cut.
+func (d *dag) trimAncestorsOfLCA(tips []Tip) error {
+	if d.lcaTip == (Tip{}) || d.nodes[d.lcaTip].GetSnapshot().GetState() == nil {
+		return nil
+	}
+
+	var boundary *historyBoundary
+
+	if d.compact && !isSystemKey([]byte(d.key)) {
+		d.engine.historyMu.Lock()
+		defer d.engine.historyMu.Unlock()
+
+		if tipsEqual(d.engine.index.Contains(d.key).Tips(), tips) {
+			boundary = d.engine.historyBoundary(d.key)
 		}
 	}
 
-	return nodes, lcaTip, walkError()
+	// Use the same snapshot-chain intersection as reconstruction. Without a
+	// reclamation boundary, only trim the nodes reconstruction already visited.
+	history := &dag{key: d.key, nodes: d.nodes}
+	if boundary != nil {
+		history.engine = d.engine
+	}
+
+	paths, err := history.topoCollect([]Tip{d.lcaTip}, false)
+	if err != nil {
+		return err
+	}
+
+	var cut Tip
+	if boundary != nil {
+		cut = paths[d.lcaTip].parent
+
+		known := make([]Tip, len(boundary.peers))
+		for _, tip := range history.topoOrder {
+			for i, peer := range boundary.peers {
+				if (tip[0] == peer.Node && tip[1] <= peer.Minted) ||
+					(tip[0] == uint64(d.engine.nodeID) && tip[1] == peer.Processed) {
+					// A witness proves only its own ancestry. Intersect it with the
+					// common snapshot chain before it can authorize reclamation.
+					safe := paths.intersect(cut, paths[tip].root)
+					if safe != (Tip{}) && (known[i] == (Tip{}) || paths[safe].order > paths[known[i]].order) {
+						known[i] = safe
+					}
+				}
+			}
+		}
+
+		for _, witness := range known {
+			cut = paths.intersect(cut, witness)
+		}
+
+		for cut != (Tip{}) && !boundary.beforeOverlays(cut) {
+			cut = paths[cut].parent
+		}
+	}
+
+	release := false
+
+	if cut != (Tip{}) {
+		if v := d.engine.effectCache.getVertex(cut); v != nil {
+			v.markRoot()
+
+			release = true
+		}
+	}
+	// A common snapshot dominates every data path. Its data ancestors are
+	// exactly the post-order prefix before it; unrelated metadata observations
+	// are not reclamation evidence and remain owned by subscription machinery.
+	for _, tip := range history.topoOrder {
+		if tip == cut {
+			release = false
+		}
+
+		if release && d.nodes[tip].GetSubscription() == nil {
+			d.engine.effectCache.decrefChainNode(d.key, tip)
+		}
+
+		if tip != d.lcaTip {
+			delete(d.nodes, tip)
+		}
+	}
+
+	return nil
 }
 
-// trimAncestorsOfLCA removes from d.nodes every node in the transitive
-// dep-ancestry of the LCA snapshot. Those nodes' state is already folded
-// into the snapshot's reduced effect; including them in ReduceChain would
-// double-count their data effects (the symptom is duplicate elements in
-// a list-append read).
-//
-// Only nodes already in d.nodes are removed — we don't fetch additional
-// effects from the engine. The bfs that populated d.nodes is the only
-// source of folded-ancestor entries we need to clear.
-func (d *dag) trimAncestorsOfLCA() {
-	var zero Tip
-	if d.lcaTip == zero {
-		return
+// dagPaths is temporary traversal state shared by reconstruction and
+// reclamation. parent links state snapshots on the common-ancestor chain.
+type dagPath struct {
+	root, parent Tip
+	order        int
+	data         bool
+}
+
+type dagPaths map[Tip]dagPath
+
+func (paths dagPaths) intersect(a, b Tip) Tip {
+	for a != b && a != (Tip{}) && b != (Tip{}) {
+		if paths[a].order > paths[b].order {
+			a = paths[a].parent
+		} else {
+			b = paths[b].parent
+		}
 	}
 
-	lcaEff, ok := d.nodes[d.lcaTip]
-	if !ok || lcaEff.GetSnapshot() == nil {
-		return
+	if a == b {
+		return a
 	}
 
-	stack := make([]Tip, 0, len(lcaEff.GetDeps()))
-	for _, dep := range lcaEff.GetDeps() {
-		stack = append(stack, r(dep))
+	return Tip{}
+}
+
+// topoCollect visits resident vertices once in fork-choice DFS post-order.
+// For each vertex, root is the nearest state snapshot crossed by EVERY data
+// path from it. A snapshot's parent is the next such snapshot in its ancestry.
+// Intersecting those chains at forks establishes the LCA without depending on
+// discovery order. The order numbers are local DFS positions, not clocks.
+func (d *dag) topoCollect(tips []Tip, stopAtSnapshot bool) (dagPaths, error) {
+	paths := make(dagPaths)
+	resident := func(tip Tip) *pb.Effect {
+		if eff, seen := d.nodes[tip]; seen {
+			return eff
+		}
+
+		var eff *pb.Effect
+		if d.engine != nil && d.engine.effectCache != nil {
+			eff, _ = d.engine.effectCache.Get(tip)
+		}
+
+		d.nodes[tip] = eff
+
+		return eff
 	}
 
-	for len(stack) > 0 {
-		cur := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
+	var visit func(Tip, bool) (dagPath, error)
 
-		eff, ok := d.nodes[cur]
-		if !ok {
+	visit = func(tip Tip, dominates bool) (dagPath, error) {
+		if p, seen := paths[tip]; seen {
+			if p.order < 0 {
+				return p, fmt.Errorf("reconstruct %q: dependency cycle at %v", d.key, tip)
+			}
+
+			return p, nil
+		}
+
+		paths[tip] = dagPath{order: -1}
+		eff := resident(tip)
+		// Along a sole data path a state snapshot already dominates the
+		// requested frontier. There are no sibling paths to reconcile.
+		if stopAtSnapshot && dominates && eff.GetSnapshot().GetState() != nil {
+			p := dagPath{root: tip, order: len(d.topoOrder), data: true}
+			paths[tip] = p
+			d.topoOrder = append(d.topoOrder, tip)
+
+			return p, nil
+		}
+
+		var local [8]dagTip
+
+		deps := local[:0]
+		dataDeps := 0
+
+		for ref := range keyDeps(d.key, eff) {
+			dep := r(ref)
+			value := resident(dep)
+
+			deps = append(deps, dagTip{dep, value})
+			if !emptySubscription(value) {
+				dataDeps++
+			}
+		}
+
+		slices.SortFunc(deps, compareDagTips)
+
+		p := dagPath{}
+
+		for _, dep := range deps {
+			ancestor, err := visit(dep.tip, dominates && dataDeps == 1 && !emptySubscription(dep.eff))
+			if err != nil {
+				return p, err
+			}
+
+			if !ancestor.data {
+				continue
+			}
+
+			if p.data {
+				p.root = paths.intersect(p.root, ancestor.root)
+			} else {
+				p.root = ancestor.root
+			}
+
+			p.data = true
+		}
+		// Metadata-only observations do not introduce a data root. Missing
+		// payloads do: they cannot be assumed to contain only metadata.
+		p.data = p.data || eff.GetSubscription() == nil
+		if eff.GetSnapshot().GetState() != nil {
+			p.parent, p.root = p.root, tip
+		}
+
+		p.order = len(d.topoOrder)
+		paths[tip] = p
+		d.topoOrder = append(d.topoOrder, tip)
+
+		return p, nil
+	}
+	sorted := make([]dagTip, 0, len(tips))
+	dataTips := 0
+
+	for _, tip := range tips {
+		eff := resident(tip)
+
+		sorted = append(sorted, dagTip{tip, eff})
+		if !emptySubscription(eff) {
+			dataTips++
+		}
+	}
+
+	slices.SortFunc(sorted, compareDagTips)
+
+	hasData := false
+
+	for _, entry := range sorted {
+		p, err := visit(entry.tip, dataTips == 1 && !emptySubscription(entry.eff))
+		if err != nil {
+			return nil, err
+		}
+
+		if !p.data {
 			continue
 		}
 
-		// Removing a node also marks it visited, so shared ancestors need no
-		// separate set and are expanded only once.
-		delete(d.nodes, cur)
-
-		for dep := range keyDeps(d.key, eff) {
-			stack = append(stack, r(dep))
+		if hasData {
+			d.lcaTip = paths.intersect(d.lcaTip, p.root)
+		} else {
+			d.lcaTip = p.root
 		}
-	}
-}
 
-// topoCollect does a post-order DFS within the collected nodes, recording
-// every visited tip into d.topoOrder. At forks, deps are visited in fork
-// choice hash order. Filtering (tx-data effects, non-LCA snapshots) is
-// applied by iterate, not here — d.topoOrder is the complete causal order
-// of visited tips so callers can propagate per-tip state along dep edges.
-func (d *dag) topoCollect(t Tip, visited map[Tip]bool) {
-	if visited[t] {
-		return
+		hasData = true
 	}
 
-	visited[t] = true
-
-	eff, ok := d.nodes[t]
-	if !ok {
-		return
-	}
-
-	// LCA snapshot: record and don't descend past it
-	if eff.GetSnapshot() != nil && t == d.lcaTip {
-		d.topoOrder = append(d.topoOrder, t)
-
-		return
-	}
-
-	// Ordinary chains need neither an iterator nor a sorting buffer.
-	if eff.GetTxnBind() == nil && len(eff.GetDeps()) == 1 {
-		d.topoCollect(r(eff.GetDeps()[0]), visited)
-		d.topoOrder = append(d.topoOrder, t)
-
-		return
-	}
-
-	// Typical forks fit on the stack; unusually wide forks can grow the slice.
-	var local [8]dagTip
-
-	deps := local[:0]
-
-	for ref := range keyDeps(d.key, eff) {
-		tip := r(ref)
-		if dep, ok := d.nodes[tip]; ok {
-			deps = append(deps, dagTip{tip, dep})
-		}
-	}
-
-	slices.SortFunc(deps, compareDagTips)
-
-	for _, dep := range deps {
-		d.topoCollect(dep.tip, visited)
-	}
-
-	d.topoOrder = append(d.topoOrder, t)
+	return paths, nil
 }
 
 // encode produces a compact string encoding of the collected dag nodes.
