@@ -1,11 +1,14 @@
 package effects
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"testing"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
+	"google.golang.org/protobuf/proto"
 )
 
 // A snapshot covers its own frontier, not a competing transaction discovered
@@ -195,5 +198,143 @@ func TestBindEvidence_VerdictShortcutDoesNotExpandFoldedData(t *testing.T) {
 				t.Fatalf("verdicts=%v, error=%v; want cached loss without folded data", verdicts, err)
 			}
 		})
+	}
+}
+
+func TestBindEvidence_ReclaimedPredecessorDoesNotBreakBatch(t *testing.T) {
+	log := newSnapshotLog()
+	e := newSnapshotEngine(log)
+
+	t.Cleanup(func() { _ = e.Close() })
+	preSubscribe(e, "k")
+
+	winner := closureBind(log, "winner", 1, []string{"k"}, nil)
+	loser := closureBind(log, "loser", 2, []string{"k"}, nil)
+
+	proof, err := e.bindProof(winner, map[string]Tip{"loser": loser}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var previous Tip
+
+	snapshots := make([]Tip, 0, 3)
+
+	for range 3 {
+		eff := bindEvidenceSnapshot("k", proof)
+
+		eff.GetSnapshot().State = &pb.ReducedEffect{Scalar: scalarInsertRaw([]byte("100"))}
+		if previous != (Tip{}) {
+			eff.Deps = toPbRefs([]Tip{previous})
+			eff.GetSnapshot().PrevSnapshot = toPbRef(previous)
+		}
+
+		previous = log.putEffect(eff)
+		snapshots = append(snapshots, previous)
+	}
+
+	e.effectCache.releaseEvidence(evidenceTips(proof))
+	e.updateIndex("k", nil, previous)
+
+	before, err := e.GetSnapshots(context.Background(), []string{"k"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d := newDag(e, "k", "")
+
+	d.compact = true
+	if err := d.prepare([]Tip{previous}); err != nil {
+		t.Fatal(err)
+	}
+
+	e.reclaimUnreferenced()
+
+	if _, ok := e.effectCache.Get(snapshots[0]); ok {
+		t.Fatal("oldest predecessor was not reclaimed")
+	}
+
+	for _, tip := range snapshots[1:] {
+		if _, ok := e.effectCache.Get(tip); !ok {
+			t.Fatalf("required snapshot was reclaimed: %v", tip)
+		}
+	}
+
+	after, err := e.GetSnapshots(context.Background(), []string{"k"})
+	if err != nil {
+		t.Fatalf("reclaimed predecessor broke readable batch: %v", err)
+	}
+
+	if len(after) != 1 || !proto.Equal(before[0], after[0]) {
+		t.Fatalf("compaction changed value: before=%v after=%v", before, after)
+	}
+
+	_, verdicts, err := e.bindKeyClosureFrom([]string{"k"}, func(string) ([]Tip, error) {
+		return []Tip{previous}, nil
+	}, true)
+	if err != nil || !verdicts["winner"].proven || !verdicts["loser"].proven ||
+		verdicts["winner"].verdict != pb.Verdict_WON || verdicts["loser"].verdict != pb.Verdict_LOST {
+		t.Fatalf("compaction lost retained bind proof: verdicts=%v err=%v", verdicts, err)
+	}
+}
+
+func TestBindEvidence_PredecessorFetchFailure(t *testing.T) {
+	transport := errors.New("peer unavailable")
+	for _, failure := range []error{nil, ErrEffectNotFound, transport} {
+		for _, required := range []bool{false, true} {
+			t.Run(fmt.Sprintf("failure=%v/required=%t", failure, required), func(t *testing.T) {
+				e := newSnapshotEngine(nil)
+
+				t.Cleanup(func() { _ = e.Close() })
+
+				old, current := Tip{7, 1}, Tip{7, 2}
+				metadata := cutEffect(old)
+				metadata.Kind = &pb.Effect_Snapshot{Snapshot: &pb.SnapshotEffect{
+					TxnVerdicts: map[string]pb.Verdict{"lost": pb.Verdict_LOST},
+				}}
+				snapshot := cutEffect(current, old)
+
+				snapshot.Kind = &pb.Effect_Snapshot{Snapshot: &pb.SnapshotEffect{
+					PrevSnapshot: toPbRef(old), State: &pb.ReducedEffect{},
+				}}
+				if required {
+					// Without a state boundary, old is a required value dependency
+					// as well as the shortcut target. Its failure must survive.
+					snapshot.GetSnapshot().State = nil
+				}
+
+				putCutEffects(t, e, map[Tip]*pb.Effect{current: snapshot})
+				e.broadcaster = &cutBroadcaster{load: func(tip Tip) ([]byte, error) {
+					if tip != old {
+						t.Fatalf("unexpected fetch: %v", tip)
+					}
+
+					if failure != nil {
+						return nil, failure
+					}
+
+					return wireEffect(metadata), nil
+				}}
+
+				_, verdicts, err := e.bindKeyClosureFrom([]string{"k"}, func(string) ([]Tip, error) {
+					return []Tip{current}, nil
+				}, true)
+				if required && failure != nil {
+					if !errors.Is(err, failure) {
+						t.Fatalf("required dependency failure lost: got %v, want %v", err, failure)
+					}
+
+					return
+				}
+
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				if failure == nil && verdicts["lost"].verdict != pb.Verdict_LOST {
+					t.Fatalf("available predecessor verdict discarded: %v", verdicts)
+				}
+			})
+		}
 	}
 }

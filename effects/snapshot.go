@@ -1550,7 +1550,8 @@ func (e *Engine) reconstructWithView(key string, tips []Tip, txID string, waitFo
 // walkBindEvidence follows the same common-snapshot boundary as reconstruction.
 // The starting set includes cross-key bind anchors: a snapshot that covered the
 // local frontier alone may not cover those anchors. PrevSnapshot is a separate
-// verdict shortcut, never a reason to traverse data below the common boundary.
+// non-owning verdict shortcut, never a required dependency or a reason to
+// traverse data below the common boundary. Required proof uses Evidence refs.
 func (e *Engine) walkBindEvidence(key string, tips []Tip, visit func(Tip, *pb.Effect)) error {
 	d := newDag(e, key, "")
 	failed := make(map[Tip]error)
@@ -1648,7 +1649,11 @@ func (e *Engine) walkBindEvidence(key string, tips []Tip, visit func(Tip, *pb.Ef
 
 		seen[t] = true
 
-		eff := load(t)
+		// Compaction may reclaim a shortcut target. Keep any available
+		// verdicts, but do not turn this optional fetch into a read failure.
+		// If the same vertex was required by the value DAG, its load failure
+		// is already recorded above and remains an error.
+		eff, _ := e.getEffect(key, t)
 		if snap := eff.GetSnapshot(); snap != nil {
 			visit(t, eff)
 
