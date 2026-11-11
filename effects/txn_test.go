@@ -84,7 +84,7 @@ func TestIsRealConflict_MetaEffect_NotConflict(t *testing.T) {
 	}
 }
 
-func TestIsRealConflict_SameElementID_Conflict(t *testing.T) {
+func TestIsRealConflict_NonTxSameElementID_NotConflict(t *testing.T) {
 	ptxn := newTestPendingTxn(pendingTxnKey{
 		key:        "k",
 		newTip:     Tip{1, 500},
@@ -100,8 +100,8 @@ func TestIsRealConflict_SameElementID_Conflict(t *testing.T) {
 		ElementId:  []byte("field1"),
 	}
 
-	if !testIsRealConflict(t, ptxn, detail) {
-		t.Fatal("same element ID should be a real conflict")
+	if testIsRealConflict(t, ptxn, detail) {
+		t.Fatal("non-transactional writes do not defeat a published bind, even on the same element")
 	}
 }
 
@@ -126,7 +126,7 @@ func TestIsRealConflict_DifferentElementID_NotConflict(t *testing.T) {
 	}
 }
 
-func TestIsRealConflict_NoopKey_AnyWriteConflicts(t *testing.T) {
+func TestIsRealConflict_NoopKey_NonTxWriteNotConflict(t *testing.T) {
 	ptxn := newTestPendingTxn(pendingTxnKey{
 		key:        "k",
 		newTip:     Tip{1, 500},
@@ -141,19 +141,20 @@ func TestIsRealConflict_NoopKey_AnyWriteConflicts(t *testing.T) {
 		Collection: pb.CollectionKind_SCALAR,
 	}
 
-	if !testIsRealConflict(t, ptxn, detail) {
-		t.Fatal("any write on a read-only key should be a real conflict (phantom write)")
+	if testIsRealConflict(t, ptxn, detail) {
+		t.Fatal("a non-transactional write to a read key does not defeat a published bind")
 	}
 }
 
-func TestIsRealConflict_DependsOnUnboundEffect_Conflict(t *testing.T) {
+func TestIsRealConflict_NonTxDependsOnUnboundEffect_NotConflict(t *testing.T) {
 	ptxn := newTestPendingTxn(pendingTxnKey{
 		key:        "k",
 		newTip:     Tip{1, 500},
 		collection: pb.CollectionKind_SCALAR,
 	})
 
-	// Observing a pre-bind effect does not observe our commit.
+	// Observing a pre-bind effect does not observe our commit, but an ordinary
+	// write still cannot establish a transaction loss after bind publication.
 	detail := &pb.NackTipDetail{
 		Ref:        &pb.EffectRef{NodeId: 1, Offset: 600},
 		Hlc:        tTs(110),
@@ -162,8 +163,8 @@ func TestIsRealConflict_DependsOnUnboundEffect_Conflict(t *testing.T) {
 		Deps:       []*pb.EffectRef{{NodeId: 1, Offset: 500}}, // depends on our newTip
 	}
 
-	if !testIsRealConflict(t, ptxn, detail) {
-		t.Fatal("effect that observes only our pre-bind tip must still conflict")
+	if testIsRealConflict(t, ptxn, detail) {
+		t.Fatal("non-transactional ancestry through a pre-bind tip must not cause an abort")
 	}
 }
 
@@ -234,7 +235,7 @@ func TestIsRealConflict_CompetingBind_OurHashLower_WeWin(t *testing.T) {
 	}
 }
 
-func TestIsRealConflict_NonTxCompetitor_Conflict(t *testing.T) {
+func TestIsRealConflict_NonTxCompetitor_NotConflict(t *testing.T) {
 	ptxn := newTestPendingTxn(pendingTxnKey{
 		key:        "k",
 		newTip:     Tip{1, 500},
@@ -250,8 +251,8 @@ func TestIsRealConflict_NonTxCompetitor_Conflict(t *testing.T) {
 		Collection:      pb.CollectionKind_SCALAR,
 	}
 
-	if !testIsRealConflict(t, ptxn, detail) {
-		t.Fatal("non-tx data write on same scalar key should be a real conflict")
+	if testIsRealConflict(t, ptxn, detail) {
+		t.Fatal("non-transactional data on the same scalar key must not defeat a published bind")
 	}
 }
 

@@ -891,7 +891,7 @@ func TestFlushTx_NoNACKs_Commits(t *testing.T) {
 	}
 }
 
-func TestFlushTx_RealConflict_Aborts(t *testing.T) {
+func TestFlushTx_NonTransactionalNack_Commits(t *testing.T) {
 	bc := &txnMockBroadcaster{
 		replicateToResults: map[pb.NodeID]*pb.NackNotify{
 			99: {
@@ -934,9 +934,8 @@ func TestFlushTx_RealConflict_Aborts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := ctx.Flush()
-	if !errors.Is(err, ErrTxnAborted) {
-		t.Fatalf("expected ErrTxnAborted, got %v", err)
+	if err := ctx.Flush(); err != nil {
+		t.Fatalf("non-transactional NACK must not abort a published bind: %v", err)
 	}
 }
 
@@ -1604,8 +1603,8 @@ func TestHandleNack_TransactionalKey_DefersEvaluation(t *testing.T) {
 		t.Fatal("asynchronous NACK must not evaluate before all subscriber responses")
 	}
 
-	if _, err := e.evaluateNacks(ptxn, []*pb.NackNotify{nack}); !errors.Is(err, ErrTxnAborted) {
-		t.Fatalf("completed responses must still detect the data conflict: %v", err)
+	if _, err := e.evaluateNacks(ptxn, []*pb.NackNotify{nack}); err != nil {
+		t.Fatalf("completed responses must not treat non-transactional data as a defeated bind: %v", err)
 	}
 }
 

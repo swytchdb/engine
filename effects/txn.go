@@ -24,7 +24,6 @@
 package effects
 
 import (
-	"bytes"
 	"errors"
 	"sync/atomic"
 	"time"
@@ -519,10 +518,11 @@ func (e *Engine) classifyNackTip(ptxn *pendingTxn, key string, detail *pb.NackTi
 		return false, ""
 	}
 
-	// Non-transactional DataEffect on same key
-	pk := findPendingKey(ptxn, key)
-
-	return pk != nil && affectsSameData(pk, detail), ""
+	// Mixing transactional and non-transactional operations has no isolation
+	// guarantee. An unordered ordinary write does not defeat a published bind:
+	// reconstruction cannot derive that transaction loss from competing binds.
+	// Writes observed before publication are still checked by hasWritesSince.
+	return false, ""
 }
 
 // reachesFromTx returns true if target is in the DAG ancestry of our
@@ -627,42 +627,6 @@ func collectOurBindTips(ptxn *pendingTxn, key string) []Tip {
 	}
 
 	return tips
-}
-
-// affectsSameData checks if a competing Tip affects the same data as our
-// transaction's key entry.
-func affectsSameData(pk *pendingTxnKey, detail *pb.NackTipDetail) bool {
-	// If our key is read-only (NoopEffect), any SCALAR write is a phantom write conflict
-	if pk.readOnly {
-		// For KEYED/ORDERED, a noop read doesn't conflict with writes to
-		// different elements, but we conservatively treat it as conflict
-		// because we can't distinguish which elements were "read".
-		return true
-	}
-
-	// SCALAR: always conflicts (single value per key)
-	if pk.collection == pb.CollectionKind_SCALAR || detail.GetCollection() == pb.CollectionKind_SCALAR {
-		return true
-	}
-
-	// ORDERED: any concurrent insert conflicts — position depends on seeing
-	// all prior inserts, so concurrent inserts create incompatible orderings.
-	if pk.collection == pb.CollectionKind_ORDERED || detail.GetCollection() == pb.CollectionKind_ORDERED {
-		return true
-	}
-
-	// KEYED: compare element IDs — concurrent writes to different fields are fine
-	if len(detail.GetElementId()) == 0 {
-		return true // no element ID → assume conflict
-	}
-
-	for _, eid := range pk.elementIDs {
-		if bytes.Equal(eid, detail.GetElementId()) {
-			return true
-		}
-	}
-
-	return false
 }
 
 // findPendingKey finds the pendingTxnKey for a given key name.
