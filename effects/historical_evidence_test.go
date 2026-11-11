@@ -183,3 +183,71 @@ func TestHistoricalReadRetainsLiveCompetition(t *testing.T) {
 		}
 	}
 }
+
+// Equivalent live proof must not hide the source already present in the frozen
+// history: membership needs that source after value ancestry has been reclaimed.
+func TestHistoricalMembershipPreservesEquivalentFrozenProof(t *testing.T) {
+	log := newSnapshotLog()
+	e := newSnapshotEngine(log)
+
+	t.Cleanup(func() { _ = e.Close() })
+
+	bind := closureBind(log, "old", 1, []string{"a", "b"}, nil)
+
+	proof, err := e.bindProof(bind, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	frozenEffect := bindEvidenceSnapshot("a", proof)
+	frozenEffect.GetSnapshot().State = &pb.ReducedEffect{}
+	frozenEffect.Deps = toPbRefs([]Tip{{99, 99}}) // Reclaimed value ancestry.
+	frozen := log.putEffect(frozenEffect)
+	liveEffect := bindEvidenceSnapshot("a", proof)
+	liveEffect.GetSnapshot().State = &pb.ReducedEffect{}
+	liveEffect.Deps = toPbRefs([]Tip{frozen})
+	newer := log.putEffect(liveEffect)
+
+	e.effectCache.releaseEvidence(evidenceTips(proof))
+
+	e.updateIndex("a", nil, newer)
+
+	live := newSnapshotReadView(e, context.Background())
+	if err := live.discover([]string{"a"}, live.capture); err != nil {
+		t.Fatal(err)
+	}
+
+	if entry := live.verdicts["old"]; !entry.proven || entry.snapshotTip != newer {
+		t.Fatalf("live fixture must use newer proof: %+v", entry)
+	}
+
+	view, err := e.historicalReadView(context.Background(), []string{"a"}, func(key string) ([]Tip, error) {
+		if key != "a" {
+			t.Fatalf("unexpected value history requested: %s", key)
+		}
+
+		return []Tip{frozen}, nil
+	}, live)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if entry := view.verdicts["old"]; !entry.proven || entry.snapshotTip != frozen {
+		t.Errorf("equivalent live proof displaced frozen source: %+v, want %v", entry, frozen)
+	}
+
+	if entry := live.verdicts["old"]; entry.snapshotTip != newer {
+		t.Error("historical merge mutated the live view")
+	}
+
+	s := &transactionSnapshot{
+		engine: e, views: map[string]*snapshotReadView{"a": view},
+		decided: make(map[Tip]bool),
+	}
+	eff, _ := e.effectCache.Get(bind)
+
+	included, err := s.member(context.Background(), bind, eff, make(map[Tip]bool))
+	if err != nil || !included {
+		t.Fatalf("equivalent proof reopened reclaimed history: included=%t error=%v", included, err)
+	}
+}

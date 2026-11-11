@@ -420,7 +420,8 @@ func (e *Engine) publishSubdag(ls *leafState, d *dag, tips []Tip) {
 }
 
 // verdictEntry holds a snapshot's verdict for a txnID; snapshotTip is the
-// offset of the snapshot that supplied it, used for debug log provenance.
+// offset of the snapshot that supplied it. Historical membership requires this
+// proof source to belong to the selected history.
 type verdictEntry struct {
 	verdict     pb.Verdict
 	snapshotTip Tip
