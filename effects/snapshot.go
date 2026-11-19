@@ -87,9 +87,9 @@ type leafState struct {
 	// (reconstruct's Subscribers accumulator can return empty for legitimate
 	// reasons — verdict-only snapshot at LCA, all-lost bind set, NoopEffect
 	// chain). It lives on the leaf so it is reclaimed automatically when the key
-	// is evicted; a departed peer's stale id is filtered against current
-	// membership at broadcast time (collectSubscribers), so no eager scrub on
-	// peer removal is needed. Guarded by subMu; lazily allocated.
+	// is evicted. Permanent peer departure removes its entries; snapshot
+	// production also prunes stale bootstrap/notification state against current
+	// membership. Guarded by subMu; lazily allocated.
 	subMu           sync.Mutex
 	subscribers     []pb.NodeID
 	subscriberBytes int64

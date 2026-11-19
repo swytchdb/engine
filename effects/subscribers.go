@@ -131,7 +131,9 @@ func (e *Engine) removePeerSubscriber(key string, peer pb.NodeID) {
 // map form, for stamping into a compaction SnapshotEffect's reduced state so
 // the set survives chain compaction and is available to a bootstrapping peer.
 // Returns nil when there are no subscribers. Sourced from the authoritative
-// leafState set — no DAG walk.
+// leafState set — no DAG walk. Prune departed peers as well as filtering the
+// snapshot: late notifications or old bootstrap snapshots must not accumulate
+// stale IDs in a long-lived leaf. Configured but unreachable peers remain.
 func (e *Engine) snapshotSubscribers(key string) map[uint64]bool {
 	ls := e.index.LoadData(key)
 	if ls == nil {
@@ -140,6 +142,16 @@ func (e *Engine) snapshotSubscribers(key string) map[uint64]bool {
 
 	ls.subMu.Lock()
 	defer ls.subMu.Unlock()
+
+	if e.broadcaster != nil {
+		members := e.broadcaster.PeerIDs()
+		ls.subscribers = shrinkSlice(slices.DeleteFunc(ls.subscribers, func(peer pb.NodeID) bool {
+			return !slices.Contains(members, peer)
+		}))
+		cost := subscriberSliceBytes(ls.subscribers)
+		e.subscriberBytes.Add(cost - ls.subscriberBytes)
+		ls.subscriberBytes = cost
+	}
 
 	if len(ls.subscribers) == 0 {
 		return nil

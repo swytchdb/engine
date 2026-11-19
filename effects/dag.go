@@ -488,33 +488,46 @@ func (d *dag) trimAncestorsOfLCA(tips []Tip) error {
 		}
 	}
 
-	release := false
-
 	if cut != (Tip{}) {
 		if v := d.engine.effectCache.getVertex(cut); v != nil {
 			v.markRoot()
-
-			release = true
+			d.releaseAncestors(cut)
 		}
 	}
-	// A common snapshot dominates every data path. Its data ancestors are
-	// exactly the post-order prefix before it; unrelated metadata observations
-	// are not reclamation evidence and remain owned by subscription machinery.
+
 	for _, tip := range history.topoOrder {
-		if tip == cut {
-			release = false
-		}
-
-		if release && d.nodes[tip].GetSubscription() == nil {
-			d.engine.effectCache.decrefChainNode(d.key, tip)
-		}
-
 		if tip != d.lcaTip {
 			delete(d.nodes, tip)
 		}
 	}
 
 	return nil
+}
+
+// releaseAncestors drops creation ownership below the retained snapshot. Its
+// state includes subscriptions as well as data. Follow actual ancestry: a
+// concurrent metadata branch may precede cut in DFS order without being covered
+// by it. Release subscriptions before reclaiming intervening data can make them
+// unreachable to subsequent compaction and whole-key eviction walks.
+func (d *dag) releaseAncestors(cut Tip) {
+	seen := map[Tip]bool{cut: true}
+
+	stack := []Tip{cut}
+	for len(stack) > 0 {
+		tip := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+
+		for ref := range keyDeps(d.key, d.nodes[tip]) {
+			dep := r(ref)
+			if seen[dep] {
+				continue
+			}
+
+			seen[dep] = true
+			stack = append(stack, dep)
+			d.engine.effectCache.decrefChainNode(d.key, dep)
+		}
+	}
 }
 
 // dagPaths is temporary traversal state shared by reconstruction and
