@@ -530,13 +530,16 @@ func (e *Engine) MemoryTarget() int64 {
 // DropPeer releases per-peer cached state when a peer permanently leaves the
 // cluster. Wired into PeerManager.SetPeerLifecycleHooks on the onRemoved hook
 // (which fires only on genuine membership removal, not transient
-// unreachability). Subscriber sets are NOT scrubbed here: they live in per-key
-// leafState (reclaimed on leaf eviction) and are filtered against current
-// membership at broadcast time, so a departed peer's id simply falls out of
-// collectSubscribers. The key filter, by contrast, is real per-peer cached
-// data that cannot be lazily re-derived, so it must be dropped explicitly.
+// unreachability). Remove its subscriptions even on idle resident keys, whose
+// next compaction or eviction may never happen. Range releases the trie lock
+// between batches and before invoking the callback.
 func (e *Engine) DropPeer(peer pb.NodeID) {
 	e.removePeerKeyFilter(peer)
+	e.index.Range(func(key string) bool {
+		e.removePeerSubscriber(key, peer)
+
+		return true
+	})
 }
 
 // SetBroadcaster sets the broadcaster for replicating effects to peers.
