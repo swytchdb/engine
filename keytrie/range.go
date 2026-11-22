@@ -30,7 +30,7 @@ import "strings"
 // may retain a detached node between batches, but never reads it after a path
 // revision: it restarts from the current root, skipping keys already delivered.
 // Concurrent mutations have the same weak consistency as the other trie scans.
-func (c *Critbit[T]) rangeKeys(prefix, after string, hasAfter bool, fn func(string) bool) {
+func (c *Critbit[T]) rangeKeys(prefix, after string, hasAfter bool, logical bool, fn func(string) bool) {
 	if fn == nil {
 		return
 	}
@@ -44,7 +44,10 @@ func (c *Critbit[T]) rangeKeys(prefix, after string, hasAfter bool, fn func(stri
 	initialized := false
 
 	for {
-		var keys [64]string
+		var (
+			keys   [64]string
+			cursor string
+		)
 
 		n := 0
 
@@ -77,7 +80,13 @@ func (c *Critbit[T]) rangeKeys(prefix, after string, hasAfter bool, fn func(stri
 
 			if node.isLeaf {
 				if !node.isDeleted() && (!hasAfter || node.key > after) && strings.HasPrefix(node.key, prefix) {
+					cursor = node.key
+
 					keys[n] = node.key
+					if logical {
+						keys[n] = c.logicalLeafKey(node)
+					}
+
 					n++
 				}
 
@@ -98,12 +107,15 @@ func (c *Critbit[T]) rangeKeys(prefix, after string, hasAfter bool, fn func(stri
 		c.reapMu.RUnlock()
 
 		for i := range n {
-			after, hasAfter = keys[i], true
 			if !fn(keys[i]) {
 				return
 			}
 
 			keys[i] = ""
+		}
+
+		if n > 0 {
+			after, hasAfter = cursor, true
 		}
 
 		if done {

@@ -52,10 +52,10 @@ func TestMemoryFrontiersPayloadsAndDeadKeys(t *testing.T) {
 		t.Fatal("insert failed")
 	}
 
-	leaf := c.findBestMatch(c.root.Load(), key)
+	leaf := c.findBestMatch(c.root.Load(), LogicalKeyPrefix+key)
 	charge := func() int64 { return c.leafArena.list.Load().chunks[leaf.chunkIdx].extra.Load() }
 
-	initial := memsize.Alloc(int64(len(key))) + tipSetBytes(first)
+	initial := memsize.Alloc(int64(len(LogicalKeyPrefix+key))) + tipSetBytes(first)
 	if charge() != initial {
 		t.Fatalf("key/frontier charge = %d, want %d", charge(), initial)
 	}
@@ -81,7 +81,7 @@ func TestMemoryFrontiersPayloadsAndDeadKeys(t *testing.T) {
 	data := &payload{}
 	c.LoadOrStoreData(key, data)
 
-	expect := memsize.Alloc(int64(len(key))) + tipSetBytes(large) + memsize.Alloc(int64(unsafe.Sizeof(*data)))
+	expect := memsize.Alloc(int64(len(LogicalKeyPrefix+key))) + tipSetBytes(large) + memsize.Alloc(int64(unsafe.Sizeof(*data)))
 	if charge() != expect {
 		t.Fatalf("growing frontier/payload charge=%d want=%d", charge(), expect)
 	}
@@ -96,7 +96,7 @@ func TestMemoryFrontiersPayloadsAndDeadKeys(t *testing.T) {
 		t.Fatal("delete failed")
 	}
 
-	if charge() != memsize.Alloc(int64(len(key))) {
+	if charge() != memsize.Alloc(int64(len(LogicalKeyPrefix+key))) {
 		t.Fatal("dead slot lost key charge or retained removed frontier/payload charge")
 	}
 
@@ -118,13 +118,13 @@ func TestMemoryGhostRetainsKeyCapacity(t *testing.T) {
 	key := strings.Repeat("ghost", 100)
 	c.Insert(key, nil, NewTipSet(tip(1)))
 
-	leaf := c.findBestMatch(c.root.Load(), key)
+	leaf := c.findBestMatch(c.root.Load(), LogicalKeyPrefix+key)
 	if c.EvictBatch(1) != 1 {
 		t.Fatal("no victim")
 	}
 
 	got := c.leafArena.list.Load().chunks[leaf.chunkIdx].extra.Load()
-	if got != memsize.Alloc(int64(len(key))) {
+	if got != memsize.Alloc(int64(len(LogicalKeyPrefix+key))) {
 		t.Fatalf("ghost retained %d bytes, want key capacity", got)
 	}
 }
@@ -148,7 +148,7 @@ func TestMemoryRecycledChunkDropsOldKeyCharges(t *testing.T) {
 		c.Insert(key, nil, NewTipSet(tip(1)))
 	}
 
-	stale := c.findBestMatch(c.root.Load(), "a")
+	stale := c.findBestMatch(c.root.Load(), LogicalKeyPrefix+"a")
 	// Public readers escape immutable results, never the arena node itself.
 	escapedKey, escapedTips := stale.key, c.Contains("a")
 	for _, key := range []string{"a", "b"} {
@@ -162,13 +162,13 @@ func TestMemoryRecycledChunkDropsOldKeyCharges(t *testing.T) {
 		t.Fatalf("recycled chunk retained %d bytes of old keys", got)
 	}
 
-	if escapedKey != "a" || !escapedTips.Contains(tip(1)) {
+	if escapedKey != LogicalKeyPrefix+"a" || !escapedTips.Contains(tip(1)) {
 		t.Fatal("reclamation mutated an escaped reader result")
 	}
 
 	c.Insert("fresh", nil, NewTipSet(tip(2)))
 
-	if got := c.leafArena.list.Load().chunks[0].extra.Load(); got != memsize.Alloc(5)+tipSetBytes(NewTipSet(tip(2))) {
+	if got := c.leafArena.list.Load().chunks[0].extra.Load(); got != memsize.Alloc(int64(len(LogicalKeyPrefix+"fresh")))+tipSetBytes(NewTipSet(tip(2))) {
 		t.Fatalf("fresh recycled slot charge=%d", got)
 	}
 }

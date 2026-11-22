@@ -425,7 +425,7 @@ func findLeaf[T any](c *Critbit[T], key string) *critNode[T] {
 		}
 
 		for i := range chunk.nodes {
-			if n := &chunk.nodes[i]; n.key == key {
+			if n := &chunk.nodes[i]; n.key == LogicalKeyPrefix+key {
 				return n
 			}
 		}

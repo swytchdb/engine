@@ -68,7 +68,7 @@ func ghostWindowTrie(tb testing.TB) *Critbit[struct{}] {
 	for i := range 4096 {
 		key := fmt.Sprintf("key:%04d", i)
 		c.Insert(key, nil, tips)
-		c.liveLeaf(key).lastAccess.Store(uint64(i + 1))
+		c.liveLeaf(LogicalKeyPrefix + key).lastAccess.Store(uint64(i + 1))
 	}
 
 	if got := c.EvictBatch(512); got != 512 {
@@ -114,7 +114,7 @@ func TestEvictGhostWindowPreservesPinnedLeaves(t *testing.T) {
 		}
 
 		leaf, ok := c.reapQueue.Load().TryDequeue()
-		if !ok || leaf.key != fmt.Sprintf("key:%04d", i) {
+		if !ok || leaf.key != LogicalKeyPrefix+fmt.Sprintf("key:%04d", i) {
 			t.Fatalf("reclaim %d did not select the oldest ghost", i)
 		}
 

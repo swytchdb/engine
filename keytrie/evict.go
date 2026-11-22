@@ -113,7 +113,7 @@ const (
 	defaultDecayInterval = 8
 )
 
-// SetEvictHooks installs the consumer callbacks the eviction sweep uses.
+// SetEvictHooksInternal installs eviction callbacks receiving raw trie keys.
 // decider vetoes a key as an eviction victim (return false to pin it, e.g.
 // system keys). notify fires after a victim leaf is soft-deleted, handing the
 // consumer the dropped key's tips and leaf payload so it can release refs and
@@ -129,7 +129,7 @@ const (
 // decider exists would carry the default (unpinned) verdict. The memory
 // governor installs the hooks inside NewEngine, before any write, so this
 // holds.
-func (c *Critbit[T]) SetEvictHooks(decider func(key string) bool, notify func(key string, tips []EffectRef, data *T), pressure func() bool) {
+func (c *Critbit[T]) SetEvictHooksInternal(decider func(key string) bool, notify func(key string, tips []EffectRef, data *T), pressure func() bool) {
 	c.evictDecider = decider
 	c.evictNotify = notify
 	c.underPressure = pressure
