@@ -76,7 +76,7 @@ message DataEffect {
     sint64 int_val = 11;
     double float_val = 12;
     CompressedValue compressed = 13;
-    bytes child = 14;      // element references a child container partition (JSON); value lives in partition <child>
+    bytes child = 14;      // element references a nested container partition; value lives in partition <child>
   }
 }
 
@@ -94,6 +94,7 @@ enum ValueType {
   TYPE_JSON = 10;        // JSON key; root is a scalar leaf
   TYPE_JSON_OBJECT = 11; // a JSON object node (ORDERED partition, elements keyed by member name)
   TYPE_JSON_ARRAY = 12;  // a JSON array node (ORDERED partition, elements keyed by generated id)
+  TYPE_GRAPH = 13;       // graph descriptor: algorithm scalar, region_subscriptions map, entry_point array
 }
 
 // MetaEffect marks a causal dependency without changing state.

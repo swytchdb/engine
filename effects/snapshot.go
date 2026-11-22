@@ -481,11 +481,12 @@ func (v verdictMap) retain(txnID string, entry verdictEntry) {
 		"new_snapshot", entry.snapshotTip)
 }
 
-// isJSONType reports whether the type tag marks a RedisJSON node (key root or a
-// nested object/array). JSON nodes are exempt from Redis empty-collection
-// auto-delete — an empty {} or [] is a real value.
-func isJSONType(t pb.ValueType) bool {
-	return t == pb.ValueType_TYPE_JSON || t == pb.ValueType_TYPE_JSON_OBJECT || t == pb.ValueType_TYPE_JSON_ARRAY
+// preservesEmptyValue reports whether the type represents a value even when
+// empty or metadata-only. JSON containers and graph descriptors are exempt
+// from Redis empty-collection auto-delete.
+func preservesEmptyValue(t pb.ValueType) bool {
+	return t == pb.ValueType_TYPE_JSON || t == pb.ValueType_TYPE_JSON_OBJECT ||
+		t == pb.ValueType_TYPE_JSON_ARRAY || t == pb.ValueType_TYPE_GRAPH
 }
 
 // filterSnapshot applies post-reconstruction filtering: key-level expiry,
@@ -505,10 +506,10 @@ func filterSnapshotAt(result *pb.ReducedEffect, now time.Time) *pb.ReducedEffect
 	if result.GetExpiresAt() != nil && now.After(result.GetExpiresAt().AsTime()) {
 		return nil
 	}
-	// JSON nodes manage their own emptiness: an empty object/array (or a
+	// Nested values manage their own emptiness: an empty object/array/graph (or a
 	// meta-only root) is a real value, not a Redis empty-collection auto-delete.
 	// (Cf. the TYPE_STREAM exception for empty streams below.)
-	if isJSONType(result.GetTypeTag()) {
+	if preservesEmptyValue(result.GetTypeTag()) {
 		return result
 	}
 	// Filter expired elements from KEYED collections
@@ -802,7 +803,7 @@ func (e *Engine) reconstructLocal(key string) (*pb.ReducedEffect, []Tip, int, er
 	// TestGetSnapshot_ExpiredReconstructedStillReturnsState. When we
 	// surface nil here, also zero chainLen so the caller's compaction
 	// path doesn't dereference a nil result.
-	if result != nil && !isJSONType(result.GetTypeTag()) &&
+	if result != nil && !preservesEmptyValue(result.GetTypeTag()) &&
 		result.GetScalar() == nil && len(result.GetNetAdds()) == 0 && len(result.GetOrderedElements()) == 0 &&
 		(result.GetOp() == pb.EffectOp_UNKNOWN_OP || result.GetOp() == pb.EffectOp_REMOVE_OP) {
 		return nil, snapshotTips, 0, nil
