@@ -25,6 +25,7 @@ package effects
 
 import (
 	"fmt"
+	"maps"
 	"slices"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
@@ -57,8 +58,15 @@ func (p *VertexPool) proofRecords(eff *pb.Effect) (map[Tip]*pb.Effect, error) {
 	return records, nil
 }
 
-// proofVerdicts uses the ordinary bind evaluator against the packaged graph.
-// Cached verdict labels are deliberately excluded from this computation.
+// verdictEvidence keeps the candidate set separate from supporting ancestry.
+// Packages are immutable once attached to a verdict map, which may be copied
+// into a historical view. A package outcome is not a final transaction verdict.
+type verdictEvidence struct {
+	records map[Tip]*pb.Effect
+	binds   map[Tip]*pb.Effect
+	owners  map[Tip]bool
+}
+
 func (e *Engine) proofVerdicts(owner Tip, eff *pb.Effect) (verdictMap, error) {
 	if !e.effectCache.Incref(owner) {
 		return nil, fmt.Errorf("proof owner %v: %w", owner, errEffectNotResident)
@@ -70,7 +78,8 @@ func (e *Engine) proofVerdicts(owner Tip, eff *pb.Effect) (verdictMap, error) {
 		return nil, err
 	}
 
-	binds := make(map[Tip]*pb.Effect)
+	proof := &verdictEvidence{records: records, binds: make(map[Tip]*pb.Effect), owners: map[Tip]bool{owner: true}}
+	verdicts := make(verdictMap)
 
 	for _, ref := range eff.GetSnapshot().GetEvidence().GetBinds() {
 		tip := r(ref)
@@ -80,31 +89,83 @@ func (e *Engine) proofVerdicts(owner Tip, eff *pb.Effect) (verdictMap, error) {
 			return nil, fmt.Errorf("invalid proof bind %v", tip)
 		}
 
-		binds[tip] = bind
+		proof.binds[tip] = bind
+		verdicts[bind.GetTxnId()] = verdictEntry{snapshotTip: owner, proven: true, evidence: proof}
+	}
+
+	e.reconcileProofVerdicts(verdicts, proof)
+
+	for txn, entry := range verdicts {
+		entry.snapshotWon = entry.verdict == pb.Verdict_WON
+		verdicts[txn] = entry
+	}
+
+	return verdicts, nil
+}
+
+// combinedVerdictEvidence unions immutable package inputs without promoting
+// supporting ancestry to candidate binds.
+func combinedVerdictEvidence(inputs ...verdictMap) *verdictEvidence {
+	seen := make(map[*verdictEvidence]bool)
+
+	var packages []*verdictEvidence
+
+	for _, input := range inputs {
+		for _, entry := range input {
+			if entry.evidence != nil && !seen[entry.evidence] {
+				seen[entry.evidence] = true
+				packages = append(packages, entry.evidence)
+			}
+		}
+	}
+
+	if len(packages) == 0 {
+		return nil
+	}
+
+	if len(packages) == 1 {
+		return packages[0]
+	}
+
+	proof := &verdictEvidence{records: make(map[Tip]*pb.Effect), binds: make(map[Tip]*pb.Effect), owners: make(map[Tip]bool)}
+	for _, pkg := range packages {
+		maps.Copy(proof.records, pkg.records)
+		maps.Copy(proof.binds, pkg.binds)
+		maps.Copy(proof.owners, pkg.owners)
+	}
+
+	return proof
+}
+
+// reconcileProofVerdicts evaluates all inputs, including packages that agreed
+// before a newly discovered competitor arrived. Snapshot order is irrelevant.
+func (e *Engine) reconcileProofVerdicts(verdicts verdictMap, proof *verdictEvidence) {
+	if proof == nil {
+		return
 	}
 
 	keys := make(map[string][]Tip)
 
-	for tip, record := range binds {
-		for _, kb := range record.GetTxnBind().GetKeys() {
+	for tip, bind := range proof.binds {
+		for _, kb := range bind.GetTxnBind().GetKeys() {
 			key := string(kb.GetKey())
 			keys[key] = append(keys[key], tip)
 		}
 	}
 
-	lost, _ := e.losersOnKeysAt(keys, func(string) []Tip { return nil }, nil, nil, false, records)
-	verdicts := make(verdictMap)
+	lost, _ := e.losersOnKeysAt(keys, func(string) []Tip { return nil }, nil, nil, false, proof.records)
+	for _, bind := range proof.binds {
+		txn := bind.GetTxnId()
+		entry := verdicts[txn]
+		entry.verdict, entry.proven, entry.evidence = pb.Verdict_WON, true, proof
 
-	for _, record := range binds {
-		verdict := pb.Verdict_WON
-		if _, loses := lost[record.GetTxnId()]; loses {
-			verdict = pb.Verdict_LOST
+		entry.disputed = false
+		if _, loses := lost[txn]; loses {
+			entry.verdict = pb.Verdict_LOST
 		}
 
-		verdicts[record.GetTxnId()] = verdictEntry{verdict: verdict, snapshotTip: owner, proven: true}
+		verdicts[txn] = entry
 	}
-
-	return verdicts, nil
 }
 
 func (e *Engine) harvestProofVerdicts(tip Tip, eff *pb.Effect, verdicts verdictMap) error {
@@ -113,17 +174,40 @@ func (e *Engine) harvestProofVerdicts(tip Tip, eff *pb.Effect, verdicts verdictM
 
 		return nil
 	}
+	// Repeated per-key visits to the same owner add no evidence.
+	for _, entry := range verdicts {
+		if entry.evidence != nil && entry.evidence.owners[tip] {
+			return nil
+		}
+	}
 
 	derived, err := e.proofVerdicts(tip, eff)
 	if err != nil {
 		return err
 	}
 
-	for txn, entry := range derived {
+	e.mergeProofVerdicts(verdicts, derived)
+
+	return nil
+}
+
+func (e *Engine) mergeProofVerdicts(verdicts, incoming verdictMap) {
+	// Merge inputs before selecting entries: an additional package may contain
+	// only transactions already encountered, but still add relevant ancestry.
+	proof := combinedVerdictEvidence(verdicts, incoming)
+	for txn, entry := range incoming {
+		// Preserve the original source for historical membership.
+		if prior, ok := verdicts[txn]; ok && prior.proven && entry.proven {
+			prior.snapshotWon = prior.snapshotWon || entry.snapshotWon
+			verdicts[txn] = prior
+
+			continue
+		}
+
 		verdicts.retain(txn, entry)
 	}
 
-	return nil
+	e.reconcileProofVerdicts(verdicts, proof)
 }
 
 // bindProof retains the transaction records used for predicate evaluation and

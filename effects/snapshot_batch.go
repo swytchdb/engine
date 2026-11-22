@@ -159,19 +159,9 @@ func (v *snapshotReadView) discoverWithEvidence(keys []string, frontier func(str
 			return slices.Concat(v.frontiers[key].resolved, live.frontiers[key].resolved)
 		}
 		verdicts = make(verdictMap, len(live.verdicts)+len(v.verdicts))
-		maps.Copy(verdicts, live.verdicts)
-
-		for txn, entry := range v.verdicts {
-			// Equivalent proofs must keep the historical source: membership
-			// checks require it to belong to the selected value history.
-			if existing := verdicts[txn]; entry.proven && existing.proven && entry.verdict == existing.verdict {
-				verdicts[txn] = entry
-
-				continue
-			}
-
-			verdicts.retain(txn, entry)
-		}
+		// Keep historical sources for membership, but reconcile all inputs.
+		maps.Copy(verdicts, v.verdicts)
+		v.engine.mergeProofVerdicts(verdicts, live.verdicts)
 
 		v.verdicts = verdicts
 	}

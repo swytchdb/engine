@@ -25,6 +25,7 @@ package effects
 
 import (
 	"errors"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -344,12 +345,12 @@ func (e *Engine) evaluateNacks(ptxn *pendingTxn, nacks []*pb.NackNotify) (map[st
 		}
 
 		for txn, entry := range evidence {
-			if prior, ok := verdicts[txn]; ok && prior.verdict != entry.verdict {
+			if prior, ok := verdicts[txn]; ok && prior.verdict != entry.verdict && (!prior.proven || !entry.proven) {
 				return nil, ErrTxnAmbiguous
 			}
-
-			verdicts[txn] = entry
 		}
+
+		e.mergeProofVerdicts(verdicts, evidence)
 
 		if findPendingKey(ptxn, key) == nil {
 			continue
@@ -387,7 +388,16 @@ func (e *Engine) evaluateNacks(ptxn *pendingTxn, nacks []*pb.NackNotify) (map[st
 
 	for _, c := range candidates {
 		if verdicts[c.txn].verdict == pb.Verdict_LOST {
-			ptxn.proofSources = append(ptxn.proofSources, verdicts[c.txn].snapshotTip)
+			entry := verdicts[c.txn]
+			if entry.evidence != nil {
+				for owner := range entry.evidence.owners {
+					if !slices.Contains(ptxn.proofSources, owner) {
+						ptxn.proofSources = append(ptxn.proofSources, owner)
+					}
+				}
+			} else {
+				ptxn.proofSources = append(ptxn.proofSources, entry.snapshotTip)
+			}
 
 			continue
 		}

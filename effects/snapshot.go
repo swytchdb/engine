@@ -419,36 +419,39 @@ func (e *Engine) publishSubdag(ls *leafState, d *dag, tips []Tip) {
 	}
 }
 
-// verdictEntry holds a snapshot's verdict for a txnID; snapshotTip is the
-// offset of the snapshot that supplied it. Historical membership requires this
-// proof source to belong to the selected history.
+// verdictEntry holds the outcome against discovered evidence. snapshotTip
+// identifies a source containing the transaction; historical membership
+// requires that source to belong to the selected history.
 type verdictEntry struct {
 	verdict     pb.Verdict
 	snapshotTip Tip
-	proven      bool // derived from retained proof, not merely a cached label
+	proven      bool             // derived from retained proof, not merely a cached label
+	evidence    *verdictEvidence // immutable inputs; outcomes remain relative to these inputs
+	snapshotWon bool             // an observed package evaluated WON; used only for conflict reports
+	disputed    bool             // conflicting legacy labels require ordinary bind arbitration
 }
 
-// verdictMap accumulates snapshot-supplied verdicts during a walk. Recorded
-// losses suppress binds; recorded wins still need checks against concurrent binds.
+// verdictMap accumulates snapshot evidence during a walk. Recomputable outcomes
+// remain candidates when newly discovered binds are evaluated.
 type verdictMap map[string]verdictEntry
 
-// harvest folds a snapshot's TxnVerdicts into the map. First-seen wins;
-// disagreement is logged but not arbitrated (HLC is author-supplied and
-// not a trustworthy tiebreaker).
+// harvest folds legacy labels into the map. Conflicting labels invalidate the
+// shortcut; neither encounter order nor the snapshot clock selects a winner.
 func (v verdictMap) harvest(snapshotTip Tip, snap *pb.SnapshotEffect) {
 	if snap == nil {
 		return
 	}
 
 	for txnID, newVerdict := range snap.GetTxnVerdicts() {
-		v.retain(txnID, verdictEntry{verdict: newVerdict, snapshotTip: snapshotTip})
+		v.retain(txnID, verdictEntry{verdict: newVerdict, snapshotTip: snapshotTip, snapshotWon: newVerdict == pb.Verdict_WON})
 	}
 }
 
-// retain keeps the first observed verdict, including when combining evidence
-// from a live walk and a historical walk.
+// retain preserves an equivalent source for historical membership. Packaged
+// evidence is reconciled by mergeProofVerdicts; legacy disagreement disables
+// the shortcut until actual evidence can decide it.
 func (v verdictMap) retain(txnID string, entry verdictEntry) {
-	if entry.verdict == pb.Verdict_VERDICT_UNSPECIFIED {
+	if entry.verdict == pb.Verdict_VERDICT_UNSPECIFIED && !entry.disputed {
 		return
 	}
 
@@ -469,7 +472,11 @@ func (v verdictMap) retain(txnID string, entry verdictEntry) {
 		return
 	}
 
-	if existing.verdict == entry.verdict {
+	if existing.disputed {
+		return
+	}
+
+	if existing.verdict == entry.verdict && !entry.disputed {
 		return
 	}
 
@@ -479,6 +486,10 @@ func (v verdictMap) retain(txnID string, entry verdictEntry) {
 		"existing_snapshot", existing.snapshotTip,
 		"new_verdict", entry.verdict,
 		"new_snapshot", entry.snapshotTip)
+	existing.verdict = pb.Verdict_VERDICT_UNSPECIFIED
+	existing.disputed = true
+	existing.snapshotWon = existing.snapshotWon || entry.snapshotWon
+	v[txnID] = existing
 }
 
 // isJSONType reports whether the type tag marks a RedisJSON node (key root or a
@@ -1728,6 +1739,7 @@ func (e *Engine) bindKeyClosureFrom(startKeys []string, tipsFor func(string) ([]
 
 	anchored := make(map[location]bool)
 	verdicts := make(verdictMap)
+	unfolded := false
 
 	for len(queue) > 0 {
 		k := queue[len(queue)-1]
@@ -1744,6 +1756,17 @@ func (e *Engine) bindKeyClosureFrom(startKeys []string, tipsFor func(string) ([]
 			proofErr   error
 		)
 
+		if len(bindsByKey[k]) != 0 {
+			// Inspect the current frontier before adding old anchors. It may
+			// already own their evidence above an LCA whose ancestry is gone.
+			_ = e.walkBindEvidence(k, frontier, func(t Tip, eff *pb.Effect) {
+				if eff.GetSnapshot() != nil {
+					proofErr = errors.Join(proofErr, e.harvestProofVerdicts(t, eff, verdicts))
+				}
+			})
+			bindsByKey[k] = withoutProvenAnchors(bindsByKey[k], verdicts)
+		}
+
 		err = e.walkBindEvidence(k, slices.Concat(frontier, bindsByKey[k]), func(t Tip, eff *pb.Effect) {
 			if eff.GetTxnBind() != nil {
 				discovered = append(discovered, t)
@@ -1758,21 +1781,41 @@ func (e *Engine) bindKeyClosureFrom(startKeys []string, tipsFor func(string) ([]
 			return nil, nil, proofErr
 		}
 
+		unfolded = unfolded || len(discovered) != 0
+		if unfolded {
+			// A visible bind can depend on competitors retained only in a
+			// package. Check their other frontiers too. A read entirely folded
+			// into an LCA state snapshot does not reopen its historical binds.
+			if proof := combinedVerdictEvidence(verdicts); proof != nil {
+				for tip := range proof.binds {
+					if !slices.Contains(discovered, tip) {
+						discovered = append(discovered, tip)
+					}
+				}
+			}
+		}
+
 		for _, t := range discovered {
 			eff, _ := e.effectCache.Get(t)
-			// An owned proof supplies the historical cross-key outcome without
-			// reopening another key's compacted value DAG. Bare cached labels
-			// retain the legacy discovery path.
-			if bind := eff.GetTxnBind(); bind != nil && !verdicts[eff.GetTxnId()].proven {
+			if bind := eff.GetTxnBind(); bind != nil {
 				for _, kb := range bind.GetKeys() {
 					other := string(kb.GetKey())
 
 					anchor := location{other, t}
 					if other != k && !anchored[anchor] {
-						// Start at the envelope, not its NewTip ancestor.
 						anchored[anchor] = true
 
-						bindsByKey[other] = append(bindsByKey[other], t)
+						if verdicts[eff.GetTxnId()].proven {
+							// Check the other frontier for competing evidence, but
+							// do not reopen value ancestry folded into its LCA.
+							if _, exists := bindsByKey[other]; !exists {
+								bindsByKey[other] = nil
+							}
+						} else {
+							// Start at the envelope, not its NewTip ancestor.
+							bindsByKey[other] = append(bindsByKey[other], t)
+						}
+
 						if !queued[other] {
 							queue = append(queue, other)
 							queued[other] = true
@@ -1787,16 +1830,27 @@ func (e *Engine) bindKeyClosureFrom(startKeys []string, tipsFor func(string) ([]
 		}
 	}
 
+	for key, anchors := range bindsByKey {
+		bindsByKey[key] = withoutProvenAnchors(anchors, verdicts)
+	}
+
 	return bindsByKey, verdicts, nil
 }
 
-// losersOnKey returns the txnIDs of binds on `key` that lost fork choice,
-// plus the count of effects walked. Binds with a LOST verdict in any
-// reachable snapshot (or in snapshotVerdicts from the caller) bypass the
-// pairwise hash comparison. WON only records a decision against the competitors
-// known to that snapshot, so those binds still run pairwise hash + predicate
-// refinement against concurrent binds. extraTips augments the starting set with bind envelopes
-// the caller harvested on other closure keys.
+func withoutProvenAnchors(anchors []Tip, verdicts verdictMap) []Tip {
+	proof := combinedVerdictEvidence(verdicts)
+	if proof == nil {
+		return anchors
+	}
+
+	return slices.DeleteFunc(anchors, func(t Tip) bool { return proof.binds[t] != nil })
+}
+
+// losersOnKey returns losing txnIDs and the number of effects walked. Retained
+// evidence is compared together with live binds; its cached outcome cannot
+// suppress that comparison. Uncontested legacy LOST labels remain supported
+// when no recomputable package is available. extraTips supplies bind envelopes
+// discovered on other keys.
 func (e *Engine) losersOnKey(key string, extraTips []Tip, snapshotVerdicts verdictMap) (map[string]struct{}, int) {
 	var isInvisible func(string) bool
 	if e.horizon != nil && !e.horizon.Empty() {
@@ -1817,6 +1871,23 @@ func (e *Engine) losersOnKeyAt(key string, tips, extraTips []Tip, snapshotVerdic
 // A bind that loses on one key cannot eliminate another bind on a different
 // key. Cached verdicts skip work; they do not change this ordering.
 func (e *Engine) losersOnKeysAt(anchors map[string][]Tip, tipsFor func(string) []Tip, verdicts verdictMap, isInvisible func(string) bool, report bool, packaged ...map[Tip]*pb.Effect) (map[string]struct{}, map[string]int) {
+	if len(packaged) == 0 {
+		// Packaged competitors may live on keys whose value history is not
+		// part of this read. Evaluate their edges without adding value anchors.
+		anchors = maps.Clone(anchors)
+
+		if proof := combinedVerdictEvidence(verdicts); proof != nil {
+			for _, bind := range proof.binds {
+				for _, kb := range bind.GetTxnBind().GetKeys() {
+					key := string(kb.GetKey())
+					if _, exists := anchors[key]; !exists {
+						anchors[key] = nil
+					}
+				}
+			}
+		}
+	}
+
 	competitors := make(map[string][]string)
 	walked := make(map[string]int, len(anchors))
 	losses := make(map[string]bool)
@@ -1829,14 +1900,14 @@ func (e *Engine) losersOnKeysAt(anchors map[string][]Tip, tipsFor func(string) [
 		// Indexes may advance after closure discovery. Preserve cached losses
 		// found by this walk, without retaining its provisional pairwise losers.
 		for txn, entry := range observed {
-			if entry.verdict == pb.Verdict_LOST {
+			if entry.verdict == pb.Verdict_LOST && !entry.proven {
 				losses[txn] = true
 			}
 		}
 	}
 
 	for txn, entry := range verdicts {
-		if entry.verdict == pb.Verdict_LOST {
+		if entry.verdict == pb.Verdict_LOST && !entry.proven {
 			losses[txn] = true
 		}
 	}
@@ -1900,7 +1971,7 @@ func (e *Engine) forkChoicesOnKeyAt(key string, tips, extraTips []Tip, snapshotV
 		}
 	}
 
-	if len(startTips) == 0 {
+	if len(startTips) == 0 && len(snapshotVerdicts) == 0 {
 		return losers, 0, snapshotVerdicts
 	}
 
@@ -1919,6 +1990,8 @@ func (e *Engine) forkChoicesOnKeyAt(key string, tips, extraTips []Tip, snapshotV
 
 	var binds []seenBind
 
+	seenBinds := make(map[Tip]bool)
+
 	walked := 0
 	// Preserve this caller's tolerant handling of unavailable evidence.
 	visit := func(t Tip, eff *pb.Effect) {
@@ -1929,6 +2002,12 @@ func (e *Engine) forkChoicesOnKeyAt(key string, tips, extraTips []Tip, snapshotV
 		}
 
 		if bind := eff.GetTxnBind(); bind != nil && (isInvisible == nil || !isInvisible(eff.GetTxnId())) {
+			if seenBinds[t] {
+				return
+			}
+
+			seenBinds[t] = true
+
 			for _, kb := range bind.GetKeys() {
 				if string(kb.GetKey()) == key && r(kb.GetNewTip()) != (Tip{}) {
 					binds = append(binds, seenBind{
@@ -1944,9 +2023,15 @@ func (e *Engine) forkChoicesOnKeyAt(key string, tips, extraTips []Tip, snapshotV
 		}
 	}
 
+	var proofRecords map[Tip]*pb.Effect
+
 	load := func(t Tip) (*pb.Effect, error) {
 		if len(packaged) != 0 {
 			return packaged[0][t], nil
+		}
+
+		if eff := proofRecords[t]; eff != nil {
+			return eff, nil
 		}
 
 		return e.getEffect(key, t)
@@ -1959,6 +2044,13 @@ func (e *Engine) forkChoicesOnKeyAt(key string, tips, extraTips []Tip, snapshotV
 		}
 	} else {
 		_ = e.walkBindEvidence(key, startTips, visit)
+
+		if proof := combinedVerdictEvidence(verdicts); proof != nil {
+			proofRecords = proof.records
+			for tip, bind := range proof.binds {
+				visit(tip, bind)
+			}
+		}
 	}
 
 	type bindWithSource struct {
@@ -1973,12 +2065,12 @@ func (e *Engine) forkChoicesOnKeyAt(key string, tips, extraTips []Tip, snapshotV
 
 	for _, b := range binds {
 		if entry, ok := verdicts[b.txnID]; ok {
-			if entry.verdict == pb.Verdict_LOST {
+			if entry.verdict == pb.Verdict_LOST && !entry.proven {
 				losers[b.txnID] = struct{}{}
 			}
 
 			verdictAdjudicated[b.txnID] = bindWithSource{seenBind: b, verdictSrc: entry.snapshotTip}
-			if entry.verdict == pb.Verdict_WON {
+			if entry.verdict != pb.Verdict_LOST || entry.proven {
 				candidates = append(candidates, b)
 			}
 
@@ -2012,7 +2104,7 @@ func (e *Engine) forkChoicesOnKeyAt(key string, tips, extraTips []Tip, snapshotV
 	if reportConflicts && !strings.HasPrefix(key, conflictKeyPrefix) && len(candidates) > 1 {
 		reportable = make(map[Tip]bool, len(candidates))
 		for _, b := range candidates {
-			if verdicts[b.txnID].verdict == pb.Verdict_WON {
+			if entry := verdicts[b.txnID]; entry.verdict == pb.Verdict_WON || entry.snapshotWon {
 				reportable[b.bindOffset] = e.unresolvedConflictTip(key, b.bindOffset, startTips, ancestry.reaches)
 			}
 		}
