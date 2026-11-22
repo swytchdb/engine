@@ -119,7 +119,9 @@ func TestLogicalTraversalWithInternalKeys(t *testing.T) {
 
 	t.Cleanup(func() { closeTestTrie(t, c) })
 
-	keys := []string{"", "\x00", "\x00animals", "a\x00b", "\xff", "*", "[a]"}
+	keys := make([]string, 0, 157)
+	keys = append(keys, "", "\x00", "\x00animals", "a\x00b", "\xff", "*", "[a]")
+
 	for i := range 150 { // Cross the traversal batch boundary.
 		keys = append(keys, fmt.Sprintf("animal:%03d", i))
 	}
