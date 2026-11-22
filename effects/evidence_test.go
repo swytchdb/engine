@@ -67,8 +67,8 @@ func TestSnapshotEvidenceReconstructsPriorityChainWithoutLabels(t *testing.T) {
 		t.Fatalf("fresh-node reconstruction=%v err=%v, want A", got, err)
 	}
 
-	if _, ok := fresh.subscriptions.Load("bc"); ok {
-		t.Fatal("proof evaluation subscribed to another key")
+	if _, ok := fresh.subscriptions.Load("bc"); !ok {
+		t.Fatal("read did not check the retained competitor's other frontier")
 	}
 
 	if _, ok := fresh.effectCache.Get(unrelated); ok {
@@ -83,6 +83,7 @@ func TestSnapshotEvidenceReconstructsPriorityChainWithoutLabels(t *testing.T) {
 	}
 
 	fresh.releaseChainRefs("winner", fresh.index.Contains("winner").Tips(), fresh.index.LoadData("winner"))
+	fresh.releaseChainRefs("bc", fresh.index.Contains("bc").Tips(), fresh.index.LoadData("bc"))
 	drainEvidence(fresh.effectCache)
 
 	if fresh.effectCache.EntryCount() != 0 {

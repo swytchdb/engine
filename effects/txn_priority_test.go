@@ -37,6 +37,68 @@ import (
 )
 
 // A and C have no common key. Only B can pass C's evidence to A.
+func TestNackReconcilesCompetingVerdictPackages(t *testing.T) {
+	for _, reverse := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reverse=%t", reverse), func(t *testing.T) {
+			log := newSnapshotLog()
+			e := newSnapshotEngine(log)
+			a := closureBind(log, "A", 3, []string{"ab"}, nil)
+			b := closureBind(log, "B", 2, []string{"ab", "bc"}, nil)
+			c := closureBind(log, "C", 1, []string{"bc"}, nil)
+
+			old, err := e.bindProof(b, nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer e.effectCache.releaseEvidence(evidenceTips(old))
+
+			newer, err := e.bindProof(c, map[string]Tip{"B": b}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer e.effectCache.releaseEvidence(evidenceTips(newer))
+
+			oldSnapshot := log.putEffect(bindEvidenceSnapshot("ab", old))
+			newSnapshot := log.putEffect(bindEvidenceSnapshot("bc", newer))
+			aEffect, _ := log.effectCache.Get(a)
+			pending := newTestPendingTxn(pendingTxnKey{key: "ab", newTip: r(aEffect.GetTxnBind().GetKeys()[0].GetNewTip())})
+			pending.txnID, pending.bindOffset, pending.forkChoiceHash = "A", a, []byte{3}
+
+			responses := []*pb.NackNotify{
+				e.buildEnrichedNack("ab", toPbRef(a), []Tip{b, oldSnapshot}),
+				e.buildEnrichedNack("bc", toPbRef(a), []Tip{newSnapshot}),
+			}
+			if reverse {
+				slices.Reverse(responses)
+			}
+
+			defeated, err := e.evaluateNacks(pending, responses)
+			if err != nil {
+				t.Fatalf("B lost to C, so A may commit: %v", err)
+			}
+
+			if !slices.Contains(pending.proofSources, oldSnapshot) || !slices.Contains(pending.proofSources, newSnapshot) {
+				t.Fatalf("commit discarded reconciled proof sources: %v", pending.proofSources)
+			}
+
+			proof, err := e.bindProof(a, defeated, pending.proofSources)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer e.effectCache.releaseEvidence(evidenceTips(proof))
+
+			owner := log.putEffect(bindEvidenceSnapshot("ab", proof))
+			eff, _ := log.effectCache.Get(owner)
+
+			verdicts, err := e.proofVerdicts(owner, eff)
+			if err != nil || verdicts["A"].verdict != pb.Verdict_WON || verdicts["B"].verdict != pb.Verdict_LOST || verdicts["C"].verdict != pb.Verdict_WON {
+				t.Fatalf("committed proof=%v err=%v", verdicts, err)
+			}
+		})
+	}
+}
+
+// A and C have no common key. Only B can pass C's evidence to A.
 func TestNackPriorityEvidenceAcrossKeys(t *testing.T) {
 	log := newSnapshotLog()
 	e := newSnapshotEngine(log)

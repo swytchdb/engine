@@ -24,12 +24,180 @@
 package effects
 
 import (
+	"context"
+	"fmt"
 	"slices"
 	"testing"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
 	"github.com/swytchdb/engine/keytrie"
 )
+
+func TestReconstruct_ConflictingLegacyVerdictsReevaluate(t *testing.T) {
+	for _, reverse := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reverse=%t", reverse), func(t *testing.T) {
+			log := newSnapshotLog()
+			e := newSnapshotEngine(log)
+			winner := closureBind(log, "winner", 1, []string{"winner"}, nil)
+			loser := closureBind(log, "loser", 2, []string{"winner"}, nil)
+
+			tips := make([]Tip, 0, 3)
+			for _, verdict := range []pb.Verdict{pb.Verdict_LOST, pb.Verdict_WON, pb.Verdict_LOST} {
+				tips = append(tips, log.putEffect(&pb.Effect{
+					Key: []byte("winner"), Deps: toPbRefs([]Tip{winner, loser}),
+					Kind: &pb.Effect_Snapshot{Snapshot: &pb.SnapshotEffect{TxnVerdicts: map[string]pb.Verdict{"winner": verdict}}},
+				}))
+			}
+
+			if reverse {
+				slices.Reverse(tips)
+			}
+
+			preSubscribe(e, "winner")
+			e.index.Insert("winner", nil, keytrie.NewTipSet(tips...))
+
+			got, _, _, err := e.GetSnapshot("winner")
+			if err != nil || string(got.GetScalar().GetRaw()) != "winner" {
+				t.Fatalf("conflicting cached labels changed bind arbitration: %v, %v", got, err)
+			}
+		})
+	}
+}
+
+// A loses to B in one package, but B loses to C on another key. Reconcile
+// inputs, not labels: A and C must survive. C may arrive without a snapshot.
+// The shared key's LCA has reclaimed its data ancestry, so opening an old bind
+// there would be both unnecessary and incorrect.
+func TestReconstruct_VerdictPackagesReconcilePriorityChain(t *testing.T) {
+	for _, cSnapshot := range []bool{false, true} {
+		for _, payoutFirst := range []bool{false, true} {
+			t.Run(fmt.Sprintf("c-snapshot=%t/payout-first=%t", cSnapshot, payoutFirst), func(t *testing.T) {
+				log := newSnapshotLog()
+				e := newSnapshotEngine(log)
+				a := closureBind(log, "A", 3, []string{"winner", "payout:A"}, nil)
+				b := closureBind(log, "B", 2, []string{"winner", "other"}, nil)
+				c := closureBind(log, "C", 1, []string{"other"}, nil)
+
+				ab, err := e.bindProof(b, map[string]Tip{"A": a}, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer e.effectCache.releaseEvidence(evidenceTips(ab))
+
+				bc, err := e.bindProof(c, map[string]Tip{"B": b}, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer e.effectCache.releaseEvidence(evidenceTips(bc))
+
+				payout := bindEvidenceSnapshot("payout:A", ab)
+				payout.Deps = toPbRefs([]Tip{a})
+				payoutTip := log.putEffect(payout)
+				folded := bindEvidenceSnapshot("winner", ab)
+				folded.GetSnapshot().State = &pb.ReducedEffect{Scalar: scalarInsertRaw([]byte("B"))}
+				folded.Deps = toPbRefs([]Tip{{99, 99}})
+				foldedTip := log.putEffect(folded)
+				otherTips := []Tip{b, c}
+
+				if cSnapshot {
+					other := bindEvidenceSnapshot("other", bc)
+					other.Deps = toPbRefs(otherTips)
+					otherTips = []Tip{log.putEffect(other)}
+				}
+
+				preSubscribe(e, "winner", "payout:A", "other")
+				e.index.Insert("winner", nil, keytrie.NewTipSet(foldedTip))
+				e.index.Insert("payout:A", nil, keytrie.NewTipSet(payoutTip))
+				e.index.Insert("other", nil, keytrie.NewTipSet(otherTips...))
+				e.broadcaster = &cutBroadcaster{load: func(tip Tip) ([]byte, error) {
+					// Optional conflict diagnostics may probe absent ancestry;
+					// value reconstruction must not require it.
+					return nil, ErrEffectNotFound
+				}}
+
+				keys := []string{"other", "payout:A"}
+				if payoutFirst {
+					slices.Reverse(keys)
+				}
+
+				for _, key := range keys {
+					got, _, _, err := e.GetSnapshot(key)
+					if err != nil || string(got.GetScalar().GetRaw()) != "100" {
+						t.Fatalf("%s=%v err=%v; A and C should survive", key, got, err)
+					}
+				}
+
+				got, err := e.GetSnapshots(context.Background(), keys)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				for i, result := range got {
+					if string(result.GetScalar().GetRaw()) != "100" {
+						t.Errorf("batch %s=%v", keys[i], result)
+					}
+				}
+			})
+		}
+	}
+}
+
+// A local WON package and a later-discovered package containing the competing
+// winner must be reconciled. The first visited snapshot cannot select which
+// verdict for the same transaction is authoritative.
+func TestReconstruct_ConflictingVerdictEvidenceOrderIndependent(t *testing.T) {
+	for _, reverse := range []bool{false, true} {
+		name := "old-first"
+		if reverse {
+			name = "new-first"
+		}
+
+		t.Run(name, func(t *testing.T) {
+			log := newSnapshotLog()
+			e := newSnapshotEngine(log)
+			loser := closureBind(log, "loser", 2, []string{"winner", "payout:loser"}, nil)
+			winner := closureBind(log, "winner", 1, []string{"winner", "payout:winner"}, nil)
+
+			oldProof, err := e.bindProof(loser, nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer e.effectCache.releaseEvidence(evidenceTips(oldProof))
+
+			newProof, err := e.bindProof(winner, map[string]Tip{"loser": loser}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer e.effectCache.releaseEvidence(evidenceTips(newProof))
+
+			tips := make([]Tip, 0, 2)
+
+			for _, proof := range []*pb.BindEvidence{oldProof, newProof} {
+				snapshot := bindEvidenceSnapshot("payout:loser", proof)
+				snapshot.Deps = toPbRefs([]Tip{loser})
+				tips = append(tips, log.putEffect(snapshot))
+			}
+
+			if reverse {
+				slices.Reverse(tips)
+			}
+
+			preSubscribe(e, "winner", "payout:loser", "payout:winner")
+			e.index.Insert("winner", nil, keytrie.NewTipSet(loser, winner))
+			e.index.Insert("payout:loser", nil, keytrie.NewTipSet(tips...))
+			e.index.Insert("payout:winner", nil, keytrie.NewTipSet(winner))
+
+			got, _, _, err := e.GetSnapshot("payout:loser")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if got != nil {
+				t.Fatalf("losing payout survived despite available competing verdict evidence: %v", got)
+			}
+		})
+	}
+}
 
 // A bind first discovered as an ancestor on winner must also become reachable
 // from payout. Reinstalling an ancestor must not replace a newer payout value.
@@ -156,11 +324,15 @@ func TestReconstruct_WonSnapshotsPreserveConflictChecks(t *testing.T) {
 		bobSnapshot   bool
 		sequential    bool
 		warmPayout    bool
+		ownedEvidence bool
 	}{
 		{name: "no_snapshots"},
 		{name: "loser_snapshot", aliceSnapshot: true},
 		{name: "winner_snapshot", bobSnapshot: true},
 		{name: "both_snapshots", aliceSnapshot: true, bobSnapshot: true},
+		// Real subscriber-backed commits attach a proof, not just WON labels.
+		// Independent proofs must not hide a newly discovered cross-key loss.
+		{name: "both_snapshots_with_evidence", aliceSnapshot: true, bobSnapshot: true, ownedEvidence: true},
 		{name: "sequential_snapshots", aliceSnapshot: true, bobSnapshot: true, sequential: true},
 		{name: "cached_payout_new_competitor", aliceSnapshot: true, bobSnapshot: true, warmPayout: true},
 	} {
@@ -209,13 +381,27 @@ func TestReconstruct_WonSnapshotsPreserveConflictChecks(t *testing.T) {
 					})
 
 					tips := map[string]Tip{"winner": bind, payoutKey: bind}
+
 					if snapshot {
+						var proof *pb.BindEvidence
+
+						if tc.ownedEvidence {
+							var err error
+
+							proof, err = e.bindProof(bind, nil, nil)
+							if err != nil {
+								t.Fatal(err)
+							}
+							defer e.effectCache.releaseEvidence(evidenceTips(proof))
+						}
+
 						for _, key := range []string{"winner", payoutKey} {
 							tips[key] = log.putEffect(&pb.Effect{
 								Key: []byte(key), Hlc: sTs(int64(log.nextOff)), NodeId: node,
 								Deps: []*pb.EffectRef{toPbRef(bind)},
 								Kind: &pb.Effect_Snapshot{Snapshot: &pb.SnapshotEffect{
 									TxnVerdicts: map[string]pb.Verdict{txnID: pb.Verdict_WON},
+									Evidence:    proof,
 								}},
 							})
 						}
