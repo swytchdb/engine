@@ -115,7 +115,7 @@ func TestInstallCloudTipsRetainsClosureWithoutReconstruction(t *testing.T) {
 
 	requireFrontier(t, e, tip)
 
-	if err := newDag(e, "k", "").prepare([]Tip{tip}); !errors.Is(err, errEffectNotResident) {
+	if err := newDag(e, logicalAddress("k"), "").prepare([]Tip{tip}); !errors.Is(err, errEffectNotResident) {
 		t.Fatalf("reconstruction must detect its missing dependency: %v", err)
 	}
 }
@@ -182,7 +182,7 @@ func TestInstallCloudTipsRetriesStreamingClosure(t *testing.T) {
 	e.broadcaster = &ancestryBroadcaster{load: func(key string, root Tip, _ []pb.NodeID, _ func(Tip) bool, receive func(Tip, []byte, bool) error) error {
 		calls++
 
-		if key != "k" || root != dep {
+		if key != logicalAddress("k") || root != dep {
 			t.Fatalf("unexpected ancestry request: %q %v", key, root)
 		}
 

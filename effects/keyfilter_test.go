@@ -90,11 +90,11 @@ func TestPeerWriteVisibleToReader(t *testing.T) {
 		t.Fatalf("writer Flush: %v", err)
 	}
 
-	if !reader.clusterMaybeHasKey("k") {
+	if !reader.clusterMaybeHasKey(logicalAddress("k")) {
 		t.Fatal("reader free-misses a key the writer committed: hit->miss regression")
 	}
 	// A key nobody wrote stays a (correct) free miss.
-	if reader.clusterMaybeHasKey("never-written") {
+	if reader.clusterMaybeHasKey(logicalAddress("never-written")) {
 		t.Fatal("reader reports a key no peer ever wrote")
 	}
 }
@@ -198,9 +198,9 @@ func TestReadOnlyHitSubscribes(t *testing.T) {
 	e := newTestEngine(bc)
 
 	// Peer 2 announces "k" (as it would via an inbound SubscriptionEffect).
-	e.peerFilterAdd(pb.NodeID(2), "k")
+	e.peerFilterAdd(pb.NodeID(2), logicalAddress("k"))
 
-	if !e.clusterMaybeHasKey("k") {
+	if !e.clusterMaybeHasKey(logicalAddress("k")) {
 		t.Fatal("clusterMaybeHasKey should report the announced key")
 	}
 
@@ -305,12 +305,12 @@ func TestPeerFilterBulkPropagation(t *testing.T) {
 	local.CachePeerFilter(pb.NodeID(2), data, ver)
 
 	for _, k := range []string{"alpha", "beta", "gamma"} {
-		if !local.clusterMaybeHasKey(k) {
+		if !local.clusterMaybeHasKey(logicalAddress(k)) {
 			t.Fatalf("local should see peer key %q after bulk transfer", k)
 		}
 	}
 
-	if local.clusterMaybeHasKey("delta-never-written") {
+	if local.clusterMaybeHasKey(logicalAddress("delta-never-written")) {
 		t.Fatal("unexpected false positive for a never-written key")
 	}
 
@@ -326,7 +326,7 @@ func TestUnfilteredPeerPresumedToHoldEverything(t *testing.T) {
 	local := newTestEngine(nil)
 	local.NotePeerConnected(pb.NodeID(2))
 
-	if !local.clusterMaybeHasKey("anything-at-all") {
+	if !local.clusterMaybeHasKey(logicalAddress("anything-at-all")) {
 		t.Fatal("a connected peer without a filter must be presumed to hold every key")
 	}
 
@@ -335,7 +335,7 @@ func TestUnfilteredPeerPresumedToHoldEverything(t *testing.T) {
 	data, ver := fresh.OwnKeyFilterSnapshot()
 	local.CachePeerFilter(pb.NodeID(2), data, ver)
 
-	if local.clusterMaybeHasKey("anything-at-all") {
+	if local.clusterMaybeHasKey(logicalAddress("anything-at-all")) {
 		t.Fatal("an empty bulk filter must release the presumed-everything default")
 	}
 
@@ -343,7 +343,7 @@ func TestUnfilteredPeerPresumedToHoldEverything(t *testing.T) {
 	local.removePeerKeyFilter(pb.NodeID(2))
 	local.NotePeerConnected(pb.NodeID(2))
 
-	if !local.clusterMaybeHasKey("anything-at-all") {
+	if !local.clusterMaybeHasKey(logicalAddress("anything-at-all")) {
 		t.Fatal("a reconnected peer must re-enter as presumed-everything")
 	}
 }
@@ -368,17 +368,17 @@ func TestPeerFilterBulkReplacePreservesRealtime(t *testing.T) {
 	local := newTestEngine(nil)
 	local.CachePeerFilter(pb.NodeID(2), data, ver)
 	// A real-time announcement arrives for a key not yet in any bulk.
-	local.peerFilterAdd(pb.NodeID(2), "realtime-key")
+	local.peerFilterAdd(pb.NodeID(2), logicalAddress("realtime-key"))
 
 	// A newer bulk arrives (still only contains bulk-key). It must replace the
 	// old bulk without dropping the real-time key.
 	local.CachePeerFilter(pb.NodeID(2), data, ver+10)
 
-	if !local.clusterMaybeHasKey("bulk-key") {
+	if !local.clusterMaybeHasKey(logicalAddress("bulk-key")) {
 		t.Fatal("bulk key lost after bulk replace")
 	}
 
-	if !local.clusterMaybeHasKey("realtime-key") {
+	if !local.clusterMaybeHasKey(logicalAddress("realtime-key")) {
 		t.Fatal("real-time key lost after bulk replace")
 	}
 }
@@ -397,11 +397,11 @@ func TestEnrichedNackCarriesNoFilter(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if nack := e.buildEnrichedNack("advertised", nil, nil); len(nack.GetNodeKeyFilter()) != 0 {
+	if nack := e.buildEnrichedNack(logicalAddress("advertised"), nil, nil); len(nack.GetNodeKeyFilter()) != 0 {
 		t.Fatal("NACKs must not carry the bulk filter")
 	}
 
-	if nack := e.buildEnrichedNack("__swytch:members", nil, nil); len(nack.GetNodeKeyFilter()) != 0 {
+	if nack := e.buildEnrichedNack(logicalAddress("__swytch:members"), nil, nil); len(nack.GetNodeKeyFilter()) != 0 {
 		t.Fatal("membership NACKs must not carry the bulk filter either")
 	}
 }

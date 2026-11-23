@@ -60,7 +60,7 @@ func addConflictLottery(e *Engine, log *snapshotLog, name string, hash byte, par
 				TxnVerdicts: map[string]pb.Verdict{name: pb.Verdict_WON},
 			}},
 		})
-		e.updateIndex(key, nil, snapshot)
+		e.updateIndex(logicalAddress(key), nil, snapshot)
 	}
 
 	return bind
@@ -322,7 +322,7 @@ func TestConflictEffects_RequiresCompetingWonTips(t *testing.T) {
 					addConflictLottery(e, log, txn, byte(i+1), nil)
 				} else {
 					bind := closureBind(log, txn, byte(i+1), []string{"winner"}, nil)
-					e.updateIndex("winner", nil, bind)
+					e.updateIndex(logicalAddress("winner"), nil, bind)
 				}
 			}
 
@@ -348,7 +348,7 @@ func TestConflictEffects_DependentTipsDoNotReport(t *testing.T) {
 			})
 			// Keep redundant ancestor tips. A dependency also resolves the
 			// transaction when it is only present on an associated key.
-			e.updateIndex(key, nil, merged)
+			e.updateIndex(logicalAddress(key), nil, merged)
 
 			if _, _, _, err := e.GetSnapshot("winner"); err != nil {
 				t.Fatal(err)

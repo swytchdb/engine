@@ -58,7 +58,7 @@ func commitAncestryFixture(t *testing.T) (*Engine, Tip, Tip, *pb.Effect) {
 	// Record the same observation as remote bind ingestion, and retain P
 	// alongside its descendant, as additional-key indexing can do.
 	e.handleRemoteBind(bind.GetTxnBind(), bindTip, bind.GetTxnId())
-	e.updateIndex("k", nil, p)
+	e.updateIndex(logicalAddress("k"), nil, p)
 
 	return e, p, bindTip, bind
 }
@@ -81,7 +81,7 @@ func TestFlushTxRedundantConsumedAncestor(t *testing.T) {
 					t.Fatalf("read: result=%v err=%v", result, err)
 				}
 
-				if !tx.keys["k"].initialTips.Contains(p) {
+				if !tx.keys[logicalAddress("k")].initialTips.Contains(p) {
 					t.Fatal("fixture lost the redundant ancestor before commit")
 				}
 
@@ -95,7 +95,7 @@ func TestFlushTxRedundantConsumedAncestor(t *testing.T) {
 					t.Fatalf("redundant ancestor prevented progress: %v", err)
 				}
 
-				e.updateIndex("k", nil, p)
+				e.updateIndex(logicalAddress("k"), nil, p)
 			}
 		})
 	}
@@ -116,7 +116,7 @@ func TestCheckCompetingBindsAncestry(t *testing.T) {
 			}
 
 			candidate := &pb.TransactionalBindEffect{Keys: []*pb.TransactionalBindEffect_KeyBind{
-				{Key: []byte("k"), ConsumedTips: toPbRefs(consumed)},
+				{Key: []byte(logicalAddress("k")), ConsumedTips: toPbRefs(consumed)},
 			}}
 
 			want := ""

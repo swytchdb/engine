@@ -151,7 +151,7 @@ func TestGraphDescriptorConcurrentBranchesAndSnapshot(t *testing.T) {
 		branches = append(branches, log.putEffect(entry))
 	}
 
-	state, _, err := e.reconstruct("graph", branches, "", false)
+	state, _, err := e.reconstruct(logicalAddress("graph"), branches, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +162,7 @@ func TestGraphDescriptorConcurrentBranchesAndSnapshot(t *testing.T) {
 		t.Fatal("concurrent metadata edits lost a peer or entry point")
 	}
 
-	reversed, _, err := e.reconstruct("graph", []Tip{branches[1], branches[0]}, "", false)
+	reversed, _, err := e.reconstruct(logicalAddress("graph"), []Tip{branches[1], branches[0]}, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,7 +204,7 @@ func TestGraphDescriptorConcurrentBranchesAndSnapshot(t *testing.T) {
 	})
 	fresh.index.Insert("graph", nil, keytrie.NewTipSet(snapshotTip))
 
-	restored, _, _, err := fresh.reconstructLocal("graph")
+	restored, _, _, err := fresh.reconstructLocal(logicalAddress("graph"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -218,7 +218,7 @@ func TestGraphDescriptorConcurrentBranchesAndSnapshot(t *testing.T) {
 	update := virt(makeDataEffect(31, keyedInsertRaw("peer-c", []byte("birds"))), pb.GraphRegionSubscriptionsKey)
 	update.Key, update.Deps = []byte("graph"), toPbRefs([]Tip{snapshotTip})
 
-	updated, _, err := fresh.reconstruct("graph", []Tip{freshLog.putEffect(update)}, "", false)
+	updated, _, err := fresh.reconstruct(logicalAddress("graph"), []Tip{freshLog.putEffect(update)}, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}

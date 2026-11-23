@@ -57,9 +57,13 @@ func historicalTestWrite(t *testing.T, e *Engine, values map[string]string, tran
 func historicalTestRead(t *testing.T, e *Engine, at time.Time, keys ...string) []*pb.ReducedEffect {
 	t.Helper()
 
+	for i, key := range keys {
+		keys[i] = logicalAddress(key)
+	}
+
 	ctx := context.Background()
 	frontier := func(key string) ([]Tip, error) {
-		return e.historicalFrontier(ctx, key, e.resolveTipDeps(e.index.Contains(key).Tips()), func(_ Tip, eff *pb.Effect) (bool, error) {
+		return e.historicalFrontier(ctx, key, e.resolveTipDeps(e.index.ContainsInternal(key).Tips()), func(_ Tip, eff *pb.Effect) (bool, error) {
 			if eff.GetNodeId() != uint64(e.NodeID()) {
 				return false, fmt.Errorf("test cut has no foreign clock mapping")
 			}

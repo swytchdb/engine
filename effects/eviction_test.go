@@ -76,8 +76,8 @@ func TestReclaim_KeepsUnreadKeyValue(t *testing.T) {
 func TestRefcount_ConcurrentReadsVsReclaim(t *testing.T) {
 	log := newSnapshotLog()
 	e := newSnapshotEngine(log)
-	e.index.SetEvictHooks(
-		func(key string) bool { return !isSystemKey([]byte(key)) },
+	e.index.SetEvictHooksInternal(
+		func(key string) bool { return !isSystemKey([]byte(wireKey(key))) },
 		e.onLeafEvicted,
 		func() bool { return true },
 	)
@@ -161,8 +161,8 @@ func TestRefcount_ConcurrentReadsVsReclaim(t *testing.T) {
 func TestRefcount_SubscriptionLifecycleEvictAll(t *testing.T) {
 	log := newSnapshotLog()
 	e := newSnapshotEngine(log)
-	e.index.SetEvictHooks(
-		func(key string) bool { return !isSystemKey([]byte(key)) },
+	e.index.SetEvictHooksInternal(
+		func(key string) bool { return !isSystemKey([]byte(wireKey(key))) },
 		e.onLeafEvicted,
 		func() bool { return true },
 	)
@@ -170,7 +170,7 @@ func TestRefcount_SubscriptionLifecycleEvictAll(t *testing.T) {
 	const n = 200
 	for i := range n {
 		key := fmt.Sprintf("user:s%d", i)
-		if err := e.ensureSubscribed(key); err != nil {
+		if err := e.ensureSubscribed(logicalAddress(key)); err != nil {
 			t.Fatalf("ensureSubscribed(%s): %v", key, err)
 		}
 
@@ -224,8 +224,8 @@ func TestRefcount_SubscriptionLifecycleEvictAll(t *testing.T) {
 func TestRefcount_ChurnEvictAllReclaimsPool(t *testing.T) {
 	log := newSnapshotLog()
 	e := newSnapshotEngine(log)
-	e.index.SetEvictHooks(
-		func(key string) bool { return !isSystemKey([]byte(key)) },
+	e.index.SetEvictHooksInternal(
+		func(key string) bool { return !isSystemKey([]byte(wireKey(key))) },
 		e.onLeafEvicted,
 		func() bool { return true },
 	)
@@ -258,7 +258,7 @@ func TestRefcount_ChurnEvictAllReclaimsPool(t *testing.T) {
 				consumed = keytrie.NewTipSet(curTip)
 			}
 
-			e.updateIndex(key, consumed, off)
+			e.updateIndex(logicalAddress(key), consumed, off)
 			curTip = off
 			hasCur = true
 
@@ -296,8 +296,8 @@ func TestRefcount_ChurnEvictAllReclaimsPool(t *testing.T) {
 func TestReleaseQueue_ZeroesDrainedEntries(t *testing.T) {
 	log := newSnapshotLog()
 	e := newSnapshotEngine(log)
-	e.index.SetEvictHooks(
-		func(key string) bool { return !isSystemKey([]byte(key)) },
+	e.index.SetEvictHooksInternal(
+		func(key string) bool { return !isSystemKey([]byte(wireKey(key))) },
 		e.onLeafEvicted,
 		func() bool { return true },
 	)
@@ -309,7 +309,7 @@ func TestReleaseQueue_ZeroesDrainedEntries(t *testing.T) {
 			Key: []byte(key), Hlc: sTs(int64(k + 1)), NodeId: 1,
 			Kind: &pb.Effect_Data{Data: scalarInsertRaw(fmt.Appendf(nil, "v%d", k))},
 		})
-		e.updateIndex(key, nil, off)
+		e.updateIndex(logicalAddress(key), nil, off)
 
 		if _, _, _, err := e.GetSnapshot(key); err != nil {
 			t.Fatalf("GetSnapshot(%s): %v", key, err)
@@ -359,8 +359,8 @@ func TestReleaseQueue_ZeroesDrainedEntries(t *testing.T) {
 func TestRefcount_EvictAllReclaimsPool(t *testing.T) {
 	log := newSnapshotLog()
 	e := newSnapshotEngine(log)
-	e.index.SetEvictHooks(
-		func(key string) bool { return !isSystemKey([]byte(key)) },
+	e.index.SetEvictHooksInternal(
+		func(key string) bool { return !isSystemKey([]byte(wireKey(key))) },
 		e.onLeafEvicted,
 		func() bool { return true },
 	)
@@ -519,7 +519,7 @@ func TestPublishSubdag_EvictedLeafRefusesPublish(t *testing.T) {
 	}
 
 	ls := &leafState{}
-	e.releaseChainRefs("user:k", nil, ls) // eviction already swept this leaf
+	e.releaseChainRefs(logicalAddress("user:k"), nil, ls) // eviction already swept this leaf
 
 	d := &dag{topoOrder: []Tip{tip}, lcaTip: tip}
 	e.publishSubdag(ls, d, []Tip{tip})
@@ -542,8 +542,8 @@ func TestPublishSubdag_EvictedLeafRefusesPublish(t *testing.T) {
 func TestEvictBounded_PinsSystemKey(t *testing.T) {
 	bc := &mockBroadcaster{}
 	e := newTestEngine(bc)
-	e.index.SetEvictHooks(
-		func(key string) bool { return !isSystemKey([]byte(key)) },
+	e.index.SetEvictHooksInternal(
+		func(key string) bool { return !isSystemKey([]byte(wireKey(key))) },
 		e.onLeafEvicted,
 		func() bool { return true },
 	)
@@ -707,7 +707,7 @@ func TestBroadcastUnsubscribe_EmitsUnsub(t *testing.T) {
 
 	tip := Tip{1, 42}
 
-	e.broadcastUnsubscribe(key, []Tip{tip})
+	e.broadcastUnsubscribe(logicalAddress(key), []Tip{tip})
 
 	if _, ok := e.subscriptions.Load(key); ok {
 		t.Fatal("did not drop subscription state")
@@ -776,7 +776,7 @@ func TestBroadcastUnsubscribe_HookSeesResidentVertex(t *testing.T) {
 		hookTip = offset
 		increfOK = e.effectCache.Incref(offset)
 	}
-	e.broadcastUnsubscribe(key, []Tip{{1, 42}})
+	e.broadcastUnsubscribe(logicalAddress(key), []Tip{{1, 42}})
 
 	if !increfOK {
 		t.Fatal("OnLocalEffect could not incref the just-emitted unsub — vertex not installed before the hook fired")
@@ -805,7 +805,7 @@ func TestBroadcastUnsubscribe_ShutdownShortCircuit(t *testing.T) {
 	e.subscriptions.Store(key, &subscriptionState{ready: make(chan struct{})})
 	e.closed.Store(true)
 
-	e.broadcastUnsubscribe(key, []Tip{{1, 42}})
+	e.broadcastUnsubscribe(logicalAddress(key), []Tip{{1, 42}})
 
 	if _, ok := e.subscriptions.Load(key); !ok {
 		t.Fatal("shutdown short-circuit failed; subscription was dropped")
@@ -901,7 +901,7 @@ func TestNewEngine_PinsSystemKeysInCache(t *testing.T) {
 func TestEvictBounded_CASProtectsConcurrentWrites(t *testing.T) {
 	bc := &mockBroadcaster{}
 	e := newTestEngine(bc)
-	e.index.SetEvictHooks(func(string) bool { return true }, e.onLeafEvicted, func() bool { return true })
+	e.index.SetEvictHooksInternal(func(string) bool { return true }, e.onLeafEvicted, func() bool { return true })
 
 	const (
 		key        = "user:contended"
@@ -929,7 +929,7 @@ func TestEvictBounded_CASProtectsConcurrentWrites(t *testing.T) {
 		go func() {
 			defer wg.Done()
 
-			e.updateIndex(key, nil, newTip)
+			e.updateIndex(logicalAddress(key), nil, newTip)
 		}()
 
 		wg.Wait()

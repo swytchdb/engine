@@ -50,7 +50,7 @@ type closureOperation struct {
 func newClosureOperation(e *Engine, attempted map[Tip]error) *closureOperation {
 	return &closureOperation{
 		engine: e, attempted: attempted, work: make(map[string]*closureWork),
-		cas: e.index.Insert,
+		cas: e.index.InsertInternal,
 	}
 }
 
@@ -125,7 +125,7 @@ func (op *closureOperation) run(key string, supplied []Tip, publish, failOnError
 	retry := false
 
 	for {
-		current := e.index.Contains(key)
+		current := e.index.ContainsInternal(key)
 
 		tips := supplied
 		if publish {
@@ -162,7 +162,7 @@ func (op *closureOperation) run(key string, supplied []Tip, publish, failOnError
 					defer otherMu.Unlock()
 					// Associated branches supply closure, not an index update on
 					// another key. Ingestion still owns bind publication ordering.
-					tips := slices.Concat(e.index.Contains(other).Tips(), pending[other])
+					tips := slices.Concat(e.index.ContainsInternal(other).Tips(), pending[other])
 					delete(pending, other)
 					walk(other, tips)
 				}()
@@ -192,7 +192,7 @@ func (op *closureOperation) run(key string, supplied []Tip, publish, failOnError
 
 		next := keytrie.NewTipSet(live...)
 
-		if e.index.Contains(key) != current {
+		if e.index.ContainsInternal(key) != current {
 			retry = true
 
 			continue

@@ -59,7 +59,7 @@ func asymmetricLottery(winner string) *Engine {
 				TxnVerdicts: map[string]pb.Verdict{item.txn: pb.Verdict_WON},
 			}},
 		})
-		e.updateIndex(item.key, nil, snap)
+		e.updateIndex(logicalAddress(item.key), nil, snap)
 	}
 
 	return e
@@ -122,7 +122,7 @@ func TestSnapshotReadView_ValidatesAssociatedFrontiers(t *testing.T) {
 	e := asymmetricLottery("alice")
 
 	v := newSnapshotReadView(e, context.Background())
-	if err := v.discover([]string{"payout:alice"}, v.capture); err != nil {
+	if err := v.discover([]string{logicalAddress("payout:alice")}, v.capture); err != nil {
 		t.Fatal(err)
 	}
 
@@ -132,7 +132,7 @@ func TestSnapshotReadView_ValidatesAssociatedFrontiers(t *testing.T) {
 	// The requested key stays unchanged; a newly learned competitor on its
 	// associated winner key must nevertheless invalidate the entire view.
 	bob, _ := e.effectCache.Get(e.index.Contains("payout:bob").Tips()[0])
-	e.updateIndex("winner", nil, r(bob.GetDeps()[0]))
+	e.updateIndex(logicalAddress("winner"), nil, r(bob.GetDeps()[0]))
 
 	if v.valid() {
 		t.Fatal("new cross-key competitor did not invalidate view")
@@ -200,7 +200,7 @@ func TestGetSnapshots_CloudFailureReturnsNoPartialBatch(t *testing.T) {
 
 func TestGetSnapshots_MissingBranchReturnsError(t *testing.T) {
 	e := newSnapshotEngine(newSnapshotLog())
-	e.updateIndex("missing-branch", nil, Tip{99, 99})
+	e.updateIndex(logicalAddress("missing-branch"), nil, Tip{99, 99})
 
 	got, err := e.NewReadOnlyContext().GetSnapshots([]string{"missing-branch"})
 	if err == nil || got != nil {
@@ -245,7 +245,7 @@ func TestGetSnapshots_PreservesTransactionReads(t *testing.T) {
 		}
 	}
 
-	if reader.keys["a"] == nil {
+	if reader.keys[logicalAddress("a")] == nil {
 		t.Fatal("transactional read was not recorded")
 	}
 }
@@ -274,7 +274,7 @@ func (h *batchInterleaveHandler) Handle(_ context.Context, record slog.Record) e
 		return true
 	})
 
-	if key == "a" {
+	if key == logicalAddress("a") {
 		h.reads++
 		// First a read is hydration/preflight. Second is materialization
 		// from the captured view, before b has been materialized.
@@ -296,7 +296,7 @@ func TestGetSnapshots_RetriesEntireBatchOnConcurrentWrite(t *testing.T) {
 			Key: []byte(key), NodeId: 1, Hlc: sTs(int64(log.nextOff)),
 			Kind: &pb.Effect_Data{Data: scalarInsertRaw([]byte("old"))},
 		})
-		e.updateIndex(key, nil, old)
+		e.updateIndex(logicalAddress(key), nil, old)
 		newTips[key] = log.putEffect(&pb.Effect{
 			Key: []byte(key), NodeId: 1, Hlc: sTs(int64(log.nextOff)),
 			Deps: []*pb.EffectRef{toPbRef(old)},
@@ -308,7 +308,7 @@ func TestGetSnapshots_RetriesEntireBatchOnConcurrentWrite(t *testing.T) {
 		Handler: slog.DiscardHandler,
 		afterFirstValue: func() {
 			for key, tip := range newTips {
-				e.updateIndex(key, e.index.Contains(key), tip)
+				e.updateIndex(logicalAddress(key), e.index.Contains(key), tip)
 			}
 		},
 	}

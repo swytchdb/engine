@@ -184,7 +184,7 @@ func TestBindConsumedTipsMatchEmittedDeps(t *testing.T) {
 			bindEff = eff
 			// The bind's NewTip on el-1 points to our committed data effect.
 			for _, kb := range b.GetKeys() {
-				if string(kb.GetKey()) != key {
+				if string(kb.GetKey()) != logicalAddress(key) {
 					continue
 				}
 
@@ -210,7 +210,7 @@ func TestBindConsumedTipsMatchEmittedDeps(t *testing.T) {
 	var consumed []Tip
 
 	for _, kb := range bindEff.GetTxnBind().GetKeys() {
-		if string(kb.GetKey()) == key {
+		if string(kb.GetKey()) == logicalAddress(key) {
 			consumed = fromPbRefs(kb.GetConsumedTips())
 		}
 	}

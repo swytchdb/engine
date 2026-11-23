@@ -37,6 +37,7 @@ import (
 	pb "github.com/swytchdb/engine/cluster/proto"
 	"github.com/swytchdb/engine/durability"
 	"github.com/swytchdb/engine/memsize"
+	"google.golang.org/protobuf/proto"
 )
 
 // vertexOverhead accounts for the wrapper and conservative concurrent-map slack.
@@ -270,7 +271,7 @@ func missingCreationKeys(eff *pb.Effect, existing []string, owns func([]byte) bo
 			add(kb.GetKey())
 		}
 	} else {
-		add(eff.GetKey())
+		add(eff.GetIKey())
 	}
 
 	slices.Sort(keys)
@@ -288,6 +289,26 @@ func (p *VertexPool) put(tip Tip, eff *pb.Effect, takeOwnership bool, owns func(
 // package installation uses it to protect cache-only records until their owner
 // has acquired its references, even with reclamation running concurrently.
 func (p *VertexPool) putWithPin(tip Tip, eff *pb.Effect, takeOwnership bool, owns func([]byte) bool, pin bool) error {
+	// Legacy callers may share their envelope across concurrent Put calls.
+	// Normalize a private envelope while preserving payload allocation ownership.
+	if len(eff.GetIKey()) == 0 {
+		original := eff
+		eff = &pb.Effect{
+			Key: original.GetKey(), Hlc: original.GetHlc(), NodeId: original.GetNodeId(),
+			Deps: original.GetDeps(), TxnId: original.GetTxnId(), ForkChoiceHash: original.GetForkChoiceHash(),
+			Virtual: original.GetVirtual(), EvidencePackage: original.GetEvidencePackage(), Kind: original.GetKind(),
+		}
+		eff.ProtoReflect().SetUnknown(original.ProtoReflect().GetUnknown())
+
+		if bind := original.GetTxnBind(); bind != nil {
+			eff.Kind = &pb.Effect_TxnBind{TxnBind: proto.Clone(bind).(*pb.TransactionalBindEffect)}
+		}
+	}
+
+	if err := prepareEffectAddress(eff); err != nil {
+		return err
+	}
+
 	if len(eff.GetEvidencePackage()) != 0 {
 		clean, release, err := p.installEvidencePackage(tip, eff)
 		if err != nil {

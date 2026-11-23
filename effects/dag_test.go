@@ -200,7 +200,7 @@ func TestOrdered_StableUnderGrowth(t *testing.T) {
 	c := orderedAppend(log, 30, 1, "id-c", []byte("c"), b)
 
 	// Initial: linear [a, b, c]
-	r1, _, err := e.reconstruct("k", []Tip{c}, "", false)
+	r1, _, err := e.reconstruct(logicalAddress("k"), []Tip{c}, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +217,7 @@ func TestOrdered_StableUnderGrowth(t *testing.T) {
 	ee := orderedAppend(log, 25, 3, "id-e", []byte("e"), d)
 
 	// Grown: same effects plus concurrent branch, tips = [c, ee]
-	r2, _, err := e.reconstruct("k", []Tip{c, ee}, "", false)
+	r2, _, err := e.reconstruct(logicalAddress("k"), []Tip{c, ee}, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -968,7 +968,7 @@ func TestCompaction_SnapshotAppearsInDAG(t *testing.T) {
 		t.Fatal("no tips in index")
 	}
 
-	d := newDag(e, "k", "")
+	d := newDag(e, logicalAddress("k"), "")
 
 	if err := d.prepare(tips.Tips()); err != nil {
 		t.Fatal(err)
@@ -1094,7 +1094,7 @@ func TestCompaction_BeaconPattern(t *testing.T) {
 		log.nodeID = oldNID
 		mu := e.GetLock(key)
 		mu.Lock()
-		e.updateIndex(key, nil, subTip)
+		e.updateIndex(logicalAddress(key), nil, subTip)
 		mu.Unlock()
 		t.Logf("planted remote subscription at %v after %d ticks", subTip, 80)
 	}
@@ -1105,7 +1105,7 @@ func TestCompaction_BeaconPattern(t *testing.T) {
 		t.Fatal("no tips in index")
 	}
 
-	d := newDag(e, key, "")
+	d := newDag(e, logicalAddress(key), "")
 
 	if err := d.prepare(tips.Tips()); err != nil {
 		t.Fatal(err)

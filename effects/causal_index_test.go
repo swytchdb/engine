@@ -81,7 +81,7 @@ func TestCausalIndex_AllSmallDAGs(t *testing.T) {
 		selected := append(slices.Clone(tips[:]), tips[0], tips[2])
 
 		for range 2 {
-			index := newCausalIndex(e, "k")
+			index := newCausalIndex(e, logicalAddress("k"))
 			before := e.effectCache.hits.Load()
 			chains := index.candidateChains(selected)
 
@@ -137,7 +137,7 @@ func TestCausalIndex_IncompleteOrCyclicHistory(t *testing.T) {
 				}
 			}
 
-			index := newCausalIndex(e, "k")
+			index := newCausalIndex(e, logicalAddress("k"))
 			if !index.reaches(first, second) || index.reaches(second, first) != cycle {
 				t.Fatal("missing history or cycle changed reachability")
 			}
@@ -158,7 +158,7 @@ func TestCausalIndex_ExtendsForConflictReporting(t *testing.T) {
 	e := newSnapshotEngine(log)
 	a := closureBind(log, "a", 1, []string{"winner"}, nil)
 	b := closureBind(log, "b", 2, []string{"winner"}, nil)
-	index := newCausalIndex(e, "winner")
+	index := newCausalIndex(e, logicalAddress("winner"))
 	tips := []Tip{a, b}
 	chains := index.candidateChains(tips)
 	// Reporting may discover a head from another key after candidate indexing.
@@ -184,7 +184,7 @@ func TestCausalIndex_MergesReuseChains(t *testing.T) {
 
 	e, tips := concurrentHistory(100, writers, 8, true)
 
-	index := newCausalIndex(e, "winner")
+	index := newCausalIndex(e, logicalAddress("winner"))
 	if !index.add(tips...) {
 		t.Fatal("acyclic history used fallback")
 	}
@@ -213,7 +213,7 @@ func TestLosersOnKey_SequentialHistoryPreservesLostVerdicts(t *testing.T) {
 		"0": {verdict: pb.Verdict_LOST},
 		"1": {verdict: pb.Verdict_WON},
 	}} {
-		losers, walked := e.losersOnKeyAt("winner", []Tip{tip}, nil, verdicts, nil, true)
+		losers, walked := e.losersOnKeyAt(logicalAddress("winner"), []Tip{tip}, nil, verdicts, nil, true)
 		if walked != 256 {
 			t.Fatalf("walked %d effects, want 256", walked)
 		}
@@ -249,7 +249,7 @@ func BenchmarkLosersOnKeySequentialHistory(b *testing.B) {
 			b.ResetTimer()
 
 			for b.Loop() {
-				losers, _ := e.losersOnKeyAt("winner", []Tip{tip}, nil, nil, nil, false)
+				losers, _ := e.losersOnKeyAt(logicalAddress("winner"), []Tip{tip}, nil, nil, nil, false)
 				if len(losers) != 0 {
 					b.Fatal(losers)
 				}

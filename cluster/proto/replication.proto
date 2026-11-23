@@ -357,6 +357,8 @@ message Effect {
   // Receivers install these before the owner and strip this field in the pool.
   repeated EvidenceRecord evidence_package = 8;
 
+  bytes i_key = 22; // complete trie address; absent = legacy logical key in key
+
   // The effect payload — exactly one of these is set.
   oneof kind {
     DataEffect data = 10;

@@ -65,7 +65,7 @@ func BenchmarkDAGPrepare(b *testing.B) {
 				b.ResetTimer()
 
 				for b.Loop() {
-					d := newDag(e, "key", "")
+					d := newDag(e, logicalAddress("key"), "")
 					if err := d.prepare(tips); err != nil {
 						b.Fatal(err)
 					}

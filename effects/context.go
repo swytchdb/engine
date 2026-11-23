@@ -200,7 +200,7 @@ func (c *Context) PendingKeys() []string {
 
 	out := make([]string, 0, len(c.keys))
 	for k := range c.keys {
-		out = append(out, k)
+		out = append(out, wireKey(k))
 	}
 
 	return out
@@ -231,6 +231,11 @@ func (c *Context) TraceCtx() context.Context {
 // yet in the context use the snapshot instead of the live index, and a
 // NOOP is emitted to record the read in the causal structure.
 func (c *Context) GetSnapshot(key string) (*pb.ReducedEffect, []Tip, error) {
+	return c.GetSnapshotInternal(logicalAddress(key))
+}
+
+// GetSnapshotInternal uses a complete trie address.
+func (c *Context) GetSnapshotInternal(key string) (*pb.ReducedEffect, []Tip, error) {
 	if c != nil && c.txSnapshot != nil && slog.Default().Enabled(c.TraceCtx(), slog.LevelDebug) {
 		s := c.txSnapshot
 
@@ -278,7 +283,7 @@ func (c *Context) getSnapshot(key string) (*pb.ReducedEffect, []Tip, error) {
 		// answered by engine.GetSnapshot's free-miss gate without announcing
 		// a subscription; with Cloud configured its backstop still checks
 		// durable storage before deciding the read is a miss.
-		result, tips, chainLen, err := c.engine.GetSnapshot(key)
+		result, tips, chainLen, err := c.engine.GetSnapshotInternal(key)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -292,7 +297,7 @@ func (c *Context) getSnapshot(key string) (*pb.ReducedEffect, []Tip, error) {
 		}
 
 		if !c.readOnly && result != nil && chainLen >= compactThreshold {
-			ls := c.engine.index.LoadData(key)
+			ls := c.engine.index.LoadDataInternal(key)
 
 			stamp := time.Since(compactionEpoch).Nanoseconds() + 1
 			if ls == nil || !ls.claimCompaction(stamp) {
@@ -332,7 +337,7 @@ func (c *Context) getSnapshot(key string) (*pb.ReducedEffect, []Tip, error) {
 			}
 
 			if err := c.Emit(&pb.Effect{
-				Key:  []byte(key),
+				Key: []byte(wireKey(key)), IKey: []byte(key),
 				Kind: &pb.Effect_Snapshot{Snapshot: snapEff},
 			}, tips); err != nil {
 				ls.lastCompaction.CompareAndSwap(stamp, 0)
@@ -368,7 +373,7 @@ func (c *Context) getSnapshot(key string) (*pb.ReducedEffect, []Tip, error) {
 			// committed-as-of-snapshot DAG as the first read did.
 			baseTips = c.engine.resolveTipDeps(ts.Tips())
 		}
-	} else if ts := c.engine.index.Contains(key); ts != nil {
+	} else if ts := c.engine.index.ContainsInternal(key); ts != nil {
 		baseTips = ts.Tips()
 	}
 
@@ -415,6 +420,16 @@ func (c *Context) getSnapshot(key string) (*pb.ReducedEffect, []Tip, error) {
 // Transactional and pending-effect contexts retain their SSI/read-your-writes
 // path, including read-set NOOPs; they must not switch to a live read view.
 func (c *Context) GetSnapshots(keys []string) ([]*pb.ReducedEffect, error) {
+	internalKeys := make([]string, len(keys))
+	for i, key := range keys {
+		internalKeys[i] = logicalAddress(key)
+	}
+
+	return c.GetSnapshotsInternal(internalKeys)
+}
+
+// GetSnapshotsInternal reads complete trie addresses.
+func (c *Context) GetSnapshotsInternal(keys []string) ([]*pb.ReducedEffect, error) {
 	results := make([]*pb.ReducedEffect, len(keys))
 	if c == nil {
 		return results, nil
@@ -444,7 +459,7 @@ func (c *Context) GetSnapshots(keys []string) ([]*pb.ReducedEffect, error) {
 		for i, key := range keys {
 			var err error
 
-			results[i], _, err = c.GetSnapshot(key)
+			results[i], _, err = c.GetSnapshotInternal(key)
 			if err != nil {
 				return nil, err
 			}
@@ -453,7 +468,7 @@ func (c *Context) GetSnapshots(keys []string) ([]*pb.ReducedEffect, error) {
 		return results, nil
 	}
 
-	results, err := c.engine.GetSnapshots(c.TraceCtx(), keys)
+	results, err := c.engine.GetSnapshotsInternal(c.TraceCtx(), keys)
 	if err != nil {
 		return nil, err
 	}
@@ -497,7 +512,7 @@ func (c *Context) getSnapshotFromTx(key string) (*pb.ReducedEffect, []Tip, error
 	// from SSI validation and the Bind, allowing absent-key write skew.
 	// Emit retains the frozen data frontier, adding only subscription metadata.
 	if err := c.Emit(&pb.Effect{
-		Key:  []byte(key),
+		Key: []byte(wireKey(key)), IKey: []byte(key),
 		Kind: &pb.Effect_Noop{Noop: &pb.NoopEffect{}},
 	}, snapshotTips); err != nil {
 		slog.Error("getSnapshotFromTx: NOOP emit failed", "key", key, "error", err)
@@ -522,6 +537,11 @@ func (c *Context) getSnapshotFromTx(key string) (*pb.ReducedEffect, []Tip, error
 // consult failed for an evicted key) must not silently record hadData=false —
 // the EXEC verdict would then rest on a fabricated observation.
 func (c *Context) Watch(key string) error {
+	return c.WatchInternal(logicalAddress(key))
+}
+
+// WatchInternal uses a complete trie address.
+func (c *Context) WatchInternal(key string) error {
 	// An observation writes a NOOP into causal history. Reuse the ordinary
 	// compaction path before recording it, including for read-only callers.
 	c.readOnly = false
@@ -537,7 +557,7 @@ func (c *Context) Watch(key string) error {
 	}
 
 	// Check if key has actual data BEFORE emitting the NOOP
-	snap, _, err := c.GetSnapshot(key)
+	snap, _, err := c.GetSnapshotInternal(key)
 	if err != nil {
 		return err
 	}
@@ -549,7 +569,7 @@ func (c *Context) Watch(key string) error {
 	// MULTI (c.inTx); WATCH is pre-MULTI but the noop still belongs
 	// to the upcoming tx.
 	if err := c.Emit(&pb.Effect{
-		Key:   []byte(key),
+		Key: []byte(wireKey(key)), IKey: []byte(key),
 		TxnId: c.txnID,
 		Kind:  &pb.Effect_Noop{Noop: &pb.NoopEffect{}},
 	}); err != nil {
@@ -568,7 +588,7 @@ func (c *Context) Watch(key string) error {
 	}
 
 	// Capture the post-flush TipSet pointer (immutable — pointer identity = equality)
-	tips := c.engine.index.Contains(key)
+	tips := c.engine.index.ContainsInternal(key)
 	c.watchedKeys[key] = &watchedKeyState{
 		noopOffset: noopOffset,
 		tips:       tips,
@@ -639,7 +659,7 @@ func (c *Context) CheckWatches() bool {
 	// Validate watched keys — same check a subscriber would perform
 	currentFlushGen := c.engine.flushGeneration.Load()
 	for key, ws := range c.watchedKeys {
-		currentTips := c.engine.index.Contains(key)
+		currentTips := c.engine.index.ContainsInternal(key)
 		if ws.tips == currentTips {
 			continue // TipSet pointer identical — no change
 		}
@@ -668,7 +688,7 @@ func (c *Context) CheckWatches() bool {
 	// key was modified (the fork is structurally detectable by any node).
 	for key, ws := range c.watchedKeys {
 		if err := c.Emit(&pb.Effect{
-			Key:  []byte(key),
+			Key: []byte(wireKey(key)), IKey: []byte(key),
 			Kind: &pb.Effect_Noop{Noop: &pb.NoopEffect{}},
 		}, []Tip{ws.noopOffset}); err != nil {
 			slog.Error("CheckWatches: transactional NOOP emit failed", "key", key, "error", err)
@@ -714,13 +734,17 @@ func (c *Context) Abort() {
 // tips the handler actually read, not whatever the index contains now.
 // Pure writes (SET, LPUSH) omit snapshotTips and Emit reads the index.
 func (c *Context) Emit(eff *pb.Effect, snapshotTips ...[]Tip) error {
+	if err := prepareEffectAddress(eff); err != nil {
+		return err
+	}
+
 	c.engine.pinHistory(&c.history)
 
 	if c.readErr != nil {
 		return c.readErr
 	}
 
-	key := string(eff.GetKey())
+	key := string(eff.GetIKey())
 
 	// The effect must dep-reference our own SubscriptionEffect, or the
 	// subscription's offset is orphaned in this node's DAG and the subscriber
@@ -772,7 +796,7 @@ func (c *Context) Emit(eff *pb.Effect, snapshotTips ...[]Tip) error {
 				return err
 			}
 		} else {
-			tips = c.engine.index.Contains(key)
+			tips = c.engine.index.ContainsInternal(key)
 		}
 
 		if c.inTx {
@@ -782,7 +806,7 @@ func (c *Context) Emit(eff *pb.Effect, snapshotTips ...[]Tip) error {
 			// retries abort forever on an already-spoken subscription tip.
 			// Never adopt newer data, binds, or snapshots from the live index.
 			deps := append([]Tip(nil), tips.Tips()...)
-			for _, tip := range c.engine.index.Contains(key).Tips() {
+			for _, tip := range c.engine.index.ContainsInternal(key).Tips() {
 				if parent, ok := c.engine.effectCache.Get(tip); ok && parent.GetSubscription() != nil {
 					deps = append(deps, tip)
 				}
@@ -904,6 +928,8 @@ func (c *Context) Emit(eff *pb.Effect, snapshotTips ...[]Tip) error {
 // cache memory is immutable and never recycled, so aliasing it is safe.
 func ownEffectBytes(eff *pb.Effect) {
 	eff.Key = bytes.Clone(eff.GetKey())
+
+	eff.IKey = bytes.Clone(eff.GetIKey())
 	switch k := eff.GetKind().(type) {
 	case *pb.Effect_Data:
 		d := k.Data
@@ -966,11 +992,15 @@ func (c *Context) applySubOps(key string, ck *contextKey) {
 // effect (Key, Hlc, NodeId, ForkChoiceHash, TxnId, Deps, Kind).
 // Returns the log offset and the constructed OffsetNotify.
 func (c *Context) rawEmit(eff *pb.Effect) (Tip, *pb.OffsetNotify, error) {
+	if err := prepareEffectAddress(eff); err != nil {
+		return Tip{}, nil, err
+	}
+
 	offset := c.engine.nextOffset()
 
 	if slog.Default().Enabled(c.TraceCtx(), slog.LevelDebug) {
 		slog.Debug("Emit: wrote effect",
-			"key", string(eff.GetKey()), "offset", offset, "deps", eff.GetDeps(), "tx", eff.GetTxnId() != "")
+			"key", string(eff.GetIKey()), "offset", offset, "deps", eff.GetDeps(), "tx", eff.GetTxnId() != "")
 	}
 
 	// Marshal once and reuse the length for the pool's byte accounting (avoids
@@ -1054,7 +1084,7 @@ func (c *Context) flushNonTx() error {
 
 	for key, ck := range c.keys {
 		// Handle flush-all: wipe index before broadcasting
-		if key == FlushKey {
+		if key == logicalAddress(FlushKey) {
 			slog.Info("Flush: flush-all effect, wiping index")
 
 			if err := c.engine.FlushIndex(); err != nil {
@@ -1152,12 +1182,12 @@ func (c *Context) flushNonTx() error {
 			c.engine.ownFilterAdd(key)
 
 			if c.engine.OnKeyDataAdded != nil {
-				c.engine.OnKeyDataAdded(key)
+				c.engine.OnKeyDataAdded(wireKey(key))
 			}
 		}
 
 		if ck.shouldNotifyDelete && c.engine.OnKeyDeleted != nil {
-			c.engine.OnKeyDeleted(key)
+			c.engine.OnKeyDeleted(wireKey(key))
 		}
 
 		delete(c.keys, key)
@@ -1351,7 +1381,7 @@ func (c *Context) flushTx() error {
 				c.engine.pendingTxTips.Delete(ck3.lastOffset)
 			}
 			// Check serialization escalation (only if no leader already active)
-			if c.engine.CheckSerializationLeader(key) == nil && c.engine.incrementAbortCount(key) {
+			if c.engine.CheckSerializationLeaderInternal(key) == nil && c.engine.incrementAbortCount(key) {
 				slog.Info("adaptive serialization: abort threshold exceeded",
 					"key", key, "threshold", DefaultSerializationThreshold)
 				c.emitSerializationEffect(key)
@@ -1366,8 +1396,20 @@ func (c *Context) flushTx() error {
 	// One hash, reused for the bind effect, the void check, and the pending
 	// txn record — all keyed on (nodeID, hlcTs), so recomputing would be waste.
 	bindHash := ComputeForkChoiceHash(c.engine.nodeID, hlcTs)
+
+	canonicalKey := bind.GetKeys()[0].GetKey()
+	for _, kb := range bind.GetKeys() {
+		if len(keytrie.WireKeyBytes(kb.GetKey())) == len(kb.GetKey()) {
+			// A graph-containing bind uses a graph wire identity. Legacy
+			// application subscribers cannot interpret its addressed keys.
+			canonicalKey = kb.GetKey()
+
+			break
+		}
+	}
+
 	bindEff := &pb.Effect{
-		Key:            bind.GetKeys()[0].GetKey(), // use first key as canonical
+		Key: bytes.Clone(keytrie.WireKeyBytes(canonicalKey)), IKey: canonicalKey,
 		Hlc:            hlcTs,
 		NodeId:         uint64(c.engine.nodeID),
 		ForkChoiceHash: bindHash,
@@ -1640,7 +1682,7 @@ func (c *Context) flushTx() error {
 
 		// Check serialization escalation (only if no leader already active)
 		for _, pk := range ptxn.keys {
-			if c.engine.CheckSerializationLeader(pk.key) == nil && c.engine.incrementAbortCount(pk.key) {
+			if c.engine.CheckSerializationLeaderInternal(pk.key) == nil && c.engine.incrementAbortCount(pk.key) {
 				slog.Info("adaptive serialization: abort threshold exceeded",
 					"key", pk.key, "threshold", DefaultSerializationThreshold)
 				c.emitSerializationEffect(pk.key)
@@ -1670,12 +1712,12 @@ func (c *Context) flushTx() error {
 			c.engine.ownFilterAdd(key)
 
 			if c.engine.OnKeyDataAdded != nil {
-				c.engine.OnKeyDataAdded(key)
+				c.engine.OnKeyDataAdded(wireKey(key))
 			}
 		}
 
 		if ck.shouldNotifyDelete && c.engine.OnKeyDeleted != nil {
-			c.engine.OnKeyDeleted(key)
+			c.engine.OnKeyDeleted(wireKey(key))
 		}
 	}
 
@@ -1701,7 +1743,7 @@ func (c *Context) emitSerializationEffect(key string) {
 
 	ctx := c.engine.NewContext()
 	if err := ctx.Emit(&pb.Effect{
-		Key: []byte(key),
+		Key: []byte(wireKey(key)), IKey: []byte(key),
 		Kind: &pb.Effect_Serialization{Serialization: &pb.SerializationEffect{
 			LeaderNodeId: uint64(leader),
 		}},
@@ -1743,7 +1785,7 @@ func (e *Engine) updateIndex(key string, initialTips *keytrie.TipSet, lastOffset
 			slog.Debug("updateIndex: CAS retry", "key", key, "attempt", attempt)
 		}
 
-		current := e.index.Contains(key)
+		current := e.index.ContainsInternal(key)
 
 		var offsets []Tip
 
@@ -1758,7 +1800,7 @@ func (e *Engine) updateIndex(key string, initialTips *keytrie.TipSet, lastOffset
 		offsets = append(offsets, lastOffset)
 
 		newTips := keytrie.NewTipSet(offsets...)
-		if _, ok := e.index.Insert(key, current, newTips); ok {
+		if _, ok := e.index.InsertInternal(key, current, newTips); ok {
 			// Insert fires the trie's refDelta hook (applyRefDelta), which
 			// increfs the added tips and decrefs the consumed ones — no manual
 			// refcount call here.

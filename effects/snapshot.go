@@ -165,7 +165,7 @@ func (e *Engine) prepareDag(d *dag, key string, tips []Tip) error {
 		return d.prepare(tips)
 	}
 
-	ls, _ := e.index.LoadOrStoreData(key, &leafState{})
+	ls, _ := e.index.LoadOrStoreDataInternal(key, &leafState{})
 	if ls == nil {
 		return d.prepare(tips)
 	}
@@ -289,16 +289,16 @@ func (e *Engine) installBoundSubdags(root *dag) {
 
 				seen[b] = true
 
-				if _, subscribed := e.subscriptions.Load(key); !subscribed {
+				if _, subscribed := e.subscription(key); !subscribed {
 					continue
 				}
 
-				tips := e.index.Contains(key)
+				tips := e.index.ContainsInternal(key)
 				if tips != nil && tips.Contains(offset) {
 					continue
 				}
 
-				if ls := e.index.LoadData(key); ls != nil && tips != nil {
+				if ls := e.index.LoadDataInternal(key); ls != nil && tips != nil {
 					if cs := ls.subdag.Load(); cs != nil && cs != evictedSubdag &&
 						tipsEqual(cs.tips, tips.Tips()) && slices.Contains(cs.topoOrder, offset) {
 						continue
@@ -311,7 +311,7 @@ func (e *Engine) installBoundSubdags(root *dag) {
 				// Do not add a redundant ancestor to a live frontier: a
 				// transaction can capture it before the next read prunes it,
 				// then mistake that pruning for a concurrent write at Flush.
-				candidates, _, err := NormalizeCloudTipCandidates(key, []Tip{offset}, tips.Tips(), func(t Tip) (*pb.Effect, error) {
+				candidates, _, err := normalizeCloudTipCandidates(key, []Tip{offset}, tips.Tips(), func(t Tip) (*pb.Effect, error) {
 					return e.getEffect(key, t)
 				})
 				if err != nil || len(candidates) == 0 {
@@ -567,6 +567,11 @@ func filterSnapshotAt(result *pb.ReducedEffect, now time.Time) *pb.ReducedEffect
 // the index tip set and reconstructs via ReduceBranch + canonical merge.
 // Unavailable ancestry returns an error, never a successful missing value.
 func (e *Engine) GetSnapshot(key string) (*pb.ReducedEffect, []Tip, int, error) {
+	return e.GetSnapshotInternal(logicalAddress(key))
+}
+
+// GetSnapshotInternal uses a complete trie address.
+func (e *Engine) GetSnapshotInternal(key string) (*pb.ReducedEffect, []Tip, int, error) {
 	// Free miss: nothing local (no tips, no subscription record) and no peer
 	// filter admits the key — there is no state to bootstrap and no writer to
 	// hear from, so announcing a subscription would be pure DAG noise (on
@@ -594,7 +599,7 @@ func (e *Engine) GetSnapshot(key string) (*pb.ReducedEffect, []Tip, int, error) 
 	// for this leaf's residency; subscriptions reconcile subsequent changes.
 	if result == nil && e.cloudReader != nil && e.subscriptionOnlyTips(tips) &&
 		(e.inMajorityPartition() || e.modeForKey(key) == UnsafeMode) {
-		ls, _ := e.index.LoadOrStoreData(key, &leafState{})
+		ls, _ := e.index.LoadOrStoreDataInternal(key, &leafState{})
 		if ls == nil || !ls.cloudConsulted.Load() {
 			if ls != nil {
 				ls.cloudMu.Lock()
@@ -627,7 +632,7 @@ func (e *Engine) GetSnapshot(key string) (*pb.ReducedEffect, []Tip, int, error) 
 
 				if ls == nil {
 					// The hydrate may have just created the leaf.
-					ls, _ = e.index.LoadOrStoreData(key, &leafState{})
+					ls, _ = e.index.LoadOrStoreDataInternal(key, &leafState{})
 				}
 
 				if ls != nil {
@@ -680,7 +685,7 @@ func (e *Engine) awaitSubscription(existing *subscriptionState, unsafe, allowAsy
 			existing.announcement = nil
 			existing.bootstrapMu.Unlock()
 			// Retry work may outlive this caller's borrowed key buffer.
-			return e.bootstrapSubscription(string(notify.GetKey()), existing, notify, unsafe)
+			return e.bootstrapSubscription(logicalAddress(string(notify.GetKey())), existing, notify, unsafe)
 		}
 		existing.bootstrapMu.Unlock()
 		<-existing.ready
@@ -707,11 +712,11 @@ func (e *Engine) awaitSubscription(existing *subscriptionState, unsafe, allowAsy
 // claim on it means there is nothing to announce — a later write (or a peer's
 // claim) puts it on the subscribe path like any other key.
 func (e *Engine) freeMissEligible(key string) bool {
-	if _, ok := e.subscriptions.Load(key); ok {
+	if _, ok := e.subscription(key); ok {
 		return false // already subscribed; ensureSubscribed is a cheap no-op
 	}
 
-	if e.index.Contains(key) != nil {
+	if e.index.ContainsInternal(key) != nil {
 		return false // we hold state (peer arrivals, backfill): formalize authority
 	}
 
@@ -719,7 +724,7 @@ func (e *Engine) freeMissEligible(key string) bool {
 		return false // a peer may hold it: bootstrap required
 	}
 
-	if e.cloudReader != nil && e.cloudReader.MayHold(key) {
+	if e.cloudReader != nil && e.cloudReader.MayHold(wireKey(key)) {
 		// Cloud may hold it: the consult path below needs the subscription's
 		// leaf to anchor the cloudConsulted marker that caps WAN round-trips.
 		return false
@@ -753,7 +758,7 @@ func (e *Engine) subscriptionOnlyTips(tips []Tip) bool {
 func (e *Engine) reconstructLocal(key string) (*pb.ReducedEffect, []Tip, int, error) {
 	// Read index tips once — these are the tips the returned snapshot
 	// corresponds to.
-	indexTips := e.index.Contains(key)
+	indexTips := e.index.ContainsInternal(key)
 
 	var snapshotTips []Tip
 	if indexTips != nil {
@@ -850,20 +855,21 @@ func (e *Engine) ensureSubscribedMode(key string, allowAsync bool) error {
 	// Allocation-free fast path: Emit calls this on every effect, so the
 	// already-subscribed case must not pay the state+channel allocation the
 	// LoadOrStore below needs.
-	if existing, ok := e.subscriptions.Load(key); ok {
+	if existing, ok := e.subscription(key); ok {
 		return e.awaitSubscription(existing, isUnsafe, allowAsync)
 	}
 	// Callers on the Redis hot path may borrow key from a pooled command
 	// buffer. A new subscription outlives that command, so own the map/trie key
 	// before publishing any state. The already-subscribed path above remains
 	// allocation-free.
-	ownedKey := e.retainKey(key)
+	ownedName := e.retainKey(ownerKey(key))
+	ownedKey := logicalAddress(ownedName)
 
 	state := &subscriptionState{ready: make(chan struct{}), ownedKey: true}
 	state.bootstrapMu.Lock()
-	if existing, loaded := e.subscriptions.LoadOrStore(ownedKey, state); loaded {
+	if existing, loaded := e.subscriptions.LoadOrStore(ownedName, state); loaded {
 		state.bootstrapMu.Unlock()
-		e.releaseKey(ownedKey)
+		e.releaseKey(ownedName)
 
 		return e.awaitSubscription(existing, isUnsafe, allowAsync)
 	}
@@ -874,7 +880,7 @@ func (e *Engine) ensureSubscribedMode(key string, allowAsync bool) error {
 
 	hlc := timestamppb.New(e.clock.Now())
 	eff := &pb.Effect{
-		Key:            []byte(ownedKey),
+		Key: []byte(wireKey(ownedKey)), IKey: []byte(ownedKey),
 		Hlc:            hlc,
 		NodeId:         uint64(e.nodeID),
 		ForkChoiceHash: ComputeForkChoiceHash(e.nodeID, hlc),
@@ -952,11 +958,12 @@ func (e *Engine) bootstrapSubscription(ownedKey string, state *subscriptionState
 
 	// Register bootstrap collector before broadcasting so NACKs aren't missed
 	collector := &bootstrapCollector{
+		key:   ownedKey,
 		nacks: make(chan *pb.NackNotify, 64),
 	}
 
-	e.pendingBootstraps.Store(ownedKey, collector)
-	defer e.pendingBootstraps.Delete(ownedKey)
+	e.pendingBootstraps.Store(wireKey(ownedKey), collector)
+	defer e.pendingBootstraps.Delete(wireKey(ownedKey))
 
 	// Send to each peer individually and wait for ACKs. Retry if no peers
 	// responded (e.g. noise sessions not yet established after restart).
@@ -1087,7 +1094,7 @@ done:
 // unsubscribed peer would re-establish it as a holder and defeat eviction.
 // Verdict snapshots (State == nil) carry no subscribers and are skipped.
 func (e *Engine) seedSubscribersFromDag(key string) {
-	cs := e.index.Contains(key)
+	cs := e.index.ContainsInternal(key)
 	if cs == nil {
 		return
 	}
@@ -1286,7 +1293,7 @@ func (e *Engine) reconstructWithView(key string, tips []Tip, txID string, waitFo
 			var walkedByKey map[string]int
 
 			atomicallyLost, walkedByKey = e.losersOnKeysAt(bindsByKey, func(k string) []Tip {
-				return e.index.Contains(k).Tips()
+				return e.index.ContainsInternal(k).Tips()
 			}, snapshotVerdicts, invisible, true)
 			for k, walked := range walkedByKey {
 				if k != key {
@@ -1510,7 +1517,7 @@ func (e *Engine) reconstructWithView(key string, tips []Tip, txID string, waitFo
 			}
 		}
 
-		currentIndex := e.index.Contains(key)
+		currentIndex := e.index.ContainsInternal(key)
 		hasCommitted := false
 
 		var stale []Tip
@@ -1529,7 +1536,7 @@ func (e *Engine) reconstructWithView(key string, tips []Tip, txID string, waitFo
 
 		if hasCommitted && len(stale) > 0 {
 			slog.Debug("reconstruct: pruning stale tips", "key", key, "stale", stale)
-			e.index.RemoveTips(key, stale)
+			e.index.RemoveTipsInternal(key, stale)
 		}
 	}
 
@@ -1699,7 +1706,7 @@ func (e *Engine) bindKeyClosure(startKey string) (map[string][]Tip, verdictMap, 
 			return nil, err
 		}
 
-		return e.index.Contains(key).Tips(), nil
+		return e.index.ContainsInternal(key).Tips(), nil
 	}, false)
 }
 
@@ -1804,7 +1811,7 @@ func (e *Engine) losersOnKey(key string, extraTips []Tip, snapshotVerdicts verdi
 		isInvisible = e.horizon.IsInvisible
 	}
 
-	return e.losersOnKeyAt(key, e.index.Contains(key).Tips(), extraTips, snapshotVerdicts, isInvisible, true)
+	return e.losersOnKeyAt(key, e.index.ContainsInternal(key).Tips(), extraTips, snapshotVerdicts, isInvisible, true)
 }
 
 func (e *Engine) losersOnKeyAt(key string, tips, extraTips []Tip, snapshotVerdicts verdictMap, isInvisible func(string) bool, reportConflicts bool) (map[string]struct{}, int) {

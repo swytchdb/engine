@@ -156,13 +156,13 @@ func safetyPatternPrefix(pattern string) (int, bool) {
 
 // SafetyModeForKey reports the active projection, including pinned system keys.
 func (e *Engine) SafetyModeForKey(key string) SafetyMode {
-	return e.modeForKey(key)
+	return e.modeForKey(logicalAddress(key))
 }
 
 // Subscribe announces interest even in a currently absent key, and collects
 // existing peer tips before returning. Ordinary read misses may skip this.
 func (e *Engine) Subscribe(key string) error {
-	return e.ensureSubscribedBlocking(key)
+	return e.ensureSubscribedBlocking(logicalAddress(key))
 }
 
 // SetOnKeyChanged installs an index-change observer. It includes metadata,
@@ -181,6 +181,6 @@ func (e *Engine) SetOnKeyChanged(hook func(string)) {
 
 func (e *Engine) notifyKeyChanged(key string) {
 	if hook := e.keyChanged.Load(); hook != nil {
-		(*hook)(key)
+		(*hook)(wireKey(key))
 	}
 }

@@ -69,7 +69,7 @@ func TestCollectPeerTipsCountsACKsAndDiscardsFailedReplies(t *testing.T) {
 	for range 2 {
 		b.started.Add(len(peers))
 
-		tips, acknowledged := e.collectPeerTips("key", &pb.OffsetNotify{}, peers, []Tip{{1, 1}})
+		tips, acknowledged := e.collectPeerTips(logicalAddress("key"), &pb.OffsetNotify{}, peers, []Tip{{1, 1}})
 		if acknowledged != 2 || !slices.Equal(tips, []Tip{{1, 1}, {3, 10}, {3, 11}}) {
 			t.Fatalf("unexpected replies: %d acknowledged, tips %v", acknowledged, tips)
 		}

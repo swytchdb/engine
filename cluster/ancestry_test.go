@@ -11,6 +11,7 @@ import (
 	"github.com/quic-go/quic-go"
 	pb "github.com/swytchdb/engine/cluster/proto"
 	"github.com/swytchdb/engine/effects"
+	"github.com/swytchdb/engine/keytrie"
 )
 
 type countedAncestryReader struct {
@@ -92,7 +93,7 @@ func TestAncestryTransferHolderFallbackStreamingAndAbsence(t *testing.T) {
 	// First holder misses; the next serves multiple generations, crossing a
 	// snapshot. The unrelated fourth node must never be queried.
 	for _, root := range []uint64{130} {
-		if err := pms[0].FetchAncestry("k", effects.Tip{42, root}, []pb.NodeID{1, 2}, have, receive); err != nil {
+		if err := pms[0].FetchAncestry(keytrie.LogicalAddress("k"), effects.Tip{42, root}, []pb.NodeID{1, 2}, have, receive); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -109,7 +110,7 @@ func TestAncestryTransferHolderFallbackStreamingAndAbsence(t *testing.T) {
 	clear(local)
 	local[effects.Tip{42, 125}] = true
 
-	if err := pms[0].FetchAncestry("k", effects.Tip{42, 130}, []pb.NodeID{2}, have, receive); err != nil {
+	if err := pms[0].FetchAncestry(keytrie.LogicalAddress("k"), effects.Tip{42, 130}, []pb.NodeID{2}, have, receive); err != nil {
 		t.Fatal(err)
 	}
 
@@ -118,14 +119,14 @@ func TestAncestryTransferHolderFallbackStreamingAndAbsence(t *testing.T) {
 	}
 
 	missing := effects.Tip{42, 999}
-	if err := pms[0].FetchAncestry("k", missing, []pb.NodeID{1, 2}, have, receive); !errors.Is(err, effects.ErrEffectNotFound) {
+	if err := pms[0].FetchAncestry(keytrie.LogicalAddress("k"), missing, []pb.NodeID{1, 2}, have, receive); !errors.Is(err, effects.ErrEffectNotFound) {
 		t.Fatal(err)
 	}
 	// A missing response cannot hide an unavailable holder, including when
 	// the CDN also responds with a missing-blob error.
 	pms[0].SetCDNFetcher(&recordingCDN{err: effects.ErrCDNBlobMissing})
 
-	err := pms[0].FetchAncestry("k", missing, []pb.NodeID{99, 1}, have, receive)
+	err := pms[0].FetchAncestry(keytrie.LogicalAddress("k"), missing, []pb.NodeID{99, 1}, have, receive)
 	if err == nil || errors.Is(err, effects.ErrEffectNotFound) || errors.Is(err, effects.ErrCDNBlobMissing) {
 		t.Fatalf("unavailable holder masked: %v", err)
 	}
@@ -147,7 +148,7 @@ func TestAncestryResidentReaderScopesBindAndReportsBoundary(t *testing.T) {
 
 	var records []*pb.AncestryResponse
 
-	err := NewEngineLogReader(e.EffectCache()).ReadAncestry("k", root, func(r *pb.AncestryResponse) error {
+	err := NewEngineLogReader(e.EffectCache()).ReadAncestry(keytrie.LogicalAddress("k"), root, func(r *pb.AncestryResponse) error {
 		records = append(records, r)
 
 		return nil

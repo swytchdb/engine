@@ -13,7 +13,7 @@ func TestClosureAdmissionSerializesShardAcrossEntryPoints(t *testing.T) {
 	key, collision, independent := "k", "", ""
 	for i := 0; collision == "" || independent == ""; i++ {
 		candidate := fmt.Sprintf("key-%d", i)
-		if e.closureLock(candidate) == e.closureLock(key) {
+		if e.closureLock(logicalAddress(candidate)) == e.closureLock(logicalAddress(key)) {
 			collision = candidate
 		} else {
 			independent = candidate
@@ -38,7 +38,7 @@ func TestClosureAdmissionSerializesShardAcrossEntryPoints(t *testing.T) {
 	done := make(chan struct{}, 4)
 
 	go func() {
-		e.installIngestedTips(key, Tip{7, 1})
+		e.installIngestedTips(logicalAddress(key), Tip{7, 1})
 
 		done <- struct{}{}
 	}()
@@ -51,17 +51,17 @@ func TestClosureAdmissionSerializesShardAcrossEntryPoints(t *testing.T) {
 
 	// Recovery of the same key and ingestion of a colliding key both wait.
 	go func() {
-		_, _, _ = e.closeIngestedFrontier(key, []Tip{{8, 1}}, make(map[Tip]error))
+		_, _, _ = e.closeIngestedFrontier(logicalAddress(key), []Tip{{8, 1}}, make(map[Tip]error))
 
 		done <- struct{}{}
 	}()
 	go func() {
-		e.installIngestedTips(collision, Tip{9, 1})
+		e.installIngestedTips(logicalAddress(collision), Tip{9, 1})
 
 		done <- struct{}{}
 	}()
 	go func() {
-		e.installIngestedTips(independent, Tip{10, 1})
+		e.installIngestedTips(logicalAddress(independent), Tip{10, 1})
 
 		done <- struct{}{}
 	}()

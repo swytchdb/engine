@@ -42,6 +42,27 @@ import (
 // in UnmarshalEffect. The original *pb.Effect is not mutated; if any
 // sanitization is required the snapshot state is cloned first.
 func MarshalEffect(eff *pb.Effect) ([]byte, error) {
+	if len(eff.GetIKey()) != 0 && len(eff.GetTxnBind().GetKeys()) != 0 {
+		logicalOnly := true
+
+		for _, kb := range eff.GetTxnBind().GetKeys() {
+			if len(kb.GetKey()) == 0 || kb.GetKey()[0] != 0 {
+				logicalOnly = false
+
+				break
+			}
+		}
+
+		if logicalOnly {
+			eff = proto.Clone(eff).(*pb.Effect)
+
+			eff.IKey = nil
+			for _, kb := range eff.GetTxnBind().GetKeys() {
+				kb.Key = kb.GetKey()[1:]
+			}
+		}
+	}
+
 	state := eff.GetSnapshot().GetState()
 	if len(state.GetNetAdds()) > 0 || len(state.GetNetRemoves()) > 0 {
 		clone := proto.Clone(eff).(*pb.Effect)
@@ -64,7 +85,7 @@ func UnmarshalEffect(data []byte, eff *pb.Effect) error {
 		desanitizeReducedKeys(snap.GetState())
 	}
 
-	return nil
+	return prepareEffectAddress(eff)
 }
 
 // sanitizeReducedKeys hex-encodes the keys of NetAdds and NetRemoves in

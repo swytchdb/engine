@@ -216,14 +216,14 @@ func TestCreationOwnershipReleasesCapacity(t *testing.T) {
 	}
 
 	for _, key := range bind.GetKeys()[:127] {
-		p.decrefChainNode(string(key.GetKey()), tip)
+		p.decrefChainNode(logicalAddress(string(key.GetKey())), tip)
 	}
 
 	if len(v.creationKeys) != 1 || cap(v.creationKeys) > 8 {
 		t.Fatalf("one remaining owner retained capacity %d", cap(v.creationKeys))
 	}
 
-	p.decrefChainNode(string(bind.GetKeys()[127].GetKey()), tip)
+	p.decrefChainNode(logicalAddress(string(bind.GetKeys()[127].GetKey())), tip)
 
 	if v.creationKeys != nil || v.creationBytes != 0 || v.refs.Load() != 1 {
 		t.Fatal("released ownership retained storage or consumed the independent pin")
@@ -242,12 +242,12 @@ func TestSubscribersShrinkAndReturnIndependentSnapshots(t *testing.T) {
 	e.index.Insert("key", nil, keytrie.NewTipSet())
 
 	for id := pb.NodeID(2); id < 130; id++ {
-		e.addPeerSubscriber("key", id)
+		e.addPeerSubscriber(logicalAddress("key"), id)
 	}
 
 	before := e.PeerSubscribers("key")
 	for id := pb.NodeID(2); id < 129; id++ {
-		e.removePeerSubscriber("key", id)
+		e.removePeerSubscriber(logicalAddress("key"), id)
 	}
 
 	ls := e.index.LoadData("key")
@@ -262,7 +262,7 @@ func TestSubscribersShrinkAndReturnIndependentSnapshots(t *testing.T) {
 		t.Fatalf("caller mutation changed subscribers: %v", got)
 	}
 
-	e.removePeerSubscriber("key", 129)
+	e.removePeerSubscriber(logicalAddress("key"), 129)
 
 	if ls.subscribers != nil || e.subscriberBytes.Load() != 0 {
 		t.Fatal("empty subscriber set retained storage")
@@ -283,7 +283,7 @@ func TestPeerFiltersReleaseDepartedStorage(t *testing.T) {
 		t.Fatal("duplicate connection added a peer twice")
 	}
 
-	e.peerFilterAdd(129, "retained")
+	e.peerFilterAdd(129, logicalAddress("retained"))
 
 	for id := pb.NodeID(2); id < 129; id++ {
 		e.DropPeer(id)
@@ -306,7 +306,7 @@ func TestPeerFiltersReleaseDepartedStorage(t *testing.T) {
 
 	e.NotePeerConnected(129)
 
-	if !e.clusterMaybeHasKey("new-after-reconnect") {
+	if !e.clusterMaybeHasKey(logicalAddress("new-after-reconnect")) {
 		t.Fatal("reconnecting peer reused stale absence evidence")
 	}
 }

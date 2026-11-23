@@ -268,7 +268,7 @@ func (h *HorizonSet) makeGroupVisible(group *horizonGroup, txnID string) {
 		h.engine.ownFilterAdd(k)
 
 		if h.engine.OnKeyDataAdded != nil {
-			h.engine.OnKeyDataAdded(k)
+			h.engine.OnKeyDataAdded(wireKey(k))
 		}
 	}
 

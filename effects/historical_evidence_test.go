@@ -70,10 +70,10 @@ func TestHistoricalMembershipConsultsFrozenEvidence(t *testing.T) {
 			}
 
 			view := newSnapshotReadView(e, context.Background())
-			view.frontiers["a"] = snapshotFrontier{resolved: []Tip{frontier}}
+			view.frontiers[logicalAddress("a")] = snapshotFrontier{resolved: []Tip{frontier}}
 			view.verdicts = verdicts
 			s := &transactionSnapshot{
-				engine: e, views: map[string]*snapshotReadView{"a": view},
+				engine: e, views: map[string]*snapshotReadView{logicalAddress("a"): view},
 				decided: make(map[Tip]bool),
 			}
 			eff, _ := e.effectCache.Get(bind)
@@ -154,7 +154,7 @@ func TestHistoricalReadRetainsLiveCompetition(t *testing.T) {
 					engine: e, at: stn.Sample{Domain: 1, Tick: boundary},
 					expiryAt: time.Now(), clocks: e.clockEvidence(),
 				}
-				if err := s.prepare(context.Background(), []string{"winner"}); err != nil {
+				if err := s.prepare(context.Background(), []string{logicalAddress("winner")}); err != nil {
 					t.Fatal(err)
 				}
 
@@ -162,7 +162,7 @@ func TestHistoricalReadRetainsLiveCompetition(t *testing.T) {
 					t.Fatalf("fixture must select A and exclude its local competitor: A=%v excluded=%v", s.decided[a], s.decided[excluded])
 				}
 
-				v := s.views["winner"]
+				v := s.views[logicalAddress("winner")]
 				if _, lost := v.lost[loser]; !lost || len(v.lost) != 1 {
 					t.Errorf("lost=%v, want only %s", v.lost, loser)
 				}
@@ -173,9 +173,9 @@ func TestHistoricalReadRetainsLiveCompetition(t *testing.T) {
 					}
 				}
 
-				tips := slices.Concat(v.frontiers["winner"].resolved, v.anchors["winner"])
+				tips := slices.Concat(v.frontiers[logicalAddress("winner")].resolved, v.anchors[logicalAddress("winner")])
 
-				result, _, err := e.reconstructWithView("winner", tips, "reader", true, v)
+				result, _, err := e.reconstructWithView(logicalAddress("winner"), tips, "reader", true, v)
 				if err != nil || string(result.GetScalar().GetRaw()) != wantValue {
 					t.Fatalf("value=%q error=%v, want %q", result.GetScalar().GetRaw(), err, wantValue)
 				}
@@ -210,10 +210,10 @@ func TestHistoricalMembershipPreservesEquivalentFrozenProof(t *testing.T) {
 
 	e.effectCache.releaseEvidence(evidenceTips(proof))
 
-	e.updateIndex("a", nil, newer)
+	e.updateIndex(logicalAddress("a"), nil, newer)
 
 	live := newSnapshotReadView(e, context.Background())
-	if err := live.discover([]string{"a"}, live.capture); err != nil {
+	if err := live.discover([]string{logicalAddress("a")}, live.capture); err != nil {
 		t.Fatal(err)
 	}
 
@@ -221,8 +221,8 @@ func TestHistoricalMembershipPreservesEquivalentFrozenProof(t *testing.T) {
 		t.Fatalf("live fixture must use newer proof: %+v", entry)
 	}
 
-	view, err := e.historicalReadView(context.Background(), []string{"a"}, func(key string) ([]Tip, error) {
-		if key != "a" {
+	view, err := e.historicalReadView(context.Background(), []string{logicalAddress("a")}, func(key string) ([]Tip, error) {
+		if key != logicalAddress("a") {
 			t.Fatalf("unexpected value history requested: %s", key)
 		}
 
@@ -241,7 +241,7 @@ func TestHistoricalMembershipPreservesEquivalentFrozenProof(t *testing.T) {
 	}
 
 	s := &transactionSnapshot{
-		engine: e, views: map[string]*snapshotReadView{"a": view},
+		engine: e, views: map[string]*snapshotReadView{logicalAddress("a"): view},
 		decided: make(map[Tip]bool),
 	}
 	eff, _ := e.effectCache.Get(bind)

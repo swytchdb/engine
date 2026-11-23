@@ -299,7 +299,7 @@ func TestLogicalCallbacksKeepOriginalKeys(t *testing.T) {
 		t.Fatal("revival miscounted namespaces")
 	}
 
-	if refs[canonical] != 1 || refs["victim"] != 1 || len(refs) != 2 {
+	if refs[canonical] != 1 || refs["victim"] != 1 || refs["node/123"] != 1 || len(refs) != 3 {
 		t.Fatalf("ownership callbacks saw wrong keys: %v", refs)
 	}
 
@@ -312,7 +312,7 @@ func TestLogicalCallbacksKeepOriginalKeys(t *testing.T) {
 	}
 }
 
-func TestInternalEvictionWithLogicalKeyOwnership(t *testing.T) {
+func TestInternalEvictionWithSharedKeyOwnership(t *testing.T) {
 	c := NewCritbit[struct{}]()
 
 	t.Cleanup(func() { closeTestTrie(t, c) })
@@ -333,8 +333,8 @@ func TestInternalEvictionWithLogicalKeyOwnership(t *testing.T) {
 	c.InsertInternal("", nil, NewTipSet(tip(3)))
 	c.Insert("", nil, NewTipSet(tip(4)))
 
-	if len(refs) != 2 || refs["animal"] != 1 || refs[""] != 1 {
-		t.Fatalf("logical owners = %v", refs)
+	if len(refs) != 3 || refs["animal"] != 1 || refs["node"] != 1 || refs[""] != 2 {
+		t.Fatalf("key owners = %v", refs)
 	}
 
 	if c.EvictBatch(4) != 4 || c.Size() != 0 || c.SizeInternal() != 0 {

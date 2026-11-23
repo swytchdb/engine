@@ -200,11 +200,11 @@ func (c *Critbit[T]) LoadOrStoreData(key string, def *T) (*T, bool) {
 	return c.LoadOrStoreDataInternal(LogicalKeyPrefix+key, def)
 }
 
-// SetKeyOwnership installs ownership callbacks for unprefixed logical keys.
+// SetKeyOwnership installs ownership callbacks for all keys. Callbacks receive
+// unprefixed logical keys and unchanged keys outside the logical namespace.
 // Returned logical keys preserve the owner's canonical allocation. The trie
 // accounts separately for the prefixed key used for navigation. Configure only
-// on an empty trie before concurrent use. Raw keys outside the logical namespace
-// are owned by the trie and do not invoke these callbacks.
+// on an empty trie before concurrent use.
 func (c *Critbit[T]) SetKeyOwnership(retain func(string) string, release func(string)) {
 	if retain == nil || release == nil {
 		panic("keytrie: key ownership requires retain and release")
@@ -248,14 +248,14 @@ func (c *Critbit[T]) retainLeafKey(leaf *critNode[T], key string) {
 		return
 	}
 
-	if logical, ok := strings.CutPrefix(key, LogicalKeyPrefix); ok {
-		leaf.ownedKey = c.retainKey(logical)
-	}
+	leaf.ownedKey = c.retainKey(strings.TrimPrefix(key, LogicalKeyPrefix))
+	leaf.keyOwned = true
 }
 
 func (c *Critbit[T]) releaseLeafKey(leaf *critNode[T]) {
-	if c.releaseKey != nil && strings.HasPrefix(leaf.key, LogicalKeyPrefix) {
+	if leaf.keyOwned {
 		c.releaseKey(leaf.ownedKey)
+		leaf.keyOwned = false
 	}
 
 	leaf.ownedKey = ""

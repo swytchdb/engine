@@ -192,7 +192,7 @@ func TestDurabilityEvictionRemovesDiskRecord(t *testing.T) {
 	e := durableTestEngine(t, dir)
 	durableSet(t, e, "evict-me", "value")
 	tips := e.index.Contains("evict-me")
-	e.releaseChainRefs("evict-me", tips.Tips(), nil)
+	e.releaseChainRefs(logicalAddress("evict-me"), tips.Tips(), nil)
 	e.index.Delete("evict-me", tips)
 	e.reclaimUnreferenced()
 

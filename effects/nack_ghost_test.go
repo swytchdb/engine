@@ -226,7 +226,7 @@ func TestEnsureSubscribed_InstallsOnlyWalkableTips(t *testing.T) {
 	// GetSnapshot drives ensureSubscribed; we just need bootstrap to run.
 	// Use the blocking variant: this test exercises the synchronous tip-walk
 	// install path, which the async-announce shortcut would skip.
-	if err := e.ensureSubscribedBlocking(key); err != nil {
+	if err := e.ensureSubscribedBlocking(logicalAddress(key)); err != nil {
 		t.Fatalf("ensureSubscribed returned error on partial reachability: %v", err)
 	}
 
@@ -299,7 +299,7 @@ func TestEnsureSubscribed_AllTipsUnreachable_RetriesBootstrap(t *testing.T) {
 	defer e.closed.Store(true) // stop retryBootstrap on test exit
 
 	// Blocking variant: exercises the "all tips unreachable → retry" path.
-	err := e.ensureSubscribedBlocking(key)
+	err := e.ensureSubscribedBlocking(logicalAddress(key))
 	if !errors.Is(err, ErrBootstrapIncomplete) {
 		t.Fatalf("expected ErrBootstrapIncomplete, got %v", err)
 	}
@@ -371,7 +371,7 @@ func TestEnsureSubscribed_Partition_FailsCleanly(t *testing.T) {
 	e := newTestEngine(bc)
 	e.safety.Store(&safetyMap{defaultMode: SafeMode})
 
-	err := e.ensureSubscribed(key)
+	err := e.ensureSubscribed(logicalAddress(key))
 	if !errors.Is(err, ErrRegionPartitioned) {
 		t.Fatalf("expected ErrRegionPartitioned, got %v", err)
 	}
@@ -401,7 +401,7 @@ func TestEnsureSubscribed_Partition_UnsafeProceeds(t *testing.T) {
 
 	// Blocking variant: the async-announce fast path would trivially pass;
 	// the gate under test sits on the blocking bootstrap.
-	if err := e.ensureSubscribedBlocking(key); err != nil {
+	if err := e.ensureSubscribedBlocking(logicalAddress(key)); err != nil {
 		t.Fatalf("unsafe minority subscribe must not error, got %v", err)
 	}
 
@@ -439,7 +439,7 @@ func TestEnsureSubscribed_Unsafe_UnreachablePeersDoNotBlock(t *testing.T) {
 	// Blocking variant: the async-announce fast path would trivially pass;
 	// the retry loop under test sits on the blocking bootstrap.
 	start := time.Now()
-	err := e.ensureSubscribedBlocking(key)
+	err := e.ensureSubscribedBlocking(logicalAddress(key))
 	elapsed := time.Since(start)
 
 	if err != nil {
@@ -475,7 +475,7 @@ func TestRetryBootstrap_ShutdownUnblocksWaiters(t *testing.T) {
 	e := newTestEngine(bc)
 	e.safety.Store(&safetyMap{defaultMode: SafeMode})
 
-	if err := e.ensureSubscribedBlocking(key); !errors.Is(err, ErrBootstrapIncomplete) {
+	if err := e.ensureSubscribedBlocking(logicalAddress(key)); !errors.Is(err, ErrBootstrapIncomplete) {
 		t.Fatalf("expected ErrBootstrapIncomplete, got %v", err)
 	}
 

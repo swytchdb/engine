@@ -80,7 +80,7 @@ func TestTransactionOwnsBorrowedElementIDs(t *testing.T) {
 	clear(id)
 
 	for i, want := range []string{"field1", "field2"} {
-		if got := string(c.keys["k"].elementIDs[i]); got != want {
+		if got := string(c.keys[logicalAddress("k")].elementIDs[i]); got != want {
 			t.Fatalf("retained element ID %d = %q, want %q after buffer reuse", i, got, want)
 		}
 	}

@@ -149,10 +149,13 @@ func (cs *CloudSync) enqueueUpload(tip effects.Tip, eff *pb.Effect, frontier, ex
 			// last-ack transitions can't interleave their index calls. PinKey
 			// reports false when the key has no live leaf (the eviction path's own
 			// unsubscribe mint) — nothing to keep findable, nothing to unpin later.
-			entry = &pendingKeyEntry{
-				tips:   make(map[effects.Tip]struct{}),
-				pinned: cs.engine.PinKey(k),
+			entry = &pendingKeyEntry{tips: make(map[effects.Tip]struct{})}
+			if len(eff.GetIKey()) != 0 {
+				entry.pinned = cs.engine.PinKeyInternal(string(eff.GetIKey()))
+			} else {
+				entry.pinned = cs.engine.PinKey(k)
 			}
+
 			cs.pendingKeys[k] = entry
 		}
 
@@ -328,7 +331,11 @@ func (cs *CloudSync) retire(tip effects.Tip) bool {
 				// Last un-acked upload on this key drained: the key is
 				// cloud-durable, eviction may take it again.
 				if entry.pinned {
-					cs.engine.UnpinKey(k)
+					if len(upload.effect.GetIKey()) != 0 {
+						cs.engine.UnpinKeyInternal(string(upload.effect.GetIKey()))
+					} else {
+						cs.engine.UnpinKey(k)
+					}
 				}
 			}
 		}

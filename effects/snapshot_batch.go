@@ -75,7 +75,7 @@ func (v *snapshotReadView) capture(key string) ([]Tip, error) {
 			}
 		}
 
-		tips := v.engine.index.Contains(key)
+		tips := v.engine.index.ContainsInternal(key)
 		frontier = snapshotFrontier{index: tips, resolved: v.engine.resolveTipDeps(tips.Tips())}
 		v.frontiers[key] = frontier
 	}
@@ -109,7 +109,7 @@ func (v *snapshotReadView) valid() bool {
 	}
 
 	for key, frontier := range v.frontiers {
-		if v.engine.index.Contains(key) != frontier.index ||
+		if v.engine.index.ContainsInternal(key) != frontier.index ||
 			!tipsEqual(frontier.resolved, v.engine.resolveTipDeps(frontier.index.Tips())) {
 			return false
 		}
@@ -191,6 +191,16 @@ func (v *snapshotReadView) discoverWithEvidence(keys []string, frontier func(str
 // or concurrent writes that change any captured input restart the whole batch;
 // no values from a discarded attempt are returned.
 func (e *Engine) GetSnapshots(ctx context.Context, keys []string) ([]*pb.ReducedEffect, error) {
+	internalKeys := make([]string, len(keys))
+	for i, key := range keys {
+		internalKeys[i] = logicalAddress(key)
+	}
+
+	return e.GetSnapshotsInternal(ctx, internalKeys)
+}
+
+// GetSnapshotsInternal reads complete trie addresses.
+func (e *Engine) GetSnapshotsInternal(ctx context.Context, keys []string) ([]*pb.ReducedEffect, error) {
 	unique := slices.Clone(keys)
 	slices.Sort(unique)
 	unique = slices.Compact(unique)
@@ -203,7 +213,7 @@ func (e *Engine) GetSnapshots(ctx context.Context, keys []string) ([]*pb.Reduced
 		// These preliminary values are discarded: later keys can reveal
 		// competitors that change an earlier key's reconstruction.
 		for _, key := range unique {
-			if _, _, _, err := e.GetSnapshot(key); err != nil {
+			if _, _, _, err := e.GetSnapshotInternal(key); err != nil {
 				return nil, err
 			}
 		}

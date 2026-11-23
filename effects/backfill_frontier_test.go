@@ -191,7 +191,7 @@ func TestBackfillFrontierSingleAdvertisedTip(t *testing.T) {
 				e.ingestNackTips(nack)
 				requireFrontier(t, e, Tip{7, n})
 
-				out := e.buildEnrichedNack("k", nil, e.index.Contains("k").Tips())
+				out := e.buildEnrichedNack(logicalAddress("k"), nil, e.index.Contains("k").Tips())
 				if len(out.GetTips()) != 1 || len(out.GetTipDetails()) != 1 || r(out.GetTips()[0]) != (Tip{7, n}) {
 					t.Fatalf("recovery advertised ancestors as current tips: %v", out.GetTips())
 				}

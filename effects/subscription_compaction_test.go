@@ -44,7 +44,7 @@ func TestCompactionReclaimsCoveredSubscriptions(t *testing.T) {
 
 					putCutEffects(t, e, nodes)
 					e.index.Insert("k", nil, keytrie.NewTipSet(latest))
-					e.addPeerSubscriber("k", 2)
+					e.addPeerSubscriber(logicalAddress("k"), 2)
 
 					var overlay historyOverlay
 
@@ -55,7 +55,7 @@ func TestCompactionReclaimsCoveredSubscriptions(t *testing.T) {
 						defer e.unpinHistory(&overlay)
 					}
 
-					d := newDag(e, "k", "")
+					d := newDag(e, logicalAddress("k"), "")
 
 					d.compact = true
 					if err := d.prepare([]Tip{latest}); err != nil {
@@ -99,14 +99,14 @@ func TestSubscriberDeparturePrunesResidentKeys(t *testing.T) {
 
 	for _, key := range []string{"hot", "idle"} {
 		e.index.Insert(key, nil, keytrie.NewTipSet())
-		e.addPeerSubscriber(key, 2)
+		e.addPeerSubscriber(logicalAddress(key), 2)
 	}
 
 	baseline := e.subscriberBytes.Load()
 
 	for peer := pb.NodeID(100); peer < 300; peer++ {
 		for _, key := range []string{"hot", "idle"} {
-			e.addPeerSubscriber(key, peer)
+			e.addPeerSubscriber(logicalAddress(key), peer)
 		}
 
 		e.DropPeer(peer)
@@ -137,7 +137,7 @@ func TestSubscriptionSnapshotsBoundChurn(t *testing.T) {
 
 	preSubscribe(e, "k")
 	historicalTestWrite(t, e, map[string]string{"k": "value"}, false)
-	e.addPeerSubscriber("k", 2)
+	e.addPeerSubscriber(logicalAddress("k"), 2)
 
 	subscriptions := make([]Tip, 0, 12)
 
@@ -149,7 +149,7 @@ func TestSubscriptionSnapshotsBoundChurn(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		subscriptions = append(subscriptions, c.keys["k"].lastOffset)
+		subscriptions = append(subscriptions, c.keys[logicalAddress("k")].lastOffset)
 		if err := c.Flush(); err != nil {
 			t.Fatal(err)
 		}
@@ -171,7 +171,7 @@ func TestSubscriptionSnapshotsBoundChurn(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		ck := compactor.keys["k"]
+		ck := compactor.keys[logicalAddress("k")]
 		if ck == nil {
 			t.Fatal("read did not emit a compaction snapshot")
 		}
@@ -236,7 +236,7 @@ func TestSubscriptionBootstrapAfterCompaction(t *testing.T) {
 
 	putCutEffects(t, e, nodes)
 	e.index.Insert("k", nil, keytrie.NewTipSet(latest))
-	d := newDag(e, "k", "")
+	d := newDag(e, logicalAddress("k"), "")
 
 	d.compact = true
 	if err := d.prepare([]Tip{latest}); err != nil {
@@ -254,7 +254,7 @@ func TestSubscriptionBootstrapAfterCompaction(t *testing.T) {
 	joiner := newTestEngine(&mockBroadcaster{peerIDs: []pb.NodeID{2}})
 	defer func() { _ = joiner.Close() }()
 
-	e.effectCache.VisitAncestry("k", latest, func(tip Tip, eff *pb.Effect, _ bool) bool {
+	e.effectCache.VisitAncestry(logicalAddress("k"), latest, func(tip Tip, eff *pb.Effect, _ bool) bool {
 		if eff != nil {
 			if err := joiner.effectCache.Put(tip, eff); err != nil {
 				t.Fatal(err)
@@ -264,7 +264,7 @@ func TestSubscriptionBootstrapAfterCompaction(t *testing.T) {
 		return true
 	})
 	joiner.index.Insert("k", nil, keytrie.NewTipSet(latest))
-	joiner.seedSubscribersFromDag("k")
+	joiner.seedSubscribersFromDag(logicalAddress("k"))
 
 	if got := joiner.PeerSubscribers("k"); !slices.Equal(got, []pb.NodeID{2}) {
 		t.Fatalf("bootstrap lost the live subscriber or resurrected the unsubscribed peer: %v", got)

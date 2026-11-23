@@ -82,7 +82,7 @@ func TestSnapshotEvidenceReconstructsPriorityChainWithoutLabels(t *testing.T) {
 		t.Fatalf("derived verdicts=%v err=%v", verdicts, err)
 	}
 
-	fresh.releaseChainRefs("winner", fresh.index.Contains("winner").Tips(), fresh.index.LoadData("winner"))
+	fresh.releaseChainRefs(logicalAddress("winner"), fresh.index.Contains("winner").Tips(), fresh.index.LoadData("winner"))
 	drainEvidence(fresh.effectCache)
 
 	if fresh.effectCache.EntryCount() != 0 {
@@ -120,8 +120,8 @@ func TestSnapshotEvidenceOwnership(t *testing.T) {
 		t.Fatal("pin first snapshot")
 	}
 
-	p.decrefChainNode("k", first)
-	p.decrefChainNode("k", second)
+	p.decrefChainNode(logicalAddress("k"), first)
+	p.decrefChainNode(logicalAddress("k"), second)
 	drainEvidence(p)
 
 	if got := p.getVertex(proof).refs.Load(); got != 1 {
@@ -220,7 +220,7 @@ reclaim:
 		t.Fatal("pool retained transport package or failed to install owner")
 	}
 
-	if _, complete, err := e.closeIngestedFrontier("k", []Tip{owner}, make(map[Tip]error)); err != nil || !complete {
+	if _, complete, err := e.closeIngestedFrontier(logicalAddress("k"), []Tip{owner}, make(map[Tip]error)); err != nil || !complete {
 		t.Fatalf("closure tried to reconstruct the foreign proof: complete=%t err=%v", complete, err)
 	}
 
@@ -232,7 +232,7 @@ reclaim:
 		t.Fatalf("duplicate package installation added evidence ownership: %d", got)
 	}
 
-	e.effectCache.decrefChainNode("k", owner)
+	e.effectCache.decrefChainNode(logicalAddress("k"), owner)
 	drainEvidence(e.effectCache)
 
 	if e.effectCache.EntryCount() != 0 {
@@ -374,7 +374,7 @@ func TestSnapshotEvidenceDurabilityKeepsProofOutOfFrontiers(t *testing.T) {
 		t.Fatal("proof ownership not restored")
 	}
 
-	e.releaseChainRefs("k", e.index.Contains("k").Tips(), nil)
+	e.releaseChainRefs(logicalAddress("k"), e.index.Contains("k").Tips(), nil)
 	e.index.Delete("k", e.index.Contains("k"))
 	drainEvidence(e.effectCache)
 

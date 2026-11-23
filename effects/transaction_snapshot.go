@@ -153,7 +153,7 @@ func (s *transactionSnapshot) member(ctx context.Context, tip Tip, eff *pb.Effec
 	// A newly discovered branch cannot extend a key whose history was
 	// already exposed. Membership is shared for the entire bind; this is
 	// history selection, not a new rule for adjudicating competing binds.
-	keys := []string{string(eff.GetKey())}
+	keys := []string{string(eff.GetIKey())}
 	if bind := eff.GetTxnBind(); bind != nil {
 		keys = nil
 		for _, kb := range bind.GetKeys() {
@@ -201,7 +201,7 @@ func (s *transactionSnapshot) member(ctx context.Context, tip Tip, eff *pb.Effec
 	}
 
 	for ref := range allDeps(eff) {
-		parent, err := s.engine.getEffect(string(eff.GetKey()), r(ref))
+		parent, err := s.engine.getEffect(string(eff.GetIKey()), r(ref))
 		if err != nil {
 			return false, err
 		}
@@ -248,7 +248,7 @@ func (s *transactionSnapshot) prepare(ctx context.Context, requested []string) e
 	// Ordinary reads reconstruct only the selected historical view below.
 	for _, key := range keys {
 		if s.engine.cloudReader != nil {
-			if _, _, _, err := s.engine.GetSnapshot(key); err != nil {
+			if _, _, _, err := s.engine.GetSnapshotInternal(key); err != nil {
 				return err
 			}
 		} else if !s.engine.freeMissEligible(key) {

@@ -86,7 +86,7 @@ func TestAsyncSubscriptionRequiresDiscoveryBeforeCommit(t *testing.T) {
 		default:
 		}
 		// Another ordinary caller may still use the async subscription.
-		if err := e.ensureSubscribed("fresh"); err != nil {
+		if err := e.ensureSubscribed(logicalAddress("fresh")); err != nil {
 			t.Fatal(err)
 		}
 
@@ -105,7 +105,7 @@ func TestAsyncSubscriptionRequiresDiscoveryBeforeCommit(t *testing.T) {
 		}()
 		// Concurrent blocking callers must share the same discovery, not redo it.
 		waiter := make(chan error, 1)
-		go func() { waiter <- e.ensureSubscribedBlocking("fresh") }()
+		go func() { waiter <- e.ensureSubscribedBlocking(logicalAddress("fresh")) }()
 
 		for round := range 2 {
 			synctest.Wait()
@@ -149,7 +149,7 @@ func TestAsyncSubscriptionUpgradePropagatesPartition(t *testing.T) {
 		e := newTestEngine(b)
 		e.safety.Store(&safetyMap{defaultMode: SafeMode})
 
-		if err := e.ensureSubscribed("fresh"); err != nil {
+		if err := e.ensureSubscribed(logicalAddress("fresh")); err != nil {
 			t.Fatal(err)
 		}
 
@@ -158,7 +158,7 @@ func TestAsyncSubscriptionUpgradePropagatesPartition(t *testing.T) {
 		state, _ := e.subscriptions.Load("fresh")
 
 		done := make(chan error, 1)
-		go func() { done <- e.ensureSubscribedBlocking("fresh") }()
+		go func() { done <- e.ensureSubscribedBlocking(logicalAddress("fresh")) }()
 
 		synctest.Wait()
 

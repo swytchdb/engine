@@ -150,7 +150,7 @@ func TestLosersOnKeyAt_SharedRootFork(t *testing.T) {
 					}
 				}
 
-				losers, _ := e.losersOnKeyAt("k", tips, nil, nil, nil, false)
+				losers, _ := e.losersOnKeyAt(logicalAddress("k"), tips, nil, nil, nil, false)
 				if _, found := losers["loser"]; !found {
 					t.Fatalf("concurrent sibling escaped fork choice: %v", losers)
 				}

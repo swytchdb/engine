@@ -70,7 +70,7 @@ func isSystemKey(key []byte) bool {
 // keeps the invariant "an owned, creation-ref'd vertex is reachable from a tip we
 // serve", so reclaim never strands an un-served fetch as a permanent leak.
 func (e *Engine) isServed(key []byte) bool {
-	_, sub := e.subscriptions.Load(string(key))
+	_, sub := e.subscriptions.Load(string(subscriptionName(key)))
 
 	return sub
 }
@@ -96,6 +96,7 @@ func (e *Engine) putIngested(tip Tip, eff *pb.Effect, protoLen int) error {
 // bootstrapCollector collects NACKs during subscription bootstrapping.
 // ensureSubscribed registers one per key and waits for NACKs from peers.
 type bootstrapCollector struct {
+	key   string // canonical address of the request; replies carry its wire name
 	nacks chan *pb.NackNotify
 }
 
@@ -363,17 +364,17 @@ func (e *Engine) FlushIndex() error {
 	e.flushGeneration.Add(1)
 	slog.Info("FlushIndex: wiping all keys from index")
 
-	keys := e.index.Keys()
+	keys := e.index.KeysInternal()
 	for _, key := range keys {
-		tips := e.index.Contains(key)
+		tips := e.index.ContainsInternal(key)
 		if tips != nil {
 			// DeleteAndSnapshot bypasses the eviction notify, so this is the only
 			// refcount-release signal for flush (see releaseChainRefs).
-			ls, _ := e.index.LoadOrStoreData(key, &leafState{})
+			ls, _ := e.index.LoadOrStoreDataInternal(key, &leafState{})
 			e.releaseChainRefs(key, tips.Tips(), ls)
 		}
 
-		e.index.Delete(key, tips)
+		e.index.DeleteInternal(key, tips)
 	}
 
 	e.notifyKeyChanged(FlushKey)
@@ -474,6 +475,12 @@ func (e *Engine) NodeID() pb.NodeID {
 func (e *Engine) PinKey(key string) bool   { return e.index.Pin(key) }
 func (e *Engine) UnpinKey(key string) bool { return e.index.Unpin(key) }
 
+// PinKeyInternal pins an existing leaf by its complete trie address.
+func (e *Engine) PinKeyInternal(key string) bool { return e.index.PinInternal(key) }
+
+// UnpinKeyInternal releases a pin on a complete trie address.
+func (e *Engine) UnpinKeyInternal(key string) bool { return e.index.UnpinInternal(key) }
+
 // generateTxnID returns a globally unique transaction ID.
 // Format: "nodeID:hlc:seq" — unique across reboots (HLC provides time component).
 func (e *Engine) generateTxnID() string {
@@ -535,7 +542,7 @@ func (e *Engine) MemoryTarget() int64 {
 // between batches and before invoking the callback.
 func (e *Engine) DropPeer(peer pb.NodeID) {
 	e.removePeerKeyFilter(peer)
-	e.index.Range(func(key string) bool {
+	e.index.RangeInternal(func(key string) bool {
 		e.removePeerSubscriber(key, peer)
 
 		return true
@@ -614,6 +621,10 @@ var ErrEffectNotFound = errors.New("effect not found on peer")
 // ancestry names it. Any missing candidate that cannot be so proven remains a
 // real tip and the caller's classification decides what to do with it.
 func NormalizeCloudTipCandidates(key string, candidates, localRoots []Tip, load func(Tip) (*pb.Effect, error)) (realTips, superseded []Tip, err error) {
+	return normalizeCloudTipCandidates(logicalAddress(key), candidates, localRoots, load)
+}
+
+func normalizeCloudTipCandidates(key string, candidates, localRoots []Tip, load func(Tip) (*pb.Effect, error)) (realTips, superseded []Tip, err error) {
 	return normalizeTipCandidates(key, candidates, localRoots, func(tip Tip) (*pb.Effect, error) {
 		eff, loadErr := load(tip)
 		if errors.Is(loadErr, ErrCDNBlobMissing) {
@@ -635,7 +646,16 @@ func (e *Engine) hydrateFromCloud(key string) (installed bool, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), cloudTipsBackstop)
 	defer cancel()
 
-	tips, sidecar, _, err := e.cloudReader.CloudTips(ctx, key)
+	read := func(ctx context.Context, key string) ([]Tip, []CloudEffect, []Tip, error) {
+		return e.cloudReader.CloudTips(ctx, wireKey(key))
+	}
+	if reader, ok := e.cloudReader.(interface {
+		CloudTipsInternal(context.Context, string) ([]Tip, []CloudEffect, []Tip, error)
+	}); ok {
+		read = reader.CloudTipsInternal
+	}
+
+	tips, sidecar, _, err := read(ctx, key)
 	if err != nil {
 		slog.Warn("cloud read-miss backstop: get tips failed; failing read", "key", key, "error", err)
 
@@ -646,11 +666,11 @@ func (e *Engine) hydrateFromCloud(key string) (installed bool, err error) {
 		return false, nil // Cloud holds nothing either: an authoritative miss.
 	}
 
-	if err := e.InstallCloudTips(key, tips, sidecar); err != nil {
+	if err := e.InstallCloudTipsInternal(key, tips, sidecar); err != nil {
 		return false, err
 	}
 
-	return e.index.Contains(key) != nil, nil
+	return e.index.ContainsInternal(key) != nil, nil
 }
 
 // InstallCloudTips supplies Cloud's candidates and inline effects to the same
@@ -659,6 +679,11 @@ func (e *Engine) hydrateFromCloud(key string) (installed bool, err error) {
 // Missing reports from GetTips describe only Cloud's storage; closure may still
 // obtain that history from peers through the existing fetch path.
 func (e *Engine) InstallCloudTips(key string, tips []Tip, sidecar []CloudEffect) error {
+	return e.InstallCloudTipsInternal(logicalAddress(key), tips, sidecar)
+}
+
+// InstallCloudTipsInternal uses a complete trie address.
+func (e *Engine) InstallCloudTipsInternal(key string, tips []Tip, sidecar []CloudEffect) error {
 	// Closure may discover a bind even when the supplied tip is ordinary data.
 	// Preserve its publication ordering with local commits, before the key lock.
 	nodeLock := e.takeNodeLock()
@@ -749,6 +774,8 @@ func withSystemKeyException(rules []KeyRangeRule) []KeyRangeRule {
 }
 
 func (e *Engine) modeForKey(key string) SafetyMode {
+	key = ownerKey(key)
+
 	return e.safety.Load().modeForKey(key)
 }
 
@@ -860,7 +887,7 @@ func (e *Engine) resolveTipDeps(tips []Tip) []Tip {
 func (e *Engine) emitSnapshot(key string, verdicts map[string]pb.Verdict, evidence ...*pb.BindEvidence) error {
 	hlc := timestamppb.New(e.clock.Now())
 	eff := &pb.Effect{
-		Key:            []byte(key),
+		Key: []byte(wireKey(key)), IKey: []byte(key),
 		Hlc:            hlc,
 		NodeId:         uint64(e.nodeID),
 		ForkChoiceHash: ComputeForkChoiceHash(e.nodeID, hlc),
@@ -873,7 +900,7 @@ func (e *Engine) emitSnapshot(key string, verdicts map[string]pb.Verdict, eviden
 		eff.GetSnapshot().Evidence = evidence[0]
 	}
 
-	currentSet := e.index.Contains(key)
+	currentSet := e.index.ContainsInternal(key)
 	if currentSet != nil {
 		tips := currentSet.Tips()
 		for _, t := range tips {
@@ -969,7 +996,7 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 
 		var err error
 
-		effectData, err = e.broadcaster.FetchFromAny(notify.GetOrigin(), e.fetchHint(string(notify.GetKey())))
+		effectData, err = e.broadcaster.FetchFromAny(notify.GetOrigin(), e.fetchHint(logicalAddress(string(notify.GetKey()))))
 		if err != nil {
 			return nil, err
 		}
@@ -995,12 +1022,12 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 	// handle them before fork_choice_hash validation and log storage since
 	// they are never persisted and only need to trigger a NACK response.
 	if sub := eff.GetSubscription(); sub != nil && sub.GetDiscovery() {
-		key := string(eff.GetKey())
+		key := string(eff.GetIKey())
 		slog.Debug("HandleRemote: discovery probe, sending NACK only",
 			"key", key, "from_node", eff.GetNodeId())
 
 		if e.broadcaster != nil {
-			initialTips := e.index.Contains(key)
+			initialTips := e.index.ContainsInternal(key)
 
 			var tipOffsets []keytrie.EffectRef
 			if initialTips != nil {
@@ -1055,9 +1082,9 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 				e.peerFilterAdd(origin, string(kb.GetKey()))
 			}
 		} else if eff.GetData() != nil {
-			e.peerFilterAdd(origin, string(eff.GetKey()))
+			e.peerFilterAdd(origin, string(eff.GetIKey()))
 		} else if sub := eff.GetSubscription(); sub != nil && !sub.GetUnsubscribe() {
-			e.peerFilterAdd(origin, string(eff.GetKey()))
+			e.peerFilterAdd(origin, string(eff.GetIKey()))
 		}
 	}
 
@@ -1076,15 +1103,15 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 	// the bind when authority holds for any key in bind.Keys (not just
 	// eff.Key, the canonical first key).
 	{
-		key := string(eff.GetKey())
-		_, subscribed := e.subscriptions.Load(key)
-		authoritative := subscribed || e.index.Contains(key) != nil
+		key := string(eff.GetIKey())
+		_, subscribed := e.subscription(key)
+		authoritative := subscribed || e.index.ContainsInternal(key) != nil
 
 		if !authoritative {
 			if bind := eff.GetTxnBind(); bind != nil {
 				for _, kb := range bind.GetKeys() {
 					kbKey := string(kb.GetKey())
-					if _, sub := e.subscriptions.Load(kbKey); sub || e.index.Contains(kbKey) != nil {
+					if _, sub := e.subscription(kbKey); sub || e.index.ContainsInternal(kbKey) != nil {
 						authoritative = true
 
 						break
@@ -1093,7 +1120,7 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 			}
 		}
 
-		if !authoritative && key == FlushKey {
+		if !authoritative && key == logicalAddress(FlushKey) {
 			authoritative = true
 		}
 
@@ -1139,7 +1166,7 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 	e.applySnapshotVerdicts(eff)
 
 	// Handle flush-all: wipe the entire index
-	if string(eff.GetKey()) == FlushKey {
+	if string(eff.GetIKey()) == logicalAddress(FlushKey) {
 		if data := eff.GetData(); data != nil && data.GetOp() == pb.EffectOp_REMOVE_OP {
 			slog.Info("HandleRemote: received flush-all from peer", "node", notify.GetOrigin().GetNodeId())
 
@@ -1168,15 +1195,15 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 		e.handleRemoteBind(bind, r(notify.GetOrigin()), eff.GetTxnId())
 	}
 
-	key := string(eff.GetKey())
+	key := string(eff.GetIKey())
 
 	slog.Debug("HandleRemote: updating index",
 		"key", key, "offset", notify.GetOrigin().GetOffset(),
 		"deps", eff.GetDeps())
 
-	initialTips := e.index.Contains(key)
+	initialTips := e.index.ContainsInternal(key)
 
-	_, canonicalIndexable := e.subscriptions.Load(key)
+	_, canonicalIndexable := e.subscription(key)
 
 	indexed := canonicalIndexable
 	if canonicalIndexable {
@@ -1190,11 +1217,11 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 				continue
 			}
 
-			if _, ok := e.subscriptions.Load(kbKey); !ok {
+			if _, ok := e.subscription(kbKey); !ok {
 				continue
 			}
 
-			preTips := e.index.Contains(kbKey)
+			preTips := e.index.ContainsInternal(kbKey)
 
 			var preOffsets []Tip
 			if preTips != nil {
@@ -1207,7 +1234,7 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 			e.installIngestedTips(kbKey, r(notify.GetOrigin()))
 
 			indexed = true
-			postTips := e.index.Contains(kbKey)
+			postTips := e.index.ContainsInternal(kbKey)
 
 			var postOffsets []Tip
 			if postTips != nil {
@@ -1236,7 +1263,7 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 		for _, kb := range bind.GetKeys() {
 			kbKey := string(kb.GetKey())
 
-			kbTips := e.index.Contains(kbKey)
+			kbTips := e.index.ContainsInternal(kbKey)
 			if kbTips == nil {
 				continue
 			}
@@ -1270,7 +1297,7 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 
 			slog.Debug("HandleRemote: deps diverged, NACK",
 				"key", key, "deps", eff.GetDeps(), "tips", initialTips.Tips())
-			postTips := e.index.Contains(key)
+			postTips := e.index.ContainsInternal(key)
 
 			var postTipOffsets []Tip
 			if postTips != nil {
@@ -1332,7 +1359,7 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 				e.ownFilterAdd(string(kb.GetKey()))
 
 				if e.OnKeyDataAdded != nil {
-					e.OnKeyDataAdded(string(kb.GetKey()))
+					e.OnKeyDataAdded(string(keytrie.WireKeyBytes(kb.GetKey())))
 				}
 			}
 		}
@@ -1345,19 +1372,19 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 			e.ownFilterAdd(key)
 
 			if e.OnKeyDataAdded != nil {
-				e.OnKeyDataAdded(key)
+				e.OnKeyDataAdded(wireKey(key))
 			}
 		case pb.EffectOp_REMOVE_OP:
 			if len(data.GetId()) == 0 {
 				if e.OnKeyDeleted != nil {
-					e.OnKeyDeleted(key)
+					e.OnKeyDeleted(wireKey(key))
 				}
 			} else if data.GetCollection() == pb.CollectionKind_ORDERED || data.GetCollection() == pb.CollectionKind_KEYED {
 				// Element remove on ordered/keyed collection — chain-wake
 				e.ownFilterAdd(key)
 
 				if e.OnKeyDataAdded != nil {
-					e.OnKeyDataAdded(key)
+					e.OnKeyDataAdded(wireKey(key))
 				}
 			}
 		}
@@ -1411,7 +1438,7 @@ func (e *Engine) ingestBackfill(notify *pb.OffsetNotify, historyKey *string) err
 
 			var err error
 
-			effectData, err = e.broadcaster.FetchFromAny(notify.GetOrigin(), e.fetchHint(string(notify.GetKey())))
+			effectData, err = e.broadcaster.FetchFromAny(notify.GetOrigin(), e.fetchHint(logicalAddress(string(notify.GetKey()))))
 			if err != nil {
 				return err
 			}
@@ -1435,15 +1462,15 @@ func (e *Engine) ingestBackfill(notify *pb.OffsetNotify, historyKey *string) err
 	}
 
 	{
-		key := string(eff.GetKey())
-		_, subscribed := e.subscriptions.Load(key)
+		key := string(eff.GetIKey())
+		_, subscribed := e.subscription(key)
 
-		authoritative := subscribed || e.index.Contains(key) != nil
+		authoritative := subscribed || e.index.ContainsInternal(key) != nil
 		if !authoritative {
 			if bind := eff.GetTxnBind(); bind != nil {
 				for _, kb := range bind.GetKeys() {
 					kbKey := string(kb.GetKey())
-					if _, sub := e.subscriptions.Load(kbKey); sub || e.index.Contains(kbKey) != nil {
+					if _, sub := e.subscription(kbKey); sub || e.index.ContainsInternal(kbKey) != nil {
 						authoritative = true
 
 						break
@@ -1481,8 +1508,8 @@ func (e *Engine) ingestBackfill(notify *pb.OffsetNotify, historyKey *string) err
 		}
 	}
 
-	key := string(eff.GetKey())
-	_, canonicalIndexable := e.subscriptions.Load(key)
+	key := string(eff.GetIKey())
+	_, canonicalIndexable := e.subscription(key)
 
 	if canonicalIndexable && (historyKey == nil || key != *historyKey) {
 		e.installIngestedTips(key, r(notify.GetOrigin()))
@@ -1495,7 +1522,7 @@ func (e *Engine) ingestBackfill(notify *pb.OffsetNotify, historyKey *string) err
 				continue
 			}
 
-			if _, ok := e.subscriptions.Load(kbKey); !ok {
+			if _, ok := e.subscription(kbKey); !ok {
 				continue
 			}
 
@@ -1585,7 +1612,7 @@ func (e *Engine) checkCompetingBinds(bind *pb.TransactionalBindEffect, txnID str
 			consumedTips = append(consumedTips, r(ct))
 		}
 
-		tipSet := e.index.Contains(k)
+		tipSet := e.index.ContainsInternal(k)
 		if tipSet == nil {
 			continue
 		}
@@ -1735,7 +1762,7 @@ func (e *Engine) HandleNack(nack *pb.NackNotify) error {
 // NACK.
 func (e *Engine) buildEnrichedNack(key string, conflicting *pb.EffectRef, tips []keytrie.EffectRef) *pb.NackNotify {
 	nack := &pb.NackNotify{
-		Key:         []byte(key),
+		Key:         []byte(wireKey(key)),
 		Conflicting: conflicting,
 	}
 
@@ -1782,7 +1809,7 @@ func nackTipDetail(tp Tip, eff *pb.Effect) *pb.NackTipDetail {
 
 		for _, kb := range bind.GetKeys() {
 			detail.BindConsumedTips = append(detail.BindConsumedTips, &pb.KeyConsumedTips{
-				Key:          kb.GetKey(),
+				Key:          bytes.Clone(keytrie.WireKeyBytes(kb.GetKey())),
 				ConsumedTips: kb.GetConsumedTips(),
 			})
 		}
@@ -1889,7 +1916,7 @@ func (e *Engine) ingestNackTips(nack *pb.NackNotify) {
 		return
 	}
 
-	key := string(nack.GetKey())
+	key := e.nackKey(nack)
 
 	if len(nack.GetCausalChain()) > 0 {
 		go e.ingestCausalChain(nack)
@@ -1981,7 +2008,7 @@ func (e *Engine) ingestNackTips(nack *pb.NackNotify) {
 	// Merge the successfully ingested advertised tips in one transition,
 	// after the walk has supplied the ancestry needed to compare them with
 	// our existing frontier (which may have advanced during recovery).
-	if _, subscribed := e.subscriptions.Load(key); subscribed {
+	if _, subscribed := e.subscription(key); subscribed {
 		var tips []Tip
 
 		for _, detail := range nack.GetTipDetails() {
@@ -2203,7 +2230,7 @@ func (e *Engine) broadcastUnsubscribe(key string, tips []Tip) {
 		deps := e.resolveTipDeps(tips)
 
 		unsub := &pb.Effect{
-			Key:            []byte(key),
+			Key: []byte(wireKey(key)), IKey: []byte(key),
 			Hlc:            hlc,
 			NodeId:         uint64(e.nodeID),
 			Deps:           toPbRefs(deps),
@@ -2363,13 +2390,13 @@ func (e *Engine) runAntiEntropy() {
 		return
 	}
 
-	keys := e.index.Keys()
+	keys := e.index.KeysInternal()
 	if len(keys) == 0 {
 		return
 	}
 
 	for _, key := range keys {
-		localTips := e.index.Contains(key)
+		localTips := e.index.ContainsInternal(key)
 		if localTips == nil {
 			continue
 		}
@@ -2388,7 +2415,7 @@ func (e *Engine) runAntiEntropy() {
 func (e *Engine) probeAndFetchKey(key string) {
 	hlc := timestamppb.Now()
 	eff := &pb.Effect{
-		Key:            []byte(key),
+		Key: []byte(wireKey(key)), IKey: []byte(key),
 		Hlc:            hlc,
 		NodeId:         uint64(e.nodeID),
 		ForkChoiceHash: ComputeForkChoiceHash(e.nodeID, hlc),
@@ -2408,11 +2435,12 @@ func (e *Engine) probeAndFetchKey(key string) {
 	notify := BuildOffsetNotify(e.nodeID, Tip{uint64(e.nodeID), uint64(hlc.GetSeconds())}, eff, data, nil)
 
 	collector := &bootstrapCollector{
+		key:   key,
 		nacks: make(chan *pb.NackNotify, 64),
 	}
 
-	e.pendingBootstraps.Store(key, collector)
-	defer e.pendingBootstraps.Delete(key)
+	e.pendingBootstraps.Store(wireKey(key), collector)
+	defer e.pendingBootstraps.Delete(wireKey(key))
 
 	var alivePeers []pb.NodeID
 	if e.rttProvider != nil {
@@ -2473,7 +2501,7 @@ func (e *Engine) probeAndFetchKey(key string) {
 	unique := compactTips(allTipOffsets)
 
 	// Filter out tips we already have locally
-	localTips := e.index.Contains(key)
+	localTips := e.index.ContainsInternal(key)
 
 	var missing []Tip
 

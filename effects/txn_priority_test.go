@@ -41,7 +41,7 @@ func TestNackPriorityEvidenceAcrossKeys(t *testing.T) {
 	log := newSnapshotLog()
 	e := newSnapshotEngine(log)
 	base := log.putEffect(scalarSet("ab", "base"))
-	a := newTestPendingTxn(pendingTxnKey{key: "ab", newTip: base})
+	a := newTestPendingTxn(pendingTxnKey{key: logicalAddress("ab"), newTip: base})
 	a.txnID = "A"
 
 	node := pb.NodeID(2)
@@ -60,7 +60,7 @@ func TestNackPriorityEvidenceAcrossKeys(t *testing.T) {
 		}},
 	}
 	bt := log.putEffect(b)
-	early := e.buildEnrichedNack("ab", toPbRef(a.bindOffset), []Tip{bt})
+	early := e.buildEnrichedNack(logicalAddress("ab"), toPbRef(a.bindOffset), []Tip{bt})
 	// Knowing B's hash does not establish a loss for A.
 	if _, err := e.evaluateNacks(a, []*pb.NackNotify{early}); !errors.Is(err, ErrTxnAmbiguous) {
 		t.Fatalf("unresolved B: got %v, want ambiguous", err)
@@ -71,7 +71,7 @@ func TestNackPriorityEvidenceAcrossKeys(t *testing.T) {
 			TxnVerdicts: map[string]pb.Verdict{"B": outcome, "C": pb.Verdict_WON},
 		}}})
 
-		late := e.buildEnrichedNack("bc", toPbRef(a.bindOffset), []Tip{evidence})
+		late := e.buildEnrichedNack(logicalAddress("bc"), toPbRef(a.bindOffset), []Tip{evidence})
 		for _, responses := range [][]*pb.NackNotify{{early, late}, {late, early}} {
 			_, err := e.evaluateNacks(a, responses)
 			if outcome == pb.Verdict_LOST && err != nil {
@@ -93,7 +93,7 @@ func TestBindResponseWaitsForPriorityEvidence(t *testing.T) {
 	log := newSnapshotLog()
 	e := newSnapshotEngine(log)
 	base := log.putEffect(scalarSet("ab", "base"))
-	b := newTestPendingTxn(pendingTxnKey{key: "ab", newTip: base})
+	b := newTestPendingTxn(pendingTxnKey{key: logicalAddress("ab"), newTip: base})
 	b.txnID = "B"
 	b.resolved = make(chan struct{})
 
@@ -114,7 +114,7 @@ func TestBindResponseWaitsForPriorityEvidence(t *testing.T) {
 
 	e.pendingTxns.Store(b.bindOffset, b)
 	e.subscriptions.Store("ab", &subscriptionState{})
-	e.updateIndex("ab", nil, base)
+	e.updateIndex(logicalAddress("ab"), nil, base)
 
 	wire, err := MarshalEffect(incoming)
 	if err != nil {
@@ -169,7 +169,7 @@ func TestBindResponseWaitsForPriorityEvidence(t *testing.T) {
 	proof := log.putEffect(&pb.Effect{Key: []byte("bc"), Kind: &pb.Effect_Snapshot{Snapshot: &pb.SnapshotEffect{
 		TxnVerdicts: map[string]pb.Verdict{"B": pb.Verdict_LOST, "C": pb.Verdict_WON},
 	}}})
-	b.responses = []*pb.NackNotify{e.buildEnrichedNack("bc", toPbRef(b.bindOffset), []Tip{proof})}
+	b.responses = []*pb.NackNotify{e.buildEnrichedNack(logicalAddress("bc"), toPbRef(b.bindOffset), []Tip{proof})}
 	close(b.resolved)
 
 	select {
@@ -303,7 +303,7 @@ func TestPriorityChainCommitsDisjointEnds(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			e.updateIndex(key, nil, base)
+			e.updateIndex(logicalAddress(key), nil, base)
 
 			state := &subscriptionState{ready: make(chan struct{})}
 			state.markReady()
@@ -311,7 +311,7 @@ func TestPriorityChainCommitsDisjointEnds(t *testing.T) {
 
 			for _, peer := range nodes {
 				if peer != id && slices.Contains(keys[peer], key) {
-					e.addPeerSubscriber(key, peer)
+					e.addPeerSubscriber(logicalAddress(key), peer)
 				}
 			}
 		}
@@ -397,7 +397,7 @@ func TestPriorityChainReconstructionWithoutVerdicts(t *testing.T) {
 
 		tip := log.putEffect(eff)
 		for _, key := range keys {
-			e.updateIndex(key, nil, tip)
+			e.updateIndex(logicalAddress(key), nil, tip)
 		}
 	}
 
@@ -408,7 +408,7 @@ func TestPriorityChainReconstructionWithoutVerdicts(t *testing.T) {
 				snap := log.putEffect(&pb.Effect{Key: []byte(key), Deps: toPbRefs(tips.Tips()), Kind: &pb.Effect_Snapshot{Snapshot: &pb.SnapshotEffect{
 					TxnVerdicts: map[string]pb.Verdict{"txn-0": pb.Verdict_WON, "txn-1": pb.Verdict_LOST, "txn-2": pb.Verdict_WON},
 				}}})
-				e.updateIndex(key, tips, snap)
+				e.updateIndex(logicalAddress(key), tips, snap)
 			}
 		}
 

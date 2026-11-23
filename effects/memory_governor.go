@@ -40,8 +40,8 @@ func (e *Engine) startMemoryGovernor(targetBytes int64) {
 	}
 
 	// Only bounded engines need eviction hooks and per-read eviction tracking.
-	e.index.SetEvictHooks(
-		func(key string) bool { return !isSystemKey([]byte(key)) },
+	e.index.SetEvictHooksInternal(
+		func(key string) bool { return !isSystemKey([]byte(wireKey(key))) },
 		e.onLeafEvicted,
 		func() bool { return e.evictBudget.Load() > 0 },
 	)
@@ -124,7 +124,7 @@ func (e *Engine) evictToTarget(target int64) MemoryStats {
 	}
 
 	for remaining := maxDrainPerTick; remaining > 0 && s.ResidentBytes > target; {
-		keys := e.index.Size()
+		keys := e.index.SizeInternal()
 		if keys == 0 {
 			break
 		}

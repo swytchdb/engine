@@ -46,7 +46,7 @@ func TestBindEvidence_CompetitorBelowSnapshot(t *testing.T) {
 				tips []Tip
 				lca  Tip
 			}{{[]Tip{snapshot}, snapshot}, {[]Tip{snapshot, bob}, base}} {
-				d := newDag(e, "winner", "")
+				d := newDag(e, logicalAddress("winner"), "")
 				if err := d.prepare(tc.tips); err != nil {
 					t.Fatal(err)
 				}
@@ -62,20 +62,20 @@ func TestBindEvidence_CompetitorBelowSnapshot(t *testing.T) {
 				"payout:bob":   {bob},
 			}
 
-			keys := []string{"winner", "payout:bob"}
+			keys := []string{logicalAddress("winner"), logicalAddress("payout:bob")}
 			if snapshotFirst {
 				// bindKeyClosureFrom processes its key queue from the end.
 				slices.Reverse(keys)
 			}
 
 			anchors, verdicts, err := e.bindKeyClosureFrom(keys, func(key string) ([]Tip, error) {
-				return frontiers[key], nil
+				return frontiers[wireKey(key)], nil
 			}, true)
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			if !slices.Contains(anchors["payout:alice"], alice) {
+			if !slices.Contains(anchors[logicalAddress("payout:alice")], alice) {
 				t.Errorf("did not discover Alice below the former LCA: anchors=%v", anchors)
 			}
 
@@ -84,7 +84,7 @@ func TestBindEvidence_CompetitorBelowSnapshot(t *testing.T) {
 			}
 
 			lost, _ := e.losersOnKeysAt(anchors, func(key string) []Tip {
-				return frontiers[key]
+				return frontiers[wireKey(key)]
 			}, verdicts, nil, false)
 			if _, ok := lost["bob"]; !ok || len(lost) != 1 {
 				t.Errorf("fork choice = %v, want only Bob to lose", lost)
@@ -92,7 +92,7 @@ func TestBindEvidence_CompetitorBelowSnapshot(t *testing.T) {
 
 			view := &snapshotReadView{anchors: anchors, verdicts: verdicts, lost: lost, historical: true}
 
-			result, _, err := e.reconstructWithView("payout:bob", []Tip{bob}, "", false, view)
+			result, _, err := e.reconstructWithView(logicalAddress("payout:bob"), []Tip{bob}, "", false, view)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -138,7 +138,7 @@ func TestBindEvidence_ConcurrentSnapshots(t *testing.T) {
 			})
 			tips := []Tip{state(noop), state(base)}
 
-			anchors, verdicts, err := e.bindKeyClosureFrom([]string{"winner"}, func(string) ([]Tip, error) {
+			anchors, verdicts, err := e.bindKeyClosureFrom([]string{logicalAddress("winner")}, func(string) ([]Tip, error) {
 				return tips, nil
 			}, true)
 			if err != nil {
@@ -152,7 +152,7 @@ func TestBindEvidence_ConcurrentSnapshots(t *testing.T) {
 
 			view := &snapshotReadView{anchors: anchors, verdicts: verdicts, lost: lost, historical: true}
 
-			result, _, err := e.reconstructWithView("winner", tips, "", false, view)
+			result, _, err := e.reconstructWithView(logicalAddress("winner"), tips, "", false, view)
 			if err != nil || string(result.GetScalar().GetRaw()) != "alice" {
 				t.Fatalf("reconstructed %v, error=%v; want Alice", result, err)
 			}
@@ -191,7 +191,7 @@ func TestBindEvidence_VerdictShortcutDoesNotExpandFoldedData(t *testing.T) {
 				return wireEffect(state), nil
 			}}
 
-			_, verdicts, err := e.bindKeyClosureFrom([]string{"k"}, func(string) ([]Tip, error) {
+			_, verdicts, err := e.bindKeyClosureFrom([]string{logicalAddress("k")}, func(string) ([]Tip, error) {
 				return []Tip{snapshot}, nil
 			}, true)
 			if err != nil || verdicts["lost"].verdict != pb.Verdict_LOST {
@@ -234,14 +234,14 @@ func TestBindEvidence_ReclaimedPredecessorDoesNotBreakBatch(t *testing.T) {
 	}
 
 	e.effectCache.releaseEvidence(evidenceTips(proof))
-	e.updateIndex("k", nil, previous)
+	e.updateIndex(logicalAddress("k"), nil, previous)
 
 	before, err := e.GetSnapshots(context.Background(), []string{"k"})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	d := newDag(e, "k", "")
+	d := newDag(e, logicalAddress("k"), "")
 
 	d.compact = true
 	if err := d.prepare([]Tip{previous}); err != nil {
@@ -269,7 +269,7 @@ func TestBindEvidence_ReclaimedPredecessorDoesNotBreakBatch(t *testing.T) {
 		t.Fatalf("compaction changed value: before=%v after=%v", before, after)
 	}
 
-	_, verdicts, err := e.bindKeyClosureFrom([]string{"k"}, func(string) ([]Tip, error) {
+	_, verdicts, err := e.bindKeyClosureFrom([]string{logicalAddress("k")}, func(string) ([]Tip, error) {
 		return []Tip{previous}, nil
 	}, true)
 	if err != nil || !verdicts["winner"].proven || !verdicts["loser"].proven ||
@@ -316,7 +316,7 @@ func TestBindEvidence_PredecessorFetchFailure(t *testing.T) {
 					return wireEffect(metadata), nil
 				}}
 
-				_, verdicts, err := e.bindKeyClosureFrom([]string{"k"}, func(string) ([]Tip, error) {
+				_, verdicts, err := e.bindKeyClosureFrom([]string{logicalAddress("k")}, func(string) ([]Tip, error) {
 					return []Tip{current}, nil
 				}, true)
 				if required && failure != nil {

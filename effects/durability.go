@@ -289,7 +289,7 @@ func (e *Engine) restoreEffects(ctx context.Context, s *durability.Store, rn *re
 				add(kb.GetKey(), id, kb.GetConsumedTips(), kb.GetNewTip())
 			}
 		} else {
-			add(eff.GetKey(), id, eff.GetDeps(), nil)
+			add(eff.GetIKey(), id, eff.GetDeps(), nil)
 		}
 
 		return nil
@@ -319,7 +319,7 @@ func (e *Engine) restoreEffects(ctx context.Context, s *durability.Store, rn *re
 					}
 
 					if len(tips) > 0 {
-						e.index.Insert(key, nil, keytrie.NewTipSet(tips...))
+						e.index.InsertInternal(key, nil, keytrie.NewTipSet(tips...))
 						e.ownFilterAdd(key)
 					}
 

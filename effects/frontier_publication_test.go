@@ -64,15 +64,15 @@ func TestClosurePublicationCrossKeyErrorSurvivesCASRetry(t *testing.T) {
 	op.cas = func(key string, old, next *keytrie.TipSet) (*keytrie.TipSet, bool) {
 		attempts++
 		if attempts <= 3 {
-			if _, ok := e.index.Insert(key, old, keytrie.NewTipSet(old.Tips()...)); !ok {
+			if _, ok := e.index.InsertInternal(key, old, keytrie.NewTipSet(old.Tips()...)); !ok {
 				t.Fatal("could not force competing publication")
 			}
 		}
 
-		return e.index.Insert(key, old, next)
+		return e.index.InsertInternal(key, old, next)
 	}
 
-	_, complete, err := op.publish("k", []Tip{bind}, false)
+	_, complete, err := op.publish(logicalAddress("k"), []Tip{bind}, false)
 	if complete || !errors.Is(err, failure) {
 		t.Fatalf("cross-key transport failure lost across retry: complete=%t err=%v", complete, err)
 	}
@@ -121,14 +121,14 @@ func TestClosurePublicationRetryResumesUnresolvedBoundary(t *testing.T) {
 		if attempts == 1 {
 			putCutEffects(t, e, map[Tip]*pb.Effect{missing: records[missing]})
 
-			if _, ok := e.index.Insert(key, old, keytrie.NewTipSet(old.Tips()...)); !ok {
+			if _, ok := e.index.InsertInternal(key, old, keytrie.NewTipSet(old.Tips()...)); !ok {
 				t.Fatal("could not force competing publication")
 			}
 		}
 
-		return e.index.Insert(key, old, next)
+		return e.index.InsertInternal(key, old, next)
 	}
-	if _, complete, err := op.publish("k", []Tip{incoming}, false); !complete || err != nil {
+	if _, complete, err := op.publish(logicalAddress("k"), []Tip{incoming}, false); !complete || err != nil {
 		t.Fatalf("available boundary was not resumed: complete=%t err=%v", complete, err)
 	}
 
@@ -148,7 +148,7 @@ func requireClosureWorkOnce(t *testing.T, records map[Tip]*pb.Effect, vertices m
 			t.Errorf("vertex %v expanded %d times, want 1", tip, got)
 		}
 
-		for ref := range keyDeps("k", eff) {
+		for ref := range keyDeps(logicalAddress("k"), eff) {
 			if got := edges[[2]Tip{tip, r(ref)}]; got != 1 {
 				t.Errorf("edge %v -> %v traversed %d times, want 1", tip, r(ref), got)
 			}
@@ -181,14 +181,14 @@ func TestClosurePublicationCASRetriesReuseDiscovery(t *testing.T) {
 		if attempts <= failures {
 			// Replace the pointer without changing causal history. Force the
 			// actual CAS to fail after closure, without scheduler timing.
-			if _, ok := e.index.Insert(key, old, keytrie.NewTipSet(old.Tips()...)); !ok {
+			if _, ok := e.index.InsertInternal(key, old, keytrie.NewTipSet(old.Tips()...)); !ok {
 				t.Fatal("could not force competing publication")
 			}
 		}
 
-		return e.index.Insert(key, old, next)
+		return e.index.InsertInternal(key, old, next)
 	}
-	if _, complete, err := op.publish("k", []Tip{incoming}, false); err != nil || !complete {
+	if _, complete, err := op.publish(logicalAddress("k"), []Tip{incoming}, false); err != nil || !complete {
 		t.Fatalf("publication: complete=%t err=%v", complete, err)
 	}
 
@@ -239,9 +239,9 @@ func TestClosurePublicationConcurrentTipExtendsCuts(t *testing.T) {
 					e.updateIndex(key, old, concurrent)
 				}
 
-				return e.index.Insert(key, old, next)
+				return e.index.InsertInternal(key, old, next)
 			}
-			if _, complete, err := op.publish("k", []Tip{incoming}, false); err != nil || !complete {
+			if _, complete, err := op.publish(logicalAddress("k"), []Tip{incoming}, false); err != nil || !complete {
 				t.Fatalf("publication: complete=%t err=%v", complete, err)
 			}
 
@@ -286,7 +286,7 @@ func (e *Engine) installTips(key string, tips []Tip) {
 		offsets = append(offsets, tips...)
 
 		newTips := keytrie.NewTipSet(offsets...)
-		if _, ok := e.index.Insert(key, current, newTips); ok {
+		if _, ok := e.index.InsertInternal(key, current, newTips); ok {
 			if current.Len() != newTips.Len() || !current.ContainsAll(newTips.Tips()) {
 				e.notifyKeyChanged(key)
 			}

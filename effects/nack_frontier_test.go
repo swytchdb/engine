@@ -298,7 +298,7 @@ func checkNackFrontier(t *testing.T, tc nackFrontierCase, reverseTips, reverseDe
 		tips = append(tips, tips...)
 	}
 
-	chain := local.collectCausalChain("k", tips)
+	chain := local.collectCausalChain(logicalAddress("k"), tips)
 	advertised := make(map[Tip]bool)
 
 	for _, entry := range chain {
@@ -356,7 +356,7 @@ func checkNackFrontier(t *testing.T, tc nackFrontierCase, reverseTips, reverseDe
 	// boundaries; their payloads deliberately remain unavailable.
 	remote.broadcaster = nil
 	for _, engine := range []*Engine{local, remote} {
-		d := newDag(engine, "k", "")
+		d := newDag(engine, logicalAddress("k"), "")
 		err := d.prepare(tips)
 
 		if tc.missing {
@@ -381,7 +381,7 @@ func checkNackFrontier(t *testing.T, tc nackFrontierCase, reverseTips, reverseDe
 			}
 		}
 
-		got, _, err := engine.reconstruct("k", tips, "", false)
+		got, _, err := engine.reconstruct(logicalAddress("k"), tips, "", false)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -326,7 +326,7 @@ func TestFlushSafeMode(t *testing.T) {
 	e.safety.Store(&safetyMap{defaultMode: SafeMode})
 	// A peer holds "k", so SafeMode has a durable-replication target and must
 	// take the synchronous first-ACK path (rather than the no-target downgrade).
-	e.peerFilterAdd(pb.NodeID(2), "k")
+	e.peerFilterAdd(pb.NodeID(2), logicalAddress("k"))
 
 	ctx := e.NewContext()
 	if err := ctx.Emit(dataEffect("k")); err != nil {
@@ -381,7 +381,7 @@ func TestFlushSafeModeError_ReplicateFailAfterPrecheck(t *testing.T) {
 	bc := &mockBroadcaster{replicateErr: errors.New("quorum unreachable"), allRegionPeersReachable: true}
 	e := newTestEngine(bc)
 	e.safety.Store(&safetyMap{defaultMode: SafeMode})
-	e.peerFilterAdd(pb.NodeID(2), "k") // a peer holds "k": exercises the Replicate-fails path
+	e.peerFilterAdd(pb.NodeID(2), logicalAddress("k")) // a peer holds "k": exercises the Replicate-fails path
 
 	ctx := e.NewContext()
 	if err := ctx.Emit(dataEffect("k")); err != nil {
@@ -397,7 +397,7 @@ func TestFlushSafeMode_AllowsWhenAllPeersReachable(t *testing.T) {
 	bc := &mockBroadcaster{allRegionPeersReachable: true}
 	e := newTestEngine(bc)
 	e.safety.Store(&safetyMap{defaultMode: SafeMode})
-	e.peerFilterAdd(pb.NodeID(2), "k") // a peer holds "k": real replication target
+	e.peerFilterAdd(pb.NodeID(2), logicalAddress("k")) // a peer holds "k": real replication target
 
 	ctx := e.NewContext()
 	if err := ctx.Emit(dataEffect("k")); err != nil {
@@ -1422,13 +1422,13 @@ func TestHandleRemoteBind_AbortDepsCannotOverrideForkChoice(t *testing.T) {
 			remote, remoteBind, _ := makeBind("remote", 2, remoteStamp)
 			ptxn := &pendingTxn{
 				txnID: "local", bindOffset: localBind, forkChoiceHash: local.GetForkChoiceHash(),
-				keys: []pendingTxnKey{{key: "k", newTip: localTip, consumedTips: []Tip{base}}},
+				keys: []pendingTxnKey{{key: logicalAddress("k"), newTip: localTip, consumedTips: []Tip{base}}},
 				done: make(chan struct{}),
 			}
 			e.pendingTxns.Store(localBind, ptxn)
 			e.pendingTxTips.Store(localTip, []Tip{base})
-			e.updateIndex("k", nil, localBind)
-			e.updateIndex("k", nil, remoteBind)
+			e.updateIndex(logicalAddress("k"), nil, localBind)
+			e.updateIndex(logicalAddress("k"), nil, remoteBind)
 
 			// Legacy senders may list our tentative tip even when our already
 			// published bind wins. Arrival alone cannot decide either outcome.
@@ -1459,9 +1459,9 @@ func TestHandleRemoteBind_AbortDepsCannotOverrideForkChoice(t *testing.T) {
 				TxnVerdicts: map[string]pb.Verdict{"remote": pb.Verdict_WON},
 			}}})
 
-			nacks := []*pb.NackNotify{e.buildEnrichedNack("k", toPbRef(localBind), []Tip{remoteBind})}
+			nacks := []*pb.NackNotify{e.buildEnrichedNack(logicalAddress("k"), toPbRef(localBind), []Tip{remoteBind})}
 			if !localWins {
-				nacks = append(nacks, e.buildEnrichedNack("k", toPbRef(localBind), []Tip{proof}))
+				nacks = append(nacks, e.buildEnrichedNack(logicalAddress("k"), toPbRef(localBind), []Tip{proof}))
 			}
 
 			_, err := e.evaluateNacks(ptxn, nacks)
@@ -1577,7 +1577,7 @@ func TestHandleNack_TransactionalKey_DefersEvaluation(t *testing.T) {
 		originNode: 42,
 		bindOffset: Tip{42, 9999},
 		keys: []pendingTxnKey{
-			{key: "k", newTip: Tip{42, 500}, collection: pb.CollectionKind_SCALAR},
+			{key: logicalAddress("k"), newTip: Tip{42, 500}, collection: pb.CollectionKind_SCALAR},
 		},
 		done: make(chan struct{}),
 	}
@@ -2129,7 +2129,7 @@ func TestSpokenBinds_PreflightAbortsOnHit(t *testing.T) {
 	e := NewTestEngine()
 	defer func() { _ = e.Close() }()
 
-	if err := e.ensureSubscribed("k"); err != nil {
+	if err := e.ensureSubscribed(logicalAddress("k")); err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
 
@@ -2182,7 +2182,7 @@ func TestSpokenBinds_PreflightAllowsOnMiss(t *testing.T) {
 	e := NewTestEngine()
 	defer func() { _ = e.Close() }()
 
-	if err := e.ensureSubscribed("k"); err != nil {
+	if err := e.ensureSubscribed(logicalAddress("k")); err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
 

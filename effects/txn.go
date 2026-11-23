@@ -108,7 +108,7 @@ func (e *Engine) hasWritesSince(key string, observed []Tip, txnID string) bool {
 		base.keys = append(base.keys, pendingTxnKey{key: key, newTip: tip})
 	}
 
-	current := e.index.Contains(key).Tips()
+	current := e.index.ContainsInternal(key).Tips()
 	if len(current) == 0 && len(observed) != 0 {
 		return true
 	}
@@ -336,7 +336,7 @@ func (e *Engine) evaluateNacks(ptxn *pendingTxn, nacks []*pb.NackNotify) (map[st
 	verdicts := make(verdictMap)
 
 	for _, nack := range nacks {
-		key := string(nack.GetKey())
+		key := e.nackKey(nack)
 
 		tips, evidence, err := e.nackCandidates(ptxn, key, nack.GetTipDetails())
 		if err != nil {
@@ -460,7 +460,7 @@ func (e *Engine) finishPriorityResponse(ref *pb.EffectRef, nacks []*pb.NackNotif
 		}
 
 		for _, pk := range txn.keys {
-			nacks = append(nacks, e.buildEnrichedNack(pk.key, ref, e.index.Contains(pk.key).Tips()))
+			nacks = append(nacks, e.buildEnrichedNack(pk.key, ref, e.index.ContainsInternal(pk.key).Tips()))
 		}
 	}
 
@@ -647,7 +647,7 @@ func (e *Engine) reachesFromTxOnKey(ptxn *pendingTxn, key *string, targets ...Ti
 
 		refs := allDeps(eff)
 		if key != nil {
-			if eff.GetTxnBind() == nil && string(eff.GetKey()) != *key {
+			if eff.GetTxnBind() == nil && string(eff.GetIKey()) != *key {
 				continue
 			}
 

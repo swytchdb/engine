@@ -65,9 +65,9 @@ func TestNonTransactionalWriteAtBindPublication(t *testing.T) {
 								t.Fatal(err)
 							}
 
-							engines[i].updateIndex(key, nil, base)
+							engines[i].updateIndex(logicalAddress(key), nil, base)
 							preSubscribe(engines[i], key)
-							engines[i].addPeerSubscriber(key, pb.NodeID(2-i))
+							engines[i].addPeerSubscriber(logicalAddress(key), pb.NodeID(2-i))
 						}
 					}
 

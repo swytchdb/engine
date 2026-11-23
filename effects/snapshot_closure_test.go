@@ -80,16 +80,16 @@ func TestBindKeyClosure_CrossKeyCandidate(t *testing.T) {
 			alice := closureBind(log, "alice", aliceHash, []string{"winner", "payout:alice"}, nil)
 			bob := closureBind(log, "bob", bobHash, []string{"winner", "payout:bob"}, nil)
 
-			e.updateIndex("winner", nil, alice)
-			e.updateIndex("payout:alice", nil, alice)
-			e.updateIndex("payout:bob", nil, bob)
+			e.updateIndex(logicalAddress("winner"), nil, alice)
+			e.updateIndex(logicalAddress("payout:alice"), nil, alice)
+			e.updateIndex(logicalAddress("payout:bob"), nil, bob)
 
-			anchors, verdicts, err := e.bindKeyClosure("payout:bob")
+			anchors, verdicts, err := e.bindKeyClosure(logicalAddress("payout:bob"))
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			losers, _ := e.losersOnKey("winner", anchors["winner"], verdicts)
+			losers, _ := e.losersOnKey(logicalAddress("winner"), anchors[logicalAddress("winner")], verdicts)
 
 			loser := "bob"
 			if winner == "bob" {
@@ -109,17 +109,17 @@ func TestBindKeyClosure_RevisitsKeyForNewAnchor(t *testing.T) {
 	old := closureBind(log, "old", 1, []string{"a", "c"}, nil)
 	late := closureBind(log, "late", 2, []string{"b", "a"}, map[string]Tip{"a": old})
 	root := closureBind(log, "root", 3, []string{"a", "b"}, nil)
-	e.updateIndex("a", nil, root)
-	e.updateIndex("b", nil, late)
+	e.updateIndex(logicalAddress("a"), nil, root)
+	e.updateIndex(logicalAddress("b"), nil, late)
 
 	// a is visited first, then b reveals another a branch carrying (a,c).
 	// That branch is absent from a's index and b's same-key ancestry.
-	anchors, _, err := e.bindKeyClosure("a")
+	anchors, _, err := e.bindKeyClosure(logicalAddress("a"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if !slices.Contains(anchors["c"], old) {
+	if !slices.Contains(anchors[logicalAddress("c")], old) {
 		t.Fatalf("late branch not explored: anchors=%v", anchors)
 	}
 }

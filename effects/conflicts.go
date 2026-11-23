@@ -24,6 +24,7 @@
 package effects
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -31,6 +32,7 @@ import (
 	"strconv"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
+	"github.com/swytchdb/engine/keytrie"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 )
@@ -113,7 +115,7 @@ func (e *Engine) unresolvedConflictTip(key string, bind Tip, tips []Tip, reaches
 	// A dependency on any associated key resolves this envelope, including
 	// when another key still indexes its old WON snapshot.
 	for _, kb := range eff.GetTxnBind().GetKeys() {
-		heads = append(heads, e.conflictHeads(string(kb.GetKey()), e.index.Contains(string(kb.GetKey())).Tips())...)
+		heads = append(heads, e.conflictHeads(string(kb.GetKey()), e.index.ContainsInternal(string(kb.GetKey())).Tips())...)
 	}
 
 	for _, head := range heads {
@@ -192,7 +194,7 @@ func (e *Engine) emitConflict(key string, a, b Tip, checks map[string]conflictDo
 
 		txn := conflictTransaction{Version: 1, TxID: envelopes[i].GetTxnId(), Bind: conflictReference(bind), MapKeyEncoding: "hex"}
 		for _, kb := range envelopes[i].GetTxnBind().GetKeys() {
-			state := conflictKey{Key: kb.GetKey()}
+			state := conflictKey{Key: bytes.Clone(keytrie.WireKeyBytes(kb.GetKey()))}
 			for _, tip := range fromPbRefs(kb.GetConsumedTips()) {
 				state.ConsumedTips = append(state.ConsumedTips, conflictReference(tip))
 			}
@@ -236,11 +238,12 @@ func (e *Engine) emitConflict(key string, a, b Tip, checks map[string]conflictDo
 
 	for _, envelope := range envelopes {
 		for _, kb := range envelope.GetTxnBind().GetKeys() {
-			if err := e.appendConflictValue(ctx, conflictIndexPrefix+string(kb.GetKey()), []byte(envelope.GetTxnId())); err != nil {
+			key := string(keytrie.WireKeyBytes(kb.GetKey()))
+			if err := e.appendConflictValue(ctx, conflictIndexPrefix+key, []byte(envelope.GetTxnId())); err != nil {
 				return err
 			}
 
-			keys[string(kb.GetKey())] = struct{}{}
+			keys[key] = struct{}{}
 		}
 	}
 

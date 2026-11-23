@@ -66,6 +66,10 @@ func newSnapshotLog() *snapshotLog {
 // putEffect serialises eff, stores it in both the raw entries map and the
 // effectCache, advances nextOff by 100, and returns the Tip assigned.
 func (l *snapshotLog) putEffect(eff *pb.Effect) Tip {
+	if err := prepareEffectAddress(eff); err != nil {
+		panic(err)
+	}
+
 	if len(eff.GetForkChoiceHash()) == 0 {
 		eff.ForkChoiceHash = ComputeForkChoiceHash(pb.NodeID(eff.GetNodeId()), eff.GetHlc())
 	}
@@ -74,7 +78,7 @@ func (l *snapshotLog) putEffect(eff *pb.Effect) Tip {
 	l.nextOff += 100
 	t := Tip{l.nodeID, off}
 
-	data, _ := proto.Marshal(eff)
+	data, _ := MarshalEffect(eff)
 
 	l.entries[t] = data
 	if err := l.effectCache.Put(t, proto.Clone(eff).(*pb.Effect)); err != nil {
@@ -162,7 +166,7 @@ func TestEnsureSubscribed_OwnsBorrowedKey(t *testing.T) {
 	buf := []byte("borrowed-key")
 	key := unsafe.String(unsafe.SliceData(buf), len(buf))
 
-	if err := e.ensureSubscribed(key); err != nil {
+	if err := e.ensureSubscribed(logicalAddress(key)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -658,7 +662,7 @@ func TestGetSnapshot_SubscriptionBroadcast(t *testing.T) {
 	bc.nackTarget = e // wire up so bootstrap NACKs arrive and don't block
 	// A peer claims the key so the subscribe takes the blocking bootstrap
 	// (a nowhere-key would announce async without probing anyone).
-	e.peerFilterAdd(pb.NodeID(10), "newkey")
+	e.peerFilterAdd(pb.NodeID(10), logicalAddress("newkey"))
 
 	_, _, _, _ = e.GetSnapshot("newkey")
 
@@ -1264,7 +1268,7 @@ func TestSubscriptionBootstrap_FetchesRemoteState(t *testing.T) {
 	// have populated our filter. Without this, clusterMaybeHasKey is false and
 	// the subscribe takes the async-announce path (nothing to fetch) — but here
 	// there IS remote state to fetch, so the blocking bootstrap must run.
-	localEngine.peerFilterAdd(2, "shared-key")
+	localEngine.peerFilterAdd(2, logicalAddress("shared-key"))
 
 	// Now the local engine reads "shared-key" for the first time
 	r, _, _, err := localEngine.GetSnapshot("shared-key")
@@ -1477,8 +1481,8 @@ func TestHandleRemote_FlushKey_BypassesAuthorityGate(t *testing.T) {
 	}
 	e.safety.Store(&safetyMap{defaultMode: UnsafeMode})
 
-	e.updateIndex("alpha", nil, Tip{1, 100})
-	e.updateIndex("beta", nil, Tip{1, 101})
+	e.updateIndex(logicalAddress("alpha"), nil, Tip{1, 100})
+	e.updateIndex(logicalAddress("beta"), nil, Tip{1, 101})
 
 	if e.index.Contains("alpha") == nil || e.index.Contains("beta") == nil {
 		t.Fatal("test setup: seeded keys not in index")
@@ -2719,7 +2723,7 @@ func TestLosersOnKey_TwoConcurrentBindsLowerHashWins(t *testing.T) {
 
 	e.index.Insert("el-2", nil, keytrie.NewTipSet(bindHi, bindLo))
 
-	losers, _ := e.losersOnKey("el-2", nil, nil)
+	losers, _ := e.losersOnKey(logicalAddress("el-2"), nil, nil)
 	if _, ok := losers["txn-hi"]; !ok {
 		t.Fatalf("expected higher-hash bind 'txn-hi' to be in losers, got %v", losers)
 	}
@@ -2877,7 +2881,7 @@ func TestLosersOnKey_XDependsOnYsAncestorsButNotNewTip(t *testing.T) {
 	// consume it because X.ConsumedTips on el-2 didn't include it), nodeA:28=xBind}.
 	e.index.Insert("el-2", nil, keytrie.NewTipSet(Tip{nodeB, 10}, yBind, x26, xBind))
 
-	losers, _ := e.losersOnKey("el-2", nil, nil)
+	losers, _ := e.losersOnKey(logicalAddress("el-2"), nil, nil)
 	t.Logf("losersOnKey(el-2) returned: %v", losers)
 
 	if _, ok := losers["txn-X"]; !ok {
@@ -3010,7 +3014,7 @@ func TestLosersOnKey_SharedAncestorConcurrentBinds(t *testing.T) {
 
 	e.index.Insert("el-1", nil, keytrie.NewTipSet(xBind, yBind))
 
-	losers, _ := e.losersOnKey("el-1", nil, nil)
+	losers, _ := e.losersOnKey(logicalAddress("el-1"), nil, nil)
 	t.Logf("losersOnKey(el-1) returned: %v", losers)
 
 	if _, ok := losers["txn-X"]; !ok {
@@ -3149,7 +3153,7 @@ func TestLosersOnKey_SideChannelMakesSequential(t *testing.T) {
 
 	e.index.Insert("el-1", nil, keytrie.NewTipSet(xBind, yBind))
 
-	losers, _ := e.losersOnKey("el-1", nil, nil)
+	losers, _ := e.losersOnKey(logicalAddress("el-1"), nil, nil)
 	t.Logf("losersOnKey(el-1) returned: %v", losers)
 
 	if len(losers) != 0 {
@@ -3264,7 +3268,7 @@ func TestIsRealConflict_TransitiveReachMakesSequential(t *testing.T) {
 		forkChoiceHash: xHash,
 		bindOffset:     xBind,
 		keys: []pendingTxnKey{
-			{key: "el-1", newTip: xData, collection: pb.CollectionKind_ORDERED},
+			{key: logicalAddress("el-1"), newTip: xData, collection: pb.CollectionKind_ORDERED},
 		},
 		done: make(chan struct{}),
 	}
@@ -3277,7 +3281,7 @@ func TestIsRealConflict_TransitiveReachMakesSequential(t *testing.T) {
 		Deps:               []*pb.EffectRef{toPbRef(yData)},
 	}
 
-	if e.isRealConflict(ptxn, "el-1", detail) {
+	if e.isRealConflict(ptxn, logicalAddress("el-1"), detail) {
 		t.Fatalf("X transitively reaches Y via the noop chain — isRealConflict must return false (sequential, not concurrent). Got true.")
 	}
 }
@@ -3324,13 +3328,13 @@ func TestBindKeyClosure_ExpandsViaBindKeysField(t *testing.T) {
 	})
 	e.index.Insert("el-3", nil, keytrie.NewTipSet(bind))
 
-	closure, _, err := e.bindKeyClosure("el-3")
+	closure, _, err := e.bindKeyClosure(logicalAddress("el-3"))
 	if err != nil {
 		t.Fatalf("bindKeyClosure: %v", err)
 	}
 
 	for _, want := range []string{"el-2", "el-3", "el-4"} {
-		if _, ok := closure[want]; !ok {
+		if _, ok := closure[logicalAddress(want)]; !ok {
 			t.Fatalf("bindKeyClosure(el-3) missing %q; got %v", want, closure)
 		}
 	}

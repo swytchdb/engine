@@ -133,6 +133,12 @@ func (e *Engine) wakeMemoryGovernor() {
 }
 
 func (e *Engine) dropSubscription(key string) {
+	name := wireKey(key)
+	if name == key {
+		return // Internal leaves do not own the logical subscription record.
+	}
+
+	key = name
 	if state, ok := e.subscriptions.LoadAndDelete(key); ok && state.ownedKey {
 		e.releaseKey(key)
 	}
@@ -142,8 +148,9 @@ func (e *Engine) configureIndexKeyOwnership() {
 	e.index.SetKeyOwnership(e.retainKey, e.releaseKey)
 }
 
-// A subscription, trie leaf (including ghosts), and pending release share one
-// key allocation. Keep it charged until the last primary owner releases it.
+// Equal keys share one allocation across primary owners, including trie leaves
+// and pending releases. Subscription names and trie addresses are distinct keys.
+// Keep each allocation charged until its last primary owner releases it.
 func (e *Engine) retainKey(key string) string {
 	if key == "" {
 		return ""

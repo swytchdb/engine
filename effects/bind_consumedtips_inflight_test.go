@@ -171,7 +171,7 @@ func TestBindConsumedTipsSubstitutesForeignInflightTip(t *testing.T) {
 	var consumed []Tip
 
 	for _, kb := range bind.GetKeys() {
-		if string(kb.GetKey()) == key {
+		if string(kb.GetKey()) == logicalAddress(key) {
 			consumed = fromPbRefs(kb.GetConsumedTips())
 
 			break

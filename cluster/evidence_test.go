@@ -10,6 +10,7 @@ import (
 
 	pb "github.com/swytchdb/engine/cluster/proto"
 	"github.com/swytchdb/engine/effects"
+	"github.com/swytchdb/engine/keytrie"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -20,7 +21,7 @@ func TestSnapshotEvidencePeerAndCloudTransport(t *testing.T) {
 	member, owner := effects.Tip{42, 1}, effects.Tip{42, 2}
 	ref := func(t effects.Tip) *pb.EffectRef { return &pb.EffectRef{NodeId: t[0], Offset: t[1]} }
 
-	proof := &pb.Effect{Key: []byte("foreign"), Deps: []*pb.EffectRef{{NodeId: 99, Offset: 99}}, Kind: &pb.Effect_Noop{Noop: &pb.NoopEffect{}}}
+	proof := &pb.Effect{Key: []byte("foreign"), IKey: []byte(keytrie.LogicalAddress("foreign")), Deps: []*pb.EffectRef{{NodeId: 99, Offset: 99}}, Kind: &pb.Effect_Noop{Noop: &pb.NoopEffect{}}}
 	if err := source.EffectCache().Put(member, proof); err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +68,7 @@ func TestSnapshotEvidencePeerAndCloudTransport(t *testing.T) {
 	t.Run("ancestry", func(t *testing.T) {
 		count := 0
 
-		err := reader.ReadAncestry("k", owner, func(record *pb.AncestryResponse) error {
+		err := reader.ReadAncestry(keytrie.LogicalAddress("k"), owner, func(record *pb.AncestryResponse) error {
 			count++
 
 			verify(t, record.GetEffectData())

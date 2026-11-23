@@ -40,7 +40,7 @@ func TestConflictEffects_ManyWonTipsPreserveAdjudication(t *testing.T) {
 
 	e, _, _ := conflictLottery(t, names...)
 	tips := e.index.Contains("winner").Tips()
-	want, _ := e.losersOnKeyAt("winner", tips, nil, nil, nil, false)
+	want, _ := e.losersOnKeyAt(logicalAddress("winner"), tips, nil, nil, nil, false)
 	documents := make(map[string]int)
 	indexes := make(map[string]int)
 
@@ -63,7 +63,7 @@ func TestConflictEffects_ManyWonTipsPreserveAdjudication(t *testing.T) {
 		}
 	})
 
-	got, _ := e.losersOnKeyAt("winner", tips, nil, nil, nil, true)
+	got, _ := e.losersOnKeyAt(logicalAddress("winner"), tips, nil, nil, nil, true)
 	if len(want) != len(names)-1 || !maps.Equal(got, want) {
 		t.Fatalf("reporting changed adjudication: got %v, want %v", got, want)
 	}
@@ -76,7 +76,7 @@ func TestConflictEffects_ManyWonTipsPreserveAdjudication(t *testing.T) {
 
 	before := maps.Clone(indexes)
 
-	e.losersOnKeyAt("winner", tips, nil, nil, nil, true)
+	e.losersOnKeyAt(logicalAddress("winner"), tips, nil, nil, nil, true)
 
 	if !maps.Equal(before, indexes) {
 		t.Fatal("existing documents did not suppress repeat notifications")
@@ -92,7 +92,7 @@ func TestConflictEffects_BatchRetriesMissingHistory(t *testing.T) {
 	addConflictLottery(e, log, "charlie", 3, nil)
 	tips := e.index.Contains("winner").Tips()
 
-	e.losersOnKeyAt("winner", tips, nil, nil, nil, true)
+	e.losersOnKeyAt(logicalAddress("winner"), tips, nil, nil, nil, true)
 
 	if e.index.Contains(conflictDocumentPrefix+"alice") != nil {
 		t.Fatal("incomplete evidence created a document gate")
@@ -109,7 +109,7 @@ func TestConflictEffects_BatchRetriesMissingHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	e.losersOnKeyAt("winner", tips, nil, nil, nil, true)
+	e.losersOnKeyAt(logicalAddress("winner"), tips, nil, nil, nil, true)
 	conflictDocument(t, e, "alice")
 }
 
@@ -124,12 +124,12 @@ func BenchmarkConflictEffectsReportedWonTips(b *testing.B) {
 			}
 
 			tips := e.index.Contains("winner").Tips()
-			e.losersOnKeyAt("winner", tips, nil, nil, nil, true)
+			e.losersOnKeyAt(logicalAddress("winner"), tips, nil, nil, nil, true)
 			b.ReportAllocs()
 			b.ResetTimer()
 
 			for range b.N {
-				e.losersOnKeyAt("winner", tips, nil, nil, nil, true)
+				e.losersOnKeyAt(logicalAddress("winner"), tips, nil, nil, nil, true)
 			}
 		})
 	}

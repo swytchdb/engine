@@ -47,13 +47,13 @@ func TestSnapshotReadViewCapturedAbsence(t *testing.T) {
 	e := newSnapshotEngine(newSnapshotLog())
 
 	v := newSnapshotReadView(e, context.Background())
-	if _, err := v.capture("absent"); err != nil {
+	if _, err := v.capture(logicalAddress("absent")); err != nil {
 		t.Fatal(err)
 	}
 
-	e.updateIndex("absent", nil, Tip{1, 1})
+	e.updateIndex(logicalAddress("absent"), nil, Tip{1, 1})
 
-	tips, err := v.capture("absent")
+	tips, err := v.capture(logicalAddress("absent"))
 	if err != nil || len(tips) != 0 {
 		t.Fatalf("captured absence changed: %v, %v", tips, err)
 	}
@@ -89,7 +89,7 @@ func TestNackBindDecision(t *testing.T) {
 			ours := &pendingTxn{txnID: "ours", forkChoiceHash: []byte{2}, bindOffset: Tip{1, 1}}
 			detail := &pb.NackTipDetail{Ref: toPbRef(tip), IsBind: true, BindForkChoiceHash: []byte{tt.hash}}
 
-			conflict, defeated := e.checkNackConflict(ours, "key", detail)
+			conflict, defeated := e.checkNackConflict(ours, logicalAddress("key"), detail)
 			if conflict != tt.conflict || (len(defeated) == 1 && defeated[tt.txn] == tip) != tt.defeated {
 				t.Fatalf("conflict=%t, defeated=%v", conflict, defeated)
 			}

@@ -443,7 +443,7 @@ func (d *dag) trimAncestorsOfLCA(tips []Tip) error {
 		d.engine.historyMu.Lock()
 		defer d.engine.historyMu.Unlock()
 
-		if tipsEqual(d.engine.index.Contains(d.key).Tips(), tips) {
+		if tipsEqual(d.engine.index.ContainsInternal(d.key).Tips(), tips) {
 			boundary = d.engine.historyBoundary(d.key)
 		}
 	}

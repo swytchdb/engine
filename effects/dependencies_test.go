@@ -42,15 +42,19 @@ func TestDependencyTraversal(t *testing.T) {
 		}}},
 	}
 
+	if err := prepareEffectAddress(eff); err != nil {
+		t.Fatal(err)
+	}
+
 	if got := slices.Collect(allDeps(eff)); !slices.Equal(got, []*pb.EffectRef{ordinary, left, right}) {
 		t.Fatalf("global dependencies: %v", got)
 	}
 
-	if got := slices.Collect(keyDeps("left", eff)); !slices.Equal(got, []*pb.EffectRef{left}) {
+	if got := slices.Collect(keyDeps(logicalAddress("left"), eff)); !slices.Equal(got, []*pb.EffectRef{left}) {
 		t.Fatalf("key-scoped dependencies: %v", got)
 	}
 
-	if got := slices.Collect(keyDeps("absent", eff)); len(got) != 0 {
+	if got := slices.Collect(keyDeps(logicalAddress("absent"), eff)); len(got) != 0 {
 		t.Fatalf("unrelated key inherited dependencies: %v", got)
 	}
 
@@ -65,7 +69,7 @@ func TestDependencyTraversal(t *testing.T) {
 	}
 
 	eff.Kind = nil
-	if got := slices.Collect(keyDeps("left", eff)); !slices.Equal(got, []*pb.EffectRef{ordinary}) {
+	if got := slices.Collect(keyDeps(logicalAddress("left"), eff)); !slices.Equal(got, []*pb.EffectRef{ordinary}) {
 		t.Fatalf("ordinary dependencies changed: %v", got)
 	}
 
@@ -83,7 +87,7 @@ func TestDAGPrepareReplacesPreviousTraversal(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	d := newDag(e, "key", "")
+	d := newDag(e, logicalAddress("key"), "")
 	if err := d.prepare([]Tip{tip}); err != nil {
 		t.Fatal(err)
 	}

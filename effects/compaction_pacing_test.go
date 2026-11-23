@@ -71,7 +71,7 @@ func TestAutomaticCompactionPacingIsPerKey(t *testing.T) {
 			t.Fatalf("read while pacing: value=%v error=%v", got, err)
 		}
 
-		if emitted := c.keys[step.key] != nil; emitted != step.want {
+		if emitted := c.keys[logicalAddress(step.key)] != nil; emitted != step.want {
 			c.Abort()
 			t.Fatalf("key %q: snapshot emitted=%t, want %t", step.key, emitted, step.want)
 		}

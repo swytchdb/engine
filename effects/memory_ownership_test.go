@@ -54,13 +54,13 @@ func TestMemorySharedPrimaryKeyOwners(t *testing.T) {
 		return true
 	})
 	before := e.keyBytes
-	e.dropSubscription(key)
+	e.dropSubscription(logicalAddress(key))
 
 	if e.keyBytes != before {
 		t.Fatal("subscription release credited the trie's key")
 	}
 
-	e.index.SetEvictHooks(func(string) bool { return true }, nil, nil)
+	e.index.SetEvictHooksInternal(func(string) bool { return true }, nil, nil)
 
 	if e.index.EvictBatch(1) != 1 {
 		t.Fatal("no eviction")
@@ -92,8 +92,8 @@ func TestMemoryClusterFiltersHaveIndependentBudget(t *testing.T) {
 
 	for i := range 5000 {
 		key := fmt.Sprintf("filter-only:%d", i)
-		e.ownFilterAdd(key)
-		e.peerFilterAdd(pb.NodeID(123), key)
+		e.ownFilterAdd(logicalAddress(key))
+		e.peerFilterAdd(pb.NodeID(123), logicalAddress(key))
 	}
 
 	e.OwnKeyFilterSnapshot()

@@ -321,7 +321,7 @@ func TestReplayRun26373595271InBindReadDiverges(t *testing.T) {
 	// --- Step 6: do a fresh reconstruct from the SAME logical tip set
 	// preTxTips (the index state BEFORE T's emits). With R promoted, this
 	// is the read every other client / process would do post-promotion.
-	postReduced, _, err := e.reconstruct("el-0", preTxTips, "", false)
+	postReduced, _, err := e.reconstruct(logicalAddress("el-0"), preTxTips, "", false)
 	if err != nil {
 		t.Fatalf("post-promotion reconstruct: %v", err)
 	}

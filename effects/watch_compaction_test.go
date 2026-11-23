@@ -33,7 +33,7 @@ func TestWatchCompactsObservationHistory(t *testing.T) {
 					t.Fatal(err)
 				}
 
-				tip := c.watchedKeys["key"].noopOffset
+				tip := c.watchedKeys[logicalAddress("key")].noopOffset
 
 				noop, ok := e.effectCache.Get(tip)
 				if !ok || noop.GetNoop() == nil {
@@ -129,7 +129,7 @@ func TestNoopEmissionMakesContextWritable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	pending := c.keys["key"]
+	pending := c.keys[logicalAddress("key")]
 	if pending == nil {
 		t.Fatal("context that emitted NOOPs still skips compaction")
 	}

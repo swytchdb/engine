@@ -62,7 +62,7 @@ type critNode[T any] struct {
 	// pinned is the eviction decider's verdict, fixed before publication.
 	// pins counts dynamic holds taken by Pin/Unpin.
 	pinned   bool
-	_        [1]byte
+	keyOwned bool // an ownership callback retained this leaf's key
 	key      string
 	ownedKey string // canonical allocation returned by the configured key owner
 	tips     atomic.Pointer[TipSet]

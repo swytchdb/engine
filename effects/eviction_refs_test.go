@@ -63,7 +63,7 @@ func TestCreationRefs_ConcurrentReleaseAndReclaim(t *testing.T) {
 					return
 				}
 
-				p.decrefChainNode("key", tip)
+				p.decrefChainNode(logicalAddress("key"), tip)
 			}
 		})
 	}
@@ -106,10 +106,10 @@ func TestReleaseChainRefs_SharedBindPins(t *testing.T) {
 			d := &dag{topoOrder: []Tip{tip}}
 			e.publishSubdag(a, d, []Tip{tip})
 			e.publishSubdag(b, d, []Tip{tip})
-			e.releaseChainRefs("a", []Tip{tip}, a)
+			e.releaseChainRefs(logicalAddress("a"), []Tip{tip}, a)
 			// A later eviction walk may reach the same resident ancestor.
 			// It must not consume b's creation reference or cached DAG pin.
-			e.releaseChainRefs("a", []Tip{tip}, &leafState{})
+			e.releaseChainRefs(logicalAddress("a"), []Tip{tip}, &leafState{})
 			e.reclaimUnreferenced()
 
 			if _, ok := e.materializeSubdag(b.subdag.Load()); !ok {
@@ -126,7 +126,7 @@ func TestReleaseChainRefs_SharedBindPins(t *testing.T) {
 				}
 			}
 
-			e.releaseChainRefs("b", []Tip{tip}, b)
+			e.releaseChainRefs(logicalAddress("b"), []Tip{tip}, b)
 			e.reclaimUnreferenced()
 
 			if e.effectCache.EntryCount() != 0 {
@@ -157,7 +157,7 @@ func TestPutIngested_BindOwnsOnlySubscribedKeys(t *testing.T) {
 				t.Fatal("bind on subscribed noncanonical key was reclaimed")
 			}
 
-			e.releaseChainRefs(key, []Tip{tip}, nil)
+			e.releaseChainRefs(logicalAddress(key), []Tip{tip}, nil)
 			e.reclaimUnreferenced()
 
 			if e.effectCache.EntryCount() != 0 {
@@ -199,8 +199,8 @@ func TestCreationRefs_ConcurrentReacquireAndRelease(t *testing.T) {
 					return
 				}
 
-				e.effectCache.decrefChainNode(key, tip)
-				e.effectCache.decrefChainNode(key, tip)
+				e.effectCache.decrefChainNode(logicalAddress(key), tip)
+				e.effectCache.decrefChainNode(logicalAddress(key), tip)
 			}
 		})
 	}
@@ -248,7 +248,7 @@ func TestPutSized_PromotesPinnedCacheEntry(t *testing.T) {
 		t.Fatal("promotion failed while a cache pin was present")
 	}
 
-	e.releaseChainRefs("a", []Tip{tip}, nil)
+	e.releaseChainRefs(logicalAddress("a"), []Tip{tip}, nil)
 	e.reclaimUnreferenced()
 
 	if e.effectCache.EntryCount() != 0 {

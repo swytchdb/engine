@@ -62,7 +62,7 @@ func TestObservationsRemainCausalDependencies(t *testing.T) {
 				c.BeginTx()
 				err = c.Emit(scalarSet("k", "next"))
 			case "verdict":
-				err = e.emitSnapshot("k", nil)
+				err = e.emitSnapshot(logicalAddress("k"), nil)
 			}
 
 			if err != nil {
@@ -141,17 +141,17 @@ func TestCompactionConsumesRemoteObservations(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if c.keys["k"] == nil {
+	if c.keys[logicalAddress("k")] == nil {
 		t.Fatal("remote observation history did not trigger compaction")
 	}
 
-	snapshot := c.keys["k"].lastOffset
+	snapshot := c.keys[logicalAddress("k")].lastOffset
 	if err := c.Flush(); err != nil {
 		t.Fatal(err)
 	}
 	// Reconciliation must recognize the old observation as consumed, rather
 	// than restoring it as a competing branch beside the snapshot.
-	e.installIngestedTips("k", first)
+	e.installIngestedTips(logicalAddress("k"), first)
 
 	tips := e.index.Contains("k").Tips()
 	if len(tips) != 1 || tips[0] != snapshot {
@@ -216,22 +216,22 @@ func TestObservingNoopDoesNotOrderBinds(t *testing.T) {
 	reader, readerBind := makeBind("reader", observation, base, 2)
 	writer, writerBind := makeBind("writer", writerTip, observation, 1)
 
-	e.updateIndex("k", nil, readerBind)
-	e.updateIndex("k", nil, writerBind)
+	e.updateIndex(logicalAddress("k"), nil, readerBind)
+	e.updateIndex(logicalAddress("k"), nil, writerBind)
 
 	if got := e.checkCompetingBinds(writer.GetTxnBind(), "writer"); got != "reader" {
 		t.Errorf("observing reader's NOOP excused its competing bind: %q", got)
 	}
 
-	ptxn := &pendingTxn{txnID: "reader", bindOffset: readerBind, forkChoiceHash: reader.GetForkChoiceHash(), keys: []pendingTxnKey{{key: "k", newTip: observation, readOnly: true}}}
+	ptxn := &pendingTxn{txnID: "reader", bindOffset: readerBind, forkChoiceHash: reader.GetForkChoiceHash(), keys: []pendingTxnKey{{key: logicalAddress("k"), newTip: observation, readOnly: true}}}
 	detail := nackTipDetail(writerBind, writer)
 
 	detail.BindForkChoiceHash = writer.GetForkChoiceHash()
-	if !e.isRealConflict(ptxn, "k", detail) {
+	if !e.isRealConflict(ptxn, logicalAddress("k"), detail) {
 		t.Error("writer observed our NOOP, not our bind; its winning bind must conflict")
 	}
 
-	losers, _ := e.losersOnKeyAt("k", []Tip{readerBind, writerBind}, nil, nil, nil, false)
+	losers, _ := e.losersOnKeyAt(logicalAddress("k"), []Tip{readerBind, writerBind}, nil, nil, nil, false)
 	if _, lost := losers["reader"]; !lost {
 		t.Errorf("reconstruction treated observation as committed ordering: losers=%v", losers)
 	}
@@ -243,12 +243,12 @@ func TestBindAncestryIsKeyScoped(t *testing.T) {
 	first := closureBind(log, "first", 1, []string{"k", "other"}, nil)
 	second := closureBind(log, "second", 2, []string{"k", "other"}, map[string]Tip{"other": first})
 
-	ancestry := newCausalIndex(e, "k")
+	ancestry := newCausalIndex(e, logicalAddress("k"))
 	if ancestry.reaches(second, first) {
 		t.Fatal("observing a bind on another key ordered concurrent branches on k")
 	}
 
-	if !newCausalIndex(e, "other").reaches(second, first) {
+	if !newCausalIndex(e, logicalAddress("other")).reaches(second, first) {
 		t.Fatal("lost the bind dependency on the key where it was observed")
 	}
 }

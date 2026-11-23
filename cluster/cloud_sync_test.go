@@ -37,6 +37,7 @@ import (
 	pb "github.com/swytchdb/engine/cluster/proto"
 	dp "github.com/swytchdb/engine/cluster/proto/dataplane"
 	"github.com/swytchdb/engine/effects"
+	"github.com/swytchdb/engine/keytrie"
 	"google.golang.org/grpc"
 )
 
@@ -713,10 +714,15 @@ type sequencedTipsClient struct {
 	dp.DataPlaneClient
 
 	responses []*dp.GetTipsResponse
+	err       error
 	call      int
 }
 
 func (c *sequencedTipsClient) GetTips(context.Context, *dp.GetTipsRequest, ...grpc.CallOption) (*dp.GetTipsResponse, error) {
+	if c.err != nil {
+		return nil, c.err
+	}
+
 	resp := c.responses[c.call]
 	if c.call < len(c.responses)-1 {
 		c.call++
@@ -747,17 +753,17 @@ func TestReconcileRetriesUnavailableClosure(t *testing.T) {
 		engine:     engine,
 		keyNameKey: keyNameKey,
 		client:     client,
-		reconcile:  map[string]struct{}{"k": {}},
+		reconcile:  map[string]struct{}{keytrie.LogicalAddress("k"): {}},
 		ctx:        context.Background(),
 	}
 
-	cs.reconcileBatch([]string{"k"})
+	cs.reconcileBatch([]string{keytrie.LogicalAddress("k")})
 
-	if got := cs.reconcileKeys(); !slices.Equal(got, []string{"k"}) {
+	if got := cs.reconcileKeys(); !slices.Equal(got, []string{keytrie.LogicalAddress("k")}) {
 		t.Fatalf("reconcile set after an unavailable closure = %v, want [k]", got)
 	}
 
-	cs.reconcileBatch([]string{"k"})
+	cs.reconcileBatch([]string{keytrie.LogicalAddress("k")})
 
 	if got := cs.reconcileKeys(); got != nil {
 		t.Fatalf("reconcile set after a complete empty response = %v, want empty", got)

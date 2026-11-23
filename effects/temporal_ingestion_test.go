@@ -61,7 +61,7 @@ func TestTemporalFetchedHistoryObservedOnce(t *testing.T) {
 	historicalTestWrite(t, source, map[string]string{key: "old"}, false)
 	historicalTestWrite(t, source, map[string]string{key: "new"}, false)
 
-	if err := reader.ensureSubscribed(key); err != nil {
+	if err := reader.ensureSubscribed(logicalAddress(key)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -117,7 +117,7 @@ func TestTemporalFetchedHistoryObservedOnce(t *testing.T) {
 		t.Fatal("cached reads sampled receipts or published evidence")
 	}
 
-	d := newDag(reader, key, "")
+	d := newDag(reader, logicalAddress(key), "")
 	if err := d.ingest([]Tip{newest}); err != nil {
 		t.Fatal(err)
 	}
@@ -135,12 +135,12 @@ func TestTemporalFetchedHistoryObservedOnce(t *testing.T) {
 		t.Fatal("dependency completion resampled receipts")
 	}
 
-	data, _, err := reader.reconstruct(key, []Tip{newest}, "", false)
+	data, _, err := reader.reconstruct(logicalAddress(key), []Tip{newest}, "", false)
 	if err != nil || string(data.GetScalar().GetRaw()) != "new" {
 		t.Fatalf("fetched reconstruction: %v, %v", data, err)
 	}
 
-	wire, err := reader.broadcaster.FetchFromAny(toPbRef(newest), reader.fetchHint(key))
+	wire, err := reader.broadcaster.FetchFromAny(toPbRef(newest), reader.fetchHint(logicalAddress(key)))
 	if err != nil {
 		t.Fatal(err)
 	}
