@@ -162,8 +162,11 @@ func (e *Engine) SafetyModeForKey(key string) SafetyMode {
 // Subscribe announces interest even in a currently absent key, and collects
 // existing peer tips before returning. Ordinary read misses may skip this.
 func (e *Engine) Subscribe(key string) error {
-	return e.ensureSubscribedBlocking(logicalAddress(key))
+	return e.SubscribeInternal(logicalAddress(key))
 }
+
+// SubscribeInternal discovers a complete canonical address without projecting it.
+func (e *Engine) SubscribeInternal(key string) error { return e.ensureSubscribedBlocking(key) }
 
 // SetOnKeyChanged installs an index-change observer. It includes metadata,
 // snapshots and backfill, unlike the data-insertion wakeup callback. The hook

@@ -208,6 +208,18 @@ func (c *Context) PendingKeys() []string {
 	return out
 }
 
+// PendingKeysInternal returns complete addresses for graph-library locking.
+func (c *Context) PendingKeysInternal() []string {
+	if c == nil {
+		return nil
+	}
+	out := make([]string, 0, len(c.keys))
+	for key := range c.keys {
+		out = append(out, key)
+	}
+	return out
+}
+
 // SetTraceCtx sets the OTel trace context for this command.
 func (c *Context) SetTraceCtx(ctx context.Context) {
 	c.traceCtx = ctx
@@ -325,31 +337,6 @@ func (c *Context) getSnapshot(key string) (*pb.ReducedEffect, []Tip, error) {
 				return nil, nil, err
 			}
 
-			route, err := c.engine.graphRouteForTips(key, tips)
-			if err != nil {
-				ls.lastCompaction.CompareAndSwap(stamp, 0)
-
-				return nil, nil, err
-			}
-
-			var graphDeps []Tip
-			if route != nil {
-				graphDeps = route.descriptorTips
-				if route.peers[c.engine.nodeID] {
-					if result.GetSubscribers() == nil {
-						result.Subscribers = make(map[uint64]bool)
-					}
-
-					result.Subscribers[uint64(c.engine.nodeID)] = true
-				}
-
-				for peer := range result.GetSubscribers() {
-					if !route.peers[pb.NodeID(peer)] {
-						delete(result.GetSubscribers(), peer)
-					}
-				}
-			}
-
 			snapEff := &pb.SnapshotEffect{
 				Collection: result.GetCollection(),
 				State:      result,
@@ -371,7 +358,7 @@ func (c *Context) getSnapshot(key string) (*pb.ReducedEffect, []Tip, error) {
 			if err := c.emitEffect(&pb.Effect{
 				Key: []byte(wireKey(key)), IKey: []byte(key),
 				Kind: &pb.Effect_Snapshot{Snapshot: snapEff},
-			}, graphDeps, route, tips); err != nil {
+			}, nil, nil, tips); err != nil {
 				ls.lastCompaction.CompareAndSwap(stamp, 0)
 				slog.Error("compaction: snapshot emit failed",
 					"key", key,
@@ -766,29 +753,6 @@ func (c *Context) Abort() {
 // tips the handler actually read, not whatever the index contains now.
 // Pure writes (SET, LPUSH) omit snapshotTips and Emit reads the index.
 func (c *Context) Emit(eff *pb.Effect, snapshotTips ...[]Tip) error {
-	// WATCH and transactional reads emit observations through this shared path.
-	// A graph observation has the same recipients as its observed node frontier.
-	if eff.GetNoop() != nil && isGraphAddress(string(eff.GetIKey())) {
-		key := string(eff.GetIKey())
-
-		tips := c.engine.index.ContainsInternal(key).Tips()
-		if len(snapshotTips) != 0 && snapshotTips[0] != nil {
-			tips = snapshotTips[0]
-		}
-
-		if pending := c.keys[key]; pending != nil {
-			tips = []Tip{pending.lastOffset}
-		}
-
-		route, err := c.engine.graphRouteForTips(key, tips)
-		if err != nil {
-			return err
-		}
-
-		if route != nil {
-			return c.emitEffect(eff, route.descriptorTips, route, snapshotTips...)
-		}
-	}
 
 	return c.emitEffect(eff, nil, nil, snapshotTips...)
 }
@@ -859,9 +823,9 @@ func (c *Context) emitEffect(eff *pb.Effect, graphDeps []Tip, route *graphRoute,
 			tips = c.engine.index.ContainsInternal(key)
 		}
 
-		if c.inTx {
-			// Subscribing after BeginTx creates metadata outside the fixed
-			// data snapshot. Consume those subscription tips as well: leaving
+		if c.inTx || len(snapshotTips) > 0 && snapshotTips[0] != nil {
+			// Subscribing after an observation creates metadata outside the observed
+			// data frontier. Consume those subscription tips as well: leaving
 			// them orphaned loses the shared causal base and can make future
 			// retries abort forever on an already-spoken subscription tip.
 			// Never adopt newer data, binds, or snapshots from the live index.
@@ -1496,15 +1460,6 @@ func (c *Context) flushTx() error {
 	bindHash := ComputeForkChoiceHash(c.engine.nodeID, hlcTs)
 
 	canonicalKey := bind.GetKeys()[0].GetKey()
-	for _, kb := range bind.GetKeys() {
-		if len(keytrie.WireKeyBytes(kb.GetKey())) == len(kb.GetKey()) {
-			// A graph-containing bind uses a graph wire identity. Legacy
-			// application subscribers cannot interpret its addressed keys.
-			canonicalKey = kb.GetKey()
-
-			break
-		}
-	}
 
 	bindEff := &pb.Effect{
 		Key: bytes.Clone(keytrie.WireKeyBytes(canonicalKey)), IKey: canonicalKey,
@@ -1572,9 +1527,7 @@ func (c *Context) flushTx() error {
 
 	if c.engine.broadcaster != nil {
 		subscribers := c.collectSubscribers()
-		if isGraphAddress(string(bindEff.GetIKey())) {
-			c.engine.recordHistoryTargets(bindOffset, subscribers)
-		}
+		c.engine.recordHistoryTargets(bindOffset, subscribers)
 
 		slog.Debug("flushTx: replicating bind",
 			"bind_offset", bindOffset,

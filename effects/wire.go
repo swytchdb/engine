@@ -43,22 +43,22 @@ import (
 // sanitization is required the snapshot state is cloned first.
 func MarshalEffect(eff *pb.Effect) ([]byte, error) {
 	if len(eff.GetIKey()) != 0 && len(eff.GetTxnBind().GetKeys()) != 0 {
-		logicalOnly := true
-
-		for _, kb := range eff.GetTxnBind().GetKeys() {
-			if len(kb.GetKey()) == 0 || kb.GetKey()[0] != 0 {
-				logicalOnly = false
-
-				break
-			}
-		}
-
-		if logicalOnly {
+		if logicalOnlyBind(eff) {
 			eff = proto.Clone(eff).(*pb.Effect)
 
 			eff.IKey = nil
 			for _, kb := range eff.GetTxnBind().GetKeys() {
 				kb.Key = kb.GetKey()[1:]
+			}
+		} else if eff.GetIKey()[0] == 0 {
+			// Legacy peers cannot interpret canonical keys in a mixed bind. Select
+			// its internal envelope only at serialization, leaving engine identity alone.
+			eff = proto.Clone(eff).(*pb.Effect)
+			for _, kb := range eff.GetTxnBind().GetKeys() {
+				if len(kb.GetKey()) != 0 && kb.GetKey()[0] != 0 {
+					eff.Key, eff.IKey = kb.GetKey(), kb.GetKey()
+					break
+				}
 			}
 		}
 	}
@@ -140,4 +140,14 @@ func desanitizeReducedKeys(r *pb.ReducedEffect) {
 
 		r.NetRemoves = out
 	}
+}
+
+// logicalOnlyBind is a transport compatibility decision, never an engine-key policy.
+func logicalOnlyBind(eff *pb.Effect) bool {
+	for _, kb := range eff.GetTxnBind().GetKeys() {
+		if len(kb.GetKey()) == 0 || kb.GetKey()[0] != 0 {
+			return false
+		}
+	}
+	return true
 }

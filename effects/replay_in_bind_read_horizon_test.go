@@ -374,7 +374,7 @@ func newInBindReadReplayEngine(t *testing.T) *Engine {
 		pendingTxns:       xsync.NewMap[Tip, *pendingTxn](),
 		pendingTxTips:     xsync.NewMap[Tip, []Tip](),
 		txAbortCounts:     xsync.NewMap[string, *atomic.Int32](),
-		pendingBootstraps: xsync.NewMap[string, *bootstrapCollector](),
+		pendingBootstraps: xsync.NewMap[Tip, *bootstrapCollector](),
 		spokenBinds:       clox.NewCloxCache[Tip, *spokenBindHistory](clox.ConfigFromCapacity(256)),
 	}
 	e.safety.Store(&safetyMap{defaultMode: UnsafeMode})
@@ -389,7 +389,7 @@ func newInBindReadReplayEngine(t *testing.T) *Engine {
 func markInBindReadSubscribed(e *Engine, key string) {
 	st := &subscriptionState{ready: make(chan struct{})}
 	close(st.ready)
-	e.subscriptions.Store(key, st)
+	e.subscriptions.Store(logicalAddress(key), st)
 }
 
 // pushInBindEffect routes a synthetic remote effect through HandleRemote

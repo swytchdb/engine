@@ -15,6 +15,10 @@ import (
 // real fetch/ancestry transport before the receiver can reconstruct the values.
 func TestInternalAddressTransactionFetch(t *testing.T) {
 	source, target := ancestryTestEngine(t), ancestryTestEngine(t)
+	address := keytrie.InternalKey("animals", "root")
+	if err := target.SubscribeInternal(address); err != nil {
+		t.Fatal(err)
+	}
 	if err := target.Subscribe("animals"); err != nil {
 		t.Fatal(err)
 	}
@@ -30,7 +34,7 @@ func TestInternalAddressTransactionFetch(t *testing.T) {
 
 	pms := startNNodeCluster(t,
 		[]EffectHandler{NewEngineEffectHandler(source), NewEngineEffectHandler(target)},
-		[]LogReader{NewEngineLogReader(source.EffectCache()), NewEngineLogReader(target.EffectCache())})
+		[]LogReader{NewEngineLogReader(source.EffectCache()), NewEngineLogReader(target.EffectCache())}, source.NodeID(), target.NodeID())
 	target.SetBroadcaster(pms[1])
 
 	var last effects.Tip
@@ -38,7 +42,6 @@ func TestInternalAddressTransactionFetch(t *testing.T) {
 	var envelope *pb.Effect
 
 	source.OnLocalEffect = func(tip effects.Tip, eff *pb.Effect) { last, envelope = tip, eff }
-	address := keytrie.InternalKey("animals", "root")
 	tx := source.NewContext()
 	tx.BeginTx()
 
@@ -61,13 +64,21 @@ func TestInternalAddressTransactionFetch(t *testing.T) {
 		t.Fatal("expected transaction bind")
 	}
 
-	if string(envelope.GetKey()) != address {
+	wire, err := effects.MarshalEffect(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded := &pb.Effect{}
+	if err := effects.UnmarshalEffect(wire, decoded); err != nil {
+		t.Fatal(err)
+	}
+	if string(decoded.GetKey()) != address {
 		t.Fatal("mixed bind exposed an application wire identity")
 	}
 
 	visited := make(map[effects.Tip]bool)
 
-	if err := pms[1].FetchAncestry(address, last, []pb.NodeID{0}, func(effects.Tip) bool { return false }, func(tip effects.Tip, _ []byte, _ bool) error {
+	if err := pms[1].FetchAncestry(address, last, []pb.NodeID{source.NodeID()}, func(effects.Tip) bool { return false }, func(tip effects.Tip, _ []byte, _ bool) error {
 		visited[tip] = true
 
 		return nil
@@ -85,7 +96,7 @@ func TestInternalAddressTransactionFetch(t *testing.T) {
 	}
 
 	notify := effects.BuildOffsetNotify(source.NodeID(), last, envelope, data, nil)
-	if _, err := pms[0].ReplicateTo(notify, notify.GetEffectData(), 1); err != nil {
+	if _, err := pms[0].ReplicateTo(notify, notify.GetEffectData(), target.NodeID()); err != nil {
 		t.Fatal(err)
 	}
 

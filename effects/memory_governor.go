@@ -25,9 +25,11 @@ package effects
 
 import (
 	"context"
+	"github.com/swytchdb/engine/keytrie"
 	"log/slog"
 	"math"
 	"runtime/debug"
+	"strings"
 	"time"
 )
 
@@ -41,7 +43,7 @@ func (e *Engine) startMemoryGovernor(targetBytes int64) {
 
 	// Only bounded engines need eviction hooks and per-read eviction tracking.
 	e.index.SetEvictHooksInternal(
-		func(key string) bool { return !isSystemKey([]byte(wireKey(key))) },
+		func(key string) bool { return !strings.HasPrefix(key, keytrie.LogicalKeyPrefix+"__swytch:") },
 		e.onLeafEvicted,
 		func() bool { return e.evictBudget.Load() > 0 },
 	)

@@ -125,7 +125,7 @@ func TestReadOnlyMissIsFree(t *testing.T) {
 		t.Fatalf("read-only miss must not block on a subscribe round-trip, but ReplicateTo was called for %v", bc.replicateToPeers)
 	}
 
-	if _, ok := e.subscriptions.Load("never-written"); ok {
+	if _, ok := e.subscriptions.Load(logicalAddress("never-written")); ok {
 		t.Fatal("a free miss must not record a subscription")
 	}
 
@@ -151,7 +151,7 @@ func TestReadWriteMissSubscribesAtWrite(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if _, ok := e.subscriptions.Load("never-written"); ok {
+	if _, ok := e.subscriptions.Load(logicalAddress("never-written")); ok {
 		t.Fatal("the miss alone must not subscribe")
 	}
 
@@ -159,7 +159,7 @@ func TestReadWriteMissSubscribesAtWrite(t *testing.T) {
 		t.Fatalf("Emit: %v", err)
 	}
 
-	if _, ok := e.subscriptions.Load("never-written"); !ok {
+	if _, ok := e.subscriptions.Load(logicalAddress("never-written")); !ok {
 		t.Fatal("the write must subscribe")
 	}
 

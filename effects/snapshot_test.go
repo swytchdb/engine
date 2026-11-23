@@ -107,7 +107,7 @@ func newSnapshotEngine(log *snapshotLog) *Engine {
 		pendingTxns:       xsync.NewMap[Tip, *pendingTxn](),
 		pendingTxTips:     xsync.NewMap[Tip, []Tip](),
 		txAbortCounts:     xsync.NewMap[string, *atomic.Int32](),
-		pendingBootstraps: xsync.NewMap[string, *bootstrapCollector](),
+		pendingBootstraps: xsync.NewMap[Tip, *bootstrapCollector](),
 		spokenBinds:       clox.NewCloxCache[Tip, *spokenBindHistory](clox.ConfigFromCapacity(256)),
 	}
 	e.safety.Store(&safetyMap{defaultMode: UnsafeMode})
@@ -172,7 +172,7 @@ func TestEnsureSubscribed_OwnsBorrowedKey(t *testing.T) {
 
 	copy(buf, "overwritten!!")
 
-	if _, ok := e.subscriptions.Load("borrowed-key"); !ok {
+	if _, ok := e.subscriptions.Load(logicalAddress("borrowed-key")); !ok {
 		t.Fatal("subscription retained the caller's borrowed key buffer")
 	}
 
@@ -636,7 +636,7 @@ func TestGetSnapshot_SubscriptionTracked(t *testing.T) {
 
 	// A key nobody holds free-misses: no subscription is recorded.
 	_, _, _, _ = e.GetSnapshot("newkey")
-	if _, ok := e.subscriptions.Load("newkey"); ok {
+	if _, ok := e.subscriptions.Load(logicalAddress("newkey")); ok {
 		t.Fatal("a free miss must not record a subscription")
 	}
 
@@ -649,7 +649,7 @@ func TestGetSnapshot_SubscriptionTracked(t *testing.T) {
 	e.index.Insert("held", nil, keytrie.NewTipSet(off))
 
 	_, _, _, _ = e.GetSnapshot("held")
-	if _, ok := e.subscriptions.Load("held"); !ok {
+	if _, ok := e.subscriptions.Load(logicalAddress("held")); !ok {
 		t.Fatal("expected subscription to be recorded for a key we hold")
 	}
 }
@@ -1211,7 +1211,7 @@ func TestSubscriptionBootstrap_FetchesRemoteState(t *testing.T) {
 		pendingTxns:       xsync.NewMap[Tip, *pendingTxn](),
 		pendingTxTips:     xsync.NewMap[Tip, []Tip](),
 		txAbortCounts:     xsync.NewMap[string, *atomic.Int32](),
-		pendingBootstraps: xsync.NewMap[string, *bootstrapCollector](),
+		pendingBootstraps: xsync.NewMap[Tip, *bootstrapCollector](),
 		spokenBinds:       clox.NewCloxCache[Tip, *spokenBindHistory](clox.ConfigFromCapacity(256)),
 	}
 	remoteEngine.safety.Store(&safetyMap{defaultMode: UnsafeMode})
@@ -1254,7 +1254,7 @@ func TestSubscriptionBootstrap_FetchesRemoteState(t *testing.T) {
 		pendingTxns:       xsync.NewMap[Tip, *pendingTxn](),
 		pendingTxTips:     xsync.NewMap[Tip, []Tip](),
 		txAbortCounts:     xsync.NewMap[string, *atomic.Int32](),
-		pendingBootstraps: xsync.NewMap[string, *bootstrapCollector](),
+		pendingBootstraps: xsync.NewMap[Tip, *bootstrapCollector](),
 		spokenBinds:       clox.NewCloxCache[Tip, *spokenBindHistory](clox.ConfigFromCapacity(256)),
 	}
 	localEngine.safety.Store(&safetyMap{defaultMode: UnsafeMode})
@@ -1338,7 +1338,7 @@ func TestSubscriptionBootstrap_AllPeersEmpty(t *testing.T) {
 		t.Fatalf("nowhere-key miss must not block on ReplicateTo rounds, got %d", len(bc.replicateToPeers))
 	}
 
-	if _, ok := e.subscriptions.Load("missing-key"); ok {
+	if _, ok := e.subscriptions.Load(logicalAddress("missing-key")); ok {
 		t.Fatal("a free miss must not record a subscription")
 	}
 
@@ -1360,7 +1360,7 @@ func TestHandleRemote_SubscriptionEffect_SendsNack(t *testing.T) {
 		pendingTxns:       xsync.NewMap[Tip, *pendingTxn](),
 		pendingTxTips:     xsync.NewMap[Tip, []Tip](),
 		txAbortCounts:     xsync.NewMap[string, *atomic.Int32](),
-		pendingBootstraps: xsync.NewMap[string, *bootstrapCollector](),
+		pendingBootstraps: xsync.NewMap[Tip, *bootstrapCollector](),
 		spokenBinds:       clox.NewCloxCache[Tip, *spokenBindHistory](clox.ConfigFromCapacity(256)),
 	}
 	e.safety.Store(&safetyMap{defaultMode: UnsafeMode})
@@ -1425,7 +1425,7 @@ func TestHandleRemote_SubscriptionEffect_NoAuthority_EmptyAck(t *testing.T) {
 		pendingTxns:       xsync.NewMap[Tip, *pendingTxn](),
 		pendingTxTips:     xsync.NewMap[Tip, []Tip](),
 		txAbortCounts:     xsync.NewMap[string, *atomic.Int32](),
-		pendingBootstraps: xsync.NewMap[string, *bootstrapCollector](),
+		pendingBootstraps: xsync.NewMap[Tip, *bootstrapCollector](),
 		spokenBinds:       clox.NewCloxCache[Tip, *spokenBindHistory](clox.ConfigFromCapacity(256)),
 	}
 	e.safety.Store(&safetyMap{defaultMode: UnsafeMode})
@@ -1476,7 +1476,7 @@ func TestHandleRemote_FlushKey_BypassesAuthorityGate(t *testing.T) {
 		pendingTxns:       xsync.NewMap[Tip, *pendingTxn](),
 		pendingTxTips:     xsync.NewMap[Tip, []Tip](),
 		txAbortCounts:     xsync.NewMap[string, *atomic.Int32](),
-		pendingBootstraps: xsync.NewMap[string, *bootstrapCollector](),
+		pendingBootstraps: xsync.NewMap[Tip, *bootstrapCollector](),
 		spokenBinds:       clox.NewCloxCache[Tip, *spokenBindHistory](clox.ConfigFromCapacity(256)),
 	}
 	e.safety.Store(&safetyMap{defaultMode: UnsafeMode})
@@ -1542,7 +1542,7 @@ func TestHandleRemote_TxnBind_AuthorityViaNonCanonicalKey(t *testing.T) {
 		pendingTxns:       xsync.NewMap[Tip, *pendingTxn](),
 		pendingTxTips:     xsync.NewMap[Tip, []Tip](),
 		txAbortCounts:     xsync.NewMap[string, *atomic.Int32](),
-		pendingBootstraps: xsync.NewMap[string, *bootstrapCollector](),
+		pendingBootstraps: xsync.NewMap[Tip, *bootstrapCollector](),
 		spokenBinds:       clox.NewCloxCache[Tip, *spokenBindHistory](clox.ConfigFromCapacity(256)),
 	}
 	e.safety.Store(&safetyMap{defaultMode: UnsafeMode})
@@ -1550,7 +1550,7 @@ func TestHandleRemote_TxnBind_AuthorityViaNonCanonicalKey(t *testing.T) {
 	// Subscribed only to "B" (non-canonical). No subscription, no
 	// index entry for "A" (canonical) — pre-fix this configuration
 	// triggers the gate drop.
-	e.subscriptions.Store("B", &subscriptionState{ready: make(chan struct{})})
+	e.subscriptions.Store(logicalAddress("B"), &subscriptionState{ready: make(chan struct{})})
 
 	bindOffset := Tip{2, 7000}
 	bind := &pb.TransactionalBindEffect{
@@ -3502,7 +3502,7 @@ func TestGetSnapshot_NilResultZeroesChainLen(t *testing.T) {
 	// only our Noop chain so result genuinely stays nil.
 	sub := &subscriptionState{ready: make(chan struct{})}
 	sub.markReady()
-	e.subscriptions.Store("k", sub)
+	e.subscriptions.Store(logicalAddress("k"), sub)
 
 	const nodeA uint64 = 1
 
@@ -3555,7 +3555,7 @@ func TestContextGetSnapshot_NilResultDoesNotPanicCompaction(t *testing.T) {
 
 	sub := &subscriptionState{ready: make(chan struct{})}
 	sub.markReady()
-	e.subscriptions.Store("k", sub)
+	e.subscriptions.Store(logicalAddress("k"), sub)
 
 	const nodeA uint64 = 1
 

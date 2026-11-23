@@ -78,7 +78,7 @@ func TestBindConsumedTipsSubstitutesForeignInflightTip(t *testing.T) {
 	// mid-flush that would perturb the tip set).
 	subState := &subscriptionState{ready: make(chan struct{})}
 	close(subState.ready)
-	e.subscriptions.Store(key, subState)
+	e.subscriptions.Store(logicalAddress(key), subState)
 
 	// Step 2: committed base on the key — a plain, non-tx data effect in
 	// both index and effectCache. This is what a correct ConsumedTips/deps

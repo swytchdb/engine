@@ -27,7 +27,6 @@ import (
 	"fmt"
 	"strings"
 	"testing"
-	"unsafe"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
 	"github.com/swytchdb/engine/keytrie"
@@ -43,12 +42,12 @@ func TestMemorySharedPrimaryKeyOwners(t *testing.T) {
 	})
 
 	key := strings.Repeat("shared", 100)
-	owned := e.retainKey(key)
+	owned := e.retainKey(logicalAddress(key))
 	e.subscriptions.Store(owned, &subscriptionState{ownedKey: true})
 	e.index.Insert(key, nil, keytrie.NewTipSet(Tip{1, 1}))
 	e.index.Range(func(indexKey string) bool {
-		if unsafe.StringData(indexKey) != unsafe.StringData(owned) {
-			t.Fatal("subscription and index did not share key allocation")
+		if indexKey != key {
+			t.Fatal("logical iteration changed key")
 		}
 
 		return true
@@ -56,9 +55,10 @@ func TestMemorySharedPrimaryKeyOwners(t *testing.T) {
 	before := e.keyBytes
 	e.dropSubscription(logicalAddress(key))
 
-	if e.keyBytes != before {
-		t.Fatal("subscription release credited the trie's key")
+	if e.keyBytes >= before {
+		t.Fatal("subscription allocation was not released")
 	}
+	before = e.keyBytes
 
 	e.index.SetEvictHooksInternal(func(string) bool { return true }, nil, nil)
 

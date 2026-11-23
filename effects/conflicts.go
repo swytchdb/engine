@@ -238,8 +238,8 @@ func (e *Engine) emitConflict(key string, a, b Tip, checks map[string]conflictDo
 
 	for _, envelope := range envelopes {
 		for _, kb := range envelope.GetTxnBind().GetKeys() {
-			key := string(keytrie.WireKeyBytes(kb.GetKey()))
-			if err := e.appendConflictValue(ctx, conflictIndexPrefix+key, []byte(envelope.GetTxnId())); err != nil {
+			key := string(kb.GetKey())
+			if err := e.appendConflictValueInternal(ctx, conflictIndexAddress(key), []byte(envelope.GetTxnId())); err != nil {
 				return err
 			}
 
@@ -252,7 +252,7 @@ func (e *Engine) emitConflict(key string, a, b Tip, checks map[string]conflictDo
 	}
 
 	for key := range keys {
-		if err := e.appendConflictValue(ctx, conflictDirectory, []byte(key)); err != nil {
+		if err := e.appendConflictValue(ctx, conflictDirectory, []byte(wireKey(key))); err != nil {
 			return err
 		}
 	}
@@ -275,15 +275,30 @@ func emitConflictDocument(ctx *Context, key string, value []byte) error {
 	})
 }
 
+// conflictIndexAddress constructs a derived address at the conflict-report API
+// boundary. Existing logical report names remain unchanged; internal indexes
+// occupy their own trie namespace even if an application key has identical bytes.
+func conflictIndexAddress(address string) string {
+	logical := keytrie.WireKey(address)
+	if len(logical) != len(address) {
+		return logicalAddress(conflictIndexPrefix + logical)
+	}
+	return keytrie.InternalKey(conflictDirectory, address)
+}
+
 func (e *Engine) appendConflictValue(ctx *Context, key string, value []byte) error {
-	if err := ctx.Emit(&pb.Effect{Key: []byte(key), Kind: &pb.Effect_Meta{Meta: &pb.MetaEffect{TypeTag: pb.ValueType_TYPE_LIST}}}); err != nil {
+	return e.appendConflictValueInternal(ctx, logicalAddress(key), value)
+}
+
+func (e *Engine) appendConflictValueInternal(ctx *Context, key string, value []byte) error {
+	if err := ctx.Emit(&pb.Effect{Key: []byte(wireKey(key)), IKey: []byte(key), Kind: &pb.Effect_Meta{Meta: &pb.MetaEffect{TypeTag: pb.ValueType_TYPE_LIST}}}); err != nil {
 		return err
 	}
 
 	id := e.nextOffset()
 
 	return ctx.Emit(&pb.Effect{
-		Key: []byte(key), Kind: &pb.Effect_Data{Data: &pb.DataEffect{
+		Key: []byte(wireKey(key)), IKey: []byte(key), Kind: &pb.Effect_Data{Data: &pb.DataEffect{
 			Op: pb.EffectOp_INSERT_OP, Merge: pb.MergeRule_LAST_WRITE_WINS, Collection: pb.CollectionKind_ORDERED,
 			Placement: pb.Placement_PLACE_TAIL, Id: []byte(fmt.Sprintf("%d:%d", id[0], id[1])), Value: &pb.DataEffect_Raw{Raw: value},
 		}},

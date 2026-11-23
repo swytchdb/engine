@@ -254,7 +254,7 @@ func TestEnsureSubscribed_InstallsOnlyWalkableTips(t *testing.T) {
 	}
 
 	// Subscription state must be ready (no retryBootstrap goroutine).
-	state, ok := e.subscriptions.Load(key)
+	state, ok := e.subscriptions.Load(logicalAddress(key))
 	if !ok {
 		t.Fatal("no subscription state for key after successful bootstrap")
 	}
@@ -332,7 +332,7 @@ func TestEnsureSubscribed_AllTipsUnreachable_RetriesBootstrap(t *testing.T) {
 	}
 
 	// Subscription state is incomplete with retry in flight.
-	state, ok := e.subscriptions.Load(key)
+	state, ok := e.subscriptions.Load(logicalAddress(key))
 	if !ok {
 		t.Fatal("no subscription state after failed bootstrap")
 	}
@@ -376,7 +376,7 @@ func TestEnsureSubscribed_Partition_FailsCleanly(t *testing.T) {
 		t.Fatalf("expected ErrRegionPartitioned, got %v", err)
 	}
 
-	if _, ok := e.subscriptions.Load(key); ok {
+	if _, ok := e.subscriptions.Load(logicalAddress(key)); ok {
 		t.Fatal("subscription state not deleted after partition failure; future calls won't re-bootstrap")
 	}
 }
@@ -405,7 +405,7 @@ func TestEnsureSubscribed_Partition_UnsafeProceeds(t *testing.T) {
 		t.Fatalf("unsafe minority subscribe must not error, got %v", err)
 	}
 
-	state, ok := e.subscriptions.Load(key)
+	state, ok := e.subscriptions.Load(logicalAddress(key))
 	if !ok {
 		t.Fatal("subscription state missing after successful unsafe bootstrap")
 	}
@@ -450,7 +450,7 @@ func TestEnsureSubscribed_Unsafe_UnreachablePeersDoNotBlock(t *testing.T) {
 		t.Fatalf("unsafe subscribe must not spin the bootstrap retry loop, took %v", elapsed)
 	}
 
-	if state, ok := e.subscriptions.Load(key); !ok || state.incomplete.Load() {
+	if state, ok := e.subscriptions.Load(logicalAddress(key)); !ok || state.incomplete.Load() {
 		t.Fatal("subscription state should be present and complete")
 	}
 }
@@ -479,7 +479,7 @@ func TestRetryBootstrap_ShutdownUnblocksWaiters(t *testing.T) {
 		t.Fatalf("expected ErrBootstrapIncomplete, got %v", err)
 	}
 
-	state, ok := e.subscriptions.Load(key)
+	state, ok := e.subscriptions.Load(logicalAddress(key))
 	if !ok {
 		t.Fatal("no subscription state after incomplete bootstrap")
 	}

@@ -56,32 +56,28 @@ func prepareEffectAddress(eff *pb.Effect) error {
 	return nil
 }
 
-// subscriptionName is a borrowed view used for admission against subscriptions.
-// Subscription directories are keyed by their owning application key.
-func subscriptionName(key []byte) []byte { return keytrie.LogicalKey(key) }
-
 func logicalAddress(key string) string { return keytrie.LogicalAddress(key) }
 func wireKey(key string) string        { return keytrie.WireKey(key) }
-func ownerKey(key string) string       { return keytrie.LogicalKeyString(key) }
 
 func (e *Engine) subscription(key string) (*subscriptionState, bool) {
-	return e.subscriptions.Load(ownerKey(key))
+	return e.subscriptions.Load(key)
 }
 
-// nackKey resolves the reply's wire name against the effect it answers. The
-// reply needs no second address field: the sender already owns that effect.
+// nackKey resolves legacy reply names at the transport boundary. Mixed binds
+// use canonical addresses because their projected names need not be unique.
 func (e *Engine) nackKey(nack *pb.NackNotify) string {
 	key := string(nack.GetKey())
-	if request, ok := e.pendingBootstraps.Load(key); ok {
+	if request, ok := e.pendingBootstraps.Load(r(nack.GetConflicting())); ok {
 		return request.key
 	}
-
 	if e.effectCache != nil {
 		if eff, ok := e.effectCache.Get(r(nack.GetConflicting())); ok {
+			if eff.GetTxnBind() != nil && !logicalOnlyBind(eff) {
+				return key
+			}
 			if string(eff.GetKey()) == key {
 				return string(eff.GetIKey())
 			}
-
 			for _, kb := range eff.GetTxnBind().GetKeys() {
 				if bytes.Equal(keytrie.WireKeyBytes(kb.GetKey()), nack.GetKey()) {
 					return string(kb.GetKey())
@@ -89,16 +85,16 @@ func (e *Engine) nackKey(nack *pb.NackNotify) string {
 			}
 		}
 	}
-
 	return logicalAddress(key)
 }
 
-func subscriberAddress(key string) string {
-	if len(key) > 0 && key[0] == keytrie.LogicalKeyPrefix[0] {
-		return key
+func (e *Engine) nackWireKey(key string, conflicting *pb.EffectRef) []byte {
+	if e.effectCache != nil {
+		if eff, ok := e.effectCache.Get(r(conflicting)); ok && eff.GetTxnBind() != nil && !logicalOnlyBind(eff) {
+			return []byte(key)
+		}
 	}
-
-	return logicalAddress(ownerKey(key))
+	return []byte(wireKey(key))
 }
 
 // effectHasAddress includes shared binds in every key they bind.

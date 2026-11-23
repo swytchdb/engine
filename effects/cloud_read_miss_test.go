@@ -373,7 +373,7 @@ func TestReadMissNoCloudFreeMisses(t *testing.T) {
 		t.Fatal("expected a free-miss with no Cloud configured")
 	}
 
-	if _, ok := e.subscriptions.Load("never-written"); ok {
+	if _, ok := e.subscriptions.Load(logicalAddress("never-written")); ok {
 		t.Fatal("a free miss must not record a subscription")
 	}
 

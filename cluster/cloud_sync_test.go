@@ -300,19 +300,19 @@ func TestPendingTipsIndex(t *testing.T) {
 	cs.handleLocalEffect(tipA, effA)
 	cs.handleLocalEffect(tipB, effB)
 
-	if got := cs.pendingTipsFor("k"); len(got) != 2 {
+	if got := cs.pendingTipsFor(keytrie.LogicalAddress("k")); len(got) != 2 {
 		t.Fatalf("expected both un-acked tips on k, got %v", got)
 	}
 
 	cs.retire(tipA)
 
-	if got := cs.pendingTipsFor("k"); len(got) != 1 || got[0] != tipB {
+	if got := cs.pendingTipsFor(keytrie.LogicalAddress("k")); len(got) != 1 || got[0] != tipB {
 		t.Fatalf("expected only %v after retiring %v, got %v", tipB, tipA, got)
 	}
 
 	cs.retire(tipB)
 
-	if got := cs.pendingTipsFor("k"); got != nil {
+	if got := cs.pendingTipsFor(keytrie.LogicalAddress("k")); got != nil {
 		t.Fatalf("expected no pending tips after full retire, got %v", got)
 	}
 
@@ -328,7 +328,7 @@ func TestPendingTipsIndex(t *testing.T) {
 	// after releasing its maps and any stale queued retries.
 	cs.handleLocalEffect(tipA, effA)
 
-	if got := cs.pendingTipsFor("k"); len(got) != 1 || got[0] != tipA {
+	if got := cs.pendingTipsFor(keytrie.LogicalAddress("k")); len(got) != 1 || got[0] != tipA {
 		t.Fatalf("expected re-enqueued tip after drain, got %v", got)
 	}
 
@@ -389,7 +389,7 @@ func TestOutboxPinsKeyUntilDrained(t *testing.T) {
 
 	cs.handleLocalEffect(tipA, effA)
 
-	if !cs.pendingKeys[key].pinned {
+	if !cs.pendingKeys[keytrie.LogicalAddress(key)].pinned {
 		t.Fatal("first enqueue on a live key must take the eviction pin")
 	}
 
@@ -397,7 +397,7 @@ func TestOutboxPinsKeyUntilDrained(t *testing.T) {
 
 	cs.retire(tipA)
 
-	if _, held := cs.pendingKeys[key]; !held {
+	if _, held := cs.pendingKeys[keytrie.LogicalAddress(key)]; !held {
 		t.Fatal("key entry must survive while a tip is still un-acked")
 	}
 	// The last retire must UnpinKey exactly once — a second release would
@@ -423,7 +423,7 @@ func TestOutboxPinsKeyUntilDrained(t *testing.T) {
 
 	cs.handleLocalEffect(ghostTip, ghost)
 
-	if cs.pendingKeys["never-indexed"].pinned {
+	if cs.pendingKeys[keytrie.LogicalAddress("never-indexed")].pinned {
 		t.Fatal("enqueue on a leafless key must not claim a pin")
 	}
 
@@ -471,7 +471,7 @@ func TestSubscriptionMintDoesNotOpenGate(t *testing.T) {
 		t.Fatal("a subscription mint must not open the read-miss gate for its key")
 	}
 
-	if got := cs.pendingTipsFor("k"); len(got) != 1 || got[0] != tip {
+	if got := cs.pendingTipsFor(keytrie.LogicalAddress("k")); len(got) != 1 || got[0] != tip {
 		t.Fatalf("the subscription must still upload, got outbox tips %v", got)
 	}
 
@@ -910,7 +910,7 @@ func TestUnsentAncestryUploads(t *testing.T) {
 	// Ancestors are interior nodes of someone else's chain, not this node's
 	// frontier: answering a read-miss with them would name an effect and its
 	// own ancestor as the key's tips.
-	got := cs.pendingTipsFor("k")
+	got := cs.pendingTipsFor(keytrie.LogicalAddress("k"))
 	if len(got) != 1 || got[0] != ours {
 		t.Fatalf("outbox frontier on k = %v, want only the local mint %v", got, ours)
 	}

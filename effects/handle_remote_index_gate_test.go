@@ -35,7 +35,7 @@ import (
 func TestMemoryPacingRemoteAdditionalBindKey(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		e := newTestEngineForEphemeral(t)
-		e.subscriptions.Store("local", &subscriptionState{ready: make(chan struct{})})
+		e.subscriptions.Store(logicalAddress("local"), &subscriptionState{ready: make(chan struct{})})
 		e.setMemoryPressure(true)
 
 		bind := &pb.Effect{
@@ -110,7 +110,7 @@ func TestHandleRemote_Rule1_UnsubscribedCanonical_NoIndexUpdate(t *testing.T) {
 
 	// Subscribe only to "el-1". The bind's canonical key will be "el-0",
 	// which we never see locally — we only participate in el-1.
-	e.subscriptions.Store("el-1", &subscriptionState{ready: make(chan struct{})})
+	e.subscriptions.Store(logicalAddress("el-1"), &subscriptionState{ready: make(chan struct{})})
 
 	bindOff := Tip{2, 4000}
 	bind := &pb.TransactionalBindEffect{
@@ -173,7 +173,7 @@ func TestHandleRemote_Rule1_UnsubscribedAdditional_NoIndexUpdate(t *testing.T) {
 
 	// Subscribe only to "el-0" (canonical). The additional key "el-1"
 	// is touched by the bind but not subscribed here.
-	e.subscriptions.Store("el-0", &subscriptionState{ready: make(chan struct{})})
+	e.subscriptions.Store(logicalAddress("el-0"), &subscriptionState{ready: make(chan struct{})})
 
 	bindOff := Tip{2, 4000}
 	bind := &pb.TransactionalBindEffect{

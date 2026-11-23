@@ -113,10 +113,6 @@ func (e *Engine) recordHistorySent(tip Tip, eff *pb.Effect) {
 	}
 
 	for _, key := range keys {
-		// Predicated publications record their actual recipients at publication.
-		if isGraphAddress(string(key)) {
-			continue
-		}
 		// Subscribers remain obligations during partitions. The provider drops
 		// departed membership entries, not temporarily unreachable peers.
 		for _, peer := range e.PeerSubscribersInternal(string(key)) {

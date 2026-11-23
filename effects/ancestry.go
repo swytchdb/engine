@@ -73,7 +73,7 @@ func (e *Engine) ancestryPeers(key string, root Tip) []pb.NodeID {
 
 	var subscribers []pb.NodeID
 
-	if leaf := e.index.LoadDataInternal(subscriberAddress(key)); leaf != nil {
+	if leaf := e.index.LoadDataInternal(key); leaf != nil {
 		leaf.subMu.Lock()
 		subscribers = slices.Clone(leaf.subscribers)
 		leaf.subMu.Unlock()
@@ -105,6 +105,11 @@ func (e *Engine) ancestryPeers(key string, root Tip) []pb.NodeID {
 
 	e.keyFilterMu.RUnlock()
 	rand.Shuffle(len(peers), func(i, j int) { peers[i], peers[j] = peers[j], peers[i] })
+	// A subscriber may hold no history yet. Keep the advertised effect origin
+	// in the bounded candidate set instead of randomly excluding its source.
+	if i := slices.Index(peers, pb.NodeID(root[0])); i >= 0 {
+		peers[0], peers[i] = peers[i], peers[0]
+	}
 	peers = peers[:min(2, len(peers))]
 
 	return peers

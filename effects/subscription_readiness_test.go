@@ -79,7 +79,7 @@ func TestAsyncSubscriptionRequiresDiscoveryBeforeCommit(t *testing.T) {
 
 		synctest.Wait()
 
-		state, _ := e.subscriptions.Load("fresh")
+		state, _ := e.subscriptions.Load(logicalAddress("fresh"))
 		select {
 		case <-state.ready:
 			t.Error("async announcement claimed completed discovery")
@@ -155,7 +155,7 @@ func TestAsyncSubscriptionUpgradePropagatesPartition(t *testing.T) {
 
 		synctest.Wait()
 
-		state, _ := e.subscriptions.Load("fresh")
+		state, _ := e.subscriptions.Load(logicalAddress("fresh"))
 
 		done := make(chan error, 1)
 		go func() { done <- e.ensureSubscribedBlocking(logicalAddress("fresh")) }()
@@ -171,7 +171,7 @@ func TestAsyncSubscriptionUpgradePropagatesPartition(t *testing.T) {
 			t.Errorf("upgrade error=%v, want partition", err)
 		}
 
-		if _, ok := e.subscriptions.Load("fresh"); ok {
+		if _, ok := e.subscriptions.Load(logicalAddress("fresh")); ok {
 			t.Error("failed upgrade retained subscription")
 		}
 

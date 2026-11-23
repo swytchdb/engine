@@ -84,7 +84,7 @@ func TestNackPriorityEvidenceAcrossKeys(t *testing.T) {
 		}
 	}
 
-	if _, ok := e.subscriptions.Load("bc"); ok {
+	if _, ok := e.subscriptions.Load(logicalAddress("bc")); ok {
 		t.Fatal("evaluating forwarded evidence subscribed A to C's key")
 	}
 }
@@ -113,7 +113,7 @@ func TestBindResponseWaitsForPriorityEvidence(t *testing.T) {
 	ref := Tip{uint64(node), 700}
 
 	e.pendingTxns.Store(b.bindOffset, b)
-	e.subscriptions.Store("ab", &subscriptionState{})
+	e.subscriptions.Store(logicalAddress("ab"), &subscriptionState{})
 	e.updateIndex(logicalAddress("ab"), nil, base)
 
 	wire, err := MarshalEffect(incoming)
@@ -307,7 +307,7 @@ func TestPriorityChainCommitsDisjointEnds(t *testing.T) {
 
 			state := &subscriptionState{ready: make(chan struct{})}
 			state.markReady()
-			e.subscriptions.Store(key, state)
+			e.subscriptions.Store(logicalAddress(key), state)
 
 			for _, peer := range nodes {
 				if peer != id && slices.Contains(keys[peer], key) {
@@ -358,7 +358,7 @@ func TestPriorityChainCommitsDisjointEnds(t *testing.T) {
 		}
 	}
 
-	if _, subscribed := net.engines[aID].subscriptions.Load("bc"); subscribed {
+	if _, subscribed := net.engines[aID].subscriptions.Load(logicalAddress("bc")); subscribed {
 		t.Fatal("A subscribed to C's key")
 	}
 }

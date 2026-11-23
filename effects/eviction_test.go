@@ -703,13 +703,13 @@ func TestBroadcastUnsubscribe_EmitsUnsub(t *testing.T) {
 	e := newTestEngine(bc)
 
 	const key = "user:k"
-	e.subscriptions.Store(key, &subscriptionState{ready: make(chan struct{})})
+	e.subscriptions.Store(logicalAddress(key), &subscriptionState{ready: make(chan struct{})})
 
 	tip := Tip{1, 42}
 
 	e.broadcastUnsubscribe(logicalAddress(key), []Tip{tip})
 
-	if _, ok := e.subscriptions.Load(key); ok {
+	if _, ok := e.subscriptions.Load(logicalAddress(key)); ok {
 		t.Fatal("did not drop subscription state")
 	}
 
@@ -767,7 +767,7 @@ func TestBroadcastUnsubscribe_HookSeesResidentVertex(t *testing.T) {
 	e := newTestEngine(bc)
 
 	const key = "user:k"
-	e.subscriptions.Store(key, &subscriptionState{ready: make(chan struct{})})
+	e.subscriptions.Store(logicalAddress(key), &subscriptionState{ready: make(chan struct{})})
 
 	var hookTip Tip
 
@@ -802,12 +802,12 @@ func TestBroadcastUnsubscribe_ShutdownShortCircuit(t *testing.T) {
 	e := newTestEngine(bc)
 
 	const key = "user:k"
-	e.subscriptions.Store(key, &subscriptionState{ready: make(chan struct{})})
+	e.subscriptions.Store(logicalAddress(key), &subscriptionState{ready: make(chan struct{})})
 	e.closed.Store(true)
 
 	e.broadcastUnsubscribe(logicalAddress(key), []Tip{{1, 42}})
 
-	if _, ok := e.subscriptions.Load(key); !ok {
+	if _, ok := e.subscriptions.Load(logicalAddress(key)); !ok {
 		t.Fatal("shutdown short-circuit failed; subscription was dropped")
 	}
 

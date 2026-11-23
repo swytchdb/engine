@@ -70,7 +70,7 @@ func isSystemKey(key []byte) bool {
 // keeps the invariant "an owned, creation-ref'd vertex is reachable from a tip we
 // serve", so reclaim never strands an un-served fetch as a permanent leak.
 func (e *Engine) isServed(key []byte) bool {
-	_, sub := e.subscriptions.Load(string(subscriptionName(key)))
+	_, sub := e.subscriptions.Load(string(key))
 
 	return sub
 }
@@ -137,8 +137,8 @@ type Engine struct {
 	rttProvider        PeerRTTProvider
 	serializationState *xsync.Map[string, *keySerializationState]
 
-	// Subscription bootstrapping: key → *bootstrapCollector
-	pendingBootstraps *xsync.Map[string, *bootstrapCollector]
+	// Subscription bootstrapping: request reference → *bootstrapCollector
+	pendingBootstraps *xsync.Map[Tip, *bootstrapCollector]
 
 	// Per-node cluster key filters powering free read-misses. ownKeyFilter
 	// holds the keys this node has data for; the cluster layer ships it to
@@ -421,7 +421,7 @@ func newEngine(cfg EngineConfig) *Engine {
 		pendingTxns:        xsync.NewMap[keytrie.EffectRef, *pendingTxn](),
 		pendingTxTips:      xsync.NewMap[keytrie.EffectRef, []Tip](),
 		txAbortCounts:      xsync.NewMap[string, *atomic.Int32](),
-		pendingBootstraps:  xsync.NewMap[string, *bootstrapCollector](),
+		pendingBootstraps:  xsync.NewMap[Tip, *bootstrapCollector](),
 		effectCache:        newVertexPool(),
 		spokenBinds:        clox.NewCloxCache[Tip, *spokenBindHistory](clox.ConfigFromCapacity(8192)),
 		compressValues:     cfg.CompressValues,
@@ -710,11 +710,6 @@ func (e *Engine) InstallCloudTipsInternal(key string, tips []Tip, sidecar []Clou
 // durability hook, broadcast. The effect must already carry its key, HLC,
 // fork-choice hash, and deps.
 func (e *Engine) mintLocalEffect(key string, currentSet *keytrie.TipSet, eff *pb.Effect) (Tip, error) {
-	route, err := e.graphRouteForTips(key, currentSet.Tips())
-	if err != nil {
-		return Tip{}, err
-	}
-
 	data, err := e.effectCache.MarshalEffect(eff)
 	if err != nil {
 		return Tip{}, err
@@ -732,13 +727,7 @@ func (e *Engine) mintLocalEffect(key string, currentSet *keytrie.TipSet, eff *pb
 
 	if e.broadcaster != nil {
 		notify := BuildOffsetNotify(e.nodeID, offset, eff, data, context.Background())
-		if route != nil {
-			if err := e.publishGraphNotice(key, notify, route, UnsafeMode); err != nil {
-				return offset, err
-			}
-		} else {
-			e.broadcaster.BroadcastWithData(notify, data)
-		}
+		e.broadcaster.BroadcastWithData(notify, data)
 	}
 
 	return offset, nil
@@ -781,12 +770,16 @@ func (e *Engine) UpdateSafetyRules(defaultMode SafetyMode, rules []KeyRangeRule)
 // invariant no config can override. Copying detaches the running config from
 // the caller's slice, so later mutations can't reach into the live engine.
 func withSystemKeyException(rules []KeyRangeRule) []KeyRangeRule {
-	return append([]KeyRangeRule{{Pattern: "__swytch:*", Mode: UnsafeMode}}, rules...)
+	out := make([]KeyRangeRule, 0, len(rules)+1)
+	out = append(out, KeyRangeRule{Pattern: logicalAddress("__swytch:*"), Mode: UnsafeMode})
+	for _, rule := range rules {
+		rule.Pattern = logicalAddress(rule.Pattern)
+		out = append(out, rule)
+	}
+	return out
 }
 
 func (e *Engine) modeForKey(key string) SafetyMode {
-	key = ownerKey(key)
-
 	return e.safety.Load().modeForKey(key)
 }
 
@@ -1007,7 +1000,7 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 
 		var err error
 
-		effectData, err = e.broadcaster.FetchFromAny(notify.GetOrigin(), e.fetchHint(logicalAddress(string(notify.GetKey()))))
+		effectData, err = e.broadcaster.FetchFromAny(notify.GetOrigin(), PreferPeers)
 		if err != nil {
 			return nil, err
 		}
@@ -1097,6 +1090,10 @@ func (e *Engine) HandleRemote(notify *pb.OffsetNotify) ([]*pb.NackNotify, error)
 		} else if sub := eff.GetSubscription(); sub != nil && !sub.GetUnsubscribe() {
 			e.peerFilterAdd(origin, string(eff.GetIKey()))
 		}
+	}
+
+	if err := e.admitGraphEffect(eff); err != nil {
+		return nil, err
 	}
 
 	// Authority gate: accept the effect only if we already track the
@@ -1449,7 +1446,7 @@ func (e *Engine) ingestBackfill(notify *pb.OffsetNotify, historyKey *string) err
 
 			var err error
 
-			effectData, err = e.broadcaster.FetchFromAny(notify.GetOrigin(), e.fetchHint(logicalAddress(string(notify.GetKey()))))
+			effectData, err = e.broadcaster.FetchFromAny(notify.GetOrigin(), PreferPeers)
 			if err != nil {
 				return err
 			}
@@ -1470,6 +1467,10 @@ func (e *Engine) ingestBackfill(notify *pb.OffsetNotify, historyKey *string) err
 		if err := UnmarshalEffect(protoData, eff); err != nil {
 			return err
 		}
+	}
+
+	if err := e.admitGraphEffect(eff); err != nil {
+		return err
 	}
 
 	{
@@ -1744,7 +1745,7 @@ func (e *Engine) HandleNack(nack *pb.NackNotify) error {
 		"tip_count", len(nack.GetTips()))
 
 	// Forward to bootstrap collector if subscription bootstrapping is in progress
-	if bc, ok := e.pendingBootstraps.Load(string(nack.GetKey())); ok {
+	if bc, ok := e.pendingBootstraps.Load(r(nack.GetConflicting())); ok {
 		select {
 		case bc.nacks <- nack:
 		default: // channel full, drop
@@ -1773,7 +1774,7 @@ func (e *Engine) HandleNack(nack *pb.NackNotify) error {
 // NACK.
 func (e *Engine) buildEnrichedNack(key string, conflicting *pb.EffectRef, tips []keytrie.EffectRef) *pb.NackNotify {
 	nack := &pb.NackNotify{
-		Key:         []byte(wireKey(key)),
+		Key:         e.nackWireKey(key, conflicting),
 		Conflicting: conflicting,
 	}
 
@@ -2450,8 +2451,8 @@ func (e *Engine) probeAndFetchKey(key string) {
 		nacks: make(chan *pb.NackNotify, 64),
 	}
 
-	e.pendingBootstraps.Store(wireKey(key), collector)
-	defer e.pendingBootstraps.Delete(wireKey(key))
+	e.pendingBootstraps.Store(r(notify.GetOrigin()), collector)
+	defer e.pendingBootstraps.Delete(r(notify.GetOrigin()))
 
 	var alivePeers []pb.NodeID
 	if e.rttProvider != nil {

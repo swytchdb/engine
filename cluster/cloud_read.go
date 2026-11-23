@@ -75,14 +75,14 @@ func (cs *CloudSync) CloudTips(ctx context.Context, key string) ([]effects.Tip, 
 }
 
 // CloudTipsInternal retains a complete trie address for background reconciliation.
-// Cloud names and the outbox continue to use the effect's wire key.
+// The outbox uses the canonical address. Cloud naming remains a transport boundary.
 func (cs *CloudSync) CloudTipsInternal(ctx context.Context, key string) ([]effects.Tip, []effects.CloudEffect, []effects.Tip, error) {
 	name := CloudKeyName(cs.keyNameKey, []byte(keytrie.WireKey(key)))
 	if !cs.cloudMayHold(name) {
 		return nil, nil, nil, nil
 	}
 
-	tips := cs.pendingTipsFor(keytrie.WireKey(key))
+	tips := cs.pendingTipsFor(key)
 
 	ctx, cancel := context.WithTimeout(ctx, cloudBackstopTimeout)
 	defer cancel()

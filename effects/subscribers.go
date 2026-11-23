@@ -84,9 +84,9 @@ func (e *Engine) addPeerSubscriber(key string, peer pb.NodeID) {
 		return
 	}
 
-	ls := e.index.LoadDataInternal(subscriberAddress(key))
+	ls := e.index.LoadDataInternal(key)
 	if ls == nil {
-		ls, _ = e.index.LoadOrStoreDataInternal(subscriberAddress(key), &leafState{})
+		ls, _ = e.index.LoadOrStoreDataInternal(key, &leafState{})
 	}
 
 	if ls == nil {
@@ -135,7 +135,7 @@ func (e *Engine) removePeerSubscriber(key string, peer pb.NodeID) {
 // snapshot: late notifications or old bootstrap snapshots must not accumulate
 // stale IDs in a long-lived leaf. Configured but unreachable peers remain.
 func (e *Engine) snapshotSubscribers(key string) map[uint64]bool {
-	ls := e.index.LoadDataInternal(subscriberAddress(key))
+	ls := e.index.LoadDataInternal(key)
 	if ls == nil {
 		return nil
 	}
@@ -175,7 +175,7 @@ func (e *Engine) PeerSubscribers(key string) []pb.NodeID {
 
 // PeerSubscribersInternal uses a complete trie address.
 func (e *Engine) PeerSubscribersInternal(key string) []pb.NodeID {
-	ls := e.index.LoadDataInternal(subscriberAddress(key))
+	ls := e.index.LoadDataInternal(key)
 	if ls == nil {
 		return nil
 	}
@@ -208,7 +208,7 @@ func (c *Context) collectSubscribers() []pb.NodeID {
 			continue
 		}
 
-		ls := c.engine.index.LoadDataInternal(subscriberAddress(key))
+		ls := c.engine.index.LoadDataInternal(key)
 		if ls == nil {
 			continue
 		}

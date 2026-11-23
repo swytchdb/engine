@@ -145,7 +145,7 @@ func TestPutIngested_BindOwnsOnlySubscribedKeys(t *testing.T) {
 				Keys: []*pb.TransactionalBindEffect_KeyBind{{Key: []byte("a")}, {Key: []byte("b")}},
 			}}}
 
-			e.subscriptions.Store(key, &subscriptionState{})
+			e.subscriptions.Store(logicalAddress(key), &subscriptionState{})
 
 			if err := e.putIngested(tip, eff, 10); err != nil {
 				t.Fatalf("putIngested: %v", err)

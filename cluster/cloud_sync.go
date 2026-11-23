@@ -149,7 +149,7 @@ type CloudSync struct {
 
 	mu      sync.Mutex
 	pending map[effects.Tip]pendingUpload
-	// pendingKeys indexes pending by plaintext key, so CloudTips can answer a
+	// pendingKeys indexes pending by canonical key address, so CloudTips can answer a
 	// read-miss from the outbox: an evicted-before-ack key has no index tips
 	// and no cloud tips, but its effects sit refcount-pinned in the pool — the
 	// outbox tips are the frontier the cloud will eventually hold, and the

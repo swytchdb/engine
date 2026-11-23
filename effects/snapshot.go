@@ -660,7 +660,7 @@ func (e *Engine) GetSnapshotInternal(key string) (*pb.ReducedEffect, []Tip, int,
 // by a failure path (markFailed) rather than a successful bootstrap — the
 // closeOnce + Store-before-close in markFailed ensures the re-load sees the
 // up-to-date value.
-func (e *Engine) awaitSubscription(existing *subscriptionState, unsafe, allowAsync bool) error {
+func (e *Engine) awaitSubscription(key string, existing *subscriptionState, unsafe, allowAsync bool) error {
 	if existing.incomplete.Load() {
 		if unsafe {
 			return nil
@@ -685,7 +685,7 @@ func (e *Engine) awaitSubscription(existing *subscriptionState, unsafe, allowAsy
 			existing.announcement = nil
 			existing.bootstrapMu.Unlock()
 			// Retry work may outlive this caller's borrowed key buffer.
-			return e.bootstrapSubscription(logicalAddress(string(notify.GetKey())), existing, notify, unsafe)
+			return e.bootstrapSubscription(strings.Clone(key), existing, notify, unsafe)
 		}
 		existing.bootstrapMu.Unlock()
 		<-existing.ready
@@ -856,22 +856,21 @@ func (e *Engine) ensureSubscribedMode(key string, allowAsync bool) error {
 	// already-subscribed case must not pay the state+channel allocation the
 	// LoadOrStore below needs.
 	if existing, ok := e.subscription(key); ok {
-		return e.awaitSubscription(existing, isUnsafe, allowAsync)
+		return e.awaitSubscription(key, existing, isUnsafe, allowAsync)
 	}
 	// Callers on the Redis hot path may borrow key from a pooled command
 	// buffer. A new subscription outlives that command, so own the map/trie key
 	// before publishing any state. The already-subscribed path above remains
 	// allocation-free.
-	ownedName := e.retainKey(ownerKey(key))
-	ownedKey := logicalAddress(ownedName)
+	ownedKey := e.retainKey(key)
 
 	state := &subscriptionState{ready: make(chan struct{}), ownedKey: true}
 	state.bootstrapMu.Lock()
-	if existing, loaded := e.subscriptions.LoadOrStore(ownedName, state); loaded {
+	if existing, loaded := e.subscriptions.LoadOrStore(ownedKey, state); loaded {
 		state.bootstrapMu.Unlock()
-		e.releaseKey(ownedName)
+		e.releaseKey(ownedKey)
 
-		return e.awaitSubscription(existing, isUnsafe, allowAsync)
+		return e.awaitSubscription(key, existing, isUnsafe, allowAsync)
 	}
 
 	if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
@@ -962,8 +961,8 @@ func (e *Engine) bootstrapSubscription(ownedKey string, state *subscriptionState
 		nacks: make(chan *pb.NackNotify, 64),
 	}
 
-	e.pendingBootstraps.Store(wireKey(ownedKey), collector)
-	defer e.pendingBootstraps.Delete(wireKey(ownedKey))
+	e.pendingBootstraps.Store(r(notify.GetOrigin()), collector)
+	defer e.pendingBootstraps.Delete(r(notify.GetOrigin()))
 
 	// Send to each peer individually and wait for ACKs. Retry if no peers
 	// responded (e.g. noise sessions not yet established after restart).

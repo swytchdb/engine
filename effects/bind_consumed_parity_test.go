@@ -75,7 +75,7 @@ func TestBindConsumedTipsMatchEmittedDeps(t *testing.T) {
 	// and doesn't block waiting on the ready channel.
 	subState := &subscriptionState{ready: make(chan struct{})}
 	subState.markReady()
-	e.subscriptions.Store(key, subState)
+	e.subscriptions.Store(logicalAddress(key), subState)
 
 	base := Tip{7, 100}    // committed base on el-1 (plays B:522)
 	foreign := Tip{8, 200} // foreign in-flight tx tip on el-1 (plays A:491 / 31947)

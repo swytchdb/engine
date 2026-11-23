@@ -172,7 +172,7 @@ func TestGraphDescriptorConcurrentBranchesAndSnapshot(t *testing.T) {
 	}
 
 	for _, key := range []string{"absent-node/peer-a", "absent-node/peer-b"} {
-		if _, subscribed := e.subscriptions.Load(key); subscribed || e.index.Contains(key) != nil {
+		if _, subscribed := e.subscriptions.Load(logicalAddress(key)); subscribed || e.index.Contains(key) != nil {
 			t.Fatalf("graph reconstruction subscribed to referenced node %q", key)
 		}
 	}

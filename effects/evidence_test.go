@@ -67,7 +67,7 @@ func TestSnapshotEvidenceReconstructsPriorityChainWithoutLabels(t *testing.T) {
 		t.Fatalf("fresh-node reconstruction=%v err=%v, want A", got, err)
 	}
 
-	if _, ok := fresh.subscriptions.Load("bc"); ok {
+	if _, ok := fresh.subscriptions.Load(logicalAddress("bc")); ok {
 		t.Fatal("proof evaluation subscribed to another key")
 	}
 
@@ -224,7 +224,7 @@ reclaim:
 		t.Fatalf("closure tried to reconstruct the foreign proof: complete=%t err=%v", complete, err)
 	}
 
-	if _, subscribed := e.subscriptions.Load("foreign"); subscribed {
+	if _, subscribed := e.subscriptions.Load(logicalAddress("foreign")); subscribed {
 		t.Fatal("receiving proof subscribed to the foreign key")
 	}
 

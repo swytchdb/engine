@@ -180,7 +180,7 @@ func newTestEngine(bc Broadcaster) *Engine {
 		pendingTxns:       xsync.NewMap[Tip, *pendingTxn](),
 		pendingTxTips:     xsync.NewMap[Tip, []Tip](),
 		txAbortCounts:     xsync.NewMap[string, *atomic.Int32](),
-		pendingBootstraps: xsync.NewMap[string, *bootstrapCollector](),
+		pendingBootstraps: xsync.NewMap[Tip, *bootstrapCollector](),
 		spokenBinds:       clox.NewCloxCache[Tip, *spokenBindHistory](clox.ConfigFromCapacity(256)),
 		effectCache:       newVertexPool(),
 	}
@@ -197,7 +197,7 @@ func preSubscribe(e *Engine, keys ...string) {
 	for _, k := range keys {
 		st := &subscriptionState{ready: make(chan struct{})}
 		st.markReady()
-		e.subscriptions.Store(k, st)
+		e.subscriptions.Store(logicalAddress(k), st)
 	}
 }
 
@@ -817,7 +817,7 @@ func newTxnTestEngine(bc Broadcaster) *Engine {
 		pendingTxns:       xsync.NewMap[Tip, *pendingTxn](),
 		pendingTxTips:     xsync.NewMap[Tip, []Tip](),
 		txAbortCounts:     xsync.NewMap[string, *atomic.Int32](),
-		pendingBootstraps: xsync.NewMap[string, *bootstrapCollector](),
+		pendingBootstraps: xsync.NewMap[Tip, *bootstrapCollector](),
 		spokenBinds:       clox.NewCloxCache[Tip, *spokenBindHistory](clox.ConfigFromCapacity(256)),
 		effectCache:       newVertexPool(),
 	}

@@ -231,7 +231,6 @@ func (e *Engine) inMajorityPartition() bool {
 // the peer holds everything until it tells us otherwise. False-positives are
 // safe — they fall through to a real subscribe + reconstruct.
 func (e *Engine) clusterMaybeHasKey(key string) bool {
-	owner := ownerKey(key)
 	key = wireKey(key)
 
 	e.keyFilterMu.RLock()
@@ -242,7 +241,7 @@ func (e *Engine) clusterMaybeHasKey(key string) bool {
 	}
 
 	for _, pf := range e.peerKeyFilters {
-		if pf.maybeContains(key) || owner != key && pf.maybeContains(owner) {
+		if pf.maybeContains(key) {
 			return true
 		}
 	}

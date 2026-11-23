@@ -60,6 +60,9 @@ func TestInternalAddressTransport(t *testing.T) {
 
 	rootBefore := receiver.index.Contains("animals")
 	address := keytrie.InternalKey("animals", "node\x00one")
+	if err := receiver.ensureSubscribedBlocking(address); err != nil {
+		t.Fatal(err)
+	}
 	ctx := sender.NewContext()
 
 	effect := addressedValue(address, "otter")
@@ -81,6 +84,7 @@ func TestInternalAddressTransport(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	receiver.SetBroadcaster(&graphSource{source: sender})
 	notify := BuildOffsetNotify(sender.NodeID(), tips.Tips()[0], effect, data, nil)
 	if _, err := receiver.HandleRemote(notify); err != nil {
 		t.Fatal(err)
@@ -307,15 +311,15 @@ func TestInternalAddressUnsubscribePreservesOwner(t *testing.T) {
 
 	e.dropSubscription(address)
 
-	if _, ok := e.subscriptions.Load("animals"); !ok {
+	if _, ok := e.subscriptions.Load(logicalAddress("animals")); !ok {
 		t.Fatal("node eviction removed owner subscription")
 	}
 
 	e.getOrCreatePeerFilter(9).hasBulk = true
 	e.peerFilterAdd(9, logicalAddress("animals"))
 
-	if !e.clusterMaybeHasKey(address) {
-		t.Fatal("owner subscriber was excluded for a new graph node")
+	if e.clusterMaybeHasKey(address) {
+		t.Fatal("main-key filter hit implied an internal node was held")
 	}
 }
 
