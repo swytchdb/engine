@@ -2216,7 +2216,7 @@ func (e *Engine) collectBindEffects(bindEff *pb.Effect, key string) ([]*pb.Effec
 			return nil, err
 		}
 
-		if eff.GetTxnId() != txnID {
+		if eff.GetTxnId() != txnID || !effectHasAddress(eff, key) {
 			continue
 		}
 

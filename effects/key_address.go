@@ -26,6 +26,7 @@ package effects
 import (
 	"bytes"
 	"fmt"
+	"slices"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
 	"github.com/swytchdb/engine/keytrie"
@@ -98,4 +99,13 @@ func subscriberAddress(key string) string {
 	}
 
 	return logicalAddress(ownerKey(key))
+}
+
+// effectHasAddress includes shared binds in every key they bind.
+func effectHasAddress(eff *pb.Effect, key string) bool {
+	if bind := eff.GetTxnBind(); bind != nil {
+		return slices.ContainsFunc(bind.GetKeys(), func(k *pb.TransactionalBindEffect_KeyBind) bool { return string(k.GetKey()) == key })
+	}
+
+	return string(eff.GetIKey()) == key
 }

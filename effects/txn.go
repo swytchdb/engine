@@ -133,6 +133,10 @@ func (e *Engine) hasWritesSince(key string, observed []Tip, txnID string) bool {
 			return true
 		}
 
+		if !effectHasAddress(eff, key) {
+			continue
+		}
+
 		if eff.GetTxnId() != txnID || txnID == "" {
 			writes := eff.GetTxnId() == "" && (eff.GetData() != nil || eff.GetMeta() != nil)
 			if eff.GetTxnBind() != nil {

@@ -609,6 +609,11 @@ func (d *dag) topoCollect(tips []Tip, stopAtSnapshot bool) (dagPaths, error) {
 		for ref := range keyDeps(d.key, eff) {
 			dep := r(ref)
 			value := resident(dep)
+			// A cross-key observation supplies causality, not this key's value
+			// or compaction boundary. Shared binds still belong to every bound key.
+			if value != nil && !effectHasAddress(value, d.key) {
+				continue
+			}
 
 			deps = append(deps, dagTip{dep, value})
 			if !emptySubscription(value) {

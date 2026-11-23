@@ -79,6 +79,7 @@ type contextKey struct {
 	initialTips *keytrie.TipSet    // tips read from index on first Emit for this key
 	lastOffset  Tip                // most recently written effect (nodeID + offset)
 	notifies    []*pb.OffsetNotify // all notifies in emit order — every effect must be broadcast for durability
+	routes      []*graphRoute      // optional, aligned with notifies; nil entries use ordinary publication
 
 	// Transaction metadata (only populated when inTx)
 	readOnly   bool              // only NoopEffects on this key
@@ -161,6 +162,7 @@ func cloneContextKeys(keys map[string]*contextKey) map[string]*contextKey {
 	for key, state := range keys {
 		clonedState := *state
 		clonedState.notifies = slices.Clone(state.notifies)
+		clonedState.routes = slices.Clone(state.routes)
 		clonedState.elementIDs = slices.Clone(state.elementIDs)
 		clonedState.subOps = slices.Clone(state.subOps)
 		cloned[key] = &clonedState
@@ -317,7 +319,37 @@ func (c *Context) getSnapshot(key string) (*pb.ReducedEffect, []Tip, error) {
 			// Compaction owns the state it emits, so detach before stamping the
 			// subscriber set instead of forcing every read to clone up front.
 			result = cloneReduced(result)
-			result.Subscribers = c.engine.snapshotSubscribers(key)
+			if err := c.engine.stampSnapshotSubscriptions(key, result); err != nil {
+				ls.lastCompaction.CompareAndSwap(stamp, 0)
+
+				return nil, nil, err
+			}
+
+			route, err := c.engine.graphRouteForTips(key, tips)
+			if err != nil {
+				ls.lastCompaction.CompareAndSwap(stamp, 0)
+
+				return nil, nil, err
+			}
+
+			var graphDeps []Tip
+			if route != nil {
+				graphDeps = route.descriptorTips
+				if route.peers[c.engine.nodeID] {
+					if result.GetSubscribers() == nil {
+						result.Subscribers = make(map[uint64]bool)
+					}
+
+					result.Subscribers[uint64(c.engine.nodeID)] = true
+				}
+
+				for peer := range result.GetSubscribers() {
+					if !route.peers[pb.NodeID(peer)] {
+						delete(result.GetSubscribers(), peer)
+					}
+				}
+			}
+
 			snapEff := &pb.SnapshotEffect{
 				Collection: result.GetCollection(),
 				State:      result,
@@ -336,10 +368,10 @@ func (c *Context) getSnapshot(key string) (*pb.ReducedEffect, []Tip, error) {
 				}
 			}
 
-			if err := c.Emit(&pb.Effect{
+			if err := c.emitEffect(&pb.Effect{
 				Key: []byte(wireKey(key)), IKey: []byte(key),
 				Kind: &pb.Effect_Snapshot{Snapshot: snapEff},
-			}, tips); err != nil {
+			}, graphDeps, route, tips); err != nil {
 				ls.lastCompaction.CompareAndSwap(stamp, 0)
 				slog.Error("compaction: snapshot emit failed",
 					"key", key,
@@ -734,6 +766,34 @@ func (c *Context) Abort() {
 // tips the handler actually read, not whatever the index contains now.
 // Pure writes (SET, LPUSH) omit snapshotTips and Emit reads the index.
 func (c *Context) Emit(eff *pb.Effect, snapshotTips ...[]Tip) error {
+	// WATCH and transactional reads emit observations through this shared path.
+	// A graph observation has the same recipients as its observed node frontier.
+	if eff.GetNoop() != nil && isGraphAddress(string(eff.GetIKey())) {
+		key := string(eff.GetIKey())
+
+		tips := c.engine.index.ContainsInternal(key).Tips()
+		if len(snapshotTips) != 0 && snapshotTips[0] != nil {
+			tips = snapshotTips[0]
+		}
+
+		if pending := c.keys[key]; pending != nil {
+			tips = []Tip{pending.lastOffset}
+		}
+
+		route, err := c.engine.graphRouteForTips(key, tips)
+		if err != nil {
+			return err
+		}
+
+		if route != nil {
+			return c.emitEffect(eff, route.descriptorTips, route, snapshotTips...)
+		}
+	}
+
+	return c.emitEffect(eff, nil, nil, snapshotTips...)
+}
+
+func (c *Context) emitEffect(eff *pb.Effect, graphDeps []Tip, route *graphRoute, snapshotTips ...[]Tip) error {
 	if err := prepareEffectAddress(eff); err != nil {
 		return err
 	}
@@ -833,6 +893,8 @@ func (c *Context) Emit(eff *pb.Effect, snapshotTips ...[]Tip) error {
 		eff.Deps = []*pb.EffectRef{toPbRef(ck.lastOffset)}
 	}
 
+	eff.Deps = appendUniqueRefs(eff.GetDeps(), graphDeps)
+
 	// Track notification intent from DataEffect ops
 	if data := eff.GetData(); data != nil {
 		switch data.GetOp() {
@@ -905,6 +967,14 @@ func (c *Context) Emit(eff *pb.Effect, snapshotTips ...[]Tip) error {
 
 	// Update contextKey
 	ck.lastOffset = offset
+	if route != nil || ck.routes != nil {
+		if ck.routes == nil {
+			ck.routes = make([]*graphRoute, len(ck.notifies))
+		}
+
+		ck.routes = append(ck.routes, route)
+	}
+
 	ck.notifies = append(ck.notifies, notify)
 	c.readOnly = false
 
@@ -1118,7 +1188,29 @@ func (c *Context) flushNonTx() error {
 		c.engine.updateIndex(key, ck.initialTips, ck.lastOffset)
 		c.applySubOps(key, ck)
 
-		if c.engine.broadcaster != nil {
+		if c.engine.broadcaster != nil && ck.routes != nil {
+			for i, n := range ck.notifies {
+				publicationMode := UnsafeMode
+				if i == len(ck.notifies)-1 {
+					publicationMode = mode
+				}
+
+				var err error
+				if ck.routes[i] != nil {
+					err = c.engine.publishGraphNotice(key, n, ck.routes[i], publicationMode)
+				} else if publicationMode == SafeMode {
+					err = c.engine.broadcaster.Replicate(n, n.GetEffectData())
+				} else {
+					c.engine.broadcaster.BroadcastWithData(n, n.GetEffectData())
+				}
+
+				if err != nil {
+					slog.Warn("replication failed after publication", "key", key, "error", err)
+				}
+			}
+		}
+
+		if c.engine.broadcaster != nil && ck.routes == nil {
 			var bcastTrace []byte
 
 			if tracing.Enabled() {
@@ -1302,8 +1394,14 @@ func (c *Context) flushTx() error {
 		}
 
 		if c.engine.broadcaster != nil {
-			for _, n := range ck.notifies {
-				c.engine.broadcaster.BroadcastWithData(n, n.GetEffectData())
+			for i, n := range ck.notifies {
+				if ck.routes != nil && ck.routes[i] != nil {
+					if err := c.engine.publishGraphNotice(key, n, ck.routes[i], UnsafeMode); err != nil {
+						return err
+					}
+				} else {
+					c.engine.broadcaster.BroadcastWithData(n, n.GetEffectData())
+				}
 			}
 		}
 	}
@@ -1474,6 +1572,10 @@ func (c *Context) flushTx() error {
 
 	if c.engine.broadcaster != nil {
 		subscribers := c.collectSubscribers()
+		if isGraphAddress(string(bindEff.GetIKey())) {
+			c.engine.recordHistoryTargets(bindOffset, subscribers)
+		}
+
 		slog.Debug("flushTx: replicating bind",
 			"bind_offset", bindOffset,
 			"subscribers", len(subscribers))

@@ -31,6 +31,9 @@ const (
 	GraphAlgorithmKey           = "algorithm"
 	GraphRegionSubscriptionsKey = "region_subscriptions"
 	GraphEntryPointKey          = "entry_point"
+
+	// GraphRegionsKey names the node partition containing algorithm-defined labels.
+	GraphRegionsKey = "regions"
 )
 
 // NewGraphEffects builds the initialization effects for a new graph descriptor.
@@ -45,8 +48,11 @@ const (
 // use ORDERED elements with independent list element IDs and raw node identities
 // as values. Node identities are not EffectRefs or child-partition markers.
 //
-// Subscription contents and algorithm identifiers are opaque at this layer.
-// This establishes storage only; it does not register interest or route data.
+// Subscription entries use "<decimal peer ID>/<hex subscription ID>" as their
+// keyed ID and point to a child partition of label-to-regex fields. Fields are
+// ANDed, entries are ORed, and patterns match whole label values. Node labels
+// live in the node's GraphRegionsKey partition. Algorithm identifiers are opaque.
+// This helper initializes storage; Context.EmitGraph performs predicate routing.
 // Inputs are copied so callers can reuse their buffers after construction.
 func NewGraphEffects(key, algorithm []byte) []*Effect {
 	return []*Effect{

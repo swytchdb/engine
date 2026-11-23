@@ -197,7 +197,17 @@ func (c *Context) collectSubscribers() []pb.NodeID {
 
 	var result []pb.NodeID
 
-	for key := range c.keys {
+	for key, ck := range c.keys {
+		if ck.routes != nil {
+			for _, id := range c.engine.contextSubscribers(key, ck) {
+				if !slices.Contains(result, id) {
+					result = append(result, id)
+				}
+			}
+
+			continue
+		}
+
 		ls := c.engine.index.LoadDataInternal(subscriberAddress(key))
 		if ls == nil {
 			continue

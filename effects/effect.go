@@ -710,6 +710,11 @@ func (e *Engine) InstallCloudTipsInternal(key string, tips []Tip, sidecar []Clou
 // durability hook, broadcast. The effect must already carry its key, HLC,
 // fork-choice hash, and deps.
 func (e *Engine) mintLocalEffect(key string, currentSet *keytrie.TipSet, eff *pb.Effect) (Tip, error) {
+	route, err := e.graphRouteForTips(key, currentSet.Tips())
+	if err != nil {
+		return Tip{}, err
+	}
+
 	data, err := e.effectCache.MarshalEffect(eff)
 	if err != nil {
 		return Tip{}, err
@@ -727,7 +732,13 @@ func (e *Engine) mintLocalEffect(key string, currentSet *keytrie.TipSet, eff *pb
 
 	if e.broadcaster != nil {
 		notify := BuildOffsetNotify(e.nodeID, offset, eff, data, context.Background())
-		e.broadcaster.BroadcastWithData(notify, data)
+		if route != nil {
+			if err := e.publishGraphNotice(key, notify, route, UnsafeMode); err != nil {
+				return offset, err
+			}
+		} else {
+			e.broadcaster.BroadcastWithData(notify, data)
+		}
 	}
 
 	return offset, nil
