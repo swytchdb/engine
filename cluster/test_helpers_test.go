@@ -41,7 +41,7 @@ import (
 
 // generateTestTLSConfig creates a self-signed TLS config for tests.
 // Uses the same cert for both server and client (mTLS with InsecureSkipVerify).
-func generateTestTLSConfig(t *testing.T) *tls.Config {
+func generateTestTLSConfig(t testing.TB) *tls.Config {
 	t.Helper()
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -160,7 +160,7 @@ func (m *mockLogReader) ReadEffect(_ *pb.EffectRef) ([]byte, error) {
 
 // startNNodeCluster starts N peer managers with OS-assigned ports and wires them together.
 // Blocks until all QUIC connections and heartbeat symmetry are established.
-func startNNodeCluster(t *testing.T, handlers []EffectHandler, logReaders []LogReader, identities ...NodeId) []*PeerManager {
+func startNNodeCluster(t testing.TB, handlers []EffectHandler, logReaders []LogReader, identities ...NodeId) []*PeerManager {
 	t.Helper()
 
 	n := len(handlers)

@@ -163,8 +163,7 @@ func TestBindConsumedTipsSubstitutesForeignInflightTip(t *testing.T) {
 		t.Fatalf("local txn did not commit: %v", err)
 	}
 
-	// Step 5: locate the emitted bind. After commit it is the index tip on
-	// the key whose effect carries a TxnBind.
+	// Step 5: locate the emitted bind through the verdict snapshot.
 	bind := findBindOnKey(t, e, key)
 
 	// Inspect its ConsumedTips for the key.
@@ -199,8 +198,7 @@ func TestBindConsumedTipsSubstitutesForeignInflightTip(t *testing.T) {
 	}
 }
 
-// findBindOnKey returns the TransactionalBindEffect that is a live index
-// tip on key, failing the test if none is present.
+// findBindOnKey returns the bind at a live tip or in its verdict evidence.
 func findBindOnKey(t *testing.T, e *Engine, key string) *pb.TransactionalBindEffect {
 	t.Helper()
 
@@ -210,10 +208,7 @@ func findBindOnKey(t *testing.T, e *Engine, key string) *pb.TransactionalBindEff
 	}
 
 	for _, off := range tips.Tips() {
-		eff, ok := e.effectCache.Get(off)
-		if !ok {
-			continue
-		}
+		eff := bindAtTip(t, e, off)
 
 		if bind := eff.GetTxnBind(); bind != nil {
 			return bind

@@ -162,6 +162,7 @@ func (b *graphRecorder) ReplicateTo(n *pb.OffsetNotify, _ []byte, peer pb.NodeID
 	if eff, err := parseWireEffect(n.GetEffectData()); err == nil && eff.GetSubscription() != nil {
 		return nil, nil
 	}
+
 	err := b.replicateErr
 	b.deliveries <- graphDelivery{peer, n}
 
@@ -177,6 +178,7 @@ func (b *graphRecorder) BroadcastWithData(n *pb.OffsetNotify, data []byte) {
 	if eff, err := parseWireEffect(n.GetEffectData()); err == nil && eff.GetSubscription() != nil {
 		return
 	}
+
 	b.mockBroadcaster.BroadcastWithData(n, data)
 }
 
@@ -205,7 +207,7 @@ func TestGraphRoutingUsesObservedDirectoryAndOrdinaryMembership(t *testing.T) {
 	old := addGraphPredicate(t, e, "animals", "a", 2, map[string]string{"region": "(mammals|reptiles)"})
 	addGraphPredicate(t, e, "animals", "b", 3, map[string]string{"region": "mammals"})
 
-	b := &graphRecorder{mockBroadcaster: mockBroadcaster{peerIDs: []pb.NodeID{2, 3}, allRegionPeersReachable: true}, deliveries: make(chan graphDelivery, 16)}
+	b := &graphRecorder{peerIDs: []pb.NodeID{2, 3}, allRegionPeersReachable: true, deliveries: make(chan graphDelivery, 16)}
 	e.SetBroadcaster(b)
 	e.addPeerSubscriber(logicalAddress("animals"), 2)
 	e.addPeerSubscriber(logicalAddress("animals"), 3)
@@ -386,7 +388,7 @@ func TestGraphTransactionBindsDistinctInternalNodes(t *testing.T) {
 	for i, address := range []string{"left", "right"} {
 		tips := e.index.ContainsInternal(keytrie.InternalKey("animals", address)).Tips()
 
-		eff, _ := e.effectCache.Get(tips[0])
+		eff := bindAtTip(t, e, tips[0])
 		if len(eff.GetTxnBind().GetKeys()) != 2 {
 			t.Fatal("collapsed internal key binds")
 		}
@@ -480,7 +482,7 @@ func TestGraphTransactionRoutingAndVerdicts(t *testing.T) {
 	})
 	seedGraph(t, e, "animals")
 	tips := addGraphPredicate(t, e, "animals", "match", 2, map[string]string{"region": "mammals"})
-	b := &graphRecorder{mockBroadcaster: mockBroadcaster{peerIDs: []pb.NodeID{2, 3}, allRegionPeersReachable: true}, deliveries: make(chan graphDelivery, 32)}
+	b := &graphRecorder{peerIDs: []pb.NodeID{2, 3}, allRegionPeersReachable: true, deliveries: make(chan graphDelivery, 32)}
 	e.SetBroadcaster(b)
 	e.addPeerSubscriber(logicalAddress("animals"), 2)
 	e.addPeerSubscriber(logicalAddress("animals"), 3)
@@ -530,11 +532,14 @@ func TestGraphTransactionRoutingAndVerdicts(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+
 		if eff.GetSnapshot() == nil {
 			t.Fatal("unexpected ordinary publication")
 		}
+
 		kinds["snapshot"]++
 	}
+
 	if kinds["data"] != 4 || kinds["bind"] != 1 || kinds["snapshot"] != 2 {
 		t.Fatalf("publication kinds: %v", kinds)
 	}
@@ -580,6 +585,25 @@ func TestGraphSharedDescriptorAndNodeBindRemainsANodeDependency(t *testing.T) {
 
 	if err := c.Flush(); err != nil {
 		t.Fatal(err)
+	}
+
+	// Model the shared frontier before verdict snapshots arrive on a peer.
+	// Local commits now emit a separate verdict snapshot for each address.
+	descriptorTips := e.index.Contains("animals")
+
+	snapshot, err := e.getEffect("", descriptorTips.Tips()[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	binds := snapshot.GetSnapshot().GetEvidence().GetBinds()
+	if len(binds) != 1 {
+		t.Fatalf("expected evidence for one shared bind, got %v", binds)
+	}
+
+	bindTip := r(binds[0])
+	for _, key := range []string{logicalAddress("animals"), keytrie.InternalKey("animals", "n")} {
+		e.updateIndex(key, e.index.ContainsInternal(key), bindTip)
 	}
 
 	shared := slices.Clone(e.index.Contains("animals").Tips())
@@ -698,10 +722,12 @@ func TestGraphRoutingReconstructsCollectionRegionsAndDescriptorDeps(t *testing.T
 	}
 
 	identity := keytrie.InternalKey("animals", "n")
+
 	route := c.keys[identity].routes[0]
 	if !route.peers[2] || route.peers[3] {
 		t.Fatalf("emission lost observed route: %v", route)
 	}
+
 	if err := c.Flush(); err != nil {
 		t.Fatal(err)
 	}
@@ -792,7 +818,7 @@ func TestGraphNodeDeletionUsesObservedRegions(t *testing.T) {
 	}
 
 	nodeTips := slices.Clone(e.index.ContainsInternal(keytrie.InternalKey("animals", "n")).Tips())
-	b := &graphRecorder{mockBroadcaster: mockBroadcaster{peerIDs: []pb.NodeID{2}, allRegionPeersReachable: true}, deliveries: make(chan graphDelivery, 8)}
+	b := &graphRecorder{peerIDs: []pb.NodeID{2}, allRegionPeersReachable: true, deliveries: make(chan graphDelivery, 8)}
 	e.SetBroadcaster(b)
 	e.addPeerSubscriber(logicalAddress("animals"), 2)
 	c = e.NewContext()
@@ -809,7 +835,6 @@ func TestGraphNodeDeletionUsesObservedRegions(t *testing.T) {
 	if delivery := receiveGraphDelivery(t, b); delivery.peer != 2 {
 		t.Fatal("deletion did not reach the node subscriber")
 	}
-
 }
 
 // Delay ordinary node/snapshot deliveries. A bind must bring in all validation
@@ -829,7 +854,9 @@ func (b *graphTransactionRecorder) ReplicateMarshalled(n *pb.OffsetNotify, _ []b
 	if eff.GetSubscription() != nil {
 		return nil, nil
 	}
+
 	b.deliveries <- graphDelivery{peer, n}
+
 	if eff.GetTxnBind() != nil {
 		return b.receivers[peer].HandleRemote(n)
 	}
@@ -849,8 +876,8 @@ func TestGraphCrossRegionTransactionCarriesCompleteEvidence(t *testing.T) {
 	addGraphPredicate(t, sender, "animals", "red", 2, map[string]string{"color": "red"})
 	observed := addGraphPredicate(t, sender, "animals", "blue", 3, map[string]string{"color": "blue"})
 	b := &graphTransactionRecorder{
-		graphRecorder: graphRecorder{mockBroadcaster: mockBroadcaster{peerIDs: []pb.NodeID{2, 3, 4}, allRegionPeersReachable: true}, deliveries: make(chan graphDelivery, 32)},
-		receivers:     make(map[pb.NodeID]*Engine),
+		peerIDs: []pb.NodeID{2, 3, 4}, allRegionPeersReachable: true, deliveries: make(chan graphDelivery, 32),
+		receivers: make(map[pb.NodeID]*Engine),
 	}
 
 	for _, peer := range []pb.NodeID{2, 3} {
@@ -954,13 +981,16 @@ func TestGraphCrossRegionTransactionCarriesCompleteEvidence(t *testing.T) {
 		if err != nil || eff.GetSnapshot().GetTxnVerdicts()[txnID] != pb.Verdict_WON || eff.GetSnapshot().GetEvidence() == nil {
 			t.Fatalf("incomplete verdict: %v %v", eff, err)
 		}
+
 		verdicts++
+
 		for _, receiver := range b.receivers {
 			if _, err := receiver.HandleRemote(notice); err != nil {
 				t.Fatal(err)
 			}
 		}
 	}
+
 	if binds != 2 || verdicts != 2 {
 		t.Fatalf("binds/verdicts = %d/%d", binds, verdicts)
 	}
@@ -978,6 +1008,7 @@ func TestGraphCrossRegionTransactionCarriesCompleteEvidence(t *testing.T) {
 
 func TestGraphCompactionUsesExactNodeSubscribers(t *testing.T) {
 	e := NewEngine(EngineConfig{DefaultMode: UnsafeMode})
+
 	t.Cleanup(func() {
 		if err := e.Close(); err != nil {
 			t.Error(err)
@@ -985,42 +1016,54 @@ func TestGraphCompactionUsesExactNodeSubscribers(t *testing.T) {
 	})
 	observed := seedGraph(t, e, "animals")
 	address := keytrie.InternalKey("animals", "n")
+
 	c := e.NewContext()
 	for range 24 {
 		if err := emitGraphNode(c, GraphTip{Key: "animals", GraphTips: observed}, graphNode("animals", "n", 2)); err != nil {
 			t.Fatal(err)
 		}
 	}
+
 	if err := c.Flush(); err != nil {
 		t.Fatal(err)
 	}
+
 	e.addPeerSubscriber(address, 2)
 	e.addPeerSubscriber(logicalAddress("animals"), 3)
 	c = e.NewContext()
+
 	state, _, err := c.GetSnapshotInternal(address)
 	if err != nil || state.GetScalar().GetIntVal() != 2 {
 		t.Fatalf("read: %v %v", state, err)
 	}
+
 	if err := c.Flush(); err != nil {
 		t.Fatal(err)
 	}
+
 	tip := e.index.ContainsInternal(address).Tips()[0]
+
 	eff, ok := e.effectCache.Get(tip)
 	if !ok || eff.GetSnapshot() == nil {
 		t.Fatal("expected compaction snapshot")
 	}
+
 	subs := eff.GetSnapshot().GetState().GetSubscribers()
 	if !subs[2] || subs[3] {
 		t.Fatalf("snapshot subscribers: %v", subs)
 	}
+
 	c = e.NewContext()
 	defer c.Abort()
+
 	if err := c.Emit(&pb.Effect{Key: []byte(address), IKey: []byte(address), Kind: &pb.Effect_Noop{Noop: &pb.NoopEffect{}}}); err != nil {
 		t.Fatal(err)
 	}
+
 	if c.keys[address].routes != nil {
 		t.Fatal("ordinary observation inferred graph routing")
 	}
+
 	if got := c.collectSubscribers(); !slices.Equal(got, []pb.NodeID{2}) {
 		t.Fatalf("participants: %v", got)
 	}

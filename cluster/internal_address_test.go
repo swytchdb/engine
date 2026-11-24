@@ -15,10 +15,12 @@ import (
 // real fetch/ancestry transport before the receiver can reconstruct the values.
 func TestInternalAddressTransactionFetch(t *testing.T) {
 	source, target := ancestryTestEngine(t), ancestryTestEngine(t)
+
 	address := keytrie.InternalKey("animals", "root")
 	if err := target.SubscribeInternal(address); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := target.Subscribe("animals"); err != nil {
 		t.Fatal(err)
 	}
@@ -41,7 +43,11 @@ func TestInternalAddressTransactionFetch(t *testing.T) {
 
 	var envelope *pb.Effect
 
-	source.OnLocalEffect = func(tip effects.Tip, eff *pb.Effect) { last, envelope = tip, eff }
+	source.OnLocalEffect = func(tip effects.Tip, eff *pb.Effect) {
+		if eff.GetTxnBind() != nil {
+			last, envelope = tip, eff
+		}
+	}
 	tx := source.NewContext()
 	tx.BeginTx()
 
@@ -68,10 +74,12 @@ func TestInternalAddressTransactionFetch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	decoded := &pb.Effect{}
 	if err := effects.UnmarshalEffect(wire, decoded); err != nil {
 		t.Fatal(err)
 	}
+
 	if string(decoded.GetKey()) != address {
 		t.Fatal("mixed bind exposed an application wire identity")
 	}

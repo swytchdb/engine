@@ -57,6 +57,7 @@ func MarshalEffect(eff *pb.Effect) ([]byte, error) {
 			for _, kb := range eff.GetTxnBind().GetKeys() {
 				if len(kb.GetKey()) != 0 && kb.GetKey()[0] != 0 {
 					eff.Key, eff.IKey = kb.GetKey(), kb.GetKey()
+
 					break
 				}
 			}
@@ -149,5 +150,6 @@ func logicalOnlyBind(eff *pb.Effect) bool {
 			return false
 		}
 	}
+
 	return true
 }

@@ -147,21 +147,28 @@ func TestGraphNodeDiscoveryFivePeers(t *testing.T) {
 	// Registration also selects future emissions. Wait for the writer to observe
 	// those directory entries, then deliver a fresh address without reader discovery.
 	deadline := time.Now().Add(5 * time.Second)
+
 	for {
 		state, tips, _, err := engines[0].GetSnapshot(key)
 		if err != nil {
 			t.Fatal(err)
 		}
+
 		if len(state.GetPartitions()[pb.GraphRegionSubscriptionsKey].GetNetAdds()) == count-1 {
 			descriptorTips = tips
+
 			break
 		}
+
 		if time.Now().After(deadline) {
 			t.Fatal("writer did not observe region subscriptions")
 		}
+
 		time.Sleep(time.Millisecond)
 	}
+
 	fresh := keytrie.InternalKey(key, "child")
+
 	c = engines[0].NewContext()
 	for _, eff := range []*pb.Effect{
 		{Key: []byte(fresh), IKey: []byte(fresh), Virtual: []byte(pb.GraphRegionsKey), Kind: &pb.Effect_Data{Data: &pb.DataEffect{
@@ -175,17 +182,21 @@ func TestGraphNodeDiscoveryFivePeers(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+
 	if err := c.Flush(); err != nil {
 		t.Fatal(err)
 	}
+
 	for i := 1; i < count; i++ {
 		deadline := time.Now().Add(5 * time.Second)
 		for !engines[i].PinKeyInternal(fresh) {
 			if time.Now().After(deadline) {
 				t.Fatalf("peer %d did not receive selected future node", i)
 			}
+
 			time.Sleep(time.Millisecond)
 		}
+
 		engines[i].UnpinKeyInternal(fresh)
 		// Ownership was installed by selected receipt before this read could subscribe.
 		for {
@@ -193,14 +204,16 @@ func TestGraphNodeDiscoveryFivePeers(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+
 			if string(state.GetScalar().GetRaw()) == "future child" {
 				break
 			}
+
 			if time.Now().After(deadline) {
 				t.Fatalf("peer %d did not receive the value", i)
 			}
+
 			time.Sleep(time.Millisecond)
 		}
 	}
-
 }

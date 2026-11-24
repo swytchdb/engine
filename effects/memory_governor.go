@@ -25,12 +25,13 @@ package effects
 
 import (
 	"context"
-	"github.com/swytchdb/engine/keytrie"
 	"log/slog"
 	"math"
 	"runtime/debug"
 	"strings"
 	"time"
+
+	"github.com/swytchdb/engine/keytrie"
 )
 
 // startMemoryGovernor evicts owned capacity above the configured budget.

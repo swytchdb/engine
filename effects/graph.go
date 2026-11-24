@@ -240,6 +240,7 @@ func (e *Engine) graphNodeState(key string, tips []Tip, txn string) (*pb.Reduced
 	if err != nil {
 		return nil, err
 	}
+
 	state, _, err := e.reconstructWithView(key, tips, txn, false, view)
 
 	return state, err
@@ -374,24 +375,30 @@ func (e *Engine) stampSnapshotSubscriptions(key string, state *pb.ReducedEffect)
 // ordinary snapshots, then applies the graph observation's historical filter.
 func (e *Engine) contextSubscribers(key string, ck *contextKey) []pb.NodeID {
 	peers := e.snapshotSubscribers(key)
+
 	for _, route := range ck.routes {
 		if route == nil {
 			continue
 		}
+
 		for peer := range e.snapshotSubscribers(route.descriptor) {
 			if route.peers[pb.NodeID(peer)] {
 				if peers == nil {
 					peers = make(map[uint64]bool)
 				}
+
 				peers[peer] = true
 			}
 		}
 	}
+
 	result := make([]pb.NodeID, 0, len(peers))
 	for peer := range peers {
 		result = append(result, pb.NodeID(peer))
 	}
+
 	slices.Sort(result)
+
 	return result
 }
 
@@ -488,22 +495,28 @@ func (e *Engine) admitGraphEffect(eff *pb.Effect) error {
 			if !isInternalAddress(string(kb.GetKey())) {
 				continue
 			}
+
 			if _, ok := e.subscription(logicalAddress(keytrie.LogicalKeyString(string(kb.GetKey())))); !ok {
 				continue
 			}
+
 			if _, ok := e.subscription(string(kb.GetKey())); ok {
 				continue
 			}
+
 			value, err := e.getEffect(string(kb.GetKey()), r(kb.GetNewTip()))
 			if err != nil {
 				return err
 			}
+
 			if err := e.admitGraphNode(value); err != nil {
 				return err
 			}
 		}
+
 		return nil
 	}
+
 	return e.admitGraphNode(eff)
 }
 
@@ -512,48 +525,63 @@ func (e *Engine) admitGraphNode(eff *pb.Effect) error {
 	if !isInternalAddress(key) || eff.GetData() == nil && eff.GetMeta() == nil {
 		return nil
 	}
+
 	if _, ok := e.subscription(key); ok {
 		return nil
 	}
+
 	descriptor := logicalAddress(keytrie.LogicalKeyString(key))
 	if _, ok := e.subscription(descriptor); !ok {
 		return nil
 	}
-	var observed []Tip
-	var nodeTips []Tip
+
+	var (
+		observed []Tip
+		nodeTips []Tip
+	)
+
 	for _, ref := range eff.GetDeps() {
 		parent, err := e.getEffect(key, r(ref))
 		if err != nil {
 			return err
 		}
+
 		if effectHasAddress(parent, descriptor) {
 			observed = append(observed, r(ref))
 		}
+
 		if effectHasAddress(parent, key) {
 			nodeTips = append(nodeTips, r(ref))
 		}
 	}
+
 	if len(observed) == 0 {
 		return nil
 	}
+
 	state, err := e.graphNodeState(descriptor, observed, eff.GetTxnId())
 	if err != nil {
 		return err
 	}
+
 	if state.GetTypeTag() != pb.ValueType_TYPE_GRAPH {
 		return nil
 	}
+
 	node, err := e.graphNodeState(key, nodeTips, eff.GetTxnId())
 	if err != nil {
 		return err
 	}
+
 	if !isRootKeyDel(eff) {
 		node = ReduceChain(node, []*pb.Effect{eff})
 	}
+
 	peers, err := graphPredicatePeers(state, graphRegions(node))
 	if err != nil {
 		return err
 	}
+
 	if !peers[e.nodeID] {
 		return nil
 	}

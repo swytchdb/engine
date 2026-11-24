@@ -25,8 +25,9 @@ package cluster
 
 import (
 	"fmt"
-	"github.com/swytchdb/engine/keytrie"
 	"log/slog"
+
+	"github.com/swytchdb/engine/keytrie"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
 	"github.com/swytchdb/engine/effects"
@@ -379,5 +380,6 @@ func cloudEffectAddress(eff *pb.Effect) string {
 	if len(eff.GetIKey()) != 0 {
 		return string(eff.GetIKey())
 	}
+
 	return keytrie.LogicalAddress(string(eff.GetKey()))
 }

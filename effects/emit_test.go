@@ -506,14 +506,11 @@ func TestBeginTxSetsFlag(t *testing.T) {
 	if tips == nil {
 		t.Fatal("expected index entry for key k")
 	}
-	// In a tx, the tip is the BIND; walk tips to find a data effect with TxnId
+	// The verdict tip retains the transactional bind carrying TxnId.
 	found := false
 
 	for _, off := range tips.Tips() {
-		cached, ok := e.effectCache.Get(off)
-		if !ok {
-			continue
-		}
+		cached := bindAtTip(t, e, off)
 
 		if cached.GetTxnId() != "" {
 			found = true
@@ -2005,8 +2002,8 @@ func TestSSI_WriteWithinTxUsesSnapshotDeps(t *testing.T) {
 
 func TestFlushTx_ConsumesTips_LinearChain(t *testing.T) {
 	// Verify that repeated transactional read-modify-writes produce a linear
-	// chain: each BIND replaces the consumed tips in the index, so subsequent
-	// NOOPs depend only on the previous BIND (not on accumulated DATA+BIND offsets).
+	// chain: each verdict snapshot replaces the bind in the index, so subsequent
+	// NOOPs depend only on that snapshot (not on accumulated DATA+BIND offsets).
 	e := newTxnTestEngine(nil)
 
 	// Setup: write initial value (non-tx)
@@ -2055,7 +2052,8 @@ func TestFlushTx_ConsumesTips_LinearChain(t *testing.T) {
 			t.Fatalf("iteration %d: Flush failed: %v", i, err)
 		}
 
-		// After each transaction, the index should have exactly 1 tip (the BIND)
+		// After each transaction, the verdict snapshot consumes the bind,
+		// leaving exactly one tip rather than accumulating transaction history.
 		postTips := e.index.Contains("k")
 		if postTips == nil {
 			t.Fatalf("iteration %d: expected tips after flush, got nil", i)
@@ -2066,16 +2064,16 @@ func TestFlushTx_ConsumesTips_LinearChain(t *testing.T) {
 				i, len(postTips.Tips()), postTips.Tips())
 		}
 
-		// Verify the tip is a BIND effect via effectCache
-		bindOffset := postTips.Tips()[0]
+		// Verify the tip is a verdict snapshot with evidence for the bind.
+		snapshotOffset := postTips.Tips()[0]
 
-		cached, ok := e.effectCache.Get(bindOffset)
+		cached, ok := e.effectCache.Get(snapshotOffset)
 		if !ok {
-			t.Fatalf("iteration %d: could not find BIND at offset %d in effectCache", i, bindOffset)
+			t.Fatalf("iteration %d: could not find snapshot at offset %v in effectCache", i, snapshotOffset)
 		}
 
-		if cached.GetTxnBind() == nil {
-			t.Fatalf("iteration %d: tip at offset %d is not a BIND", i, bindOffset)
+		if len(cached.GetSnapshot().GetEvidence().GetBinds()) != 1 {
+			t.Fatalf("iteration %d: tip at offset %v lacks bind evidence", i, snapshotOffset)
 		}
 	}
 }

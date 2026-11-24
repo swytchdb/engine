@@ -58,6 +58,7 @@ func TestMemorySharedPrimaryKeyOwners(t *testing.T) {
 	if e.keyBytes >= before {
 		t.Fatal("subscription allocation was not released")
 	}
+
 	before = e.keyBytes
 
 	e.index.SetEvictHooksInternal(func(string) bool { return true }, nil, nil)

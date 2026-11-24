@@ -175,10 +175,7 @@ func TestBindConsumedTipsMatchEmittedDeps(t *testing.T) {
 	)
 
 	for _, off := range committedTips.Tips() {
-		eff, ok := e.effectCache.Get(off)
-		if !ok {
-			continue
-		}
+		eff := bindAtTip(t, e, off)
 
 		if b := eff.GetTxnBind(); b != nil && eff.GetTxnId() == txnID {
 			bindEff = eff

@@ -110,6 +110,7 @@ func (e *Engine) ancestryPeers(key string, root Tip) []pb.NodeID {
 	if i := slices.Index(peers, pb.NodeID(root[0])); i >= 0 {
 		peers[0], peers[i] = peers[i], peers[0]
 	}
+
 	peers = peers[:min(2, len(peers))]
 
 	return peers

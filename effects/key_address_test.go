@@ -59,10 +59,12 @@ func TestInternalAddressTransport(t *testing.T) {
 	}
 
 	rootBefore := receiver.index.Contains("animals")
+
 	address := keytrie.InternalKey("animals", "node\x00one")
 	if err := receiver.ensureSubscribedBlocking(address); err != nil {
 		t.Fatal(err)
 	}
+
 	ctx := sender.NewContext()
 
 	effect := addressedValue(address, "otter")
@@ -85,6 +87,7 @@ func TestInternalAddressTransport(t *testing.T) {
 	}
 
 	receiver.SetBroadcaster(&graphSource{source: sender})
+
 	notify := BuildOffsetNotify(sender.NodeID(), tips.Tips()[0], effect, data, nil)
 	if _, err := receiver.HandleRemote(notify); err != nil {
 		t.Fatal(err)

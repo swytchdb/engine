@@ -70,14 +70,17 @@ func (e *Engine) nackKey(nack *pb.NackNotify) string {
 	if request, ok := e.pendingBootstraps.Load(r(nack.GetConflicting())); ok {
 		return request.key
 	}
+
 	if e.effectCache != nil {
 		if eff, ok := e.effectCache.Get(r(nack.GetConflicting())); ok {
 			if eff.GetTxnBind() != nil && !logicalOnlyBind(eff) {
 				return key
 			}
+
 			if string(eff.GetKey()) == key {
 				return string(eff.GetIKey())
 			}
+
 			for _, kb := range eff.GetTxnBind().GetKeys() {
 				if bytes.Equal(keytrie.WireKeyBytes(kb.GetKey()), nack.GetKey()) {
 					return string(kb.GetKey())
@@ -85,6 +88,7 @@ func (e *Engine) nackKey(nack *pb.NackNotify) string {
 			}
 		}
 	}
+
 	return logicalAddress(key)
 }
 
@@ -94,6 +98,7 @@ func (e *Engine) nackWireKey(key string, conflicting *pb.EffectRef) []byte {
 			return []byte(key)
 		}
 	}
+
 	return []byte(wireKey(key))
 }
 

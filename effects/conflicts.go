@@ -283,6 +283,7 @@ func conflictIndexAddress(address string) string {
 	if len(logical) != len(address) {
 		return logicalAddress(conflictIndexPrefix + logical)
 	}
+
 	return keytrie.InternalKey(conflictDirectory, address)
 }
 

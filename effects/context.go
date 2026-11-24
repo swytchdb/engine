@@ -213,10 +213,12 @@ func (c *Context) PendingKeysInternal() []string {
 	if c == nil {
 		return nil
 	}
+
 	out := make([]string, 0, len(c.keys))
 	for key := range c.keys {
 		out = append(out, key)
 	}
+
 	return out
 }
 
@@ -753,7 +755,6 @@ func (c *Context) Abort() {
 // tips the handler actually read, not whatever the index contains now.
 // Pure writes (SET, LPUSH) omit snapshotTips and Emit reads the index.
 func (c *Context) Emit(eff *pb.Effect, snapshotTips ...[]Tip) error {
-
 	return c.emitEffect(eff, nil, nil, snapshotTips...)
 }
 
@@ -1524,6 +1525,11 @@ func (c *Context) flushTx() error {
 	nodeLock.release()
 
 	// Step 5: Gather subscribers and replicate bind
+	decision := txnStateCommitted
+
+	var defeatedSet map[string]Tip
+
+	horizonRegistered := false
 
 	if c.engine.broadcaster != nil {
 		subscribers := c.collectSubscribers()
@@ -1543,7 +1549,6 @@ func (c *Context) flushTx() error {
 			// chance to commit it.
 			slog.Debug("flushTx: no subscribers, committing immediately",
 				"bind_offset", bindOffset)
-			ptxn.finish(txnStateCommitted)
 		} else {
 			// Peers exist — bind stays invisible until we finish processing
 			// peer responses and explicitly call MakeVisible (commit) or
@@ -1553,6 +1558,8 @@ func (c *Context) flushTx() error {
 			// has had a chance to fire.
 			if c.engine.horizon != nil {
 				c.engine.horizon.Add(c.txnID, bindOffset, bind)
+
+				horizonRegistered = true
 			}
 			// Replicate to all subscribers concurrently, collect responses.
 			// Per the TLA+ spec (ExactlyOnce.CommitPop): commit requires
@@ -1614,21 +1621,12 @@ func (c *Context) flushTx() error {
 				c.engine.ingestNackTips(nack)
 			}
 
-			var (
-				defeatedSet map[string]Tip
-				proof       *pb.BindEvidence
-			)
-
-			decision := txnStateAmbiguous
+			decision = txnStateAmbiguous
 
 			if responseCount == len(subscribers) {
 				var err error
 
 				defeatedSet, err = c.engine.evaluateNacks(ptxn, ptxn.responses)
-				if err == nil {
-					proof, err = c.engine.bindProof(bindOffset, defeatedSet, ptxn.proofSources)
-					defer func() { c.engine.effectCache.releaseEvidence(evidenceTips(proof)) }()
-				}
 
 				switch {
 				case errors.Is(err, ErrTxnAborted):
@@ -1641,75 +1639,86 @@ func (c *Context) flushTx() error {
 
 				slog.Debug("flushTx: priority evaluation", "bind_offset", bindOffset, "state", decision, "error", err)
 			}
+		}
+	}
 
-			if decision == txnStateCommitted {
-				verdicts := make(map[string]pb.Verdict, 1+len(defeatedSet))
-				verdicts[c.txnID] = pb.Verdict_WON
+	// Every committed bind publishes verdict evidence, including standalone
+	// commits and commits with no subscribers.
+	var proof *pb.BindEvidence
+	if decision == txnStateCommitted {
+		proof, err = c.engine.bindProof(bindOffset, defeatedSet, ptxn.proofSources)
+		defer func() { c.engine.effectCache.releaseEvidence(evidenceTips(proof)) }()
 
-				// Cache the computed outcomes on our keys and the defeated
-				// binds' keys. Readers and deferred responses can reuse this
-				// evidence without rediscovering cross-key competitors.
+		if err != nil {
+			decision = txnStateAmbiguous
 
-				emitKeys := make(map[string]struct{}, len(bind.GetKeys()))
-				for _, kb := range bind.GetKeys() {
-					emitKeys[string(kb.GetKey())] = struct{}{}
-				}
+			slog.Warn("flushTx: bind proof failed", "bind_offset", bindOffset, "error", err)
+		}
+	}
 
-				for beatenTxn, beatenOffset := range defeatedSet {
-					verdicts[beatenTxn] = pb.Verdict_LOST
+	if decision == txnStateCommitted {
+		verdicts := make(map[string]pb.Verdict, 1+len(defeatedSet))
+		verdicts[c.txnID] = pb.Verdict_WON
 
-					loserEff, err := c.engine.getEffect("", beatenOffset)
-					if err != nil {
-						slog.Warn("flushTx: cannot fetch beaten bind for verdict emit",
-							"loser_txn", beatenTxn,
-							"loser_offset", beatenOffset,
-							"bind_offset", bindOffset,
-							"error", err)
+		// Cache the computed outcomes on our keys and the defeated
+		// binds' keys. Readers and deferred responses can reuse this
+		// evidence without rediscovering cross-key competitors.
 
-						continue
-					}
+		emitKeys := make(map[string]struct{}, len(bind.GetKeys()))
+		for _, kb := range bind.GetKeys() {
+			emitKeys[string(kb.GetKey())] = struct{}{}
+		}
 
-					loserBind := loserEff.GetTxnBind()
-					if loserBind == nil {
-						slog.Warn("flushTx: beaten effect is not a TxnBind",
-							"loser_txn", beatenTxn,
-							"loser_offset", beatenOffset,
-							"bind_offset", bindOffset)
+		for beatenTxn, beatenOffset := range defeatedSet {
+			verdicts[beatenTxn] = pb.Verdict_LOST
 
-						continue
-					}
+			loserEff, err := c.engine.getEffect("", beatenOffset)
+			if err != nil {
+				slog.Warn("flushTx: cannot fetch beaten bind for verdict emit",
+					"loser_txn", beatenTxn,
+					"loser_offset", beatenOffset,
+					"bind_offset", bindOffset,
+					"error", err)
 
-					for _, kb := range loserBind.GetKeys() {
-						emitKeys[string(kb.GetKey())] = struct{}{}
-					}
-				}
-
-				for key := range emitKeys {
-					if err := c.engine.emitSnapshot(key, verdicts, proof); err != nil {
-						decision = txnStateAmbiguous
-
-						slog.Warn("flushTx: emitSnapshot for verdict failed",
-							"key", key,
-							"bind_offset", bindOffset,
-							"error", err)
-					}
-				}
+				continue
 			}
-			// Evidence ownership must be published before local completion and
-			// before deferred priority responses can use this outcome.
-			ptxn.finish(decision)
 
-			if c.engine.horizon != nil {
-				if decision == txnStateCommitted {
-					c.engine.horizon.MakeVisible(c.txnID)
-				} else {
-					c.engine.horizon.Abort(c.txnID)
-				}
+			loserBind := loserEff.GetTxnBind()
+			if loserBind == nil {
+				slog.Warn("flushTx: beaten effect is not a TxnBind",
+					"loser_txn", beatenTxn,
+					"loser_offset", beatenOffset,
+					"bind_offset", bindOffset)
+
+				continue
+			}
+
+			for _, kb := range loserBind.GetKeys() {
+				emitKeys[string(kb.GetKey())] = struct{}{}
 			}
 		}
-	} else {
-		// Standalone: commit immediately
-		ptxn.finish(txnStateCommitted)
+
+		for key := range emitKeys {
+			if err := c.engine.emitSnapshot(key, verdicts, proof); err != nil {
+				decision = txnStateAmbiguous
+
+				slog.Warn("flushTx: emitSnapshot for verdict failed",
+					"key", key,
+					"bind_offset", bindOffset,
+					"error", err)
+			}
+		}
+	}
+	// Evidence ownership must be published before local completion and
+	// before deferred priority responses can use this outcome.
+	ptxn.finish(decision)
+
+	if horizonRegistered {
+		if decision == txnStateCommitted {
+			c.engine.horizon.MakeVisible(c.txnID)
+		} else {
+			c.engine.horizon.Abort(c.txnID)
+		}
 	}
 
 	// Step 6: Process result
@@ -1718,9 +1727,9 @@ func (c *Context) flushTx() error {
 	c.engine.pendingTxns.Delete(bindOffset)
 
 	if state != txnStateCommitted {
-		// Release local pending state. Horizon.Abort already did this when
-		// enabled; neither path retracts the published bind from peers.
-		if c.engine.horizon == nil {
+		// Release local pending state. Horizon.Abort already did this for
+		// registered binds; neither path retracts the published bind from peers.
+		if !horizonRegistered {
 			for _, pk := range ptxn.keys {
 				c.engine.pendingTxTips.Delete(pk.newTip)
 			}
@@ -1751,10 +1760,9 @@ func (c *Context) flushTx() error {
 
 	slog.Debug("Flush: transaction committed", "bind_offset", bindOffset)
 	// Committed: clean up pending tx tips, reset abort counts.
-	// When horizon is active, MakeVisible (fast-path or timer) handles
-	// pendingTxTips cleanup.
+	// For horizon-registered binds, MakeVisible handles pendingTxTips cleanup.
 	for _, pk := range ptxn.keys {
-		if c.engine.horizon == nil {
+		if !horizonRegistered {
 			c.engine.pendingTxTips.Delete(pk.newTip)
 		}
 

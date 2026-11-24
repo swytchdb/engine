@@ -771,11 +771,13 @@ func (e *Engine) UpdateSafetyRules(defaultMode SafetyMode, rules []KeyRangeRule)
 // the caller's slice, so later mutations can't reach into the live engine.
 func withSystemKeyException(rules []KeyRangeRule) []KeyRangeRule {
 	out := make([]KeyRangeRule, 0, len(rules)+1)
+
 	out = append(out, KeyRangeRule{Pattern: logicalAddress("__swytch:*"), Mode: UnsafeMode})
 	for _, rule := range rules {
 		rule.Pattern = logicalAddress(rule.Pattern)
 		out = append(out, rule)
 	}
+
 	return out
 }
 
