@@ -133,7 +133,7 @@ func TestBackfillFrontierBindKeys(t *testing.T) {
 					e.index.Insert("other", nil, keytrie.NewTipSet(otherWant))
 				}
 
-				e.ingestNackTips(&pb.NackNotify{Key: []byte("k"), TipDetails: []*pb.NackTipDetail{{Ref: toPbRef(Tip{7, 3})}}})
+				_ = e.ingestNackTips(&pb.NackNotify{Key: []byte("k"), TipDetails: []*pb.NackTipDetail{{Ref: toPbRef(Tip{7, 3})}}})
 				requireFrontier(t, e, Tip{7, 3})
 
 				got := e.index.Contains("other")
@@ -188,7 +188,7 @@ func TestBackfillFrontierSingleAdvertisedTip(t *testing.T) {
 
 			nack := &pb.NackNotify{Key: []byte("k"), TipDetails: []*pb.NackTipDetail{{Ref: toPbRef(Tip{7, n})}}}
 			for range 3 {
-				e.ingestNackTips(nack)
+				_ = e.ingestNackTips(nack)
 				requireFrontier(t, e, Tip{7, n})
 
 				out := e.buildEnrichedNack(logicalAddress("k"), nil, e.index.Contains("k").Tips())

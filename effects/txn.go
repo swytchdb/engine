@@ -25,6 +25,7 @@ package effects
 
 import (
 	"errors"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -73,17 +74,20 @@ const (
 
 // pendingTxn tracks a transaction awaiting NACK resolution.
 type pendingTxn struct {
-	txnID          string // transaction ID (matches TxnId on emitted effects)
-	txnHLC         time.Time
-	originNode     pb.NodeID
-	forkChoiceHash []byte           // precomputed ForkChoiceHash(originNode, txnHLC)
-	bindOffset     Tip              // offset of the TransactionalBindEffect
-	keys           []pendingTxnKey  // read-only after creation
-	state          atomic.Uint32    // txnState*
-	done           chan struct{}    // closed on decision
-	resolved       chan struct{}    // closed after evaluation and evidence publication
-	responses      []*pb.NackNotify // immutable once resolved closes
-	proofSources   []Tip            // predecessor snapshots actually used in resolution
+	txnID           string // transaction ID (matches TxnId on emitted effects)
+	txnHLC          time.Time
+	originNode      pb.NodeID
+	forkChoiceHash  []byte           // precomputed ForkChoiceHash(originNode, txnHLC)
+	bindOffset      Tip              // offset of the TransactionalBindEffect
+	keys            []pendingTxnKey  // read-only after creation
+	state           atomic.Uint32    // txnState*
+	done            chan struct{}    // closed on decision
+	resolved        chan struct{}    // closed after evaluation and evidence publication
+	responses       []*pb.NackNotify // immutable once resolved closes
+	proofSources    []Tip            // predecessor snapshots actually used in resolution
+	nackMu          sync.Mutex
+	deferredNacks   []*pb.NackNotify
+	nackBatchClosed bool
 }
 
 type pendingTxnKey struct {
@@ -100,16 +104,56 @@ type pendingTxnKey struct {
 // Tentative effects do not write a value until their bind arrives. Follow these
 // wrappers to find actual writes, stopping at the observed causal boundary.
 func (e *Engine) hasWritesSince(key string, observed []Tip, txnID string) bool {
-	seen := make(map[Tip]bool, len(observed))
-	base := &pendingTxn{}
+	return e.newWriteObservation(key, observed, txnID).changed()
+}
 
+// observationCheck validates writes and, for admission, bound observations.
+// It reuses only successfully checked immutable history. Each call reads the
+// current frontier anew; unseen tips are always checked, and a
+// failed or incomplete walk is never recorded as safe.
+type observationCheck struct {
+	engine       *Engine
+	key          string
+	txnID        string
+	observed     []Tip
+	validated    map[Tip]bool
+	load         func(Tip) (*pb.Effect, error)
+	newTip       Tip // nonzero enables bind admission in addition to write validation
+	competingTxn string
+}
+
+func (e *Engine) newWriteObservation(key string, observed []Tip, txnID string) *observationCheck {
+	w := &observationCheck{
+		engine: e, key: key, txnID: txnID, observed: observed,
+		validated: make(map[Tip]bool, len(observed)),
+		load:      func(t Tip) (*pb.Effect, error) { return e.getEffect(key, t) },
+	}
 	for _, tip := range observed {
-		seen[tip] = true
-		base.keys = append(base.keys, pendingTxnKey{key: key, newTip: tip})
+		w.validated[tip] = true
 	}
 
+	return w
+}
+
+// Admission also honors binds that only read this key. Observing their NOOP
+// does not order their later bind, even though no value has changed. WATCH
+// continues to use write-only validation through newWriteObservation.
+func (e *Engine) newAdmissionCheck(key string, observed []Tip, txnID string, newTip Tip) *observationCheck {
+	w := e.newWriteObservation(key, observed, txnID)
+	w.newTip = newTip
+
+	return w
+}
+
+func (w *observationCheck) changed() bool {
+	w.competingTxn = ""
+
+	e, key, txnID := w.engine, w.key, w.txnID
+	seen := make(map[Tip]bool)
+	ancestry := newAncestrySearch(key, w.observed, w.load)
+
 	current := e.index.ContainsInternal(key).Tips()
-	if len(current) == 0 && len(observed) != 0 {
+	if len(current) == 0 && len(w.observed) != 0 {
 		return true
 	}
 
@@ -118,15 +162,15 @@ func (e *Engine) hasWritesSince(key string, observed []Tip, txnID string) bool {
 		tip := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
 
-		if seen[tip] {
+		if seen[tip] || w.validated[tip] {
 			continue
 		}
 
 		seen[tip] = true
 
-		eff, err := e.getEffect(key, tip)
+		eff, err := w.load(tip)
 		if err != nil {
-			if e.reachesFromTxOnKey(base, &key, tip) {
+			if ancestry.contains(tip) {
 				continue
 			}
 
@@ -141,7 +185,7 @@ func (e *Engine) hasWritesSince(key string, observed []Tip, txnID string) bool {
 			writes := eff.GetTxnId() == "" && (eff.GetData() != nil || eff.GetMeta() != nil)
 			if eff.GetTxnBind() != nil {
 				// The bind, not its pre-bind effects, must be in our past.
-				if e.reachesFromTxOnKey(base, &key, tip) {
+				if ancestry.contains(tip) {
 					continue
 				}
 
@@ -153,10 +197,20 @@ func (e *Engine) hasWritesSince(key string, observed []Tip, txnID string) bool {
 				for _, bound := range effects {
 					writes = writes || bound.GetData() != nil || bound.GetMeta() != nil || bound.GetRowWrite() != nil
 				}
+
+				if !writes && w.newTip != (Tip{}) {
+					conflict, evidence := e.hasPredicateConflict(txnID, eff.GetTxnId(), key,
+						[]Tip{w.newTip}, []Tip{tip})
+					if conflict || !evidence {
+						w.competingTxn = eff.GetTxnId()
+
+						return true
+					}
+				}
 			}
 
 			if writes {
-				if !e.reachesFromTxOnKey(base, &key, tip) {
+				if !ancestry.contains(tip) {
 					return true
 				}
 
@@ -167,6 +221,10 @@ func (e *Engine) hasWritesSince(key string, observed []Tip, txnID string) bool {
 		for dep := range keyDeps(key, eff) {
 			stack = append(stack, r(dep))
 		}
+	}
+
+	for tip := range seen {
+		w.validated[tip] = true
 	}
 
 	return false
@@ -193,14 +251,28 @@ func (e *Engine) isRealConflict(ptxn *pendingTxn, key string, detail *pb.NackTip
 // cannot authorize a commit. Keep the defeated bind anchors from the same pass
 // so flushTx publishes the same decisions for wrapped and unwrapped competitors.
 func (e *Engine) checkNackConflict(ptxn *pendingTxn, key string, detail *pb.NackTipDetail) (bool, map[string]Tip) {
-	candidates, _, err := e.nackCandidates(ptxn, key, []*pb.NackTipDetail{detail})
-	if err != nil {
+	groups := []keyNacks{{key: key, details: []*pb.NackTipDetail{detail}}}
+
+	verdicts, err := e.responseVerdicts(groups)
+	if err != nil || verdicts[ptxn.txnID].verdict == pb.Verdict_LOST {
+		return true, nil
+	}
+
+	candidates, err := e.nackCandidatesWithVerdicts(ptxn, key, groups[0].details, verdicts)
+	if err != nil || verdicts[ptxn.txnID].verdict == pb.Verdict_LOST {
 		return true, nil
 	}
 
 	var defeated map[string]Tip
 
 	for _, cur := range candidates {
+		if cur.GetIsBind() && len(verdicts) != 0 {
+			eff, err := e.getEffect(key, r(cur.GetRef()))
+			if err == nil && verdicts.adjudicated(eff.GetTxnId()) {
+				continue
+			}
+		}
+
 		conflict, txn := e.classifyNackTip(ptxn, key, cur)
 		if conflict {
 			return true, nil
@@ -222,9 +294,19 @@ func (e *Engine) checkNackConflict(ptxn *pendingTxn, key string, detail *pb.Nack
 // Discovery does not decide winners. Unrelated keys can supply evidence without
 // subscribing to them or treating their effects as conflicts with our transaction.
 func (e *Engine) nackCandidates(ptxn *pendingTxn, key string, details []*pb.NackTipDetail) ([]*pb.NackTipDetail, verdictMap, error) {
+	verdicts, err := e.responseVerdicts([]keyNacks{{key: key, details: details}})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	candidates, err := e.nackCandidatesWithVerdicts(ptxn, key, details, verdicts)
+
+	return candidates, verdicts, err
+}
+
+func (e *Engine) nackCandidatesWithVerdicts(ptxn *pendingTxn, key string, details []*pb.NackTipDetail, verdicts verdictMap) ([]*pb.NackTipDetail, error) {
 	queue := append([]*pb.NackTipDetail(nil), details...)
 	visited := make(map[Tip]bool)
-	verdicts := make(verdictMap)
 
 	var (
 		candidates []*pb.NackTipDetail
@@ -254,8 +336,8 @@ func (e *Engine) nackCandidates(ptxn *pendingTxn, key string, details []*pb.Nack
 
 		if eff, err := e.getEffect(key, tip); err == nil {
 			if snap := eff.GetSnapshot(); snap != nil {
-				if err := e.harvestProofVerdicts(tip, eff, verdicts); err != nil {
-					return nil, nil, err
+				if err := e.harvestResponseVerdicts(tip, eff, verdicts); err != nil {
+					return nil, err
 				}
 
 				predecessor = snap.GetPrevSnapshot()
@@ -272,20 +354,20 @@ func (e *Engine) nackCandidates(ptxn *pendingTxn, key string, details []*pb.Nack
 
 		for _, dep := range deps {
 			dt := r(dep)
-			if visited[dt] || e.reachesFromTxOnKey(ptxn, &key, dt) {
+			if visited[dt] {
 				continue
 			}
 
 			eff, err := e.getEffect(key, dt)
 			if err != nil {
-				if findPendingKey(ptxn, key) != nil {
-					return nil, nil, ErrTxnAmbiguous
+				if findPendingKey(ptxn, key) != nil && !e.reachesFromTxOnKey(ptxn, &key, dt) {
+					return nil, ErrTxnAmbiguous
 				}
 
 				continue
 			}
 
-			queue = append(queue, nackTipDetail(dt, eff))
+			queue = append(queue, nackCandidateDetail(dt, eff))
 		}
 	}
 
@@ -310,8 +392,8 @@ func (e *Engine) nackCandidates(ptxn *pendingTxn, key string, details []*pb.Nack
 		// A cache-only predecessor can be reclaimed between loading it and
 		// pinning its proof. Its unavailability is still optional; malformed
 		// proofs and failures on the required-ancestry path remain errors.
-		if err := e.harvestProofVerdicts(tip, eff, verdicts); err != nil && !errors.Is(err, errEffectNotResident) {
-			return nil, nil, err
+		if err := e.harvestResponseVerdicts(tip, eff, verdicts); err != nil && !errors.Is(err, errEffectNotResident) {
+			return nil, err
 		}
 
 		if prev := eff.GetSnapshot().GetPrevSnapshot(); prev != nil {
@@ -319,7 +401,7 @@ func (e *Engine) nackCandidates(ptxn *pendingTxn, key string, details []*pb.Nack
 		}
 	}
 
-	return candidates, verdicts, nil
+	return candidates, nil
 }
 
 // evaluateNacks runs only after every subscriber has responded. First collect
@@ -327,32 +409,38 @@ func (e *Engine) nackCandidates(ptxn *pendingTxn, key string, details []*pb.Nack
 // A better hash grants priority, not victory. Without its resolution the
 // published transaction remains ambiguous, rather than reporting a false abort.
 func (e *Engine) evaluateNacks(ptxn *pendingTxn, nacks []*pb.NackNotify) (map[string]Tip, error) {
+	groups := e.groupNacks(nacks)
+
+	verdicts, err := e.responseVerdicts(groups)
+	if err != nil {
+		return nil, err
+	}
+
+	return e.evaluateNacksWithVerdicts(ptxn, groups, verdicts)
+}
+
+func (e *Engine) evaluateNacksWithVerdicts(ptxn *pendingTxn, groups []keyNacks, verdicts verdictMap) (map[string]Tip, error) {
 	ptxn.proofSources = nil
+	if verdicts[ptxn.txnID].verdict == pb.Verdict_LOST {
+		return nil, ErrTxnAborted
+	}
 
 	type candidate struct {
-		key    string
-		detail *pb.NackTipDetail
-		txn    string
+		key      string
+		detail   *pb.NackTipDetail
+		txn      string
+		conflict bool
+		defeated string
 	}
 
 	var candidates []candidate
 
-	verdicts := make(verdictMap)
+	for _, group := range groups {
+		key := group.key
 
-	for _, nack := range nacks {
-		key := e.nackKey(nack)
-
-		tips, evidence, err := e.nackCandidates(ptxn, key, nack.GetTipDetails())
+		tips, err := e.nackCandidatesWithVerdicts(ptxn, key, group.details, verdicts)
 		if err != nil {
 			return nil, err
-		}
-
-		for txn, entry := range evidence {
-			if prior, ok := verdicts[txn]; ok && prior.verdict != entry.verdict {
-				return nil, ErrTxnAmbiguous
-			}
-
-			verdicts[txn] = entry
 		}
 
 		if findPendingKey(ptxn, key) == nil {
@@ -360,49 +448,58 @@ func (e *Engine) evaluateNacks(ptxn *pendingTxn, nacks []*pb.NackNotify) (map[st
 		}
 
 		for _, tip := range tips {
-			c := candidate{key: key, detail: tip}
-			if tip.GetIsBind() {
-				eff, err := e.getEffect(key, r(tip.GetRef()))
-				if err != nil || eff.GetTxnBind() == nil {
-					return nil, ErrTxnAmbiguous
-				}
-
-				c.txn = eff.GetTxnId()
-			}
-
-			candidates = append(candidates, c)
+			candidates = append(candidates, candidate{key: key, detail: tip})
 		}
 	}
+
+	if verdicts[ptxn.txnID].verdict == pb.Verdict_LOST {
+		return nil, ErrTxnAborted
+	}
+
 	// Establish priority before evaluating competing candidates. Predicate-
 	// disjoint binds can coexist regardless of the other transaction's outcome.
-	for _, c := range candidates {
-		if c.detail.GetIsBind() && c.txn != ptxn.txnID &&
-			ForkChoiceLess(c.detail.GetBindForkChoiceHash(), ptxn.forkChoiceHash) &&
-			!e.nackTipOrdered(ptxn, c.key, c.detail) && verdicts[c.txn].verdict == pb.Verdict_VERDICT_UNSPECIFIED {
-			if e.bindPredicatesDisjoint(ptxn, c.key, c.txn, r(c.detail.GetRef())) {
-				continue
+	for i := range candidates {
+		c := &candidates[i]
+		if c.detail.GetIsBind() {
+			eff, err := e.getEffect(c.key, r(c.detail.GetRef()))
+			if err != nil || eff.GetTxnBind() == nil {
+				return nil, ErrTxnAmbiguous
 			}
 
+			c.txn = eff.GetTxnId()
+		}
+
+		if verdicts.adjudicated(c.txn) {
+			continue
+		}
+		// Ordering and predicate checks are shared by priority gating and
+		// the final decision rather than walking the same candidate twice.
+		c.conflict, c.defeated = e.classifyNackTip(ptxn, c.key, c.detail)
+		if c.conflict && verdicts[c.txn].verdict == pb.Verdict_VERDICT_UNSPECIFIED {
 			return nil, ErrTxnAmbiguous
 		}
 	}
 
 	defeated := make(map[string]Tip)
+	proofSources := make(map[Tip]bool)
 
 	for _, c := range candidates {
-		if verdicts[c.txn].verdict == pb.Verdict_LOST {
-			ptxn.proofSources = append(ptxn.proofSources, verdicts[c.txn].snapshotTip)
+		if verdicts.adjudicated(c.txn) {
+			source := verdicts[c.txn].snapshotTip
+			if !proofSources[source] {
+				proofSources[source] = true
+				ptxn.proofSources = append(ptxn.proofSources, source)
+			}
 
 			continue
 		}
 
-		conflict, txn := e.classifyNackTip(ptxn, c.key, c.detail)
-		if conflict {
+		if c.conflict {
 			return nil, ErrTxnAborted
 		}
 
-		if txn != "" {
-			defeated[txn] = r(c.detail.GetRef())
+		if c.defeated != "" {
+			defeated[c.defeated] = r(c.detail.GetRef())
 		}
 	}
 

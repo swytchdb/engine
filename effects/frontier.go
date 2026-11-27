@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/maphash"
 	"log/slog"
+	"maps"
 	"slices"
 	"sync"
 
@@ -29,10 +30,101 @@ func (e *Engine) installIngestedTips(key string, arrivals ...Tip) {
 	op := newClosureOperation(e, make(map[Tip]error))
 	defer op.release()
 
+	// A membership announcement is not a new transaction admission. Recover
+	// its key's causal dependencies, but do not reopen every other key of an
+	// observed bind. Bind receipt and read/bootstrap recovery own that work.
+	op.subscriptionOnly = len(arrivals) != 0
+	for _, tip := range arrivals {
+		if e.effectCache == nil {
+			op.subscriptionOnly = false
+
+			break
+		}
+
+		eff, ok := e.effectCache.Get(tip)
+		if !ok || eff.GetSubscription() == nil {
+			op.subscriptionOnly = false
+
+			break
+		}
+	}
+
 	_, _, err := op.publish(key, arrivals, false)
 	if err != nil {
 		slog.Warn("frontier closure incomplete; retaining unresolved tips", "key", key, "error", err)
 	}
+}
+
+// ingestedFrontiers collects publication obligations across a recovery batch.
+// A bind can be replayed through several keys; publish each projection once,
+// after all available history has been ingested.
+type ingestedFrontiers map[string]map[Tip]struct{}
+
+func (frontiers ingestedFrontiers) add(key string, arrivals ...Tip) {
+	if len(arrivals) == 0 {
+		return
+	}
+
+	if frontiers[key] == nil {
+		frontiers[key] = make(map[Tip]struct{}, len(arrivals))
+	}
+
+	for _, tip := range arrivals {
+		frontiers[key][tip] = struct{}{}
+	}
+}
+
+func (e *Engine) installIngestedFrontiers(frontiers ingestedFrontiers, verdicts verdictMap) {
+	op := newClosureOperation(e, make(map[Tip]error))
+	defer op.release()
+
+	op.verdicts = make(verdictMap, len(verdicts))
+	maps.Copy(op.verdicts, verdicts)
+
+	op.publishBatch(frontiers)
+}
+
+// Bind responses must not report acceptance after a closure fetch failed.
+// Missing older history retains the existing reconstruction boundary rules.
+func (e *Engine) installBindFrontiers(frontiers ingestedFrontiers) error {
+	op := newClosureOperation(e, make(map[Tip]error))
+	defer op.release()
+
+	op.recordProgress = true
+
+	return op.publishBatchChecked(frontiers, true)
+}
+
+func (op *closureOperation) publishBatch(frontiers ingestedFrontiers) {
+	_ = op.publishBatchChecked(frontiers, false)
+}
+
+func (op *closureOperation) publishBatchChecked(frontiers ingestedFrontiers, failOnError bool) error {
+	keys := make([]string, 0, len(frontiers))
+	for key := range frontiers {
+		keys = append(keys, key)
+	}
+
+	slices.Sort(keys)
+
+	for _, key := range keys {
+		arrivals := make([]Tip, 0, len(frontiers[key]))
+		for tip := range frontiers[key] {
+			arrivals = append(arrivals, tip)
+		}
+
+		// Associated-key discovery from earlier publications remains in op.
+		// publish still reloads the current frontier and holds only one shard.
+		if _, _, err := op.publish(key, arrivals, failOnError); err != nil {
+			if failOnError {
+				return err
+			}
+
+			slog.Warn("frontier closure incomplete; retaining unresolved tips", "key", key, "error", err)
+		}
+	}
+
+	return nil
 }
 
 // closureOperation owns discovery through publication. Cloud and notification
@@ -40,17 +132,67 @@ func (e *Engine) installIngestedTips(key string, arrivals ...Tip) {
 // publishing. Optional observation and an explicit CAS let regressions count
 // actual graph work and force contention without timing-dependent goroutines.
 type closureOperation struct {
-	engine    *Engine
-	attempted map[Tip]error
-	work      map[string]*closureWork
-	observe   func(Tip, *pb.EffectRef) // nil ref: vertex expansion; otherwise: dependency edge
-	cas       func(string, *keytrie.TipSet, *keytrie.TipSet) (*keytrie.TipSet, bool)
+	generation       uint64
+	reclaimed        uint64
+	cacheUsed        bool
+	cacheDisabled    bool
+	engine           *Engine
+	recordProgress   bool // strict bind publication still records successful receipt; cloud does not
+	subscriptionOnly bool // membership publication does not adjudicate cross-key transactions
+	attempted        map[Tip]error
+	work             map[string]*closureWork
+	binds            map[Tip]map[string]*pb.EffectRef // immutable per-key projections, enumerated once per operation
+	verdicts         verdictMap                       // adjudicated competitions discovered on this operation's paths
+	observe          func(Tip, *pb.EffectRef)         // nil ref: vertex expansion; otherwise: dependency edge
+	observeBind      func(Tip)                        // bind-wide enumeration, independent of per-key expansion
+	cas              func(string, *keytrie.TipSet, *keytrie.TipSet) (*keytrie.TipSet, bool)
 }
 
 func newClosureOperation(e *Engine, attempted map[Tip]error) *closureOperation {
-	return &closureOperation{
-		engine: e, attempted: attempted, work: make(map[string]*closureWork),
+	op := &closureOperation{
+		generation: e.flushGeneration.Load(),
+		engine:     e, attempted: attempted, work: make(map[string]*closureWork),
 		cas: e.index.InsertInternal,
+	}
+	if e.effectCache != nil {
+		op.reclaimed = e.effectCache.reclaimed.Load()
+	}
+
+	return op
+}
+
+// A loss cannot enter another competition even if the winning transaction is
+// still waiting on subscribers. Invalid or unavailable evidence grants no shortcut.
+func (op *closureOperation) harvestVerdicts(tip Tip, eff *pb.Effect) {
+	snap := eff.GetSnapshot()
+	if len(snap.GetTxnVerdicts()) == 0 {
+		return
+	}
+
+	if snap.GetOutstandingSubscribers() == nil || len(snap.GetOutstandingSubscribers().GetNodeIds()) != 0 {
+		lost := false
+		for _, outcome := range snap.GetTxnVerdicts() {
+			lost = lost || outcome == pb.Verdict_LOST
+		}
+
+		if !lost {
+			return
+		}
+	}
+
+	incoming := make(verdictMap)
+	if err := op.engine.harvestProofVerdicts(tip, eff, incoming); err != nil {
+		return
+	}
+
+	for txn, entry := range incoming {
+		if incoming.adjudicated(txn) {
+			if op.verdicts == nil {
+				op.verdicts = make(verdictMap)
+			}
+
+			op.verdicts.retain(txn, entry)
+		}
 	}
 }
 
@@ -60,6 +202,8 @@ func (op *closureOperation) release() {
 	}
 
 	clear(op.work)
+	clear(op.binds)
+	clear(op.verdicts)
 }
 
 func (op *closureOperation) publish(key string, arrivals []Tip, failOnError bool) ([]Tip, bool, error) {
@@ -79,27 +223,66 @@ func (e *Engine) closeIngestedFrontier(key string, supplied []Tip, attempted map
 func (op *closureOperation) run(key string, supplied []Tip, publish, failOnError bool) ([]Tip, bool, error) {
 	e := op.engine
 
-	type branch struct {
-		key string
-		tip Tip
-	}
-
-	seen := make(map[branch]bool)
 	pending := make(map[string][]Tip)
 
 	var queue []string
 
 	walk := func(key string, tips []Tip) []Tip {
-		return op.walk(key, tips, func(tip Tip, bind *pb.TransactionalBindEffect) {
+		type discoveredBind struct {
+			tip Tip
+			eff *pb.Effect
+		}
+
+		var discovered []discoveredBind
+
+		visitBind := func(tip Tip, eff *pb.Effect) {
+			if op.subscriptionOnly || op.verdicts.adjudicated(eff.GetTxnId()) {
+				return
+			}
+
+			if _, seen := op.binds[tip]; seen {
+				return
+			}
+
+			discovered = append(discovered, discoveredBind{tip, eff})
+		}
+
+		live, cached := op.extendClosedFrontier(key, tips, visitBind)
+		if !cached {
+			live = op.walk(key, tips, visitBind)
+		}
+		// A verdict may be reached after its bind, through another supplied
+		// tip or fetched ancestry. Finish this key before opening other keys.
+		for _, candidate := range discovered {
+			if op.verdicts.adjudicated(candidate.eff.GetTxnId()) {
+				continue
+			}
+
+			tip, bind := candidate.tip, candidate.eff.GetTxnBind()
+
+			if op.binds == nil {
+				op.binds = make(map[Tip]map[string]*pb.EffectRef)
+			}
+
+			projections := make(map[string]*pb.EffectRef, len(bind.GetKeys()))
+
+			op.binds[tip] = projections
+			if op.observeBind != nil {
+				op.observeBind(tip)
+			}
+
+			// A shared bind is expanded separately on every key, but its key
+			// list and associated-key discovery belong to the whole operation.
 			for _, kb := range bind.GetKeys() {
 				other := string(kb.GetKey())
-
-				b := branch{other, tip}
-				if seen[b] || !e.isServed(kb.GetKey()) {
+				if _, exists := projections[other]; exists {
 					continue
 				}
 
-				seen[b] = true
+				projections[other] = kb.GetNewTip()
+				if _, served := e.subscription(other); !served {
+					continue
+				}
 
 				if other != key {
 					if _, queued := pending[other]; !queued {
@@ -109,7 +292,9 @@ func (op *closureOperation) run(key string, supplied []Tip, publish, failOnError
 					pending[other] = append(pending[other], tip)
 				}
 			}
-		})
+		}
+
+		return live
 	}
 
 	mu := e.closureLock(key)
@@ -177,6 +362,16 @@ func (op *closureOperation) run(key string, supplied []Tip, publish, failOnError
 			continue
 		}
 
+		// Reclamation can invalidate a proof while associated-key discovery
+		// releases our shard. Retry with ordinary discovery in that case.
+		if op.cacheUsed && !op.cacheCurrent() {
+			op.release()
+			op.cacheUsed = false
+			op.cacheDisabled = true
+
+			continue
+		}
+
 		var err error
 
 		for _, w := range op.work {
@@ -212,10 +407,14 @@ func (op *closureOperation) run(key string, supplied []Tip, publish, failOnError
 		}
 		// Notification ingestion records processing only after publication,
 		// under the same shard as before. Cloud retains its existing policy.
-		if !failOnError && complete && len(live) == 1 && e.effectCache != nil {
+		if (!failOnError || op.recordProgress) && complete && len(live) == 1 && e.effectCache != nil {
 			tip := live[0]
 			eff, _ := e.effectCache.Get(tip)
 			e.recordHistoryProcessed(tip, eff)
+		}
+
+		if complete {
+			op.rememberClosedFrontier(key, live)
 		}
 
 		return live, complete, err
@@ -237,6 +436,7 @@ const (
 	closureExpanded
 	closureNoFetch
 	closureLive
+	closureEstablished
 )
 
 // Cuts express connected membership, never dominance or downward expansion.
@@ -251,12 +451,14 @@ type closureCut struct {
 // lookup separate from the dense state array makes queue processing hash-free.
 // A randomized hash avoids depending on origin/offset distributions.
 type closureWork struct {
-	seed     maphash.Seed
-	slots    []int
-	visits   []closureVisit
-	queue    []int
-	pending  map[int][]Tip
-	failures map[int]error
+	seed         maphash.Seed
+	slots        []int
+	visits       []closureVisit
+	queue        []int
+	pending      map[int][]Tip
+	failures     map[int]error
+	cachedInput  []Tip
+	cachedOutput []Tip
 }
 
 var closureWorkPool = sync.Pool{New: func() any {
@@ -310,6 +512,8 @@ func (w *closureWork) release() {
 		return
 	}
 
+	w.cachedInput = nil
+	w.cachedOutput = nil
 	clear(w.visits)
 	clear(w.pending)
 	clear(w.failures)
@@ -322,20 +526,25 @@ func (w *closureWork) release() {
 // walk extends this operation's per-key cuts under the key's closure shard.
 // New seeds add work; established consumption and expanded ancestry survive CAS
 // retries. Cross-key branches are queued rather than taking a second shard.
-func (op *closureOperation) walk(key string, supplied []Tip, visitBind func(Tip, *pb.TransactionalBindEffect)) []Tip {
+func (op *closureOperation) walk(key string, supplied []Tip, visitBind func(Tip, *pb.Effect)) []Tip {
 	e, attempted := op.engine, op.attempted
 
 	w := op.work[key]
 	if w == nil {
 		w = closureWorkPool.Get().(*closureWork)
-		if w.pending == nil {
-			w.pending = make(map[int][]Tip)
-		}
-
 		op.work[key] = w
 	}
 
+	if w.pending == nil {
+		w.pending = make(map[int][]Tip)
+	}
+
 	pending := w.pending
+	stop := func(i int) {
+		if w.visits[i].flags&closureExpanded == 0 {
+			w.visits[i].flags |= closureExpanded | closureEstablished
+		}
+	}
 	resident := func(i int) *vertex {
 		v := w.visits[i].vertex
 		if v != nil && v.refs.Load() >= 0 {
@@ -449,8 +658,8 @@ func (op *closureOperation) walk(key string, supplied []Tip, visitBind func(Tip,
 		}
 	}
 
-	// 1. Supplied tips seed downward discovery in fork-choice order. They do
-	// not initiate upward searches, including when an input is already local.
+	// 1. Register every supplied tip before following existing parent links,
+	// so an established chain can join another supplied frontier directly.
 	seeds := keytrie.NewTipSet(supplied...).Tips()
 	slices.SortFunc(seeds, compare)
 
@@ -475,19 +684,24 @@ func (op *closureOperation) walk(key string, supplied []Tip, visitBind func(Tip,
 	// 2. A preexisting reverse link identifies established history. Follow
 	// one chain to its cut BEFORE installing the newly discovered incoming
 	// edge. Record membership along the chain so another join stops there.
-	// This never consumes tips and never marks a vertex expanded downward.
-	ascend := func(v *vertex, c *closureCut) {
+	// A retained link accounts for the dependency ancestry already discovered.
+	// Follow successors to find the frontier without reopening that ancestry.
+	ascend := func(v *vertex, c *closureCut) bool {
+		established := false
+
 		for {
 			parent, ok := v.firstParent(key)
 			if !ok {
-				return // the downward edge is already consuming this dependency
+				return established
 			}
+
+			established = true
 
 			i := w.intern(parent)
 			if known := w.visits[i].owner; known != nil {
 				join(c, known)
 
-				return
+				return true
 			}
 
 			claim(i, c)
@@ -496,20 +710,33 @@ func (op *closureOperation) walk(key string, supplied []Tip, visitBind func(Tip,
 			if v == nil {
 				// The retained link proves a join to a reclaimed cut. The
 				// missing parent is neither a new tip nor a fetch obligation.
-				return
+				return true
 			}
 
+			stop(i)
+
 			if _, hasParent := v.firstParent(key); !hasParent {
-				w.visits[i].flags |= closureLive
+				w.visits[i].flags |= closureLive | closureExpanded
 
 				c = root(c)
 				if compare(parent, c.first) < 0 {
 					c.first = parent
 				}
 
-				enqueue(i)
+				return true
+			}
+		}
+	}
 
-				return
+	// A delayed advertised ancestor is already consumed by its retained
+	// parent. Discover that successor without walking the ancestor again.
+	for _, tip := range seeds {
+		i := w.intern(tip)
+		if v := resident(i); v != nil {
+			if _, known := v.firstParent(key); known {
+				w.visits[i].flags &^= closureLive
+				stop(i)
+				ascend(v, w.visits[i].owner)
 			}
 		}
 	}
@@ -543,10 +770,20 @@ func (op *closureOperation) walk(key string, supplied []Tip, visitBind func(Tip,
 			if parents := pending[i]; len(parents) != 0 {
 				// A fetched dependency may now connect to established local
 				// history. Its incoming edges must not mask those older links.
-				ascend(v, w.visits[i].owner)
+				established := ascend(v, w.visits[i].owner)
 
 				for _, parent := range parents {
-					e.effectCache.addParent(v, parent, key)
+					if !op.subscriptionOnly {
+						e.effectCache.addParent(v, parent, key)
+					}
+				}
+
+				if established {
+					stop(i)
+					delete(pending, i)
+					delete(w.failures, i)
+
+					continue
 				}
 			}
 
@@ -554,9 +791,26 @@ func (op *closureOperation) walk(key string, supplied []Tip, visitBind func(Tip,
 			delete(w.failures, i)
 
 			w.visits[i].flags |= closureExpanded
+			w.visits[i].flags &^= closureEstablished
 
+			op.harvestVerdicts(tip, v.eff)
+
+			deps := v.eff.GetDeps()
 			if bind := v.eff.GetTxnBind(); bind != nil {
-				visitBind(tip, bind)
+				visitBind(tip, v.eff)
+				// Settled binds need only this key's projection. Full projection
+				// tables are built only when cross-key discovery is necessary.
+				deps = nil
+
+				if projections, expanded := op.binds[tip]; expanded {
+					if ref := projections[key]; ref != nil {
+						deps = []*pb.EffectRef{ref}
+					}
+				} else {
+					for ref := range keyDeps(key, v.eff) {
+						deps = append(deps, ref)
+					}
+				}
 			}
 
 			if v.root() {
@@ -567,7 +821,7 @@ func (op *closureOperation) walk(key string, supplied []Tip, visitBind func(Tip,
 				op.observe(tip, nil)
 			}
 
-			for ref := range keyDeps(key, v.eff) {
+			for _, ref := range deps {
 				dep := r(ref)
 				if dep == (Tip{}) || dep == tip {
 					continue
@@ -597,22 +851,61 @@ func (op *closureOperation) walk(key string, supplied []Tip, visitBind func(Tip,
 				} else {
 					claim(j, w.visits[i].owner)
 
-					if dv != nil {
-						ascend(dv, w.visits[j].owner)
+					if dv != nil && ascend(dv, w.visits[j].owner) {
+						stop(j)
 					}
 				}
 
 				if dv != nil {
-					e.effectCache.addParent(dv, tip, key)
+					// Membership-only discovery deliberately omits bind closure;
+					// it must not mark that omitted work as already processed.
+					if !op.subscriptionOnly {
+						e.effectCache.addParent(dv, tip, key)
+					}
 				} else if w.visits[j].flags&closureExpanded == 0 {
 					pending[j] = append(pending[j], tip)
 				}
 
-				enqueue(j)
+				if w.visits[j].flags&closureExpanded == 0 {
+					enqueue(j)
+				}
 			}
 		}
 
 		w.queue = w.queue[:0]
+
+		// Parent links establish closure, but a key-scoped link may be absent
+		// on a shared vertex. If candidate regions have not joined, follow the
+		// retained boundaries only as far as needed to relate those frontiers.
+		var first *closureCut
+
+		separate := false
+
+		for i := range w.visits {
+			if w.visits[i].flags&closureLive != 0 {
+				cut := root(w.visits[i].owner)
+				if first == nil {
+					first = cut
+				} else if first != cut {
+					separate = true
+
+					break
+				}
+			}
+		}
+
+		if separate {
+			for i := range w.visits {
+				if w.visits[i].flags&closureEstablished != 0 {
+					w.visits[i].flags &^= closureExpanded
+					w.queue = append(w.queue, i)
+				}
+			}
+
+			if len(w.queue) != 0 {
+				continue
+			}
+		}
 
 		if len(pending) == 0 {
 			return result()

@@ -63,6 +63,12 @@ func (e *Engine) historicalFrontier(ctx context.Context, key string, tips []Tip,
 			return nil, fmt.Errorf("historical frontier %q: %w", key, err)
 		}
 
+		// Cross-key observations carry causality, not this key's value.
+		// Match reconstruction's dependency filtering while stepping back.
+		if !effectHasAddress(eff, key) {
+			continue
+		}
+
 		include, err := member(t, eff)
 		if err != nil {
 			return nil, err

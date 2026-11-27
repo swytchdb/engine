@@ -58,7 +58,6 @@ func assertGraphDescriptor(t *testing.T, state *pb.ReducedEffect) {
 		key string
 		tag pb.ValueType
 	}{
-		{pb.GraphRegionSubscriptionsKey, pb.ValueType_TYPE_JSON_OBJECT},
 		{pb.GraphEntryPointKey, pb.ValueType_TYPE_JSON_ARRAY},
 	} {
 		child := state.GetNetAdds()[field.key].GetData().GetChild()
@@ -78,8 +77,6 @@ func TestGraphDescriptorReduction(t *testing.T) {
 
 	node := []byte{0xff, 0, 1} // An opaque node identity, not a causal reference.
 	state := ReduceChain(seed, []*pb.Effect{
-		virt(makeDataEffect(10, keyedInsertRaw("peer-a/sub-1", []byte("mammals"))), pb.GraphRegionSubscriptionsKey),
-		virt(makeDataEffect(11, keyedInsertRaw("peer-b/sub-1", []byte("reptiles"))), pb.GraphRegionSubscriptionsKey),
 		virt(makeDataEffect(12, orderedInsert(pb.Placement_PLACE_TAIL, "first", node)), pb.GraphEntryPointKey),
 		virt(makeDataEffect(13, orderedInsert(pb.Placement_PLACE_TAIL, "last", []byte("node/z"))), pb.GraphEntryPointKey),
 		virt(makeDataEffect(14, orderedInsertRef(pb.Placement_PLACE_AFTER, "middle", []byte("node/m"), []byte("first"))), pb.GraphEntryPointKey),
@@ -91,25 +88,16 @@ func TestGraphDescriptorReduction(t *testing.T) {
 		t.Fatalf("entry-point order or identity lost: %v", entries)
 	}
 
-	if state.GetPartitions()[pb.GraphRegionSubscriptionsKey].GetCollection() != pb.CollectionKind_KEYED {
-		t.Fatal("subscription directory did not reduce as a keyed collection")
-	}
-
-	if len(seed.GetPartitions()[pb.GraphRegionSubscriptionsKey].GetNetAdds()) != 0 || len(seed.GetPartitions()[pb.GraphEntryPointKey].GetOrderedElements()) != 0 {
+	if len(seed.GetPartitions()[pb.GraphEntryPointKey].GetOrderedElements()) != 0 {
 		t.Fatal("graph update mutated the original snapshot")
 	}
 
 	state = ReduceChain(state, []*pb.Effect{
-		virt(makeDataEffect(15, keyedRemove("peer-a/sub-1")), pb.GraphRegionSubscriptionsKey),
 		virt(makeDataEffect(16, orderedRemove("first")), pb.GraphEntryPointKey),
 		virt(makeDataEffect(17, orderedRemove("middle")), pb.GraphEntryPointKey),
 		virt(makeDataEffect(18, orderedRemove("last")), pb.GraphEntryPointKey),
 	})
 	assertGraphDescriptor(t, state)
-
-	if directory := state.GetPartitions()[pb.GraphRegionSubscriptionsKey]; len(directory.GetNetAdds()) != 1 || directory.GetNetAdds()["peer-b/sub-1"] == nil {
-		t.Fatal("unsubscribe removed another peer's entry")
-	}
 
 	if len(state.GetPartitions()[pb.GraphEntryPointKey].GetOrderedElements()) != 0 || filterSnapshot(state) == nil {
 		t.Fatal("removing the final entry point removed the graph")
@@ -143,11 +131,8 @@ func TestGraphDescriptorConcurrentBranchesAndSnapshot(t *testing.T) {
 	branches := make([]Tip, 0, 2)
 
 	for i, peer := range []string{"peer-a", "peer-b"} {
-		sub := virt(makeDataEffect(int64(10+i), keyedInsertRaw(peer, []byte("mammals"))), pb.GraphRegionSubscriptionsKey)
-		sub.Key, sub.NodeId, sub.Deps = []byte("graph"), uint64(i+2), toPbRefs([]Tip{base})
-		subTip := log.putEffect(sub)
 		entry := virt(makeDataEffect(int64(20+i), orderedInsert(pb.Placement_PLACE_TAIL, peer, []byte("absent-node/"+peer))), pb.GraphEntryPointKey)
-		entry.Key, entry.NodeId, entry.Deps = []byte("graph"), uint64(i+2), toPbRefs([]Tip{subTip})
+		entry.Key, entry.NodeId, entry.Deps = []byte("graph"), uint64(i+2), toPbRefs([]Tip{base})
 		branches = append(branches, log.putEffect(entry))
 	}
 
@@ -158,8 +143,8 @@ func TestGraphDescriptorConcurrentBranchesAndSnapshot(t *testing.T) {
 
 	assertGraphDescriptor(t, state)
 
-	if len(state.GetPartitions()[pb.GraphRegionSubscriptionsKey].GetNetAdds()) != 2 || len(state.GetPartitions()[pb.GraphEntryPointKey].GetOrderedElements()) != 2 {
-		t.Fatal("concurrent metadata edits lost a peer or entry point")
+	if len(state.GetPartitions()[pb.GraphEntryPointKey].GetOrderedElements()) != 2 {
+		t.Fatal("concurrent metadata edits lost an entry point")
 	}
 
 	reversed, _, err := e.reconstruct(logicalAddress("graph"), []Tip{branches[1], branches[0]}, "", false)
@@ -215,7 +200,7 @@ func TestGraphDescriptorConcurrentBranchesAndSnapshot(t *testing.T) {
 		t.Fatal("graph snapshot round trip changed metadata")
 	}
 
-	update := virt(makeDataEffect(31, keyedInsertRaw("peer-c", []byte("birds"))), pb.GraphRegionSubscriptionsKey)
+	update := virt(makeDataEffect(31, keyedInsertRaw("custom", []byte("metadata"))), "custom_metadata")
 	update.Key, update.Deps = []byte("graph"), toPbRefs([]Tip{snapshotTip})
 
 	updated, _, err := fresh.reconstruct(logicalAddress("graph"), []Tip{freshLog.putEffect(update)}, "", false)
@@ -223,12 +208,12 @@ func TestGraphDescriptorConcurrentBranchesAndSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(updated.GetPartitions()[pb.GraphRegionSubscriptionsKey].GetNetAdds()) != 3 {
-		t.Fatal("update after snapshot lost directory entries")
+	if string(updated.GetPartitions()["custom_metadata"].GetNetAdds()["custom"].GetData().GetRaw()) != "metadata" {
+		t.Fatal("update after snapshot lost custom metadata")
 	}
 
 	if !proto.Equal(updated.GetPartitions()[pb.GraphEntryPointKey], state.GetPartitions()[pb.GraphEntryPointKey]) {
-		t.Fatal("directory update changed entry points")
+		t.Fatal("custom metadata update changed entry points")
 	}
 }
 

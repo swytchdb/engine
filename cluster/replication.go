@@ -361,9 +361,17 @@ func (r *Replicator) HandleNotify(peerID NodeId, requestID uint64, notify *pb.Of
 				"peer", peerID, "requestID", requestID,
 				"error", err,
 			)
+			// An ingestion failure is not a conflict response or an ACK.
+			// Leave the request unresolved so existing peers retain their
+			// retry/ambiguous-outcome behavior.
+			return
 		}
 	}
 
+	r.respondToNotify(peerID, requestID, nacks)
+}
+
+func (r *Replicator) respondToNotify(peerID NodeId, requestID uint64, nacks []*pb.NackNotify) {
 	// Credits field kept for wire compatibility but QUIC handles flow control
 	credits := uint32(0)
 	status := "ACK"
@@ -442,10 +450,19 @@ func (r *Replicator) HandleNotifyACKWithData(peerID NodeId, requestID uint64, st
 	// of Wait()/Nacks() see them immediately.
 	notSubscribed := false
 
+	if status != 0x01 || len(fullPacket) <= notifyACKHeaderSize {
+		tr.future.reject(fmt.Errorf("missing NACK payload"))
+
+		return
+	}
+
 	if status == 0x01 && len(fullPacket) > notifyACKHeaderSize {
 		nacks, err := parseNotifyNACKPayload(fullPacket[notifyACKHeaderSize:])
 		if err != nil {
 			slog.Debug("failed to parse NACK payload", "peer", peerID, "error", err)
+			tr.future.reject(err)
+
+			return
 		}
 
 		if len(nacks) > 0 {
@@ -505,6 +522,14 @@ func (r *Replicator) ReplicateMarshalled(_ *pb.OffsetNotify, notifyBody []byte, 
 // packet, sends it, and blocks for the ACK/NACK. Shared by ReplicateTo (which
 // marshals per call) and ReplicateMarshalled (which reuses a shared body).
 func (r *Replicator) replicateBody(notifyBody []byte, targetPeerID NodeId) ([]*pb.NackNotify, error) {
+	return r.replicateBodyWith(notifyBody, targetPeerID, func(packet []byte) error {
+		_, err := r.transport.Send(targetPeerID, packet)
+
+		return err
+	})
+}
+
+func (r *Replicator) replicateBodyWith(notifyBody []byte, targetPeerID NodeId, send func([]byte) error) ([]*pb.NackNotify, error) {
 	// Populate every field — deadline and retransmit included — BEFORE storing,
 	// so the sweep can never observe a deadline=0 entry and expire it in the
 	// window before initialization. Stored before Send because a fast peer's
@@ -520,7 +545,7 @@ func (r *Replicator) replicateBody(notifyBody []byte, targetPeerID NodeId) ([]*p
 	}
 	requestID := r.tracker.register(tr, notifyBody)
 
-	_, err := r.transport.Send(targetPeerID, tr.packetData)
+	err := send(tr.packetData)
 	if err != nil {
 		r.tracker.pending.Delete(requestID)
 

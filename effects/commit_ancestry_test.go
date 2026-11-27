@@ -25,13 +25,14 @@ package effects
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
 )
 
-func commitAncestryFixture(t *testing.T) (*Engine, Tip, Tip, *pb.Effect) {
+func commitAncestryFixture(t *testing.T) (*Engine, Tip, Tip) {
 	t.Helper()
 
 	e := newTxnTestEngine(nil)
@@ -60,7 +61,7 @@ func commitAncestryFixture(t *testing.T) (*Engine, Tip, Tip, *pb.Effect) {
 	e.handleRemoteBind(bind.GetTxnBind(), bindTip, bind.GetTxnId())
 	e.updateIndex(logicalAddress("k"), nil, p)
 
-	return e, p, bindTip, bind
+	return e, p, bindTip
 }
 
 func TestFlushTxRedundantConsumedAncestor(t *testing.T) {
@@ -71,7 +72,7 @@ func TestFlushTxRedundantConsumedAncestor(t *testing.T) {
 		}
 
 		t.Run(name, func(t *testing.T) {
-			e, p, _, _ := commitAncestryFixture(t)
+			e, p, _ := commitAncestryFixture(t)
 			for range 3 {
 				tx := e.NewContext()
 				tx.BeginTx()
@@ -81,7 +82,7 @@ func TestFlushTxRedundantConsumedAncestor(t *testing.T) {
 					t.Fatalf("read: result=%v err=%v", result, err)
 				}
 
-				if !tx.keys[logicalAddress("k")].initialTips.Contains(p) {
+				if ck := tx.keys[logicalAddress("k")]; !ck.initialTips.Contains(p) && !tx.txSnapshot.views[logicalAddress("k")].frontiers[logicalAddress("k")].compacted.Contains(p) {
 					t.Fatal("fixture lost the redundant ancestor before commit")
 				}
 
@@ -101,10 +102,10 @@ func TestFlushTxRedundantConsumedAncestor(t *testing.T) {
 	}
 }
 
-func TestCheckCompetingBindsAncestry(t *testing.T) {
+func TestAdmissionChecksBindAncestry(t *testing.T) {
 	for _, dependency := range []string{"shared-parent", "bind", "descendant"} {
 		t.Run(dependency, func(t *testing.T) {
-			e, p, b, prior := commitAncestryFixture(t)
+			e, p, b := commitAncestryFixture(t)
 			consumed := []Tip{p}
 
 			switch dependency {
@@ -115,48 +116,56 @@ func TestCheckCompetingBindsAncestry(t *testing.T) {
 				consumed = append(consumed, e.index.Contains("k").Tips()...)
 			}
 
-			candidate := &pb.TransactionalBindEffect{Keys: []*pb.TransactionalBindEffect_KeyBind{
-				{Key: []byte(logicalAddress("k")), ConsumedTips: toPbRefs(consumed)},
-			}}
+			check := e.newAdmissionCheck(logicalAddress("k"), consumed, "candidate", Tip{99, 1})
 
-			want := ""
-			if dependency == "shared-parent" {
-				want = prior.GetTxnId()
-			}
-
-			if got := e.checkCompetingBinds(candidate, "candidate"); got != want {
-				t.Fatalf("competing bind: got %q, want %q", got, want)
+			want := dependency == "shared-parent"
+			if got := check.changed(); got != want {
+				t.Fatalf("admission rejected=%t, want %t", got, want)
 			}
 		})
 	}
 }
 
 func TestFlushTxRequiresEverySpokenBind(t *testing.T) {
-	e, p, _, _ := commitAncestryFixture(t)
-	// Another bind also consumed P, but is not an ancestor of our snapshot.
-	// It may have been recorded before its index transition completed.
-	other := Tip{99, 1}
-	e.handleRemoteBind(&pb.TransactionalBindEffect{Keys: []*pb.TransactionalBindEffect_KeyBind{
-		{Key: []byte("k"), ConsumedTips: []*pb.EffectRef{toPbRef(p)}, NewTip: toPbRef(Tip{99, 2})},
-	}}, other, "other")
+	for _, rollback := range []bool{false, true} {
+		t.Run(fmt.Sprint(rollback), func(t *testing.T) {
+			e, p, _ := commitAncestryFixture(t)
+			// Another bind also consumed P, but is not an ancestor of our snapshot.
+			// It may have been recorded before its index transition completed.
+			other := Tip{99, 1}
+			e.handleRemoteBind(&pb.TransactionalBindEffect{Keys: []*pb.TransactionalBindEffect_KeyBind{
+				{Key: []byte("k"), ConsumedTips: []*pb.EffectRef{toPbRef(p)}, NewTip: toPbRef(Tip{99, 2})},
+			}}, other, "other")
 
-	tx := e.NewContext()
-	tx.BeginTx()
+			tx := e.NewContext()
+			tx.BeginTx()
 
-	if _, _, err := tx.GetSnapshot("k"); err != nil {
-		t.Fatal(err)
-	}
+			savepoint := tx.TakeSavepoint()
 
-	if err := tx.Emit(scalarSet("unrelated", "must not commit")); err != nil {
-		t.Fatal(err)
-	}
+			if _, _, err := tx.GetSnapshot("k"); err != nil {
+				t.Fatal(err)
+			}
 
-	if err := tx.Flush(); !errors.Is(err, ErrTxnAborted) {
-		t.Fatalf("unproven consuming bind should abort, got %v", err)
-	}
+			if rollback {
+				tx.RestoreSavepoint(savepoint)
 
-	if result, _, _, err := e.GetSnapshot("unrelated"); err != nil || result != nil {
-		t.Fatalf("aborted transaction leaked writes: result=%v err=%v", result, err)
+				if _, _, err := tx.GetSnapshot("k"); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if err := tx.Emit(scalarSet("unrelated", "must not commit")); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := tx.Flush(); !errors.Is(err, ErrTxnAborted) {
+				t.Fatalf("unproven consuming bind should abort, got %v", err)
+			}
+
+			if result, _, _, err := e.GetSnapshot("unrelated"); err != nil || result != nil {
+				t.Fatalf("aborted transaction leaked writes: result=%v err=%v", result, err)
+			}
+		})
 	}
 }
 

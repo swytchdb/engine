@@ -92,6 +92,7 @@ func TestMemoryPacing(t *testing.T) {
 func TestMemoryPacingAfterPublication(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		e := NewEngine(EngineConfig{DefaultMode: UnsafeMode})
+		stopMemoryGovernorForTest(e)
 
 		t.Cleanup(func() {
 			if err := e.Close(); err != nil {
@@ -142,6 +143,7 @@ func TestMemoryPacingAfterPublication(t *testing.T) {
 
 func TestMemoryEvictionStopsWithoutGC(t *testing.T) {
 	e := NewEngine(EngineConfig{DefaultMode: UnsafeMode})
+	stopMemoryGovernorForTest(e)
 
 	t.Cleanup(func() {
 		if err := e.Close(); err != nil {
@@ -348,6 +350,7 @@ func TestMemoryRuntimeFootprintDoesNotBlockWrites(t *testing.T) {
 
 func TestMemoryConcurrentPublicationAndEviction(t *testing.T) {
 	e := NewEngine(EngineConfig{})
+	stopMemoryGovernorForTest(e)
 
 	t.Cleanup(func() {
 		if err := e.Close(); err != nil {

@@ -43,7 +43,11 @@ var (
 )
 
 func init() {
-	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
+	// EncodeAll retains a history buffer per worker. Bound its window rather
+	// than retaining the default multi-megabyte window on every CPU after a
+	// large publication. Keep parallelism and the existing decoder limits.
+	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault),
+		zstd.WithWindowSize(1<<20), zstd.WithLowerEncoderMem(true))
 	if err != nil {
 		panic(fmt.Sprintf("zstd encoder init: %v", err))
 	}

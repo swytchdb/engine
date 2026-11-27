@@ -186,6 +186,7 @@ func (t *QUICNotifyTransport) AcceptUniStreams(conn *quic.Conn) {
 // handleInboundUniStream reads a complete message from a uni-stream and dispatches it.
 // Wire format: [8:senderNodeID LE][1:compressionFlag][body]
 func (t *QUICNotifyTransport) handleInboundUniStream(conn *quic.Conn, stream *quic.ReceiveStream) {
+	defer stream.CancelRead(0)
 	// Read sender nodeID prefix
 	var header [8]byte
 	if _, err := io.ReadFull(stream, header[:]); err != nil {
@@ -205,10 +206,20 @@ func (t *QUICNotifyTransport) handleInboundUniStream(conn *quic.Conn, stream *qu
 		t.onPeerIdentified(peerID, conn)
 	}
 
-	// Read [1:compressionFlag][body] (compressed body limited to maxFrameSize
+	var flag [1]byte
+	if _, err := io.ReadFull(stream, flag[:]); err != nil {
+		return
+	}
+
+	if flag[0] == wireTransaction {
+		t.handleTransactionStream(peerID, stream)
+
+		return
+	}
+	// Read body (compressed body limited to maxFrameSize
 	// to prevent abuse; the decoder bounds the decompressed size).
 	data, err := io.ReadAll(io.LimitReader(stream, maxFrameSize))
-	if err != nil || len(data) < 2 {
+	if err != nil || len(data) < 1 {
 		if err != nil {
 			slog.Debug("failed to read uni-stream data", "peer", peerID, "error", err)
 			RecordQUICStreamError()
@@ -217,8 +228,8 @@ func (t *QUICNotifyTransport) handleInboundUniStream(conn *quic.Conn, stream *qu
 		return
 	}
 
-	flag, body := data[0], data[1:]
-	if flag == wireZstd {
+	body := data
+	if flag[0] == wireZstd {
 		body, err = effects.Decompress(body)
 		if err != nil {
 			slog.Debug("failed to decompress uni-stream data", "peer", peerID, "error", err)
@@ -321,6 +332,18 @@ func (t *QUICNotifyTransport) dispatchPlaintext(peerID NodeId, plaintext []byte)
 
 		if t.handler != nil {
 			t.handler.HandleNackNotify(peerID, nack)
+		}
+
+	case PacketTypeNodeVersion:
+		if handler, ok := t.handler.(interface{ HandleNodeVersion(NodeId, string) }); ok {
+			// Version strings are tiny. Invalid or absent values are unknown,
+			// never permission to enable a newer protocol behavior.
+			version := ""
+			if len(plaintext) <= 257 {
+				version = string(plaintext[1:])
+			}
+
+			handler.HandleNodeVersion(peerID, version)
 		}
 
 	case PacketTypeKeyFilter:

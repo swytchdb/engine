@@ -1,0 +1,6 @@
+type CritMeta {
+    isLeaf: bool
+    bytePos: uint32
+    otherBits: uint8
+    key: string
+}

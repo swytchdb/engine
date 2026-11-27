@@ -1569,6 +1569,8 @@ func TestHandleRemote_TxnBind_AuthorityViaNonCanonicalKey(t *testing.T) {
 		TxnId:          "2:40:1",
 		Kind:           &pb.Effect_TxnBind{TxnBind: bind},
 	}
+	seedRemoteBindTips(t, e, bind)
+
 	data, _ := proto.Marshal(bindEff)
 	notify := BuildOffsetNotify(2, bindOffset, bindEff, data, nil)
 

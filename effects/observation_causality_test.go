@@ -62,7 +62,7 @@ func TestObservationsRemainCausalDependencies(t *testing.T) {
 				c.BeginTx()
 				err = c.Emit(scalarSet("k", "next"))
 			case "verdict":
-				err = e.emitSnapshot(logicalAddress("k"), nil)
+				err = e.emitSnapshot(logicalAddress("k"), nil, nil)
 			}
 
 			if err != nil {
@@ -219,8 +219,9 @@ func TestObservingNoopDoesNotOrderBinds(t *testing.T) {
 	e.updateIndex(logicalAddress("k"), nil, readerBind)
 	e.updateIndex(logicalAddress("k"), nil, writerBind)
 
-	if got := e.checkCompetingBinds(writer.GetTxnBind(), "writer"); got != "reader" {
-		t.Errorf("observing reader's NOOP excused its competing bind: %q", got)
+	check := e.newAdmissionCheck(logicalAddress("k"), []Tip{observation}, "writer", writerTip)
+	if !check.changed() || check.competingTxn != "reader" {
+		t.Errorf("observing reader's NOOP excused its competing bind: %q", check.competingTxn)
 	}
 
 	ptxn := &pendingTxn{txnID: "reader", bindOffset: readerBind, forkChoiceHash: reader.GetForkChoiceHash(), keys: []pendingTxnKey{{key: logicalAddress("k"), newTip: observation, readOnly: true}}}

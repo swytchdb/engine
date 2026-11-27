@@ -82,6 +82,8 @@ func (c ClockConfig) withDefaults() ClockConfig {
 
 // ClusterConfig holds the full cluster topology.
 type ClusterConfig struct {
+	// Version is this process's application version. Empty uses cluster.Version.
+	Version            string
 	NodeID             NodeId        // This node's ID
 	Nodes              []NodeConfig  // All nodes including self
 	TLSPassphrase      string        // Shared passphrase for deterministic mTLS CA derivation

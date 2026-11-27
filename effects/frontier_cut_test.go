@@ -48,38 +48,38 @@ func requireCutTips(t *testing.T, got, want []Tip) {
 }
 
 func TestFrontierCutDominanceStillResolvesBoundary(t *testing.T) {
-	e := newSnapshotEngine(nil)
-	defer func() { _ = e.Close() }()
-
 	old, middle, newest, gone := Tip{7, 1}, Tip{8, 1}, Tip{9, 1}, Tip{6, 1}
-	putCutEffects(t, e, map[Tip]*pb.Effect{
-		old: cutEffect(old, gone), middle: cutEffect(middle, old), newest: cutEffect(newest, middle),
-	})
 
 	transport := errors.New("peer unavailable")
 	for _, failure := range []error{ErrEffectNotFound, ErrCDNBlobMissing, transport} {
-		loads := 0
-		e.broadcaster = &cutBroadcaster{load: func(tip Tip) ([]byte, error) {
-			loads++
-
-			if tip != gone {
-				t.Fatalf("unexpected boundary %v", tip)
-			}
-
-			return nil, failure
-		}}
-
 		for _, tips := range [][]Tip{{old, newest, middle}, {newest, middle, old}} {
+			e := newSnapshotEngine(nil)
+			putCutEffects(t, e, map[Tip]*pb.Effect{
+				old: cutEffect(old, gone), middle: cutEffect(middle, old), newest: cutEffect(newest, middle),
+			})
+
+			loads := 0
+			e.broadcaster = &cutBroadcaster{load: func(tip Tip) ([]byte, error) {
+				loads++
+
+				if tip != gone {
+					t.Fatalf("unexpected boundary %v", tip)
+				}
+
+				return nil, failure
+			}}
 			got, complete, err := e.closeIngestedFrontier(logicalAddress("k"), tips, make(map[Tip]error))
+			_ = e.Close()
+
 			requireCutTips(t, got, []Tip{newest})
 
 			if complete != (failure != transport) || errors.Is(err, transport) != (failure == transport) {
 				t.Fatalf("boundary %v: complete=%t error=%v", failure, complete, err)
 			}
-		}
 
-		if loads != 2 {
-			t.Fatalf("boundary %v fetched %d times, want once per closure", failure, loads)
+			if loads != 1 {
+				t.Fatalf("new history boundary %v fetched %d times", failure, loads)
+			}
 		}
 	}
 }
@@ -278,42 +278,48 @@ func TestFrontierCutReclaimedParentIsAnEstablishedJoin(t *testing.T) {
 }
 
 func TestFrontierCutSharedBindNavigationStaysOnItsKey(t *testing.T) {
-	e := newSnapshotEngine(nil)
-	defer func() { _ = e.Close() }()
+	for _, reclaim := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reclaimed=%t", reclaim), func(t *testing.T) {
+			e := newSnapshotEngine(nil)
+			defer func() { _ = e.Close() }()
 
-	kRoot, otherRoot, bind := Tip{7, 1}, Tip{8, 1}, Tip{9, 1}
-	kTip, otherTip, separate := Tip{7, 2}, Tip{8, 2}, Tip{10, 1}
-	shared := cutEffect(bind)
-	shared.Kind = &pb.Effect_TxnBind{TxnBind: &pb.TransactionalBindEffect{
-		Keys: []*pb.TransactionalBindEffect_KeyBind{
-			{Key: []byte("k"), NewTip: toPbRef(kRoot)},
-			{Key: []byte("other"), NewTip: toPbRef(otherRoot)},
-		},
-	}}
-	otherBase, otherParent := cutEffect(otherRoot), cutEffect(otherTip, bind)
-	otherBase.Key, otherParent.Key = []byte("other"), []byte("other")
-	putCutEffects(t, e, map[Tip]*pb.Effect{
-		kRoot: cutEffect(kRoot), otherRoot: otherBase, bind: shared,
-		kTip: cutEffect(kTip, bind), otherTip: otherParent, separate: cutEffect(separate),
-	})
-	// Establish the other key first, so its reverse link is stored first.
-	e.installIngestedTips(logicalAddress("other"), otherTip, otherRoot)
-	e.installIngestedTips(logicalAddress("k"), kTip, separate)
-	e.effectCache.decref(otherTip)
-	e.effectCache.drainReclaim()
+			kRoot, otherRoot, bind := Tip{7, 1}, Tip{8, 1}, Tip{9, 1}
+			kTip, otherTip, separate := Tip{7, 2}, Tip{8, 2}, Tip{10, 1}
+			shared := cutEffect(bind)
+			shared.Kind = &pb.Effect_TxnBind{TxnBind: &pb.TransactionalBindEffect{
+				Keys: []*pb.TransactionalBindEffect_KeyBind{
+					{Key: []byte("k"), NewTip: toPbRef(kRoot)},
+					{Key: []byte("other"), NewTip: toPbRef(otherRoot)},
+				},
+			}}
+			otherBase, otherParent := cutEffect(otherRoot), cutEffect(otherTip, bind)
+			otherBase.Key, otherParent.Key = []byte("other"), []byte("other")
+			putCutEffects(t, e, map[Tip]*pb.Effect{
+				kRoot: cutEffect(kRoot), otherRoot: otherBase, bind: shared,
+				kTip: cutEffect(kTip, bind), otherTip: otherParent, separate: cutEffect(separate),
+			})
+			// Establish the other key first, so its reverse link is stored first.
+			e.installIngestedTips(logicalAddress("other"), otherTip, otherRoot)
+			e.installIngestedTips(logicalAddress("k"), kTip, separate)
 
-	incoming := Tip{11, 1}
-	putCutEffects(t, e, map[Tip]*pb.Effect{incoming: cutEffect(incoming, bind)})
-	e.broadcaster = &cutBroadcaster{load: func(tip Tip) ([]byte, error) {
-		t.Fatalf("key-scoped resident closure unexpectedly fetched %v", tip)
+			if reclaim {
+				e.effectCache.decref(otherTip)
+				e.effectCache.drainReclaim()
+			}
 
-		return nil, ErrEffectNotFound
-	}}
-	got, complete, err := e.closeIngestedFrontier(logicalAddress("k"), []Tip{incoming, separate}, make(map[Tip]error))
-	requireCutTips(t, got, []Tip{incoming, kTip, separate})
+			incoming := Tip{11, 1}
+			putCutEffects(t, e, map[Tip]*pb.Effect{incoming: cutEffect(incoming, bind)})
+			e.broadcaster = &cutBroadcaster{load: func(tip Tip) ([]byte, error) {
+				t.Fatalf("key-scoped resident closure unexpectedly fetched %v", tip)
 
-	if !complete || err != nil {
-		t.Fatalf("shared-bind closure: complete=%t error=%v", complete, err)
+				return nil, ErrEffectNotFound
+			}}
+			// Publication must retain the existing frontier on k even when the
+			// shared bind's sole reverse hint belongs to the other key. Production
+			// supplies current tips; it does not recover them through reverse hints.
+			e.installIngestedTips(logicalAddress("k"), incoming)
+			requireFrontier(t, e, incoming, kTip, separate)
+		})
 	}
 }
 
@@ -492,7 +498,12 @@ func TestFrontierCutSharedHistoryWorkRemainsLinear(t *testing.T) {
 		after, _, _ := e.effectCache.Stats()
 		// A repeated closure sees established reverse links throughout the
 		// chain. Following each one to the tip would make work quadratic.
-		if after-before > 30*length || loads != attempt+1 {
+		limit := uint64(30 * length)
+		if attempt > 0 {
+			limit = 32
+		}
+
+		if after-before > limit || loads != 1 {
 			t.Fatalf("attempt=%d lookups=%d loads=%d", attempt, after-before, loads)
 		}
 	}

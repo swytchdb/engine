@@ -197,17 +197,7 @@ func (c *Context) collectSubscribers() []pb.NodeID {
 
 	var result []pb.NodeID
 
-	for key, ck := range c.keys {
-		if ck.routes != nil {
-			for _, id := range c.engine.contextSubscribers(key, ck) {
-				if !slices.Contains(result, id) {
-					result = append(result, id)
-				}
-			}
-
-			continue
-		}
-
+	for key := range c.keys {
 		ls := c.engine.index.LoadDataInternal(key)
 		if ls == nil {
 			continue
@@ -227,4 +217,85 @@ func (c *Context) collectSubscribers() []pb.NodeID {
 	}
 
 	return result
+}
+
+// competitionOutstanding covers the whole adjudicated competition, not just
+// the committing bind's fan-out. Unknown membership cannot certify closure.
+func (e *Engine) competitionOutstanding(proof *pb.BindEvidence, responded map[uint64]bool) *pb.SubscriberSet {
+	if len(proof.GetBinds()) == 0 {
+		return nil
+	}
+
+	required := make(map[uint64]bool)
+
+	for _, ref := range proof.GetBinds() {
+		eff, err := e.getEffect("", r(ref))
+
+		bind := eff.GetTxnBind()
+		if err != nil || bind.GetSubscribers() == nil {
+			return nil
+		}
+
+		required[bind.GetOriginatorNodeId()] = true
+		for _, id := range bind.GetSubscribers().GetNodeIds() {
+			required[id] = true
+		}
+	}
+
+	outstanding := &pb.SubscriberSet{}
+
+	for id := range required {
+		if !responded[id] {
+			outstanding.NodeIds = append(outstanding.NodeIds, id)
+		}
+	}
+
+	slices.Sort(outstanding.GetNodeIds())
+
+	return outstanding
+}
+
+// verdictOutstanding accounts for closure independently of retained evidence.
+// Predecessor snapshots already record their unanswered participants; carry
+// those forward even when the predecessor intentionally has no proof package.
+func (e *Engine) verdictOutstanding(bind Tip, defeated map[string]Tip, sources []Tip, responded map[uint64]bool) *pb.SubscriberSet {
+	refs := make([]*pb.EffectRef, 0, 1+len(defeated))
+
+	refs = append(refs, toPbRef(bind))
+	for _, tip := range defeated {
+		refs = append(refs, toPbRef(tip))
+	}
+
+	outstanding := e.competitionOutstanding(&pb.BindEvidence{Binds: refs}, responded)
+	if outstanding == nil {
+		return nil
+	}
+
+	for _, source := range sources {
+		eff, err := e.getEffect("", source)
+
+		prior := eff.GetSnapshot().GetOutstandingSubscribers()
+		if err != nil || prior == nil {
+			return nil
+		}
+
+		for _, id := range prior.GetNodeIds() {
+			if !responded[id] {
+				outstanding.NodeIds = append(outstanding.NodeIds, id)
+			}
+		}
+	}
+
+	slices.Sort(outstanding.GetNodeIds())
+	outstanding.NodeIds = slices.Compact(outstanding.GetNodeIds())
+
+	return outstanding
+}
+
+func (e *Engine) recordHistoryTargets(tip Tip, peers []pb.NodeID) {
+	if provider, ok := e.broadcaster.(historyProgressProvider); ok {
+		for _, peer := range peers {
+			provider.RecordHistorySent(peer, tip[1])
+		}
+	}
 }

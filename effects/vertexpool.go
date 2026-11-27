@@ -63,13 +63,12 @@ type vertex struct {
 	creationMu    sync.Mutex
 	creationKeys  []string // sorted, unique; usually just the effect's own key
 	creationBytes int64
-	// Reverse navigation is not ownership. Identities do not pin descendant
-	// payloads, and this storage disappears with the ancestor. creationMu
-	// protects the slice and its memory accounting, not descendant lifetimes.
-	parents []struct {
-		tip Tip
-		key string
-	}
+	// One reverse link records prior dependency discovery, not ownership.
+	// Keep its key so a shared bind cannot lead another key's walk into unrelated history.
+	// Other keys use forward discovery from their supplied/current tips.
+	// creationMu protects the link and its memory accounting.
+	parent    Tip
+	parentKey string
 }
 
 // VertexPool is the engine's deserialized effect store: a map from Tip to
@@ -178,38 +177,25 @@ func (p *VertexPool) addParent(v *vertex, parent Tip, key string) {
 	v.creationMu.Lock()
 	defer v.creationMu.Unlock()
 
-	if v.refs.Load() < 0 {
+	if v.refs.Load() < 0 || v.parent != (Tip{}) {
 		return
 	}
 
-	for _, link := range v.parents {
-		if link.tip == parent && link.key == key {
-			return
-		}
-	}
-	// Reclamation removes payloads, not evidence of an established join.
-	// Keep the key as well: a shared bind can have parents on different keys,
-	// and the parent's payload may be gone when this edge is traversed.
-	v.parents = append(v.parents, struct {
-		tip Tip
-		key string
-	}{parent, key})
-	p.accountCreation(v)
+	v.parent, v.parentKey = parent, key
+	// The inline link is included in vertexOverhead. Charge only its key,
+	// without rescanning creation ownership on a shared bind.
+	cost := memsize.Alloc(int64(len(key)))
+	v.creationBytes += cost
+	p.vertexBytes.Add(cost)
 }
 
-// firstParent follows one established chain; cut discovery never enumerates
-// all reverse paths. A reclaimed parent's identity remains valid join evidence.
+// firstParent follows the retained chain only on the key that established it.
+// A reclaimed parent's identity remains valid join evidence.
 func (v *vertex) firstParent(key string) (Tip, bool) {
 	v.creationMu.Lock()
 	defer v.creationMu.Unlock()
 
-	for _, link := range v.parents {
-		if link.key == key {
-			return link.tip, true
-		}
-	}
-
-	return Tip{}, false
+	return v.parent, v.parent != (Tip{}) && v.parentKey == key
 }
 
 // Put stores eff at tip and accounts for its resident protobuf allocations.
@@ -488,6 +474,24 @@ func (p *VertexPool) decrefChainNode(key string, tip Tip) (*pb.Effect, bool) {
 	return v.eff, true
 }
 
+// acquireCreation restores key ownership of a vertex held by a pending-history
+// pin. That pin must remain held throughout acquisition, including accounting.
+func (p *VertexPool) acquireCreation(key string, tip Tip) {
+	v := p.getVertex(tip)
+	if v == nil {
+		panic("pending history lost its vertex pin")
+	}
+
+	v.creationMu.Lock()
+	defer v.creationMu.Unlock()
+
+	if i, owned := slices.BinarySearch(v.creationKeys, key); !owned {
+		v.refs.Add(1) // the caller's pin prevents reclamation
+		v.creationKeys = slices.Insert(v.creationKeys, i, key)
+		p.accountCreation(v)
+	}
+}
+
 // recordColdEviction counts one key evicted by the index's bounded sweep under
 // memory pressure. Called once per victim from onLeafEvicted — the cold-key
 // eviction the old conflated counter never saw.
@@ -628,13 +632,9 @@ func (p *VertexPool) Bytes() int64 {
 
 // Call with creationMu held, or before publishing a new vertex.
 func (p *VertexPool) accountCreation(v *vertex) {
-	cost := memsize.Alloc(int64(cap(v.creationKeys))*16) + memsize.Alloc(int64(cap(v.parents))*int64(unsafe.Sizeof(v.parents[0])))
+	cost := memsize.Alloc(int64(cap(v.creationKeys))*16) + memsize.Alloc(int64(len(v.parentKey)))
 	for _, key := range v.creationKeys {
 		cost += memsize.Alloc(int64(len(key)))
-	}
-
-	for _, link := range v.parents {
-		cost += memsize.Alloc(int64(len(link.key)))
 	}
 
 	p.vertexBytes.Add(cost - v.creationBytes)

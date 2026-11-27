@@ -276,7 +276,7 @@ func emptySubscription(eff *pb.Effect) bool {
 // without making the subscription itself a data root. A chain containing only
 // subscription observations has the same data ancestry as no dependencies.
 // Missing effects remain unresolved data dependencies, never assumed metadata.
-func visitDataDeps(key string, eff *pb.Effect, visit func(Tip) *pb.Effect) bool {
+func visitDataDeps(key string, eff *pb.Effect, visit func(Tip) *pb.Effect, local bool) bool {
 	pending := []*pb.Effect{eff}
 
 	var subscriptions map[Tip]bool
@@ -291,6 +291,10 @@ func visitDataDeps(key string, eff *pb.Effect, visit func(Tip) *pb.Effect) bool 
 			tip := r(ref)
 
 			dep := visit(tip)
+			if local && dep != nil && !effectHasAddress(dep, key) {
+				continue
+			}
+
 			if dep.GetSubscription() == nil {
 				hasDataDeps = true
 
@@ -322,6 +326,16 @@ func visitDataDeps(key string, eff *pb.Effect, visit func(Tip) *pb.Effect) bool 
 // convergence; their folded history need not remain available. Callers decide
 // how to use partial nodes when errors occur.
 func walkKeyHistory(key string, tips []Tip, load func(Tip) (*pb.Effect, error)) (map[Tip]*pb.Effect, error) {
+	nodes, _, err := walkDataFrontier(key, tips, load, false)
+
+	return nodes, err
+}
+
+// walkDataFrontier treats roots and unresolved dependencies as sets. Defer
+// snapshots until ordinary paths converge; only the common snapshot is a cut.
+// Local reconstruction excludes cross-key observations, while recovery retains
+// them to establish causal availability.
+func walkDataFrontier(key string, tips []Tip, load func(Tip) (*pb.Effect, error), local bool) (map[Tip]*pb.Effect, Tip, error) {
 	nodes := make(map[Tip]*pb.Effect, len(tips)*8)
 
 	var (
@@ -367,11 +381,10 @@ func walkKeyHistory(key string, tips []Tip, load func(Tip) (*pb.Effect, error)) 
 			return eff
 		}
 
-		frontier[t] = struct{}{}
-
 		eff, err := load(t)
 		if err != nil {
 			nodes[t] = nil
+			frontier[t] = struct{}{}
 
 			recordError(err)
 
@@ -379,6 +392,12 @@ func walkKeyHistory(key string, tips []Tip, load func(Tip) (*pb.Effect, error)) 
 		}
 
 		nodes[t] = eff
+		if local && eff != nil && !effectHasAddress(eff, key) {
+			return eff
+		}
+
+		frontier[t] = struct{}{}
+
 		if eff == nil {
 			return nil
 		}
@@ -390,7 +409,7 @@ func walkKeyHistory(key string, tips []Tip, load func(Tip) (*pb.Effect, error)) 
 
 	for _, t := range tips {
 		if eff := visit(t); eff.GetSubscription() != nil {
-			visitDataDeps(key, eff, visit)
+			visitDataDeps(key, eff, visit, local)
 		}
 	}
 
@@ -414,18 +433,18 @@ func walkKeyHistory(key string, tips []Tip, load func(Tip) (*pb.Effect, error)) 
 		eff := nodes[cur]
 
 		if snap := eff.GetSnapshot(); snap != nil && snap.GetState() != nil && len(frontier) == 1 {
-			return nodes, walkError()
+			return nodes, cur, walkError()
 		}
 
 		// A data effect with only subscription observations is a data root,
 		// exactly as if those metadata references had not been attached.
-		hasDataDeps := visitDataDeps(key, eff, visit)
+		hasDataDeps := visitDataDeps(key, eff, visit, local)
 		if hasDataDeps {
 			delete(frontier, cur)
 		}
 	}
 
-	return nodes, walkError()
+	return nodes, Tip{}, walkError()
 }
 
 // trimAncestorsOfLCA removes folded history from reconstruction. Its existing
@@ -578,9 +597,24 @@ func (d *dag) topoCollect(tips []Tip, stopAtSnapshot bool) (dagPaths, error) {
 		return eff
 	}
 
-	var visit func(Tip, bool) (dagPath, error)
+	tips = compactTips(slices.Clone(tips))
 
-	visit = func(tip Tip, dominates bool) (dagPath, error) {
+	var cut Tip
+
+	if stopAtSnapshot {
+		var err error
+
+		_, cut, err = walkDataFrontier(d.key, tips, func(t Tip) (*pb.Effect, error) {
+			return resident(t), nil
+		}, true)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	var visit func(Tip) (dagPath, error)
+
+	visit = func(tip Tip) (dagPath, error) {
 		if p, seen := paths[tip]; seen {
 			if p.order < 0 {
 				return p, fmt.Errorf("reconstruct %q: dependency cycle at %v", d.key, tip)
@@ -591,9 +625,8 @@ func (d *dag) topoCollect(tips []Tip, stopAtSnapshot bool) (dagPaths, error) {
 
 		paths[tip] = dagPath{order: -1}
 		eff := resident(tip)
-		// Along a sole data path a state snapshot already dominates the
-		// requested frontier. There are no sibling paths to reconcile.
-		if stopAtSnapshot && dominates && eff.GetSnapshot().GetState() != nil {
+		// Frontier convergence established this snapshot covers every data path.
+		if cut != (Tip{}) && tip == cut {
 			p := dagPath{root: tip, order: len(d.topoOrder), data: true}
 			paths[tip] = p
 			d.topoOrder = append(d.topoOrder, tip)
@@ -604,7 +637,6 @@ func (d *dag) topoCollect(tips []Tip, stopAtSnapshot bool) (dagPaths, error) {
 		var local [8]dagTip
 
 		deps := local[:0]
-		dataDeps := 0
 
 		for ref := range keyDeps(d.key, eff) {
 			dep := r(ref)
@@ -616,9 +648,6 @@ func (d *dag) topoCollect(tips []Tip, stopAtSnapshot bool) (dagPaths, error) {
 			}
 
 			deps = append(deps, dagTip{dep, value})
-			if !emptySubscription(value) {
-				dataDeps++
-			}
 		}
 
 		slices.SortFunc(deps, compareDagTips)
@@ -626,7 +655,7 @@ func (d *dag) topoCollect(tips []Tip, stopAtSnapshot bool) (dagPaths, error) {
 		p := dagPath{}
 
 		for _, dep := range deps {
-			ancestor, err := visit(dep.tip, dominates && dataDeps == 1 && !emptySubscription(dep.eff))
+			ancestor, err := visit(dep.tip)
 			if err != nil {
 				return p, err
 			}
@@ -657,15 +686,11 @@ func (d *dag) topoCollect(tips []Tip, stopAtSnapshot bool) (dagPaths, error) {
 		return p, nil
 	}
 	sorted := make([]dagTip, 0, len(tips))
-	dataTips := 0
 
 	for _, tip := range tips {
 		eff := resident(tip)
 
 		sorted = append(sorted, dagTip{tip, eff})
-		if !emptySubscription(eff) {
-			dataTips++
-		}
 	}
 
 	slices.SortFunc(sorted, compareDagTips)
@@ -673,7 +698,7 @@ func (d *dag) topoCollect(tips []Tip, stopAtSnapshot bool) (dagPaths, error) {
 	hasData := false
 
 	for _, entry := range sorted {
-		p, err := visit(entry.tip, dataTips == 1 && !emptySubscription(entry.eff))
+		p, err := visit(entry.tip)
 		if err != nil {
 			return nil, err
 		}

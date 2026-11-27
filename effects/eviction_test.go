@@ -830,6 +830,8 @@ func TestNewEngine_PinsSystemKeysInCache(t *testing.T) {
 	})
 	defer func() { _ = e.Close() }()
 
+	stopMemoryGovernorForTest(e)
+
 	// Seed a membership-style effect. It has no index entry, so it is not
 	// in any active path — only the system-key pin should keep it.
 	systemKey := "__swytch:members"

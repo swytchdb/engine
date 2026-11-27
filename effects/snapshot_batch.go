@@ -44,7 +44,7 @@ type snapshotReadView struct {
 	anchors    map[string][]Tip // every key in the closure, including keys without anchors
 	verdicts   verdictMap
 	lost       map[string]struct{}
-	walked     int
+	walked     map[string]int
 	historical bool // report reconstruction uses recorded ancestry only
 }
 
@@ -53,6 +53,9 @@ type snapshotReadView struct {
 type snapshotFrontier struct {
 	index    *keytrie.TipSet
 	resolved []Tip
+	// A read-created snapshot preserves bind promises made for its original
+	// frontier, even if a savepoint rolls back the transaction's read marker.
+	compacted *keytrie.TipSet
 }
 
 func newSnapshotReadView(e *Engine, ctx context.Context) *snapshotReadView {
@@ -176,12 +179,7 @@ func (v *snapshotReadView) discoverWithEvidence(keys []string, frontier func(str
 		v.verdicts = verdicts
 	}
 
-	var walkedByKey map[string]int
-
-	v.lost, walkedByKey = v.engine.losersOnKeysAt(anchors, tipsFor, verdicts, v.isInvisible, !v.historical)
-	for _, walked := range walkedByKey {
-		v.walked += walked
-	}
+	v.lost, v.walked = v.engine.losersOnKeysAt(anchors, tipsFor, verdicts, v.isInvisible, !v.historical)
 
 	return nil
 }

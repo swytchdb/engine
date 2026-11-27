@@ -25,6 +25,7 @@ package effects
 
 import (
 	"fmt"
+	"iter"
 	"slices"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
@@ -57,9 +58,84 @@ func (p *VertexPool) proofRecords(eff *pb.Effect) (map[Tip]*pb.Effect, error) {
 	return records, nil
 }
 
-// proofVerdicts uses the ordinary bind evaluator against the packaged graph.
-// Cached verdict labels are deliberately excluded from this computation.
+func settledSnapshotVerdicts(owner Tip, snap *pb.SnapshotEffect) iter.Seq2[string, verdictEntry] {
+	return func(yield func(string, verdictEntry) bool) {
+		if snap.GetOutstandingSubscribers() == nil || len(snap.GetOutstandingSubscribers().GetNodeIds()) != 0 {
+			return
+		}
+
+		for txn, outcome := range snap.GetTxnVerdicts() {
+			if outcome == pb.Verdict_WON || outcome == pb.Verdict_LOST {
+				if !yield(txn, verdictEntry{verdict: outcome, snapshotTip: owner, proven: true, settled: true}) {
+					return
+				}
+			}
+		}
+	}
+}
+
+// adjudicated binds need no further competition discovery. An open win can
+// still lose to another participant; a recorded loss cannot defeat anyone.
+func (v verdictMap) adjudicated(txn string) bool {
+	entry := v[txn]
+
+	return entry.verdict == pb.Verdict_LOST || entry.settled && entry.verdict == pb.Verdict_WON
+}
+
+// mergeResponseVerdicts preserves disagreement as an ambiguous response rather
+// than letting response order choose a transaction outcome.
+func mergeResponseVerdicts(dst, src verdictMap) error {
+	for txn, entry := range src {
+		if prior, ok := dst[txn]; ok && prior.verdict != entry.verdict {
+			return ErrTxnAmbiguous
+		}
+
+		dst.retain(txn, entry)
+	}
+
+	return nil
+}
+
+// Keep response disagreement visible even when retain would prefer a settled
+// entry. Different snapshots must not silently select different outcomes.
+func (e *Engine) harvestResponseVerdicts(tip Tip, eff *pb.Effect, verdicts verdictMap) error {
+	// Ingestion and candidate discovery share this map. Do not validate the
+	// same immutable proof again when the metadata pass already accepted it.
+	known := len(eff.GetSnapshot().GetTxnVerdicts()) != 0
+	for txn := range eff.GetSnapshot().GetTxnVerdicts() {
+		if entry, ok := verdicts[txn]; !ok || entry.snapshotTip != tip {
+			known = false
+
+			break
+		}
+	}
+
+	if known {
+		return nil
+	}
+
+	incoming := make(verdictMap)
+	if err := e.harvestProofVerdicts(tip, eff, incoming); err != nil {
+		return err
+	}
+
+	return mergeResponseVerdicts(verdicts, incoming)
+}
+
+// proofVerdicts trusts outcomes with explicitly completed subscriber responses.
+// Other outcomes use the ordinary bind evaluator against the packaged graph.
 func (e *Engine) proofVerdicts(owner Tip, eff *pb.Effect) (verdictMap, error) {
+	snap := eff.GetSnapshot()
+
+	verdicts := make(verdictMap)
+	for txn, entry := range settledSnapshotVerdicts(owner, snap) {
+		verdicts.retain(txn, entry)
+	}
+
+	if len(verdicts) > 0 && len(verdicts) == len(snap.GetTxnVerdicts()) {
+		return verdicts, nil
+	}
+
 	if !e.effectCache.Incref(owner) {
 		return nil, fmt.Errorf("proof owner %v: %w", owner, errEffectNotResident)
 	}
@@ -93,7 +169,6 @@ func (e *Engine) proofVerdicts(owner Tip, eff *pb.Effect) (verdictMap, error) {
 	}
 
 	lost, _ := e.losersOnKeysAt(keys, func(string) []Tip { return nil }, nil, nil, false, records)
-	verdicts := make(verdictMap)
 
 	for _, record := range binds {
 		verdict := pb.Verdict_WON
@@ -110,6 +185,10 @@ func (e *Engine) proofVerdicts(owner Tip, eff *pb.Effect) (verdictMap, error) {
 func (e *Engine) harvestProofVerdicts(tip Tip, eff *pb.Effect, verdicts verdictMap) error {
 	if eff.GetSnapshot().GetEvidence() == nil {
 		verdicts.harvest(tip, eff.GetSnapshot())
+
+		for txn, entry := range settledSnapshotVerdicts(tip, eff.GetSnapshot()) {
+			verdicts.retain(txn, entry)
+		}
 
 		return nil
 	}

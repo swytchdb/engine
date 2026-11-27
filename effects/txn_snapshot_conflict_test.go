@@ -250,7 +250,7 @@ func TestNackConflictFetchesWrappedCompetitors(t *testing.T) {
 			nack.CausalChain = nil // synchronous correctness cannot rely on prefetch timing
 			local := newTxnTestEngine(bc)
 			preSubscribe(local, "k")
-			local.ingestNackTips(nack)
+			_ = local.ingestNackTips(nack)
 
 			// A single state snapshot is enough for ingestion/replay, but conflict
 			// classification must compare its underlying binds with our branch.

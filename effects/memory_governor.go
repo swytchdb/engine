@@ -34,20 +34,18 @@ import (
 	"github.com/swytchdb/engine/keytrie"
 )
 
-// startMemoryGovernor evicts owned capacity above the configured budget.
+// startMemoryGovernor reclaims released vertices for every engine and evicts
+// owned capacity only when a memory budget is configured.
 // Go handles collection/scavenging independently of cache policy.
-// targetBytes <= 0 leaves the existing unbounded-cache mode unchanged.
 func (e *Engine) startMemoryGovernor(targetBytes int64) {
-	if targetBytes <= 0 {
-		return
-	}
-
 	// Only bounded engines need eviction hooks and per-read eviction tracking.
-	e.index.SetEvictHooksInternal(
-		func(key string) bool { return !strings.HasPrefix(key, keytrie.LogicalKeyPrefix+"__swytch:") },
-		e.onLeafEvicted,
-		func() bool { return e.evictBudget.Load() > 0 },
-	)
+	if targetBytes > 0 {
+		e.index.SetEvictHooksInternal(
+			func(key string) bool { return !strings.HasPrefix(key, keytrie.LogicalKeyPrefix+"__swytch:") },
+			e.onLeafEvicted,
+			func() bool { return e.evictBudget.Load() > 0 },
+		)
+	}
 
 	// The Go limit belongs to the operator and covers more than owned cache
 	// memory. A negative argument only reads it; never tune it for the caller.
@@ -104,7 +102,11 @@ func (e *Engine) memoryGovernorLoop() {
 			continue
 		}
 
-		e.evictToTarget(e.cacheTarget)
+		if e.cacheTarget > 0 {
+			e.evictToTarget(e.cacheTarget)
+		} else {
+			e.reclaimUnreferenced()
+		}
 	}
 }
 

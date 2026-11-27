@@ -159,6 +159,7 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (_ *Runtime, err error) 
 	}
 
 	engine, err := effects.OpenEngine(ctx, effects.EngineConfig{
+		BuildVersion:       cluster.Version,
 		DataDir:            cfg.DataDir,
 		NodeID:             pb.NewNodeID(),
 		DefaultMode:        effects.SafeMode,

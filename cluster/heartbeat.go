@@ -39,11 +39,12 @@ import (
 // 0x01 (heartbeat) and 0x02 (heartbeat ACK) were the legacy fixed-size
 // liveness packets, replaced by PacketTypeClockTick; reserved to avoid reuse.
 const (
-	PacketTypeNotify    byte = 0x03
-	PacketTypeNotifyACK byte = 0x04
-	PacketTypeNack      byte = 0x05
-	PacketTypeClockTick byte = 0x06
-	PacketTypeKeyFilter byte = 0x07
+	PacketTypeNotify      byte = 0x03
+	PacketTypeNotifyACK   byte = 0x04
+	PacketTypeNack        byte = 0x05
+	PacketTypeClockTick   byte = 0x06
+	PacketTypeKeyFilter   byte = 0x07
+	PacketTypeNodeVersion byte = 0x08
 )
 
 // Clock tick protocol constants.

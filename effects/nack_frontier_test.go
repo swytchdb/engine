@@ -314,7 +314,7 @@ func checkNackFrontier(t *testing.T, tc nackFrontierCase, reverseTips, reverseDe
 		nack.TipDetails = append(nack.TipDetails, &pb.NackTipDetail{Ref: toPbRef(tip)})
 	}
 	// No prefetch list: require the synchronous walk to discover ancestry.
-	remote.ingestNackTips(nack)
+	_ = remote.ingestNackTips(nack)
 
 	for tip := range advertised {
 		if !bc.fetched[tip] {

@@ -190,6 +190,7 @@ func TestDurabilityRecoveryOrderIndependentFrontier(t *testing.T) {
 func TestDurabilityEvictionRemovesDiskRecord(t *testing.T) {
 	dir := t.TempDir()
 	e := durableTestEngine(t, dir)
+	stopMemoryGovernorForTest(e)
 	durableSet(t, e, "evict-me", "value")
 	tips := e.index.Contains("evict-me")
 	e.releaseChainRefs(logicalAddress("evict-me"), tips.Tips(), nil)

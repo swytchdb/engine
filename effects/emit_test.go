@@ -1000,6 +1000,17 @@ func TestFlushTx_FakeConflict_Commits(t *testing.T) {
 // {each beaten loser's keys}. Every key a LOST txn touched now carries
 // a direct verdict record, independent of closure expansion.
 func TestFlushTx_VerdictSnapshotEmittedOnLoserOnlyKeys(t *testing.T) {
+	t.Run("legacy_competitor", func(t *testing.T) {
+		testVerdictSnapshotOnLoserKeys(t, nil, nil)
+	})
+	t.Run("uncontacted_competitor_subscriber", func(t *testing.T) {
+		testVerdictSnapshotOnLoserKeys(t, &pb.SubscriberSet{NodeIds: []uint64{42, 77}}, &pb.SubscriberSet{NodeIds: []uint64{5, 77}})
+	})
+}
+
+func testVerdictSnapshotOnLoserKeys(t *testing.T, subscribers, outstanding *pb.SubscriberSet) {
+	t.Helper()
+
 	const (
 		sharedKey    = "shared"
 		loserOnlyKey = "loser-only"
@@ -1056,6 +1067,7 @@ func TestFlushTx_VerdictSnapshotEmittedOnLoserOnlyKeys(t *testing.T) {
 		Kind: &pb.Effect_TxnBind{TxnBind: &pb.TransactionalBindEffect{
 			TxnHlc:           loserBindHlc,
 			OriginatorNodeId: uint64(loserNodeID),
+			Subscribers:      subscribers,
 			Keys: []*pb.TransactionalBindEffect_KeyBind{
 				{Key: []byte(sharedKey), NewTip: toPbRef(loserDataShared)},
 				{Key: []byte(loserOnlyKey), NewTip: toPbRef(loserDataLoserOnly)},
@@ -1145,6 +1157,10 @@ func TestFlushTx_VerdictSnapshotEmittedOnLoserOnlyKeys(t *testing.T) {
 		derived, err := e.proofVerdicts(tip, eff)
 		if err != nil || derived[loserTxnID].verdict != pb.Verdict_LOST {
 			t.Fatalf("loser-only proof: verdicts=%v error=%v", derived, err)
+		}
+
+		if !proto.Equal(snap.GetOutstandingSubscribers(), outstanding) || derived[loserTxnID].settled {
+			t.Fatalf("competition incorrectly closed: outstanding=%v, verdict=%v", snap.GetOutstandingSubscribers(), derived[loserTxnID])
 		}
 
 		foundLoserOnlyVerdict = true

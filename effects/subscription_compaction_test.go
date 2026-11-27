@@ -161,11 +161,6 @@ func TestSubscriptionSnapshotsBoundChurn(t *testing.T) {
 			historicalTestWrite(t, e, map[string]string{"k": "value"}, false)
 		}
 
-		leaf := e.index.LoadData("k")
-		if leaf.lastCompaction.Load() != 0 {
-			leaf.lastCompaction.Add(-int64(compactionInterval))
-		}
-
 		compactor := e.NewContext()
 		if _, _, err := compactor.GetSnapshot("k"); err != nil {
 			t.Fatal(err)

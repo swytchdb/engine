@@ -56,11 +56,6 @@ const (
 // cloudEffectInfo is the domain-separation info for sealed effect payloads.
 var cloudEffectInfo = []byte("effect")
 
-// Version is the swytch build, set from main.Version at startup (ldflags). The
-// cloud stream announces it — with the node id — as gRPC metadata, which is how
-// the Cloud dashboard knows each cluster's node count and running version.
-var Version = "dev"
-
 // Metadata keys the dataplane reads off the WriteEffects stream; must match
 // cloud's internal/dataplane.
 const (

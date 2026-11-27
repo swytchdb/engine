@@ -66,9 +66,7 @@ func TestCompactionPreservesTransactionHistory(t *testing.T) {
 			}
 
 			// A second snapshot makes the first an eligible reclamation
-			// boundary. Simulate the pacing interval without sleeping.
-			leaf := e.index.LoadData("k")
-			leaf.lastCompaction.Add(-int64(compactionInterval))
+			// boundary once enough new effects have accumulated.
 
 			for range 6 {
 				historicalTestWrite(t, e, map[string]string{"k": "new"}, false)
@@ -332,12 +330,6 @@ func TestCompactionAdvancesPastEndedOverlayWhileNewerTransactionLives(t *testing
 
 	compact := func(value string) Tip {
 		t.Helper()
-
-		// Exercise successive compaction passes without waiting in the test.
-		leaf := e.index.LoadData("k")
-		if leaf != nil && leaf.lastCompaction.Load() != 0 {
-			leaf.lastCompaction.Add(-int64(compactionInterval))
-		}
 
 		for range 6 {
 			historicalTestWrite(t, e, map[string]string{"k": value}, false)

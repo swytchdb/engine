@@ -182,9 +182,8 @@ func TestBoundaryAuditOrdinaryNoopRouting(t *testing.T) {
 			auditWrite(t, e, logicalAddress("main"), "ordinary scalar, not GRAPH")
 			observed := e.index.ContainsInternal(logicalAddress("main")).Tips()
 			c := e.NewContext()
-			// Use the shared emit implementation solely to attach a cross-key dependency.
-			// The value has no graph type, regions, predicates, or selected graph route.
-			if err := c.emitEffect(addressedValue(addresses[0], "child"), observed, nil, []Tip{}); err != nil {
+			// Model a legacy cross-key dependency; it must not alter subscriber selection.
+			if err := c.Emit(addressedValue(addresses[0], "child"), observed); err != nil {
 				t.Fatal(err)
 			}
 
@@ -200,10 +199,6 @@ func TestBoundaryAuditOrdinaryNoopRouting(t *testing.T) {
 
 			if err := c.Emit(&pb.Effect{Key: []byte(wireKey(addresses[0])), IKey: []byte(addresses[0]), Kind: &pb.Effect_Noop{Noop: &pb.NoopEffect{}}}); err != nil {
 				t.Fatal(err)
-			}
-
-			if len(c.keys[addresses[0]].routes) != 0 {
-				t.Error("ordinary NOOP invented graph predicate routing solely from internal address and cross-key dependency")
 			}
 
 			if got := c.collectSubscribers(); !slices.Equal(got, []pb.NodeID{2}) {
