@@ -98,7 +98,7 @@ func BenchmarkSubscriberChurn(b *testing.B) {
 	b.ResetTimer()
 
 	for b.Loop() {
-		e.addPeerSubscriber("key", 2)
-		e.removePeerSubscriber("key", 2)
+		e.addPeerSubscriber(logicalAddress("key"), 2)
+		e.removePeerSubscriber(logicalAddress("key"), 2)
 	}
 }

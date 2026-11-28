@@ -26,7 +26,37 @@ package effects
 import (
 	"bytes"
 	"testing"
+
+	"github.com/klauspost/compress/zstd"
 )
+
+func TestCompressionWindowCompatibility(t *testing.T) {
+	legacyEncoder, err := zstd.NewWriter(nil, zstd.WithEncoderConcurrency(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = legacyEncoder.Close() }()
+
+	legacyDecoder, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer legacyDecoder.Close()
+
+	// Exceed the new window. Existing peers and sealed blobs must remain
+	// interoperable in both directions; only encoder working memory changes.
+	payload := bytes.Repeat([]byte("transaction data and bind references"), 100000)
+
+	decoded, err := legacyDecoder.DecodeAll(Compress(payload), nil)
+	if err != nil || !bytes.Equal(decoded, payload) {
+		t.Fatalf("legacy decoder: %v", err)
+	}
+
+	decoded, err = Decompress(legacyEncoder.EncodeAll(payload, nil))
+	if err != nil || !bytes.Equal(decoded, payload) {
+		t.Fatalf("legacy frame: %v", err)
+	}
+}
 
 func testEncryptor(t *testing.T) *Encryptor {
 	t.Helper()

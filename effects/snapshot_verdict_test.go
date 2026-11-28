@@ -40,7 +40,7 @@ func TestReconstruct_InstallsAssociatedBindHistory(t *testing.T) {
 
 			e := newSnapshotEngine(log)
 			for _, key := range []string{"winner", "payout"} {
-				if err := e.ensureSubscribed(key); err != nil {
+				if err := e.ensureSubscribed(logicalAddress(key)); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -76,7 +76,7 @@ func TestReconstruct_InstallsAssociatedBindHistory(t *testing.T) {
 			want := "100"
 
 			if state == "already_tip" {
-				e.updateIndex("payout", nil, bind)
+				e.updateIndex(logicalAddress("payout"), nil, bind)
 			}
 
 			if state == "descendant" || state == "descendant_preinstalled" {
@@ -85,13 +85,13 @@ func TestReconstruct_InstallsAssociatedBindHistory(t *testing.T) {
 					Deps: []*pb.EffectRef{toPbRef(bind)},
 					Kind: &pb.Effect_Data{Data: scalarInsertRaw([]byte("200"))},
 				})
-				e.updateIndex("payout", nil, newer)
+				e.updateIndex(logicalAddress("payout"), nil, newer)
 
 				want = "200"
 			}
 
 			if state == "descendant_preinstalled" {
-				e.updateIndex("payout", nil, bind)
+				e.updateIndex(logicalAddress("payout"), nil, bind)
 			}
 
 			payoutTips := e.index.Contains("payout").Tips()
@@ -101,11 +101,11 @@ func TestReconstruct_InstallsAssociatedBindHistory(t *testing.T) {
 				Deps: []*pb.EffectRef{toPbRef(bind)},
 				Kind: &pb.Effect_Data{Data: scalarInsertRaw([]byte("charlie"))},
 			})
-			e.updateIndex("winner", nil, middle)
+			e.updateIndex(logicalAddress("winner"), nil, middle)
 
 			if state == "transaction_snapshot" {
 				before := e.index.Contains("payout").Tips()
-				if _, _, err := e.reconstruct("winner", e.index.Contains("winner").Tips(), "active", true); err != nil {
+				if _, _, err := e.reconstruct(logicalAddress("winner"), e.index.Contains("winner").Tips(), "active", true); err != nil {
 					t.Fatal(err)
 				}
 

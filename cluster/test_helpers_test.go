@@ -41,7 +41,7 @@ import (
 
 // generateTestTLSConfig creates a self-signed TLS config for tests.
 // Uses the same cert for both server and client (mTLS with InsecureSkipVerify).
-func generateTestTLSConfig(t *testing.T) *tls.Config {
+func generateTestTLSConfig(t testing.TB) *tls.Config {
 	t.Helper()
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -160,10 +160,22 @@ func (m *mockLogReader) ReadEffect(_ *pb.EffectRef) ([]byte, error) {
 
 // startNNodeCluster starts N peer managers with OS-assigned ports and wires them together.
 // Blocks until all QUIC connections and heartbeat symmetry are established.
-func startNNodeCluster(t *testing.T, handlers []EffectHandler, logReaders []LogReader) []*PeerManager {
+func startNNodeCluster(t testing.TB, handlers []EffectHandler, logReaders []LogReader, identities ...NodeId) []*PeerManager {
 	t.Helper()
 
 	n := len(handlers)
+
+	if len(identities) == 0 {
+		identities = make([]NodeId, n)
+
+		for i := range n {
+			identities[i] = NodeId(i)
+		}
+	}
+
+	if len(identities) != n {
+		t.Fatal("peer identity count must match handler count")
+	}
 
 	pms := make([]*PeerManager, n)
 	pmCtx, pmCancel := context.WithCancel(context.Background())
@@ -172,9 +184,9 @@ func startNNodeCluster(t *testing.T, handlers []EffectHandler, logReaders []LogR
 	// Phase 1: bootstrap each node with just its own address (port 0)
 	for i := range n {
 		cfg := &ClusterConfig{
-			NodeID: NodeId(i),
+			NodeID: identities[i],
 			Nodes: []NodeConfig{
-				{ID: NodeId(i), Address: "127.0.0.1:0", Region: "test"},
+				{ID: identities[i], Address: "127.0.0.1:0", Region: "test"},
 			},
 		}
 
@@ -209,7 +221,7 @@ func startNNodeCluster(t *testing.T, handlers []EffectHandler, logReaders []LogR
 	nodes := make([]NodeConfig, n)
 	for i := range n {
 		nodes[i] = NodeConfig{
-			ID:      NodeId(i),
+			ID:      identities[i],
 			Address: pms[i].ListenAddr(),
 			Region:  "test",
 		}
@@ -217,7 +229,7 @@ func startNNodeCluster(t *testing.T, handlers []EffectHandler, logReaders []LogR
 
 	for i := range n {
 		pms[i].UpdateTopology(&ClusterConfig{
-			NodeID: NodeId(i),
+			NodeID: identities[i],
 			Nodes:  nodes,
 		})
 	}
@@ -232,7 +244,7 @@ func startNNodeCluster(t *testing.T, handlers []EffectHandler, logReaders []LogR
 				continue
 			}
 
-			if !pms[i].WaitForPeer(waitCtx, NodeId(j)) {
+			if !pms[i].WaitForPeer(waitCtx, identities[j]) {
 				pmCancel()
 
 				for k := range n {
@@ -260,7 +272,7 @@ func startNNodeCluster(t *testing.T, handlers []EffectHandler, logReaders []LogR
 						continue
 					}
 
-					ph := pms[i].healthTable.GetOrCreate(NodeId(j))
+					ph := pms[i].healthTable.GetOrCreate(identities[j])
 					if !ph.alive.Load() || !ph.symmetric.Load() {
 						allHealthy = false
 

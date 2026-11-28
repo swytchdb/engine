@@ -142,8 +142,9 @@ func (e *Engine) configureIndexKeyOwnership() {
 	e.index.SetKeyOwnership(e.retainKey, e.releaseKey)
 }
 
-// A subscription, trie leaf (including ghosts), and pending release share one
-// key allocation. Keep it charged until the last primary owner releases it.
+// Equal keys share one allocation across primary owners, including trie leaves
+// and pending releases. Subscriptions retain complete canonical addresses.
+// Keep each allocation charged until its last primary owner releases it.
 func (e *Engine) retainKey(key string) string {
 	if key == "" {
 		return ""

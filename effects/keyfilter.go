@@ -68,6 +68,8 @@ func (pf *peerKeyFilter) maybeContains(key string) bool {
 // ownFilterAdd records that this node now holds data for key. Called from the
 // data-added notification sites.
 func (e *Engine) ownFilterAdd(key string) {
+	key = wireKey(key)
+
 	e.keyFilterMu.Lock()
 	if e.ownKeyFilter.Add(key) {
 		// Only bump the version when the set actually changed, so the
@@ -104,6 +106,8 @@ func (e *Engine) OwnKeyFilterSnapshot() ([]byte, uint64) {
 // fires synchronously with the majority-gated subscription broadcast, so a
 // committed write's key is visible to every majority peer before the write acks.
 func (e *Engine) peerFilterAdd(peer pb.NodeID, key string) {
+	key = wireKey(key)
+
 	if peer == e.nodeID {
 		return
 	}
@@ -227,6 +231,8 @@ func (e *Engine) inMajorityPartition() bool {
 // the peer holds everything until it tells us otherwise. False-positives are
 // safe — they fall through to a real subscribe + reconstruct.
 func (e *Engine) clusterMaybeHasKey(key string) bool {
+	key = wireKey(key)
+
 	e.keyFilterMu.RLock()
 	defer e.keyFilterMu.RUnlock()
 

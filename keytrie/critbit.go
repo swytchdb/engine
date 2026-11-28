@@ -61,11 +61,12 @@ type critNode[T any] struct {
 	isLeaf    bool
 	// pinned is the eviction decider's verdict, fixed before publication.
 	// pins counts dynamic holds taken by Pin/Unpin.
-	pinned  bool
-	_       [1]byte
-	key     string
-	tips    atomic.Pointer[TipSet]
-	deleted atomic.Bool
+	pinned   bool
+	keyOwned bool // an ownership callback retained this leaf's key
+	key      string
+	ownedKey string // canonical allocation returned by the configured key owner
+	tips     atomic.Pointer[TipSet]
+	deleted  atomic.Bool
 	// Negative frequency marks a ghost: a deleted leaf retaining its frequency
 	// for a warm restart. Live accesses update frequency and recency atomically.
 	freq       atomic.Int32
@@ -83,12 +84,15 @@ func (n *critNode[T]) isDeleted() bool {
 	return n.deleted.Load()
 }
 
-// Critbit is a crit-bit trie for storing string keys, generic over the
-// per-leaf payload type T (see critNode).
+// Critbit is a crit-bit trie with per-leaf payload type T. Its existing key
+// methods use the logical namespace transparently. Methods ending in Internal
+// accept and return raw trie keys across all namespaces, without translation.
+// Resource management (Close, eviction, reclamation) covers the whole trie.
 type Critbit[T any] struct {
-	root   atomic.Pointer[critNode[T]]
-	size   atomic.Int64
-	closed atomic.Bool
+	root        atomic.Pointer[critNode[T]]
+	size        atomic.Int64
+	logicalSize atomic.Int64
+	closed      atomic.Bool
 
 	deletedCount atomic.Int64 // deleted-but-linked leaves still in the tree
 	reapRunning  atomic.Bool  // prevents concurrent reap goroutines
@@ -145,8 +149,8 @@ type Critbit[T any] struct {
 	// consumer could re-enter.
 	refDelta func(added, removed []EffectRef, droppedData *T)
 
-	// Optional shared key ownership, configured before publishing the trie.
-	// The owner accounts for interned key storage; each leaf holds one reference.
+	// Optional shared logical key ownership, configured before publishing the trie.
+	// The owner accounts for interned logical keys; the trie owns prefixed keys.
 	retainKey  func(string) string
 	releaseKey func(string)
 
@@ -169,17 +173,6 @@ type Critbit[T any] struct {
 	// Incremented under the write lock when existing paths are detached. Range
 	// cursors restart after their last key instead of following retired nodes.
 	readRevision uint64
-}
-
-// SetKeyOwnership shares key allocations with an external primary-cache owner.
-// Set it only on an empty trie before concurrent use. Relocations transfer a
-// reference; deletion releases it when the leaf is physically unlinked.
-func (c *Critbit[T]) SetKeyOwnership(retain func(string) string, release func(string)) {
-	if retain == nil || release == nil {
-		panic("keytrie: key ownership requires retain and release")
-	}
-
-	c.retainKey, c.releaseKey = retain, release
 }
 
 // NewCritbit creates a new crit-bit trie with leaf payload type T.
@@ -215,11 +208,8 @@ func (c *Critbit[T]) allocLeafNode(key string, ts *TipSet) *critNode[T] {
 	n, ci := c.leafArena.alloc() // born deleted=true via the arena init hook
 	n.chunkIdx = ci
 
-	if c.retainKey != nil {
-		key = c.retainKey(key)
-	}
-
-	n.key = key
+	c.retainLeafKey(n, key)
+	key = n.key
 	c.leafArena.addExtra(ci, c.keyBytes(key)+tipSetBytes(ts))
 	// A decider returning false means "do not evict" → pinned. When no decider is
 	// installed, no sweep ever runs, so the default false is inert.
@@ -290,14 +280,15 @@ func getDirection(key string, bytePos uint32, otherbits uint8) int {
 	return int(1+uint16(otherbits|c)) >> 8
 }
 
-// Insert attempts to store a TipSet for the given key using CAS.
+// InsertInternal attempts to store a TipSet for a raw trie key using CAS.
+// It does not add a namespace prefix.
 //
 // For new keys (old is nil): CAS retry loop for tree structural insertion.
 // For existing keys: single CAS comparing old to the current pointer.
 //
 // On success: returns (nil, true).
 // On CAS failure: returns (currentTips, false) — the conflicting tip set.
-func (c *Critbit[T]) Insert(key string, old *TipSet, newTips *TipSet) (*TipSet, bool) {
+func (c *Critbit[T]) InsertInternal(key string, old *TipSet, newTips *TipSet) (*TipSet, bool) {
 	if c.closed.Load() {
 		return nil, false
 	}
@@ -333,7 +324,7 @@ func (c *Critbit[T]) Insert(key string, old *TipSet, newTips *TipSet) (*TipSet, 
 				c.leafArena.addExtra(bestLeaf.chunkIdx, tipSetBytes(newTips)-tipSetBytes(old))
 
 				if bestLeaf.deleted.CompareAndSwap(true, false) {
-					c.size.Add(1)
+					c.addSize(key, 1)
 					// A ghost (freq < 0) was never counted as a deleted leaf;
 					// promote it instead of decrementing deletedCount.
 					if bestLeaf.freq.Load() < 0 {
@@ -402,7 +393,7 @@ func (c *Critbit[T]) Insert(key string, old *TipSet, newTips *TipSet) (*TipSet, 
 
 		if link.CompareAndSwap(node, replacement) {
 			newLeaf.deleted.Store(false)
-			c.size.Add(1)
+			c.addSize(key, 1)
 			c.reapMu.RUnlock()
 			c.fireTipDelta(old, newTips, nil)
 
@@ -453,11 +444,11 @@ func (c *Critbit[T]) fireTipDelta(old, newTips *TipSet, droppedData *T) {
 	}
 }
 
-// RemoveTips drops refs from key's tip set (CAS retry). The CAS runs under the
+// RemoveTipsInternal drops refs from key's tip set (CAS retry). The CAS runs under the
 // reap read-lock like every other leaf-field mutation: compaction (write lock)
 // relocates leaves, and a CAS landing on a relocated husk would be silently
 // lost. The delta fires outside the lock (the hook may re-enter the trie).
-func (c *Critbit[T]) RemoveTips(key string, refs []EffectRef) {
+func (c *Critbit[T]) RemoveTipsInternal(key string, refs []EffectRef) {
 	if len(refs) == 0 {
 		return
 	}
@@ -498,13 +489,14 @@ func (c *Critbit[T]) RemoveTips(key string, refs []EffectRef) {
 	}
 }
 
-func (c *Critbit[T]) Delete(key string, old *TipSet) bool {
-	return c.DeleteAndSnapshot(key, old) != nil
+// DeleteInternal removes a raw trie key only if its tips match old.
+func (c *Critbit[T]) DeleteInternal(key string, old *TipSet) bool {
+	return c.DeleteAndSnapshotInternal(key, old) != nil
 }
 
-// DeleteAndSnapshot removes a key only if its current tips match old
+// DeleteAndSnapshotInternal removes a raw trie key only if its current tips match old
 // (CAS). Returns the previous tip set on success, nil on failure.
-func (c *Critbit[T]) DeleteAndSnapshot(key string, old *TipSet) *TipSet {
+func (c *Critbit[T]) DeleteAndSnapshotInternal(key string, old *TipSet) *TipSet {
 	c.reapMu.Lock()
 
 	leaf := c.liveLeaf(key)
@@ -540,7 +532,8 @@ func (c *Critbit[T]) DeleteAndSnapshot(key string, old *TipSet) *TipSet {
 	return old
 }
 
-func (c *Critbit[T]) Size() int64 {
+// SizeInternal returns the live key count across all namespaces.
+func (c *Critbit[T]) SizeInternal() int64 {
 	if c.closed.Load() {
 		return 0
 	}
@@ -560,16 +553,19 @@ func (c *Critbit[T]) ArenaBytes() int64 {
 	return c.leafArena.bytes() + c.internalArena.bytes()
 }
 
-func (c *Critbit[T]) Range(fn func(key string) bool) {
-	c.rangeKeys("", "", false, fn)
+// RangeInternal iterates over raw trie keys in lexicographic order.
+func (c *Critbit[T]) RangeInternal(fn func(key string) bool) {
+	c.rangeKeys("", "", false, false, fn)
 }
 
-func (c *Critbit[T]) RangeFrom(after string, fn func(key string) bool) {
-	c.rangeKeys("", after, after != "", fn)
+// RangeFromInternal iterates over raw keys after after; empty starts at the beginning.
+func (c *Critbit[T]) RangeFromInternal(after string, fn func(key string) bool) {
+	c.rangeKeys("", after, after != "", false, fn)
 }
 
-func (c *Critbit[T]) RangePrefix(prefix string, fn func(key string) bool) {
-	c.rangeKeys(prefix, "", false, fn)
+// RangePrefixInternal iterates over raw trie keys starting with prefix.
+func (c *Critbit[T]) RangePrefixInternal(prefix string, fn func(key string) bool) {
+	c.rangeKeys(prefix, "", false, false, fn)
 }
 
 func (c *Critbit[T]) findPrefixSubtree(node *critNode[T], prefix string) *critNode[T] {
@@ -586,13 +582,14 @@ func (c *Critbit[T]) findPrefixSubtree(node *critNode[T], prefix string) *critNo
 	return current
 }
 
-func (c *Critbit[T]) Keys() []string {
+// KeysInternal returns raw keys from every namespace in lexicographic order.
+func (c *Critbit[T]) KeysInternal() []string {
 	if c.closed.Load() {
 		return nil
 	}
 
 	result := make([]string, 0, c.size.Load())
-	c.Range(func(key string) bool {
+	c.RangeInternal(func(key string) bool {
 		result = append(result, key)
 
 		return true
@@ -601,18 +598,19 @@ func (c *Critbit[T]) Keys() []string {
 	return result
 }
 
-func (c *Critbit[T]) MatchPattern(pattern string) []string {
+// MatchPatternInternal matches a Redis-style glob against raw trie keys.
+func (c *Critbit[T]) MatchPatternInternal(pattern string) []string {
 	if c.closed.Load() {
 		return nil
 	}
 
 	if pattern == "*" {
-		return c.Keys()
+		return c.KeysInternal()
 	}
 
 	result := make([]string, 0)
 
-	c.Range(func(key string) bool {
+	c.RangeInternal(func(key string) bool {
 		if MatchGlob(key, pattern) {
 			result = append(result, key)
 		}
@@ -638,7 +636,8 @@ func (c *Critbit[T]) liveLeaf(key string) *critNode[T] {
 	return leaf
 }
 
-func (c *Critbit[T]) TryClaimKey(key string) (exists bool, release ReleaseClaimFunc) {
+// TryClaimKeyInternal checks a raw key and returns a no-op release on success.
+func (c *Critbit[T]) TryClaimKeyInternal(key string) (exists bool, release ReleaseClaimFunc) {
 	c.reapMu.RLock()
 	defer c.reapMu.RUnlock()
 
@@ -649,22 +648,23 @@ func (c *Critbit[T]) TryClaimKey(key string) (exists bool, release ReleaseClaimF
 	return true, noop
 }
 
-func (c *Critbit[T]) GetHeadHint(prefix string) string      { return "" }
-func (c *Critbit[T]) SetHeadHint(prefix string, key string) {}
-func (c *Critbit[T]) GetTailHint(prefix string) string      { return "" }
-func (c *Critbit[T]) SetTailHint(prefix string, key string) {}
+func (c *Critbit[T]) GetHeadHintInternal(prefix string) string      { return "" }
+func (c *Critbit[T]) SetHeadHintInternal(prefix string, key string) {}
+func (c *Critbit[T]) GetTailHintInternal(prefix string) string      { return "" }
+func (c *Critbit[T]) SetTailHintInternal(prefix string, key string) {}
 
-// Snapshot returns a frozen copy of the index. The new Critbit is independent —
+// SnapshotInternal copies raw keys from every namespace. Concurrent mutations
+// have the same weak consistency as RangeInternal. The copy is independent —
 // mutations to either copy don't affect the other. TipSets are immutable so
 // only pointers are copied. Leaf payloads (T) are NOT copied: a snapshot is a
 // tip-only view used for SSI reads. O(n) in key count.
-func (c *Critbit[T]) Snapshot() KeyIndex {
+func (c *Critbit[T]) SnapshotInternal() KeyIndex {
 	snap := NewCritbit[T]()
 
-	c.Range(func(key string) bool {
-		tips := c.Contains(key)
+	c.RangeInternal(func(key string) bool {
+		tips := c.ContainsInternal(key)
 		if tips != nil {
-			snap.Insert(key, nil, tips)
+			snap.InsertInternal(key, nil, tips)
 		}
 
 		return true
@@ -691,6 +691,7 @@ func (c *Critbit[T]) Close() error {
 	c.root.Store(nil)
 	c.readRevision++
 	c.size.Store(0)
+	c.logicalSize.Store(0)
 
 	if c.releaseKey != nil {
 		for _, chunk := range c.leafArena.list.Load().chunks {
@@ -699,9 +700,7 @@ func (c *Critbit[T]) Close() error {
 			}
 
 			for i := range chunk.nodes {
-				if key := chunk.nodes[i].key; key != "" {
-					c.releaseKey(key)
-				}
+				c.releaseLeafKey(&chunk.nodes[i])
 			}
 		}
 	}

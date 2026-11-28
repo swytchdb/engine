@@ -92,6 +92,7 @@ func TestMemoryPacing(t *testing.T) {
 func TestMemoryPacingAfterPublication(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		e := NewEngine(EngineConfig{DefaultMode: UnsafeMode})
+		stopMemoryGovernorForTest(e)
 
 		t.Cleanup(func() {
 			if err := e.Close(); err != nil {
@@ -142,13 +143,14 @@ func TestMemoryPacingAfterPublication(t *testing.T) {
 
 func TestMemoryEvictionStopsWithoutGC(t *testing.T) {
 	e := NewEngine(EngineConfig{DefaultMode: UnsafeMode})
+	stopMemoryGovernorForTest(e)
 
 	t.Cleanup(func() {
 		if err := e.Close(); err != nil {
 			t.Error(err)
 		}
 	})
-	e.index.SetEvictHooks(func(string) bool { return true }, e.onLeafEvicted, func() bool { return e.evictBudget.Load() > 0 })
+	e.index.SetEvictHooksInternal(func(string) bool { return true }, e.onLeafEvicted, func() bool { return e.evictBudget.Load() > 0 })
 
 	value := strings.Repeat("v", 32<<10)
 
@@ -348,6 +350,7 @@ func TestMemoryRuntimeFootprintDoesNotBlockWrites(t *testing.T) {
 
 func TestMemoryConcurrentPublicationAndEviction(t *testing.T) {
 	e := NewEngine(EngineConfig{})
+	stopMemoryGovernorForTest(e)
 
 	t.Cleanup(func() {
 		if err := e.Close(); err != nil {
@@ -372,9 +375,9 @@ func TestMemoryConcurrentPublicationAndEviction(t *testing.T) {
 			wg.Go(func() { e.publishSubdag(ls, d, []Tip{id}) })
 		}
 
-		wg.Go(func() { e.releaseChainRefs(key, []Tip{id}, ls) })
+		wg.Go(func() { e.releaseChainRefs(logicalAddress(key), []Tip{id}, ls) })
 		wg.Wait()
-		e.releaseChainRefs(key, []Tip{id}, ls)
+		e.releaseChainRefs(logicalAddress(key), []Tip{id}, ls)
 		e.reclaimUnreferenced()
 
 		if e.cachedDagBytes.Load() != 0 || e.effectCache.vertexBytes.Load() != 0 {
@@ -392,19 +395,19 @@ func TestMemorySubscribersReleasedOnce(t *testing.T) {
 		}
 	})
 	e.index.Insert("key", nil, keytrie.NewTipSet())
-	e.addPeerSubscriber("key", 1)
+	e.addPeerSubscriber(logicalAddress("key"), 1)
 	charged := e.subscriberBytes.Load()
-	e.addPeerSubscriber("key", 1)
-	e.removePeerSubscriber("key", 1)
+	e.addPeerSubscriber(logicalAddress("key"), 1)
+	e.removePeerSubscriber(logicalAddress("key"), 1)
 
 	if charged == 0 || e.subscriberBytes.Load() != 0 {
 		t.Fatal("last unsubscribe must release subscriber capacity")
 	}
 
 	ls := e.index.LoadData("key")
-	e.releaseChainRefs("key", nil, ls)
-	e.releaseChainRefs("key", nil, ls)
-	e.addPeerSubscriber("key", 2)
+	e.releaseChainRefs(logicalAddress("key"), nil, ls)
+	e.releaseChainRefs(logicalAddress("key"), nil, ls)
+	e.addPeerSubscriber(logicalAddress("key"), 2)
 
 	if e.subscriberBytes.Load() != 0 {
 		t.Fatal("evicted subscribers remained or were resurrected")

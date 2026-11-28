@@ -24,7 +24,7 @@ func TestWalkKeyHistoryTransportErrorPrecedesMissing(t *testing.T) {
 					tips = []Tip{{7, 3}}
 				}
 
-				_, err := walkKeyHistory("k", tips, func(tip Tip) (*pb.Effect, error) {
+				_, err := walkKeyHistory(logicalAddress("k"), tips, func(tip Tip) (*pb.Effect, error) {
 					switch tip {
 					case (Tip{7, 1}):
 						return nil, fmt.Errorf("fetch %v: %w", tip, ErrCDNBlobMissing)

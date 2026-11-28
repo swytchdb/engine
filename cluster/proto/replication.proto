@@ -76,7 +76,7 @@ message DataEffect {
     sint64 int_val = 11;
     double float_val = 12;
     CompressedValue compressed = 13;
-    bytes child = 14;      // element references a child container partition (JSON); value lives in partition <child>
+    bytes child = 14;      // element references a nested container partition; value lives in partition <child>
   }
 }
 
@@ -94,6 +94,7 @@ enum ValueType {
   TYPE_JSON = 10;        // JSON key; root is a scalar leaf
   TYPE_JSON_OBJECT = 11; // a JSON object node (ORDERED partition, elements keyed by member name)
   TYPE_JSON_ARRAY = 12;  // a JSON array node (ORDERED partition, elements keyed by generated id)
+  TYPE_GRAPH = 13;       // graph descriptor: algorithm scalar, entry_point array
 }
 
 // MetaEffect marks a causal dependency without changing state.
@@ -124,6 +125,8 @@ message TransactionalBindEffect {
   google.protobuf.Timestamp txn_hlc = 2;                      // originator HLC for FWW
   uint64 originator_node_id = 3;           // originator node
   repeated EffectRef abort_deps = 4;       // competing tx effects being folded
+  // Frozen before publication. Absent on binds emitted by older peers.
+  SubscriberSet subscribers = 5;
 }
 
 // ReducedElement is a single element within a KEYED or ORDERED collection after reduction.
@@ -205,6 +208,13 @@ message SnapshotEffect {
   // Owned proof references for the recorded bind outcomes. These are not
   // value dependencies and do not participate in frontier or LCA selection.
   BindEvidence evidence = 5;
+
+  // Origins and bind-time subscribers still outstanding across the competition
+  // represented by the verdict evidence, including predecessor proof subjects.
+  // A present empty set closes competition. Absence means its extent is unknown
+  // (for example, a competing bind came from an older peer).
+  // Evidence remains populated so older peers can recompute the outcomes.
+  SubscriberSet outstanding_subscribers = 6;
 }
 
 // The evaluated binds are distinct from supporting ancestry. All references
@@ -356,6 +366,8 @@ message Effect {
   // Receivers install these before the owner and strip this field in the pool.
   repeated EvidenceRecord evidence_package = 8;
 
+  bytes i_key = 22; // complete trie address; absent = legacy logical key in key
+
   // The effect payload — exactly one of these is set.
   oneof kind {
     DataEffect data = 10;
@@ -459,4 +471,9 @@ service Replication {
 
   // Fetch retrieves effect bytes by offset from the origin node.
   rpc Fetch(FetchRequest) returns (FetchResponse);
+}
+
+// Message presence distinguishes an explicitly empty set from unknown state.
+message SubscriberSet {
+  repeated uint64 node_ids = 1;
 }

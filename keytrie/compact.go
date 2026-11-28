@@ -235,10 +235,7 @@ func (c *Critbit[T]) relocateLeaf(old *critNode[T]) bool {
 	n2, ci := c.leafArena.alloc() // born deleted=true via the arena init hook
 	n2.chunkIdx = ci
 
-	n2.key = old.key
-	if c.retainKey != nil {
-		n2.key = c.retainKey(n2.key)
-	}
+	c.retainLeafKey(n2, old.key)
 
 	n2.pinned = old.pinned
 	n2.pins.Store(old.pins.Load())

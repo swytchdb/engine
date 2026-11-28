@@ -88,7 +88,7 @@ func collectTxnEffects(txnID, key string, load func(Tip) (*pb.Effect, error), st
 			continue
 		}
 
-		if string(eff.GetKey()) == key {
+		if string(eff.GetIKey()) == key {
 			if o := eff.GetObservation(); o != nil {
 				obs = append(obs, o)
 			}

@@ -75,7 +75,7 @@ func TestSTNRealHistoryNumericalInference(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		tip := c.keys[key].lastOffset
+		tip := c.keys[logicalAddress(key)].lastOffset
 		if err := c.Flush(); err != nil {
 			t.Fatal(err)
 		}
@@ -83,7 +83,7 @@ func TestSTNRealHistoryNumericalInference(t *testing.T) {
 		return tip
 	}
 	// Establish one actual cross-node dependency on an unrelated witness key.
-	if err := a.ensureSubscribed("witness"); err != nil {
+	if err := a.ensureSubscribed(logicalAddress("witness")); err != nil {
 		t.Fatal(err)
 	}
 

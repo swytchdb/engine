@@ -27,6 +27,8 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/swytchdb/engine/keytrie"
+
 	pb "github.com/swytchdb/engine/cluster/proto"
 	"github.com/swytchdb/engine/effects"
 )
@@ -133,7 +135,7 @@ func (cs *CloudSync) enqueueUpload(tip effects.Tip, eff *pb.Effect, frontier, ex
 	cs.pending[tip] = pendingUpload{effect: eff, expand: expand}
 
 	if frontier {
-		k := string(eff.GetKey())
+		k := cloudEffectAddress(eff)
 
 		entry := cs.pendingKeys[k]
 		if entry == nil {
@@ -149,10 +151,9 @@ func (cs *CloudSync) enqueueUpload(tip effects.Tip, eff *pb.Effect, frontier, ex
 			// last-ack transitions can't interleave their index calls. PinKey
 			// reports false when the key has no live leaf (the eviction path's own
 			// unsubscribe mint) — nothing to keep findable, nothing to unpin later.
-			entry = &pendingKeyEntry{
-				tips:   make(map[effects.Tip]struct{}),
-				pinned: cs.engine.PinKey(k),
-			}
+			entry = &pendingKeyEntry{tips: make(map[effects.Tip]struct{})}
+			entry.pinned = cs.engine.PinKeyInternal(k)
+
 			cs.pendingKeys[k] = entry
 		}
 
@@ -319,7 +320,7 @@ func (cs *CloudSync) retire(tip effects.Tip) bool {
 	delete(cs.pending, tip)
 
 	if held {
-		k := string(upload.effect.GetKey())
+		k := cloudEffectAddress(upload.effect)
 		if entry := cs.pendingKeys[k]; entry != nil {
 			delete(entry.tips, tip)
 
@@ -328,7 +329,7 @@ func (cs *CloudSync) retire(tip effects.Tip) bool {
 				// Last un-acked upload on this key drained: the key is
 				// cloud-durable, eviction may take it again.
 				if entry.pinned {
-					cs.engine.UnpinKey(k)
+					cs.engine.UnpinKeyInternal(k)
 				}
 			}
 		}
@@ -371,4 +372,14 @@ func (cs *CloudSync) pendingTipsFor(key string) []effects.Tip {
 	}
 
 	return tips
+}
+
+// cloudEffectAddress adapts legacy hook inputs once at the cloud boundary.
+// The outbox itself uses the same opaque identity as the engine.
+func cloudEffectAddress(eff *pb.Effect) string {
+	if len(eff.GetIKey()) != 0 {
+		return string(eff.GetIKey())
+	}
+
+	return keytrie.LogicalAddress(string(eff.GetKey()))
 }

@@ -132,7 +132,7 @@ func TestDAGSnapshotDependencyFrontier(t *testing.T) {
 							tips = append(tips, tips...)
 						}
 
-						d := newDag(e, "k", "")
+						d := newDag(e, logicalAddress("k"), "")
 						if err := d.prepare(tips); err != nil {
 							t.Fatal(err)
 						}
@@ -141,7 +141,7 @@ func TestDAGSnapshotDependencyFrontier(t *testing.T) {
 							t.Errorf("selected snapshot %v, want %v", d.lcaTip, expectedLCA)
 						}
 
-						got, _, err := e.reconstruct("k", tips, "", false)
+						got, _, err := e.reconstruct(logicalAddress("k"), tips, "", false)
 						if err != nil {
 							t.Fatal(err)
 						}
@@ -178,7 +178,7 @@ func TestReconstructionPrunesOnlyCommittedAncestors(t *testing.T) {
 
 			e.index.Insert("k", nil, keytrie.NewTipSet(indexed...))
 
-			state, _, err := e.reconstruct("k", []Tip{root, child, root}, "pending", false)
+			state, _, err := e.reconstruct(logicalAddress("k"), []Tip{root, child, root}, "pending", false)
 			if err != nil {
 				t.Fatal(err)
 			}

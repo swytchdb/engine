@@ -65,6 +65,18 @@ type Broadcaster interface {
 	ForwardTransaction(ctx context.Context, targetNodeID pb.NodeID, tx *pb.ForwardedTransaction) (*pb.ForwardedResponse, error)
 }
 
+// TransactionBroadcaster delivers a bind and its tentative effects as one
+// ingestion operation. A successful response requires complete delivery.
+// Version negotiation must enable this optional path before individual effect
+// notifications can be omitted.
+type TransactionBroadcaster interface {
+	ReplicateTransaction(notify *pb.OffsetNotify, body []byte, records []*pb.OffsetNotify, target pb.NodeID) ([]*pb.NackNotify, error)
+}
+
+// TransactionReceiver streams transaction records into temporary pool pins.
+// It must return an error on truncation, cancellation, or an incomplete transfer.
+type TransactionReceiver func(func(*pb.FetchResponse) error) error
+
 // FetchHint orders the two effect-byte sources for FetchFromAny. The engine
 // derives it from knowledge it already holds: the per-peer key filters claim
 // the key → PreferPeers; otherwise the cluster provably lacks it →

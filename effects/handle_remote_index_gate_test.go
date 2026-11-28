@@ -32,10 +32,23 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-func TestMemoryPacingRemoteAdditionalBindKey(t *testing.T) {
+// Authority tests supply actual bind dependencies: an empty fetch response is
+// an ingestion failure, not successful closure of the authoritative key.
+func seedRemoteBindTips(t *testing.T, e *Engine, bind *pb.TransactionalBindEffect) {
+	t.Helper()
+
+	for _, kb := range bind.GetKeys() {
+		eff := scalarSet(string(kb.GetKey()), "value")
+		if err := e.effectCache.Put(r(kb.GetNewTip()), eff); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestMemoryPressureDoesNotDelayRemoteBindResponse(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		e := newTestEngineForEphemeral(t)
-		e.subscriptions.Store("local", &subscriptionState{ready: make(chan struct{})})
+		e.subscriptions.Store(logicalAddress("local"), &subscriptionState{ready: make(chan struct{})})
 		e.setMemoryPressure(true)
 
 		bind := &pb.Effect{
@@ -49,6 +62,8 @@ func TestMemoryPacingRemoteAdditionalBindKey(t *testing.T) {
 				},
 			}},
 		}
+
+		seedRemoteBindTips(t, e, bind.GetTxnBind())
 
 		data, err := proto.Marshal(bind)
 		if err != nil {
@@ -72,8 +87,11 @@ func TestMemoryPacingRemoteAdditionalBindKey(t *testing.T) {
 
 		select {
 		case err := <-result:
-			t.Fatalf("owned additional bind key did not trigger pacing: %v", err)
+			if err != nil {
+				t.Fatal(err)
+			}
 		default:
+			t.Fatal("memory pressure delayed the bind response")
 		}
 
 		if e.index.Contains("local") == nil || e.index.Contains("remote") != nil {
@@ -83,14 +101,7 @@ func TestMemoryPacingRemoteAdditionalBindKey(t *testing.T) {
 		select {
 		case <-callback:
 		default:
-			t.Fatal("pacing delayed the published bind's callback")
-		}
-
-		e.setMemoryPressure(false)
-		synctest.Wait()
-
-		if err := <-result; err != nil {
-			t.Fatal(err)
+			t.Fatal("bind response returned before the publication callback")
 		}
 	})
 }
@@ -110,7 +121,7 @@ func TestHandleRemote_Rule1_UnsubscribedCanonical_NoIndexUpdate(t *testing.T) {
 
 	// Subscribe only to "el-1". The bind's canonical key will be "el-0",
 	// which we never see locally — we only participate in el-1.
-	e.subscriptions.Store("el-1", &subscriptionState{ready: make(chan struct{})})
+	e.subscriptions.Store(logicalAddress("el-1"), &subscriptionState{ready: make(chan struct{})})
 
 	bindOff := Tip{2, 4000}
 	bind := &pb.TransactionalBindEffect{
@@ -129,6 +140,7 @@ func TestHandleRemote_Rule1_UnsubscribedCanonical_NoIndexUpdate(t *testing.T) {
 		TxnId:          "2:50:1",
 		Kind:           &pb.Effect_TxnBind{TxnBind: bind},
 	}
+	seedRemoteBindTips(t, e, bind)
 
 	data, err := proto.Marshal(eff)
 	if err != nil {
@@ -173,7 +185,7 @@ func TestHandleRemote_Rule1_UnsubscribedAdditional_NoIndexUpdate(t *testing.T) {
 
 	// Subscribe only to "el-0" (canonical). The additional key "el-1"
 	// is touched by the bind but not subscribed here.
-	e.subscriptions.Store("el-0", &subscriptionState{ready: make(chan struct{})})
+	e.subscriptions.Store(logicalAddress("el-0"), &subscriptionState{ready: make(chan struct{})})
 
 	bindOff := Tip{2, 4000}
 	bind := &pb.TransactionalBindEffect{
@@ -192,6 +204,7 @@ func TestHandleRemote_Rule1_UnsubscribedAdditional_NoIndexUpdate(t *testing.T) {
 		TxnId:          "2:60:1",
 		Kind:           &pb.Effect_TxnBind{TxnBind: bind},
 	}
+	seedRemoteBindTips(t, e, bind)
 
 	data, err := proto.Marshal(eff)
 	if err != nil {

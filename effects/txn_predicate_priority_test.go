@@ -57,9 +57,9 @@ func TestPredicateDisjointBindDoesNotRequirePriorityVerdict(t *testing.T) {
 							t.Fatal(err)
 						}
 
-						es[i].updateIndex(key, nil, base)
+						es[i].updateIndex(logicalAddress(key), nil, base)
 						preSubscribe(es[i], key)
-						es[i].addPeerSubscriber(key, pb.NodeID(2-i))
+						es[i].addPeerSubscriber(logicalAddress(key), pb.NodeID(2-i))
 					}
 
 					tx[i] = es[i].NewContext()
@@ -147,7 +147,7 @@ func TestPredicateDisjointBindDoesNotRequirePriorityVerdict(t *testing.T) {
 					ours.keys = append(ours.keys, pendingTxnKey{key: string(kb.GetKey()), newTip: r(kb.GetNewTip()), consumedTips: fromPbRefs(kb.GetConsumedTips())})
 				}
 
-				conflict, known := es[weak].hasPredicateConflict(ours.txnID, binds[strong].GetTxnId(), "k", collectOurBindTips(ours, "k"), []Tip{r(ns[strong].GetOrigin())})
+				conflict, known := es[weak].hasPredicateConflict(ours.txnID, binds[strong].GetTxnId(), logicalAddress("k"), collectOurBindTips(ours, logicalAddress("k")), []Tip{r(ns[strong].GetOrigin())})
 				if (mode == "disjoint" || mode == "other-key-overlap") && (conflict || !known) {
 					t.Fatalf("disjoint fixture failed: conflict=%t evidence=%t", conflict, known)
 				}

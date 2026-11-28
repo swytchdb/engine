@@ -84,9 +84,9 @@ func (e *Engine) addPeerSubscriber(key string, peer pb.NodeID) {
 		return
 	}
 
-	ls := e.index.LoadData(key)
+	ls := e.index.LoadDataInternal(key)
 	if ls == nil {
-		ls, _ = e.index.LoadOrStoreData(key, &leafState{})
+		ls, _ = e.index.LoadOrStoreDataInternal(key, &leafState{})
 	}
 
 	if ls == nil {
@@ -112,7 +112,7 @@ func (e *Engine) addPeerSubscriber(key string, peer pb.NodeID) {
 // removePeerSubscriber removes peer from the subscriber set for key.
 // Called from HandleRemote on a foreign unsubscribe SubscriptionEffect.
 func (e *Engine) removePeerSubscriber(key string, peer pb.NodeID) {
-	ls := e.index.LoadData(key)
+	ls := e.index.LoadDataInternal(key)
 	if ls == nil {
 		return
 	}
@@ -135,7 +135,7 @@ func (e *Engine) removePeerSubscriber(key string, peer pb.NodeID) {
 // snapshot: late notifications or old bootstrap snapshots must not accumulate
 // stale IDs in a long-lived leaf. Configured but unreachable peers remain.
 func (e *Engine) snapshotSubscribers(key string) map[uint64]bool {
-	ls := e.index.LoadData(key)
+	ls := e.index.LoadDataInternal(key)
 	if ls == nil {
 		return nil
 	}
@@ -170,7 +170,12 @@ func (e *Engine) snapshotSubscribers(key string) map[uint64]bool {
 // unfiltered by membership — flushTx's collectSubscribers applies the
 // current-membership filter at broadcast time.
 func (e *Engine) PeerSubscribers(key string) []pb.NodeID {
-	ls := e.index.LoadData(key)
+	return e.PeerSubscribersInternal(logicalAddress(key))
+}
+
+// PeerSubscribersInternal uses a complete trie address.
+func (e *Engine) PeerSubscribersInternal(key string) []pb.NodeID {
+	ls := e.index.LoadDataInternal(key)
 	if ls == nil {
 		return nil
 	}
@@ -193,7 +198,7 @@ func (c *Context) collectSubscribers() []pb.NodeID {
 	var result []pb.NodeID
 
 	for key := range c.keys {
-		ls := c.engine.index.LoadData(key)
+		ls := c.engine.index.LoadDataInternal(key)
 		if ls == nil {
 			continue
 		}
@@ -212,4 +217,85 @@ func (c *Context) collectSubscribers() []pb.NodeID {
 	}
 
 	return result
+}
+
+// competitionOutstanding covers the whole adjudicated competition, not just
+// the committing bind's fan-out. Unknown membership cannot certify closure.
+func (e *Engine) competitionOutstanding(proof *pb.BindEvidence, responded map[uint64]bool) *pb.SubscriberSet {
+	if len(proof.GetBinds()) == 0 {
+		return nil
+	}
+
+	required := make(map[uint64]bool)
+
+	for _, ref := range proof.GetBinds() {
+		eff, err := e.getEffect("", r(ref))
+
+		bind := eff.GetTxnBind()
+		if err != nil || bind.GetSubscribers() == nil {
+			return nil
+		}
+
+		required[bind.GetOriginatorNodeId()] = true
+		for _, id := range bind.GetSubscribers().GetNodeIds() {
+			required[id] = true
+		}
+	}
+
+	outstanding := &pb.SubscriberSet{}
+
+	for id := range required {
+		if !responded[id] {
+			outstanding.NodeIds = append(outstanding.NodeIds, id)
+		}
+	}
+
+	slices.Sort(outstanding.GetNodeIds())
+
+	return outstanding
+}
+
+// verdictOutstanding accounts for closure independently of retained evidence.
+// Predecessor snapshots already record their unanswered participants; carry
+// those forward even when the predecessor intentionally has no proof package.
+func (e *Engine) verdictOutstanding(bind Tip, defeated map[string]Tip, sources []Tip, responded map[uint64]bool) *pb.SubscriberSet {
+	refs := make([]*pb.EffectRef, 0, 1+len(defeated))
+
+	refs = append(refs, toPbRef(bind))
+	for _, tip := range defeated {
+		refs = append(refs, toPbRef(tip))
+	}
+
+	outstanding := e.competitionOutstanding(&pb.BindEvidence{Binds: refs}, responded)
+	if outstanding == nil {
+		return nil
+	}
+
+	for _, source := range sources {
+		eff, err := e.getEffect("", source)
+
+		prior := eff.GetSnapshot().GetOutstandingSubscribers()
+		if err != nil || prior == nil {
+			return nil
+		}
+
+		for _, id := range prior.GetNodeIds() {
+			if !responded[id] {
+				outstanding.NodeIds = append(outstanding.NodeIds, id)
+			}
+		}
+	}
+
+	slices.Sort(outstanding.GetNodeIds())
+	outstanding.NodeIds = slices.Compact(outstanding.GetNodeIds())
+
+	return outstanding
+}
+
+func (e *Engine) recordHistoryTargets(tip Tip, peers []pb.NodeID) {
+	if provider, ok := e.broadcaster.(historyProgressProvider); ok {
+		for _, peer := range peers {
+			provider.RecordHistorySent(peer, tip[1])
+		}
+	}
 }

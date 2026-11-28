@@ -56,7 +56,7 @@ func TestResidentReconstructionNestedSnapshots(t *testing.T) {
 
 					return nil, ErrEffectNotFound
 				}}
-				d := newDag(e, "k", "")
+				d := newDag(e, logicalAddress("k"), "")
 
 				err := d.prepare(tips)
 				if absent == "required" {
@@ -75,7 +75,7 @@ func TestResidentReconstructionNestedSnapshots(t *testing.T) {
 					t.Fatal("reconstruction retained folded ancestry")
 				}
 
-				state, _, err := e.reconstruct("k", tips, "", false)
+				state, _, err := e.reconstruct(logicalAddress("k"), tips, "", false)
 				if err != nil || state.GetScalar().GetIntVal() != 14 {
 					t.Fatalf("reconstruction=%v error=%v, want 14", state, err)
 				}

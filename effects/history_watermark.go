@@ -107,7 +107,7 @@ func (e *Engine) recordHistorySent(tip Tip, eff *pb.Effect) {
 		return
 	}
 
-	keys := [][]byte{eff.GetKey()}
+	keys := [][]byte{eff.GetIKey()}
 	for _, kb := range eff.GetTxnBind().GetKeys() {
 		keys = append(keys, kb.GetKey())
 	}
@@ -115,7 +115,7 @@ func (e *Engine) recordHistorySent(tip Tip, eff *pb.Effect) {
 	for _, key := range keys {
 		// Subscribers remain obligations during partitions. The provider drops
 		// departed membership entries, not temporarily unreachable peers.
-		for _, peer := range e.PeerSubscribers(string(key)) {
+		for _, peer := range e.PeerSubscribersInternal(string(key)) {
 			provider.RecordHistorySent(peer, tip[1])
 		}
 	}
@@ -158,7 +158,7 @@ func (e *Engine) historyBoundary(key string) *historyBoundary {
 	}
 
 	progress := e.historyProgress()
-	for _, peer := range e.PeerSubscribers(key) {
+	for _, peer := range e.PeerSubscribersInternal(key) {
 		if !slices.Contains(members, peer) {
 			continue
 		}

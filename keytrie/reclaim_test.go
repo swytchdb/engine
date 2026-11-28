@@ -48,7 +48,7 @@ func TestReclaimDetachedInternalDoesNotRetainLeafChunk(t *testing.T) {
 		c.Insert(key, nil, NewTipSet(tip(1)))
 	}
 
-	old := weak.Make(c.findBestMatch(c.root.Load(), "a"))
+	old := weak.Make(c.findBestMatch(c.root.Load(), LogicalKeyPrefix+"a"))
 	for _, key := range []string{"a", "b"} {
 		c.Delete(key, c.Contains(key))
 	}
@@ -90,9 +90,9 @@ func TestReclaimRelocationReleasesOldChunkAndPreservesEscapedValues(t *testing.T
 	value := 42
 	c.LoadOrStoreData("a", &value)
 	escapedTips, escapedData := c.Contains("a"), c.LoadData("a")
-	c.findBestMatch(c.root.Load(), "a").lastDecayEpoch.Store(7)
+	c.findBestMatch(c.root.Load(), LogicalKeyPrefix+"a").lastDecayEpoch.Store(7)
 
-	old := weak.Make(c.findBestMatch(c.root.Load(), "a"))
+	old := weak.Make(c.findBestMatch(c.root.Load(), LogicalKeyPrefix+"a"))
 	for _, key := range []string{"b", "c", "d"} {
 		c.Delete(key, c.Contains(key))
 	}
@@ -118,7 +118,7 @@ func TestReclaimRelocationReleasesOldChunkAndPreservesEscapedValues(t *testing.T
 		t.Fatal("relocated leaf did not preserve value identity")
 	}
 
-	if c.findBestMatch(c.root.Load(), "a").lastDecayEpoch.Load() != 7 {
+	if c.findBestMatch(c.root.Load(), LogicalKeyPrefix+"a").lastDecayEpoch.Load() != 7 {
 		t.Fatal("relocation lost the leaf's decay history")
 	}
 
@@ -349,7 +349,7 @@ func TestReclaimReleasesSharedKeysOnce(t *testing.T) {
 
 	// Retiring one leaf must release its key even while survivors keep the
 	// rest of the chunk resident. Replaying its stale queue entry is harmless.
-	old := c.findBestMatch(c.root.Load(), "b")
+	old := c.findBestMatch(c.root.Load(), LogicalKeyPrefix+"b")
 	c.Delete("b", c.Contains("b"))
 	drainAllReaps(c)
 

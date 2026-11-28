@@ -50,7 +50,7 @@ func TestSweepBudgetIncludesGhosts(t *testing.T) {
 
 		for i := range chunk.nodes {
 			n := &chunk.nodes[i]
-			if n.key != "" && n.key != liveKey {
+			if n.key != "" && n.key != LogicalKeyPrefix+liveKey {
 				n.deleted.Store(true)
 				n.freq.Store(-1)
 				c.clearLeaf(n, n.tips.Swap(nil))

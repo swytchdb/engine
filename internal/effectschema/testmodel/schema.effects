@@ -1,0 +1,43 @@
+// Composite fields and policies exercised independently of critbit.
+type Account {
+    name: string
+    balance: int64 additive
+    lastSeen: int64 max
+    weight: float64 additive
+    tags: set<string>
+    attributes: map<string, string>
+    messages: list<string>
+    profile: Profile
+    backup: Profile
+    payloads: list<bytes>
+    blobs: map<string, bytes>
+}
+
+type Profile {
+    displayName: string
+    contact: Contact
+}
+
+type Contact {
+    email: string
+}
+
+type Box<T> {
+    value: T
+    label: string
+}
+
+type Pair<T, U> {
+    first: T
+    second: U
+}
+
+type Catalog {
+    title: Box<string>
+    account: Box<Account>
+}
+
+type Link<T> {
+    value: T
+    next: Link<T>
+}

@@ -23,13 +23,13 @@ func TestSafetyConfigurationIsOwnedByEngine(t *testing.T) {
 	e := NewEngine(EngineConfig{KeyRangeRules: rules})
 	defer func() { _ = e.Close() }()
 
-	if got := e.modeForKey("unmatched"); got != SafeMode {
+	if got := e.modeForKey(logicalAddress("unmatched")); got != SafeMode {
 		t.Fatalf("zero-value default mode = %v, want SafeMode", got)
 	}
 
 	rules[0].Mode = UnsafeMode
 
-	if got := e.modeForKey("tenant:key"); got != SafeMode {
+	if got := e.modeForKey(logicalAddress("tenant:key")); got != SafeMode {
 		t.Fatalf("mutating EngineConfig rules changed running mode to %v", got)
 	}
 
@@ -37,13 +37,13 @@ func TestSafetyConfigurationIsOwnedByEngine(t *testing.T) {
 	e.UpdateSafetyRules(SafeMode, updated)
 	updated[0].Mode = UnsafeMode
 
-	if got := e.modeForKey("tenant:key"); got != SafeMode {
+	if got := e.modeForKey(logicalAddress("tenant:key")); got != SafeMode {
 		t.Fatalf("mutating updated rules changed running mode to %v", got)
 	}
 
 	e.UpdateSafetyRules(UnsafeMode, nil)
 
-	if got := e.modeForKey("tenant:key"); got != UnsafeMode {
+	if got := e.modeForKey(logicalAddress("tenant:key")); got != UnsafeMode {
 		t.Fatalf("explicit UnsafeMode update = %v, want UnsafeMode", got)
 	}
 }
@@ -54,7 +54,7 @@ func TestUpdateSafetyRulesPreservesSystemKeyException(t *testing.T) {
 
 	e.UpdateSafetyRules(SafeMode, []KeyRangeRule{{Pattern: "__swytch:*", Mode: SafeMode}})
 
-	if got := e.modeForKey("__swytch:members"); got != UnsafeMode {
+	if got := e.modeForKey(logicalAddress("__swytch:members")); got != UnsafeMode {
 		t.Fatalf("system key mode = %v, want UnsafeMode", got)
 	}
 }

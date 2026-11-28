@@ -43,10 +43,10 @@ func TestInstallBoundSubdags_ReusesLocalAncestry(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	e.updateIndex("other", e.index.Contains("other"), parents["other"])
+	e.updateIndex(logicalAddress("other"), e.index.Contains("other"), parents["other"])
 	frontier := e.index.Contains("other")
 
-	root := newDag(e, "winner", "")
+	root := newDag(e, logicalAddress("winner"), "")
 	if err := root.prepare([]Tip{parents["winner"]}); err != nil {
 		t.Fatal(err)
 	}
@@ -81,10 +81,10 @@ func TestInstallBoundSubdags_ValidatesNewBranches(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			e.updateIndex("other", e.index.Contains("other"), base)
+			e.updateIndex(logicalAddress("other"), e.index.Contains("other"), base)
 			frontier := e.index.Contains("other")
 
-			root := newDag(e, "winner", "")
+			root := newDag(e, logicalAddress("winner"), "")
 			if err := root.prepare([]Tip{branch}); err != nil {
 				t.Fatal(err)
 			}

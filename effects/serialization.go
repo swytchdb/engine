@@ -137,7 +137,7 @@ func (e *Engine) emitSerializationRelease(key string) {
 	ctx.BeginTx()
 
 	if err := ctx.Emit(&pb.Effect{
-		Key: []byte(key),
+		Key: []byte(wireKey(key)), IKey: []byte(key),
 		Kind: &pb.Effect_Serialization{Serialization: &pb.SerializationEffect{
 			LeaderNodeId: uint64(e.nodeID),
 			Release:      true,
@@ -159,6 +159,11 @@ func (e *Engine) emitSerializationRelease(key string) {
 // CheckSerializationLeader returns the serialization leader for a key,
 // or nil if no serialization is active.
 func (e *Engine) CheckSerializationLeader(key string) *pb.NodeID {
+	return e.CheckSerializationLeaderInternal(logicalAddress(key))
+}
+
+// CheckSerializationLeaderInternal uses a complete trie address.
+func (e *Engine) CheckSerializationLeaderInternal(key string) *pb.NodeID {
 	if e.serializationState == nil {
 		return nil
 	}
@@ -177,6 +182,11 @@ func (e *Engine) CheckSerializationLeader(key string) *pb.NodeID {
 // serialized key. Called when the leader processes a forwarded command
 // or performs a local write on a serialized key.
 func (e *Engine) RecordSerializationActivity(key string) {
+	e.RecordSerializationActivityInternal(logicalAddress(key))
+}
+
+// RecordSerializationActivityInternal uses a complete trie address.
+func (e *Engine) RecordSerializationActivityInternal(key string) {
 	if e.serializationState == nil {
 		return
 	}
@@ -229,7 +239,7 @@ func (e *Engine) selectSerializationLeader(key string) pb.NodeID {
 	}
 
 	// Collect contender node IDs from the key's tips
-	tips := e.index.Contains(key)
+	tips := e.index.ContainsInternal(key)
 	if tips == nil {
 		return e.nodeID
 	}

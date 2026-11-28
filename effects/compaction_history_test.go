@@ -51,7 +51,7 @@ func TestCompactionPreservesTransactionHistory(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			ck := compactor.keys["k"]
+			ck := compactor.keys[logicalAddress("k")]
 			if ck == nil {
 				t.Fatal("read did not emit a compaction snapshot")
 			}
@@ -66,9 +66,7 @@ func TestCompactionPreservesTransactionHistory(t *testing.T) {
 			}
 
 			// A second snapshot makes the first an eligible reclamation
-			// boundary. Simulate the pacing interval without sleeping.
-			leaf := e.index.LoadData("k")
-			leaf.lastCompaction.Add(-int64(compactionInterval))
+			// boundary once enough new effects have accumulated.
 
 			for range 6 {
 				historicalTestWrite(t, e, map[string]string{"k": "new"}, false)
@@ -78,7 +76,7 @@ func TestCompactionPreservesTransactionHistory(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if compactor.keys["k"] == nil {
+			if compactor.keys[logicalAddress("k")] == nil {
 				t.Fatal("read did not emit the second compaction snapshot")
 			}
 
@@ -172,9 +170,9 @@ func TestCompactionRequiresSubscriberEvidence(t *testing.T) {
 			}
 
 			e.index.Insert("k", nil, keytrie.NewTipSet(latest))
-			e.addPeerSubscriber("k", 2)
-			e.addPeerSubscriber("k", 3)
-			d := newDag(e, "k", "")
+			e.addPeerSubscriber(logicalAddress("k"), 2)
+			e.addPeerSubscriber(logicalAddress("k"), 3)
+			d := newDag(e, logicalAddress("k"), "")
 
 			d.compact = true
 			if err := d.prepare([]Tip{latest}); err != nil {
@@ -225,7 +223,7 @@ func TestCompactionRetainsTwoSnapshots(t *testing.T) {
 			t.Fatal("failed to install snapshot frontier")
 		}
 
-		d := newDag(e, "k", "")
+		d := newDag(e, logicalAddress("k"), "")
 
 		d.compact = true
 		if err := d.prepare([]Tip{current}); err != nil {
@@ -301,7 +299,7 @@ func TestHistoryProgressRetriesIncompleteIngestion(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	e.installIngestedTips("k", snapshot, missing)
+	e.installIngestedTips(logicalAddress("k"), snapshot, missing)
 
 	if len(b.processed) != 0 {
 		t.Fatal("incomplete ingestion advertised processed history")
@@ -311,7 +309,7 @@ func TestHistoryProgressRetriesIncompleteIngestion(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Retrying the same arrivals repairs ancestry and advances evidence.
-	e.installIngestedTips("k", snapshot, missing)
+	e.installIngestedTips(logicalAddress("k"), snapshot, missing)
 
 	if !slices.Contains(b.processed, missing) {
 		t.Fatal("a repaired duplicate arrival did not advance progress")
@@ -333,12 +331,6 @@ func TestCompactionAdvancesPastEndedOverlayWhileNewerTransactionLives(t *testing
 	compact := func(value string) Tip {
 		t.Helper()
 
-		// Exercise successive compaction passes without waiting in the test.
-		leaf := e.index.LoadData("k")
-		if leaf != nil && leaf.lastCompaction.Load() != 0 {
-			leaf.lastCompaction.Add(-int64(compactionInterval))
-		}
-
 		for range 6 {
 			historicalTestWrite(t, e, map[string]string{"k": value}, false)
 		}
@@ -350,11 +342,11 @@ func TestCompactionAdvancesPastEndedOverlayWhileNewerTransactionLives(t *testing
 			t.Fatal(err)
 		}
 
-		if c.keys["k"] == nil {
+		if c.keys[logicalAddress("k")] == nil {
 			t.Fatal("compaction did not emit a snapshot")
 		}
 
-		tip := c.keys["k"].lastOffset
+		tip := c.keys[logicalAddress("k")].lastOffset
 		if err := c.Flush(); err != nil {
 			t.Fatal(err)
 		}
@@ -492,8 +484,8 @@ func TestCompactionRetainsCommonSnapshotsDuringRejoin(t *testing.T) {
 
 				putCutEffects(t, e, nodes)
 				e.index.Insert("k", nil, keytrie.NewTipSet(latest))
-				e.addPeerSubscriber("k", 2)
-				d := newDag(e, "k", "")
+				e.addPeerSubscriber(logicalAddress("k"), 2)
+				d := newDag(e, logicalAddress("k"), "")
 
 				d.compact = true
 				if err := d.prepare([]Tip{latest}); err != nil {
@@ -535,7 +527,7 @@ func TestCompactionRetainsCommonSnapshotsDuringRejoin(t *testing.T) {
 				delayed := Tip{2, 10}
 				putCutEffects(t, e, map[Tip]*pb.Effect{delayed: cutEffect(delayed, rightSnapshot)})
 
-				state, _, err := e.reconstruct("k", []Tip{latest, delayed}, "", false)
+				state, _, err := e.reconstruct(logicalAddress("k"), []Tip{latest, delayed}, "", false)
 				if err != nil || state.GetScalar().GetIntVal() != 5 {
 					t.Fatalf("rejoining reconstruction=%v error=%v, want 5", state, err)
 				}

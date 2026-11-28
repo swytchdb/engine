@@ -38,13 +38,13 @@ func BenchmarkNackWinningBind(b *testing.B) {
 		b.Fatal(err)
 	}
 
-	ours := &pendingTxn{txnID: "ours", forkChoiceHash: []byte{1}, bindOffset: Tip{1, 1}, keys: []pendingTxnKey{{key: "key", newTip: Tip{1, 2}}}}
+	ours := &pendingTxn{txnID: "ours", forkChoiceHash: []byte{1}, bindOffset: Tip{1, 1}, keys: []pendingTxnKey{{key: logicalAddress("key"), newTip: Tip{1, 2}}}}
 	detail := nackTipDetail(tip, eff)
 
 	b.ReportAllocs()
 
 	for b.Loop() {
-		conflict, defeated := e.checkNackConflict(ours, "key", detail)
+		conflict, defeated := e.checkNackConflict(ours, logicalAddress("key"), detail)
 		if conflict || defeated["theirs"] != tip {
 			b.Fatalf("NACK decision: conflict=%t, defeated=%v", conflict, defeated)
 		}

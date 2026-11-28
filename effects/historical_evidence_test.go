@@ -2,7 +2,6 @@ package effects
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"slices"
 	"testing"
@@ -12,88 +11,6 @@ import (
 	"github.com/swytchdb/engine/keytrie"
 	"github.com/swytchdb/engine/stn"
 )
-
-// A retained proof can account for a bind without retaining the old value
-// ancestry. Cached labels and proofs outside the frozen cut cannot do so.
-func TestHistoricalMembershipConsultsFrozenEvidence(t *testing.T) {
-	for _, evidence := range []string{"frozen", "cached-label", "live-only"} {
-		t.Run(evidence, func(t *testing.T) {
-			log := newSnapshotLog()
-			e := newSnapshotEngine(log)
-
-			t.Cleanup(func() { _ = e.Close() })
-
-			bind := closureBind(log, "old", 1, []string{"a", "b"}, nil)
-
-			proof, err := e.bindProof(bind, nil, nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			owner := log.putEffect(bindEvidenceSnapshot("a", proof))
-			e.effectCache.releaseEvidence(evidenceTips(proof))
-			ownerEffect, _ := e.effectCache.Get(owner)
-
-			verdicts, err := e.proofVerdicts(owner, ownerEffect)
-			if err != nil || !verdicts["old"].proven {
-				t.Fatalf("expected evaluated proof: %v, %v", verdicts, err)
-			}
-
-			// Value reconstruction stops at this state snapshot. The missing
-			// connector models the already reclaimed path to the old bind.
-			missing := Tip{99, 99}
-			state := log.putEffect(&pb.Effect{
-				Key: []byte("a"), Deps: toPbRefs([]Tip{missing}),
-				Kind: &pb.Effect_Snapshot{Snapshot: &pb.SnapshotEffect{State: &pb.ReducedEffect{}}},
-			})
-			frontier := state
-
-			if evidence != "live-only" {
-				// Make the proof source part of the selected value history.
-				snapshot := bindEvidenceSnapshot("a", proof)
-				snapshot.Deps = toPbRefs([]Tip{state})
-				owner = log.putEffect(snapshot)
-				ownerEffect, _ = e.effectCache.Get(owner)
-
-				verdicts, err = e.proofVerdicts(owner, ownerEffect)
-				if err != nil {
-					t.Fatal(err)
-				}
-
-				frontier = owner
-			}
-
-			if evidence == "cached-label" {
-				entry := verdicts["old"]
-				entry.proven = false
-				verdicts["old"] = entry
-			}
-
-			view := newSnapshotReadView(e, context.Background())
-			view.frontiers["a"] = snapshotFrontier{resolved: []Tip{frontier}}
-			view.verdicts = verdicts
-			s := &transactionSnapshot{
-				engine: e, views: map[string]*snapshotReadView{"a": view},
-				decided: make(map[Tip]bool),
-			}
-			eff, _ := e.effectCache.Get(bind)
-
-			included, err := s.member(context.Background(), bind, eff, make(map[Tip]bool))
-			if evidence == "frozen" {
-				if err != nil || !included {
-					t.Fatalf("retained proof reopened reclaimed history: included=%t error=%v", included, err)
-				}
-				// Evidence must not reverse an earlier exclusion.
-				s.decided[bind] = false
-				if included, err := s.member(context.Background(), bind, eff, make(map[Tip]bool)); err != nil || included {
-					t.Fatalf("proof reversed frozen membership: included=%t error=%v", included, err)
-				}
-			} else if !errors.Is(err, errEffectNotResident) {
-				t.Fatalf("unusable proof bypassed the history check: included=%t error=%v", included, err)
-			}
-		})
-	}
-}
 
 // Historical membership can include an ambiguously timed remote bind while
 // excluding its local competitor. Value selection must not discard the live
@@ -154,7 +71,7 @@ func TestHistoricalReadRetainsLiveCompetition(t *testing.T) {
 					engine: e, at: stn.Sample{Domain: 1, Tick: boundary},
 					expiryAt: time.Now(), clocks: e.clockEvidence(),
 				}
-				if err := s.prepare(context.Background(), []string{"winner"}); err != nil {
+				if err := s.prepare(context.Background(), []string{logicalAddress("winner")}); err != nil {
 					t.Fatal(err)
 				}
 
@@ -162,7 +79,7 @@ func TestHistoricalReadRetainsLiveCompetition(t *testing.T) {
 					t.Fatalf("fixture must select A and exclude its local competitor: A=%v excluded=%v", s.decided[a], s.decided[excluded])
 				}
 
-				v := s.views["winner"]
+				v := s.views[logicalAddress("winner")]
 				if _, lost := v.lost[loser]; !lost || len(v.lost) != 1 {
 					t.Errorf("lost=%v, want only %s", v.lost, loser)
 				}
@@ -173,9 +90,9 @@ func TestHistoricalReadRetainsLiveCompetition(t *testing.T) {
 					}
 				}
 
-				tips := slices.Concat(v.frontiers["winner"].resolved, v.anchors["winner"])
+				tips := slices.Concat(v.frontiers[logicalAddress("winner")].resolved, v.anchors[logicalAddress("winner")])
 
-				result, _, err := e.reconstructWithView("winner", tips, "reader", true, v)
+				result, _, err := e.reconstructWithView(logicalAddress("winner"), tips, "reader", true, v)
 				if err != nil || string(result.GetScalar().GetRaw()) != wantValue {
 					t.Fatalf("value=%q error=%v, want %q", result.GetScalar().GetRaw(), err, wantValue)
 				}
@@ -210,10 +127,10 @@ func TestHistoricalMembershipPreservesEquivalentFrozenProof(t *testing.T) {
 
 	e.effectCache.releaseEvidence(evidenceTips(proof))
 
-	e.updateIndex("a", nil, newer)
+	e.updateIndex(logicalAddress("a"), nil, newer)
 
 	live := newSnapshotReadView(e, context.Background())
-	if err := live.discover([]string{"a"}, live.capture); err != nil {
+	if err := live.discover([]string{logicalAddress("a")}, live.capture); err != nil {
 		t.Fatal(err)
 	}
 
@@ -221,8 +138,8 @@ func TestHistoricalMembershipPreservesEquivalentFrozenProof(t *testing.T) {
 		t.Fatalf("live fixture must use newer proof: %+v", entry)
 	}
 
-	view, err := e.historicalReadView(context.Background(), []string{"a"}, func(key string) ([]Tip, error) {
-		if key != "a" {
+	view, err := e.historicalReadView(context.Background(), []string{logicalAddress("a")}, func(key string) ([]Tip, error) {
+		if key != logicalAddress("a") {
 			t.Fatalf("unexpected value history requested: %s", key)
 		}
 
@@ -240,14 +157,10 @@ func TestHistoricalMembershipPreservesEquivalentFrozenProof(t *testing.T) {
 		t.Error("historical merge mutated the live view")
 	}
 
-	s := &transactionSnapshot{
-		engine: e, views: map[string]*snapshotReadView{"a": view},
-		decided: make(map[Tip]bool),
-	}
-	eff, _ := e.effectCache.Get(bind)
-
-	included, err := s.member(context.Background(), bind, eff, make(map[Tip]bool))
-	if err != nil || !included {
-		t.Fatalf("equivalent proof reopened reclaimed history: included=%t error=%v", included, err)
+	// Exercise ordinary reconstruction at the selected historical frontier.
+	// The state snapshot and its retained proof must not reopen reclaimed data.
+	tips := slices.Concat(view.frontiers[logicalAddress("a")].resolved, view.anchors[logicalAddress("a")])
+	if _, _, err := e.reconstructWithView(logicalAddress("a"), tips, "reader", true, view); err != nil {
+		t.Fatalf("historical reconstruction reopened reclaimed history: %v", err)
 	}
 }

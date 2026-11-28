@@ -48,7 +48,7 @@ func testIsRealConflict(t *testing.T, ptxn *pendingTxn, detail *pb.NackTipDetail
 
 	e := &Engine{}
 
-	return e.isRealConflict(ptxn, "k", detail)
+	return e.isRealConflict(ptxn, logicalAddress("k"), detail)
 }
 
 func newTestPendingTxn(keys ...pendingTxnKey) *pendingTxn {
@@ -66,7 +66,7 @@ func newTestPendingTxn(keys ...pendingTxnKey) *pendingTxn {
 
 func TestIsRealConflict_MetaEffect_NotConflict(t *testing.T) {
 	ptxn := newTestPendingTxn(pendingTxnKey{
-		key:        "k",
+		key:        logicalAddress("k"),
 		newTip:     Tip{1, 500},
 		collection: pb.CollectionKind_SCALAR,
 	})
@@ -86,7 +86,7 @@ func TestIsRealConflict_MetaEffect_NotConflict(t *testing.T) {
 
 func TestIsRealConflict_NonTxSameElementID_NotConflict(t *testing.T) {
 	ptxn := newTestPendingTxn(pendingTxnKey{
-		key:        "k",
+		key:        logicalAddress("k"),
 		newTip:     Tip{1, 500},
 		collection: pb.CollectionKind_KEYED,
 		elementIDs: [][]byte{[]byte("field1")},
@@ -107,7 +107,7 @@ func TestIsRealConflict_NonTxSameElementID_NotConflict(t *testing.T) {
 
 func TestIsRealConflict_DifferentElementID_NotConflict(t *testing.T) {
 	ptxn := newTestPendingTxn(pendingTxnKey{
-		key:        "k",
+		key:        logicalAddress("k"),
 		newTip:     Tip{1, 500},
 		collection: pb.CollectionKind_KEYED,
 		elementIDs: [][]byte{[]byte("field1")},
@@ -128,7 +128,7 @@ func TestIsRealConflict_DifferentElementID_NotConflict(t *testing.T) {
 
 func TestIsRealConflict_NoopKey_NonTxWriteNotConflict(t *testing.T) {
 	ptxn := newTestPendingTxn(pendingTxnKey{
-		key:        "k",
+		key:        logicalAddress("k"),
 		newTip:     Tip{1, 500},
 		readOnly:   true,
 		collection: pb.CollectionKind_SCALAR,
@@ -148,7 +148,7 @@ func TestIsRealConflict_NoopKey_NonTxWriteNotConflict(t *testing.T) {
 
 func TestIsRealConflict_NonTxDependsOnUnboundEffect_NotConflict(t *testing.T) {
 	ptxn := newTestPendingTxn(pendingTxnKey{
-		key:        "k",
+		key:        logicalAddress("k"),
 		newTip:     Tip{1, 500},
 		collection: pb.CollectionKind_SCALAR,
 	})
@@ -173,7 +173,7 @@ func TestIsRealConflict_NonTxDependsOnUnboundEffect_NotConflict(t *testing.T) {
 // hash is lower than ours; otherwise we win and continue.
 func TestIsRealConflict_CompetingBind_TheirHashLower_WeAbort(t *testing.T) {
 	ptxn := newTestPendingTxn(pendingTxnKey{
-		key:          "k",
+		key:          logicalAddress("k"),
 		newTip:       Tip{1, 500},
 		consumedTips: []Tip{{1, 300}},
 		collection:   pb.CollectionKind_SCALAR,
@@ -205,7 +205,7 @@ func TestIsRealConflict_CompetingBind_TheirHashLower_WeAbort(t *testing.T) {
 
 func TestIsRealConflict_CompetingBind_OurHashLower_WeWin(t *testing.T) {
 	ptxn := newTestPendingTxn(pendingTxnKey{
-		key:          "k",
+		key:          logicalAddress("k"),
 		newTip:       Tip{1, 500},
 		consumedTips: []Tip{{1, 300}},
 		collection:   pb.CollectionKind_SCALAR,
@@ -237,7 +237,7 @@ func TestIsRealConflict_CompetingBind_OurHashLower_WeWin(t *testing.T) {
 
 func TestIsRealConflict_NonTxCompetitor_NotConflict(t *testing.T) {
 	ptxn := newTestPendingTxn(pendingTxnKey{
-		key:        "k",
+		key:        logicalAddress("k"),
 		newTip:     Tip{1, 500},
 		collection: pb.CollectionKind_SCALAR,
 	})
@@ -258,7 +258,7 @@ func TestIsRealConflict_NonTxCompetitor_NotConflict(t *testing.T) {
 
 func TestIsRealConflict_InProgressTx_NotConflict(t *testing.T) {
 	ptxn := newTestPendingTxn(pendingTxnKey{
-		key:        "k",
+		key:        logicalAddress("k"),
 		newTip:     Tip{1, 500},
 		collection: pb.CollectionKind_SCALAR,
 	})
@@ -332,7 +332,7 @@ func TestAbortThenCommit(t *testing.T) {
 
 func TestIsRealConflict_SubscriptionEffect_NotConflict(t *testing.T) {
 	ptxn := newTestPendingTxn(pendingTxnKey{
-		key:        "k",
+		key:        logicalAddress("k"),
 		newTip:     Tip{1, 500},
 		collection: pb.CollectionKind_SCALAR,
 	})
@@ -352,7 +352,7 @@ func TestIsRealConflict_SubscriptionEffect_NotConflict(t *testing.T) {
 
 func TestIsRealConflict_DependsOnBindOffset_NotConflict(t *testing.T) {
 	ptxn := newTestPendingTxn(pendingTxnKey{
-		key:        "k",
+		key:        logicalAddress("k"),
 		newTip:     Tip{1, 500},
 		collection: pb.CollectionKind_SCALAR,
 	})
@@ -425,7 +425,7 @@ func TestDefeatedCompetitor_TheirBindReachableViaDeps_NotDefeated(t *testing.T) 
 		forkChoiceHash: make([]byte, 32), // all-zeros: lower than 0xff..
 		bindOffset:     ourBindOffset,
 		keys: []pendingTxnKey{
-			{key: "k", newTip: Tip{42, 199}},
+			{key: logicalAddress("k"), newTip: Tip{42, 199}},
 		},
 		done: make(chan struct{}),
 	}
@@ -442,7 +442,7 @@ func TestDefeatedCompetitor_TheirBindReachableViaDeps_NotDefeated(t *testing.T) 
 		},
 	}
 
-	if _, defeated := e.classifyNackTip(ptxn, "k", detail); defeated != "" {
+	if _, defeated := e.classifyNackTip(ptxn, logicalAddress("k"), detail); defeated != "" {
 		t.Fatalf("bind reachable from our tx via deps must not be marked defeated; got %q", defeated)
 	}
 }
@@ -479,7 +479,7 @@ func TestDefeatedCompetitor_DetailDepsReferenceOurNewTip_StillCompetes(t *testin
 		forkChoiceHash: make([]byte, 32),
 		bindOffset:     Tip{42, 9999},
 		keys: []pendingTxnKey{
-			{key: "k", newTip: Tip{42, 500}},
+			{key: logicalAddress("k"), newTip: Tip{42, 500}},
 		},
 		done: make(chan struct{}),
 	}
@@ -497,7 +497,7 @@ func TestDefeatedCompetitor_DetailDepsReferenceOurNewTip_StillCompetes(t *testin
 		},
 	}
 
-	if _, defeated := e.classifyNackTip(ptxn, "k", detail); defeated != theirTxnID {
+	if _, defeated := e.classifyNackTip(ptxn, logicalAddress("k"), detail); defeated != theirTxnID {
 		t.Fatalf("observing our pre-bind tip must not exempt the competing bind; defeated=%q", defeated)
 	}
 }
@@ -542,7 +542,7 @@ func TestDefeatedCompetitor_ConcurrentHigherHash_Defeated(t *testing.T) {
 		forkChoiceHash: make([]byte, 32),
 		bindOffset:     ourBindOffset,
 		keys: []pendingTxnKey{
-			{key: "k", newTip: Tip{42, 199}},
+			{key: logicalAddress("k"), newTip: Tip{42, 199}},
 		},
 		done: make(chan struct{}),
 	}
@@ -559,7 +559,7 @@ func TestDefeatedCompetitor_ConcurrentHigherHash_Defeated(t *testing.T) {
 		},
 	}
 
-	if _, defeated := e.classifyNackTip(ptxn, "k", detail); defeated != theirTxnID {
+	if _, defeated := e.classifyNackTip(ptxn, logicalAddress("k"), detail); defeated != theirTxnID {
 		t.Fatalf("concurrent foreign bind with higher hash should be marked defeated; got %q want %q", defeated, theirTxnID)
 	}
 }

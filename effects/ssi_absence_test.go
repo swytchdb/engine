@@ -55,7 +55,7 @@ func TestSSIAbsentReadRecordsDependency(t *testing.T) {
 				t.Fatalf("snapshot must preserve absence: result=%v tips=%v err=%v", result, tips, err)
 			}
 
-			ck := tx.keys["x"]
+			ck := tx.keys[logicalAddress("x")]
 			if ck == nil || !ck.readOnly {
 				t.Fatalf("absent read must record a read-only dependency, got %+v", ck)
 			}
@@ -133,7 +133,7 @@ func TestSSIAbsentReadIncludedInBind(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !slices.Equal(boundKeys, []string{"absent", "written"}) {
+	if !slices.Equal(boundKeys, []string{logicalAddress("absent"), logicalAddress("written")}) {
 		t.Fatalf("bind dropped the read-only key: %v", boundKeys)
 	}
 

@@ -57,16 +57,12 @@ func (a *critbitArena[T]) addExtra(chunk uint32, delta int64) {
 func (c *Critbit[T]) clearLeaf(leaf *critNode[T], tips *TipSet) *T {
 	data := leaf.data.Swap(nil)
 	c.leafArena.addExtra(leaf.chunkIdx, -tipSetBytes(tips)-payloadBytes(data))
-	c.size.Add(-1)
+	c.addSize(leaf.key, -1)
 
 	return data
 }
 
 func (c *Critbit[T]) keyBytes(key string) int64 {
-	if c.retainKey != nil {
-		return 0 // shared owner charges the allocation once
-	}
-
 	return memsize.Alloc(int64(len(key)))
 }
 
@@ -76,15 +72,12 @@ func (c *Critbit[T]) keyBytes(key string) int64 {
 // Clear before recording the slot: the final record may drop/recycle its array.
 func (c *Critbit[T]) retireLeaf(leaf *critNode[T]) {
 	key, tips, data := leaf.key, leaf.tips.Load(), leaf.data.Load()
+	c.releaseLeafKey(leaf)
 	leaf.key = ""
 	leaf.tips.Store(nil)
 	leaf.data.Store(nil)
 	leaf.deleted.Store(true)
 	c.leafArena.addExtra(leaf.chunkIdx, -c.keyBytes(key)-tipSetBytes(tips)-payloadBytes(data))
-
-	if c.releaseKey != nil && key != "" {
-		c.releaseKey(key)
-	}
 
 	c.leafArena.recordReaped(leaf.chunkIdx)
 }

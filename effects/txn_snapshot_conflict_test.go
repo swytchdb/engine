@@ -142,10 +142,10 @@ func testSnapshotConflict(t *testing.T, relation string, ourWins bool, depth int
 
 	ptxn := &pendingTxn{
 		txnID: "ours", bindOffset: ours, forkChoiceHash: ComputeForkChoiceHash(ourNode, ourHLC),
-		keys: []pendingTxnKey{{key: "k", newTip: ourData, collection: pb.CollectionKind_SCALAR}},
+		keys: []pendingTxnKey{{key: logicalAddress("k"), newTip: ourData, collection: pb.CollectionKind_SCALAR}},
 		done: make(chan struct{}),
 	}
-	nack := e.buildEnrichedNack("k", toPbRef(ours), []Tip{peer})
+	nack := e.buildEnrichedNack(logicalAddress("k"), toPbRef(ours), []Tip{peer})
 
 	if len(nack.GetTipDetails()) != 1 {
 		t.Fatal("fixture did not advertise its frontier")
@@ -154,7 +154,7 @@ func testSnapshotConflict(t *testing.T, relation string, ourWins bool, depth int
 	want := !ourWins && relation != "ancestor" && relation != "descendant"
 	// Replay's fork choice over the underlying binds is the reference answer;
 	// advertising those same binds through wrappers must preserve the decision.
-	losers, _ := e.losersOnKeyAt("k", []Tip{ours, rival}, nil, nil, nil, false)
+	losers, _ := e.losersOnKeyAt(logicalAddress("k"), []Tip{ours, rival}, nil, nil, nil, false)
 	_, replayLoses := losers["ours"]
 
 	if replayLoses != want {
@@ -165,11 +165,11 @@ func testSnapshotConflict(t *testing.T, relation string, ourWins bool, depth int
 		want = true // incomplete evidence cannot authorize a commit
 	}
 
-	if got := e.isRealConflict(ptxn, "k", nack.GetTipDetails()[0]); got != want {
+	if got := e.isRealConflict(ptxn, logicalAddress("k"), nack.GetTipDetails()[0]); got != want {
 		t.Errorf("conflict = %t, want %t", got, want)
 	}
 
-	conflict, defeated := e.checkNackConflict(ptxn, "k", nack.GetTipDetails()[0])
+	conflict, defeated := e.checkNackConflict(ptxn, logicalAddress("k"), nack.GetTipDetails()[0])
 	if conflict != want {
 		t.Errorf("commit-path conflict = %t, want %t", conflict, want)
 	}
@@ -198,9 +198,9 @@ func TestIsRealConflictCommonSnapshotBoundary(t *testing.T) {
 	bc := &frontierBroadcaster{fetched: make(map[Tip]bool)}
 	e.broadcaster = bc
 	ptxn := &pendingTxn{bindOffset: ours}
-	nack := e.buildEnrichedNack("k", toPbRef(ours), []Tip{common})
+	nack := e.buildEnrichedNack(logicalAddress("k"), toPbRef(ours), []Tip{common})
 
-	if e.isRealConflict(ptxn, "k", nack.GetTipDetails()[0]) {
+	if e.isRealConflict(ptxn, logicalAddress("k"), nack.GetTipDetails()[0]) {
 		t.Fatal("common ancestry is not a conflict")
 	}
 
@@ -246,16 +246,16 @@ func TestNackConflictFetchesWrappedCompetitors(t *testing.T) {
 			}
 			tip := log.putEffect(snap)
 			bc.fetchable[tip] = wireEffect(snap)
-			nack := peer.buildEnrichedNack("k", nil, []Tip{tip})
+			nack := peer.buildEnrichedNack(logicalAddress("k"), nil, []Tip{tip})
 			nack.CausalChain = nil // synchronous correctness cannot rely on prefetch timing
 			local := newTxnTestEngine(bc)
 			preSubscribe(local, "k")
-			local.ingestNackTips(nack)
+			_ = local.ingestNackTips(nack)
 
 			// A single state snapshot is enough for ingestion/replay, but conflict
 			// classification must compare its underlying binds with our branch.
 			ptxn := &pendingTxn{forkChoiceHash: []byte{0}, bindOffset: Tip{42, 1}}
-			conflict, defeated := local.checkNackConflict(ptxn, "k", nack.GetTipDetails()[0])
+			conflict, defeated := local.checkNackConflict(ptxn, logicalAddress("k"), nack.GetTipDetails()[0])
 
 			if conflict || len(defeated) != len(binds) {
 				t.Fatalf("conflict=%t defeated=%v, want both underlying binds", conflict, defeated)
@@ -310,11 +310,11 @@ func TestIsRealConflictWrappedData(t *testing.T) {
 				Key: []byte("k"), NodeId: 1, Hlc: sTs(1), TxnId: tc.txn,
 				Kind: &pb.Effect_Data{Data: &pb.DataEffect{Collection: pb.CollectionKind_KEYED, Id: []byte(tc.element)}},
 			})
-			ptxn := newTestPendingTxn(pendingTxnKey{key: "k", collection: pb.CollectionKind_KEYED, elementIDs: [][]byte{[]byte("a")}})
+			ptxn := newTestPendingTxn(pendingTxnKey{key: logicalAddress("k"), collection: pb.CollectionKind_KEYED, elementIDs: [][]byte{[]byte("a")}})
 
 			for depth := range 3 {
-				nack := e.buildEnrichedNack("k", nil, []Tip{tip})
-				if got := e.isRealConflict(ptxn, "k", nack.GetTipDetails()[0]); got != tc.want {
+				nack := e.buildEnrichedNack(logicalAddress("k"), nil, []Tip{tip})
+				if got := e.isRealConflict(ptxn, logicalAddress("k"), nack.GetTipDetails()[0]); got != tc.want {
 					t.Errorf("depth %d: conflict=%t, want %t", depth, got, tc.want)
 				}
 
@@ -366,11 +366,11 @@ func TestNackConflictOtherKeyAncestry(t *testing.T) {
 
 			ptxn := &pendingTxn{
 				txnID: "ours", bindOffset: ours, forkChoiceHash: []byte{0xff},
-				keys: []pendingTxnKey{{key: key, newTip: data}, {key: "other", newTip: other}},
+				keys: []pendingTxnKey{{key: logicalAddress(key), newTip: data}, {key: logicalAddress("other"), newTip: other}},
 			}
-			nack := e.buildEnrichedNack(key, nil, []Tip{rival})
+			nack := e.buildEnrichedNack(logicalAddress(key), nil, []Tip{rival})
 
-			if !e.isRealConflict(ptxn, key, nack.GetTipDetails()[0]) {
+			if !e.isRealConflict(ptxn, logicalAddress(key), nack.GetTipDetails()[0]) {
 				t.Fatal("ordering through another key cannot excuse a concurrent fork on k")
 			}
 

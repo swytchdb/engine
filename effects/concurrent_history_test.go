@@ -80,7 +80,7 @@ func TestLosersOnKey_ConcurrentHistory(t *testing.T) {
 
 			e, tips := concurrentHistory(100, writers, rounds, merge)
 			before := e.effectCache.hits.Load()
-			losers, _ := e.losersOnKeyAt("winner", tips, nil, nil, nil, false)
+			losers, _ := e.losersOnKeyAt(logicalAddress("winner"), tips, nil, nil, nil, false)
 			// Bound history reads structurally, rather than using a timing
 			// assertion. Rebuilding per-candidate ancestry exceeds this bound.
 			if reads := e.effectCache.hits.Load() - before; reads > 10*(100+writers*rounds) {
@@ -122,7 +122,7 @@ func BenchmarkLosersOnKeyConcurrentHistory(b *testing.B) {
 			b.ReportAllocs()
 
 			for b.Loop() {
-				losers, _ := e.losersOnKeyAt("winner", tips, nil, nil, nil, false)
+				losers, _ := e.losersOnKeyAt(logicalAddress("winner"), tips, nil, nil, nil, false)
 				if len(losers) == 0 {
 					b.Fatal("concurrent transactions were not adjudicated")
 				}
@@ -273,7 +273,7 @@ func TestLosersOnKey_ConcurrentPredicatesMatchOracle(t *testing.T) {
 				}
 
 				for range 2 {
-					got, _ := e.losersOnKeyAt("winner", tips, nil, verdicts, func(txn string) bool { return invisible[txn] }, false)
+					got, _ := e.losersOnKeyAt(logicalAddress("winner"), tips, nil, verdicts, func(txn string) bool { return invisible[txn] }, false)
 					if !maps.Equal(got, want) {
 						t.Fatalf("got %v, want %v", got, want)
 					}
@@ -291,6 +291,6 @@ func BenchmarkLosersOnKeyConcurrentPredicates(b *testing.B) {
 	b.ReportAllocs()
 
 	for b.Loop() {
-		e.losersOnKeyAt("winner", tips, nil, nil, nil, false)
+		e.losersOnKeyAt(logicalAddress("winner"), tips, nil, nil, nil, false)
 	}
 }

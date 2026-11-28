@@ -1,0 +1,5 @@
+// The public descriptor supplies graph initialization, its key, and observed tips.
+type DescriptorFields {
+    algorithm: string
+    entry_point: map<string, string>
+}

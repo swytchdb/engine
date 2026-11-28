@@ -34,10 +34,10 @@ import (
 	"github.com/swytchdb/engine/stn"
 )
 
-// transactionSnapshot is a local temporal boundary plus an incrementally
-// constructed causal cut. BeginTx does not visit the index. Only accessed key
-// closures acquire frontiers. Numerical Unknown is an inclusion choice, not
-// an inferred time inequality; later evidence cannot reverse that choice.
+// transactionSnapshot captures a temporal boundary and selects historical tips
+// lazily for accessed keys. Reconstruction owns value ancestry, shared binds,
+// and snapshot stopping. Numerical Unknown is an inclusion choice, not an
+// inferred time inequality; later evidence cannot reverse that choice.
 // Nothing in this type decides whether a transaction is admissible to commit.
 type transactionSnapshot struct {
 	engine    *Engine
@@ -73,61 +73,10 @@ func (s *transactionSnapshot) tips(ctx context.Context, key string) (*keytrie.Ti
 	return keytrie.NewTipSet(tips...), nil
 }
 
-// contains first consults evaluated evidence carried by the frozen history.
-// Only when it does not account for the bind do we search older value ancestry.
-// An unavailable required ancestor is an error, not nil.
-func (s *transactionSnapshot) contains(ctx context.Context, key string, target Tip) (bool, error) {
-	v := s.views[key]
-	if v == nil {
-		return false, nil
-	}
-
-	frontier := slices.Concat(v.frontiers[key].resolved, v.anchors[key])
-	seen := make(map[Tip]bool)
-
-	var proof verdictEntry
-	if eff, ok := s.engine.effectCache.Get(target); ok && eff.GetTxnBind() != nil {
-		proof = v.verdicts[eff.GetTxnId()]
-	}
-
-	for len(frontier) != 0 {
-		if err := ctx.Err(); err != nil {
-			return false, err
-		}
-
-		d := newDag(s.engine, key, "")
-		if err := d.prepare(frontier); err != nil {
-			return false, err
-		}
-
-		if _, ok := d.nodes[target]; ok {
-			return true, nil
-		}
-		// This history already accounts for the bind through retained proof;
-		// its old value-ancestry path need not still exist. A cached label is
-		// insufficient. Nor may live-only evidence extend a frozen view: its
-		// source snapshot must actually belong to the selected history.
-		if proof.proven && d.nodes[proof.snapshotTip] != nil {
-			return true, nil
-		}
-
-		frontier = nil
-
-		for tip, eff := range d.nodes {
-			if eff.GetSnapshot() == nil || seen[tip] {
-				continue
-			}
-
-			seen[tip] = true
-
-			frontier = appendRefs(frontier, eff.GetDeps())
-		}
-	}
-
-	return false, nil
-}
-
-func (s *transactionSnapshot) member(ctx context.Context, tip Tip, eff *pb.Effect, visiting map[Tip]bool) (bool, error) {
+// member selects a frontier effect at the transaction's temporal boundary.
+// Historical selection walks backwards only when a candidate is excluded;
+// value ancestry and state-snapshot boundaries belong to reconstruction.
+func (s *transactionSnapshot) member(ctx context.Context, tip Tip, eff *pb.Effect) (bool, error) {
 	if chosen, ok := s.decided[tip]; ok {
 		return chosen, nil
 	}
@@ -136,52 +85,11 @@ func (s *transactionSnapshot) member(ctx context.Context, tip Tip, eff *pb.Effec
 		return false, err
 	}
 
-	if visiting[tip] {
-		return false, fmt.Errorf("mvcc: cyclic effect history at %v", tip)
-	}
-
-	visiting[tip] = true
-	defer delete(visiting, tip)
-
 	choose := func(include bool, why string) bool {
 		s.decided[tip] = include
 		temporalDebug(ctx, s.at, tip, why)
 
 		return include
-	}
-
-	// A newly discovered branch cannot extend a key whose history was
-	// already exposed. Membership is shared for the entire bind; this is
-	// history selection, not a new rule for adjudicating competing binds.
-	keys := []string{string(eff.GetKey())}
-	if bind := eff.GetTxnBind(); bind != nil {
-		keys = nil
-		for _, kb := range bind.GetKeys() {
-			keys = append(keys, string(kb.GetKey()))
-		}
-	}
-
-	knownPast := false
-
-	for _, key := range keys {
-		if s.views[key] == nil {
-			continue
-		}
-
-		included, err := s.contains(ctx, key, tip)
-		if err != nil {
-			return false, err
-		}
-
-		if !included {
-			return choose(false, "outside frozen key frontier"), nil
-		}
-
-		knownPast = true
-	}
-
-	if knownPast {
-		return choose(true, "accounted for by frozen history"), nil
 	}
 
 	lower, upper, err := s.clocks.Difference(s.at, effectSample(eff))
@@ -191,29 +99,6 @@ func (s *transactionSnapshot) member(ctx context.Context, tip Tip, eff *pb.Effec
 
 	if lower > 0 {
 		return choose(false, "numerically after boundary"), nil
-	}
-	// A proven-before state snapshot summarizes an entire causal prefix.
-	// Before any keys have been frozen there are no prior cut choices that
-	// could reject part of that prefix. Do not demand discarded ancestry
-	// merely to re-prove what an existing state snapshot already records.
-	if eff.GetSnapshot().GetState() != nil && upper <= 0 && len(s.views) == 0 {
-		return choose(true, "before-boundary state snapshot"), nil
-	}
-
-	for ref := range allDeps(eff) {
-		parent, err := s.engine.getEffect(string(eff.GetKey()), r(ref))
-		if err != nil {
-			return false, err
-		}
-
-		include, err := s.member(ctx, r(ref), parent, visiting)
-		if err != nil {
-			return false, err
-		}
-
-		if !include {
-			return choose(false, "descendant of excluded history"), nil
-		}
 	}
 
 	if upper <= 0 {
@@ -248,7 +133,7 @@ func (s *transactionSnapshot) prepare(ctx context.Context, requested []string) e
 	// Ordinary reads reconstruct only the selected historical view below.
 	for _, key := range keys {
 		if s.engine.cloudReader != nil {
-			if _, _, _, err := s.engine.GetSnapshot(key); err != nil {
+			if _, _, _, err := s.engine.GetSnapshotInternal(key); err != nil {
 				return err
 			}
 		} else if !s.engine.freeMissEligible(key) {
@@ -288,10 +173,6 @@ func (s *transactionSnapshot) prepare(ctx context.Context, requested []string) e
 	// over subsequent numerical tightening.
 	s.clocks = s.engine.clockEvidence()
 
-	// member removes each active visit on return; reuse the cycle detector
-	// across frontier candidates instead of allocating one map per candidate.
-	visiting := make(map[Tip]bool)
-
 	view, err := s.engine.historicalReadView(ctx, keys, func(key string) ([]Tip, error) {
 		if old := s.views[key]; old != nil {
 			return old.frontiers[key].resolved, nil
@@ -308,7 +189,7 @@ func (s *transactionSnapshot) prepare(ctx context.Context, requested []string) e
 		tips := live.frontiers[key].index.Tips()
 
 		return s.engine.historicalFrontier(ctx, key, tips, func(t Tip, eff *pb.Effect) (bool, error) {
-			return s.member(ctx, t, eff, visiting)
+			return s.member(ctx, t, eff)
 		})
 	}, live)
 	if err != nil {

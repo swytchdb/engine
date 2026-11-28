@@ -101,7 +101,7 @@ func TestReadMissRehydratesFromCloud(t *testing.T) {
 
 	// No peer announces the key and we hold nothing: without the Cloud backstop
 	// this would free-miss.
-	if e.clusterMaybeHasKey(key) {
+	if e.clusterMaybeHasKey(logicalAddress(key)) {
 		t.Fatal("precondition: no peer should announce the evicted key")
 	}
 
@@ -373,7 +373,7 @@ func TestReadMissNoCloudFreeMisses(t *testing.T) {
 		t.Fatal("expected a free-miss with no Cloud configured")
 	}
 
-	if _, ok := e.subscriptions.Load("never-written"); ok {
+	if _, ok := e.subscriptions.Load(logicalAddress("never-written")); ok {
 		t.Fatal("a free miss must not record a subscription")
 	}
 

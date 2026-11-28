@@ -23,7 +23,9 @@
 
 package keytrie
 
-// KeyIndex is the common interface for key indexing implementations.
+// KeyIndex indexes logical application keys. Implementations add and remove the
+// logical namespace transparently; all key arguments and results are unprefixed.
+// The interface remains independent of the raw Internal methods on Critbit.
 type KeyIndex interface {
 	// Insert attempts to store a TipSet for the given key using CAS.
 	// old is the expected current TipSet (nil for new keys).
@@ -50,7 +52,7 @@ type KeyIndex interface {
 	// doesn't exist or the refs aren't present.
 	RemoveTips(key string, refs []EffectRef)
 
-	// Size returns the number of keys.
+	// Size returns the number of logical keys.
 	Size() int64
 
 	// Range iterates over all keys in lexicographic order.
@@ -96,7 +98,8 @@ type KeyIndex interface {
 	// SetTailHint sets the tail key hint for a prefix.
 	SetTailHint(prefix string, key string)
 
-	// Snapshot returns a point-in-time copy of the index as a new KeyIndex.
+	// Snapshot copies the logical index as a new KeyIndex. Concurrent writes
+	// have the same weak consistency as Range.
 	// TipSets are immutable, so only pointers are copied. Preserves all
 	// critbit properties (prefix ranges, ordered iteration).
 	Snapshot() KeyIndex

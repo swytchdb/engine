@@ -56,11 +56,6 @@ const (
 // cloudEffectInfo is the domain-separation info for sealed effect payloads.
 var cloudEffectInfo = []byte("effect")
 
-// Version is the swytch build, set from main.Version at startup (ldflags). The
-// cloud stream announces it — with the node id — as gRPC metadata, which is how
-// the Cloud dashboard knows each cluster's node count and running version.
-var Version = "dev"
-
 // Metadata keys the dataplane reads off the WriteEffects stream; must match
 // cloud's internal/dataplane.
 const (
@@ -149,7 +144,7 @@ type CloudSync struct {
 
 	mu      sync.Mutex
 	pending map[effects.Tip]pendingUpload
-	// pendingKeys indexes pending by plaintext key, so CloudTips can answer a
+	// pendingKeys indexes pending by canonical key address, so CloudTips can answer a
 	// read-miss from the outbox: an evicted-before-ack key has no index tips
 	// and no cloud tips, but its effects sit refcount-pinned in the pool — the
 	// outbox tips are the frontier the cloud will eventually hold, and the

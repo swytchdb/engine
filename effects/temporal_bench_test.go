@@ -50,7 +50,7 @@ func BenchmarkTemporalEngine(b *testing.B) {
 				}
 			})
 
-			if err := e.ensureSubscribed("witness"); err != nil {
+			if err := e.ensureSubscribed(logicalAddress("witness")); err != nil {
 				b.Fatal(err)
 			}
 
@@ -77,7 +77,7 @@ func BenchmarkTemporalEngine(b *testing.B) {
 					return Tip{}, err
 				}
 
-				tip := c.keys[key].lastOffset
+				tip := c.keys[logicalAddress(key)].lastOffset
 
 				return tip, c.Flush()
 			}

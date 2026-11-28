@@ -180,7 +180,7 @@ func newTestEngine(bc Broadcaster) *Engine {
 		pendingTxns:       xsync.NewMap[Tip, *pendingTxn](),
 		pendingTxTips:     xsync.NewMap[Tip, []Tip](),
 		txAbortCounts:     xsync.NewMap[string, *atomic.Int32](),
-		pendingBootstraps: xsync.NewMap[string, *bootstrapCollector](),
+		pendingBootstraps: xsync.NewMap[Tip, *bootstrapCollector](),
 		spokenBinds:       clox.NewCloxCache[Tip, *spokenBindHistory](clox.ConfigFromCapacity(256)),
 		effectCache:       newVertexPool(),
 	}
@@ -197,7 +197,7 @@ func preSubscribe(e *Engine, keys ...string) {
 	for _, k := range keys {
 		st := &subscriptionState{ready: make(chan struct{})}
 		st.markReady()
-		e.subscriptions.Store(k, st)
+		e.subscriptions.Store(logicalAddress(k), st)
 	}
 }
 
@@ -326,7 +326,7 @@ func TestFlushSafeMode(t *testing.T) {
 	e.safety.Store(&safetyMap{defaultMode: SafeMode})
 	// A peer holds "k", so SafeMode has a durable-replication target and must
 	// take the synchronous first-ACK path (rather than the no-target downgrade).
-	e.peerFilterAdd(pb.NodeID(2), "k")
+	e.peerFilterAdd(pb.NodeID(2), logicalAddress("k"))
 
 	ctx := e.NewContext()
 	if err := ctx.Emit(dataEffect("k")); err != nil {
@@ -381,7 +381,7 @@ func TestFlushSafeModeError_ReplicateFailAfterPrecheck(t *testing.T) {
 	bc := &mockBroadcaster{replicateErr: errors.New("quorum unreachable"), allRegionPeersReachable: true}
 	e := newTestEngine(bc)
 	e.safety.Store(&safetyMap{defaultMode: SafeMode})
-	e.peerFilterAdd(pb.NodeID(2), "k") // a peer holds "k": exercises the Replicate-fails path
+	e.peerFilterAdd(pb.NodeID(2), logicalAddress("k")) // a peer holds "k": exercises the Replicate-fails path
 
 	ctx := e.NewContext()
 	if err := ctx.Emit(dataEffect("k")); err != nil {
@@ -397,7 +397,7 @@ func TestFlushSafeMode_AllowsWhenAllPeersReachable(t *testing.T) {
 	bc := &mockBroadcaster{allRegionPeersReachable: true}
 	e := newTestEngine(bc)
 	e.safety.Store(&safetyMap{defaultMode: SafeMode})
-	e.peerFilterAdd(pb.NodeID(2), "k") // a peer holds "k": real replication target
+	e.peerFilterAdd(pb.NodeID(2), logicalAddress("k")) // a peer holds "k": real replication target
 
 	ctx := e.NewContext()
 	if err := ctx.Emit(dataEffect("k")); err != nil {
@@ -506,14 +506,11 @@ func TestBeginTxSetsFlag(t *testing.T) {
 	if tips == nil {
 		t.Fatal("expected index entry for key k")
 	}
-	// In a tx, the tip is the BIND; walk tips to find a data effect with TxnId
+	// The verdict tip retains the transactional bind carrying TxnId.
 	found := false
 
 	for _, off := range tips.Tips() {
-		cached, ok := e.effectCache.Get(off)
-		if !ok {
-			continue
-		}
+		cached := bindAtTip(t, e, off)
 
 		if cached.GetTxnId() != "" {
 			found = true
@@ -817,7 +814,7 @@ func newTxnTestEngine(bc Broadcaster) *Engine {
 		pendingTxns:       xsync.NewMap[Tip, *pendingTxn](),
 		pendingTxTips:     xsync.NewMap[Tip, []Tip](),
 		txAbortCounts:     xsync.NewMap[string, *atomic.Int32](),
-		pendingBootstraps: xsync.NewMap[string, *bootstrapCollector](),
+		pendingBootstraps: xsync.NewMap[Tip, *bootstrapCollector](),
 		spokenBinds:       clox.NewCloxCache[Tip, *spokenBindHistory](clox.ConfigFromCapacity(256)),
 		effectCache:       newVertexPool(),
 	}
@@ -1003,6 +1000,17 @@ func TestFlushTx_FakeConflict_Commits(t *testing.T) {
 // {each beaten loser's keys}. Every key a LOST txn touched now carries
 // a direct verdict record, independent of closure expansion.
 func TestFlushTx_VerdictSnapshotEmittedOnLoserOnlyKeys(t *testing.T) {
+	t.Run("legacy_competitor", func(t *testing.T) {
+		testVerdictSnapshotOnLoserKeys(t, nil, nil)
+	})
+	t.Run("uncontacted_competitor_subscriber", func(t *testing.T) {
+		testVerdictSnapshotOnLoserKeys(t, &pb.SubscriberSet{NodeIds: []uint64{42, 77}}, &pb.SubscriberSet{NodeIds: []uint64{5, 77}})
+	})
+}
+
+func testVerdictSnapshotOnLoserKeys(t *testing.T, subscribers, outstanding *pb.SubscriberSet) {
+	t.Helper()
+
 	const (
 		sharedKey    = "shared"
 		loserOnlyKey = "loser-only"
@@ -1059,6 +1067,7 @@ func TestFlushTx_VerdictSnapshotEmittedOnLoserOnlyKeys(t *testing.T) {
 		Kind: &pb.Effect_TxnBind{TxnBind: &pb.TransactionalBindEffect{
 			TxnHlc:           loserBindHlc,
 			OriginatorNodeId: uint64(loserNodeID),
+			Subscribers:      subscribers,
 			Keys: []*pb.TransactionalBindEffect_KeyBind{
 				{Key: []byte(sharedKey), NewTip: toPbRef(loserDataShared)},
 				{Key: []byte(loserOnlyKey), NewTip: toPbRef(loserDataLoserOnly)},
@@ -1148,6 +1157,10 @@ func TestFlushTx_VerdictSnapshotEmittedOnLoserOnlyKeys(t *testing.T) {
 		derived, err := e.proofVerdicts(tip, eff)
 		if err != nil || derived[loserTxnID].verdict != pb.Verdict_LOST {
 			t.Fatalf("loser-only proof: verdicts=%v error=%v", derived, err)
+		}
+
+		if !proto.Equal(snap.GetOutstandingSubscribers(), outstanding) || derived[loserTxnID].settled {
+			t.Fatalf("competition incorrectly closed: outstanding=%v, verdict=%v", snap.GetOutstandingSubscribers(), derived[loserTxnID])
 		}
 
 		foundLoserOnlyVerdict = true
@@ -1422,13 +1435,13 @@ func TestHandleRemoteBind_AbortDepsCannotOverrideForkChoice(t *testing.T) {
 			remote, remoteBind, _ := makeBind("remote", 2, remoteStamp)
 			ptxn := &pendingTxn{
 				txnID: "local", bindOffset: localBind, forkChoiceHash: local.GetForkChoiceHash(),
-				keys: []pendingTxnKey{{key: "k", newTip: localTip, consumedTips: []Tip{base}}},
+				keys: []pendingTxnKey{{key: logicalAddress("k"), newTip: localTip, consumedTips: []Tip{base}}},
 				done: make(chan struct{}),
 			}
 			e.pendingTxns.Store(localBind, ptxn)
 			e.pendingTxTips.Store(localTip, []Tip{base})
-			e.updateIndex("k", nil, localBind)
-			e.updateIndex("k", nil, remoteBind)
+			e.updateIndex(logicalAddress("k"), nil, localBind)
+			e.updateIndex(logicalAddress("k"), nil, remoteBind)
 
 			// Legacy senders may list our tentative tip even when our already
 			// published bind wins. Arrival alone cannot decide either outcome.
@@ -1459,9 +1472,9 @@ func TestHandleRemoteBind_AbortDepsCannotOverrideForkChoice(t *testing.T) {
 				TxnVerdicts: map[string]pb.Verdict{"remote": pb.Verdict_WON},
 			}}})
 
-			nacks := []*pb.NackNotify{e.buildEnrichedNack("k", toPbRef(localBind), []Tip{remoteBind})}
+			nacks := []*pb.NackNotify{e.buildEnrichedNack(logicalAddress("k"), toPbRef(localBind), []Tip{remoteBind})}
 			if !localWins {
-				nacks = append(nacks, e.buildEnrichedNack("k", toPbRef(localBind), []Tip{proof}))
+				nacks = append(nacks, e.buildEnrichedNack(logicalAddress("k"), toPbRef(localBind), []Tip{proof}))
 			}
 
 			_, err := e.evaluateNacks(ptxn, nacks)
@@ -1577,7 +1590,7 @@ func TestHandleNack_TransactionalKey_DefersEvaluation(t *testing.T) {
 		originNode: 42,
 		bindOffset: Tip{42, 9999},
 		keys: []pendingTxnKey{
-			{key: "k", newTip: Tip{42, 500}, collection: pb.CollectionKind_SCALAR},
+			{key: logicalAddress("k"), newTip: Tip{42, 500}, collection: pb.CollectionKind_SCALAR},
 		},
 		done: make(chan struct{}),
 	}
@@ -2005,8 +2018,8 @@ func TestSSI_WriteWithinTxUsesSnapshotDeps(t *testing.T) {
 
 func TestFlushTx_ConsumesTips_LinearChain(t *testing.T) {
 	// Verify that repeated transactional read-modify-writes produce a linear
-	// chain: each BIND replaces the consumed tips in the index, so subsequent
-	// NOOPs depend only on the previous BIND (not on accumulated DATA+BIND offsets).
+	// chain: each verdict snapshot replaces the bind in the index, so subsequent
+	// NOOPs depend only on that snapshot (not on accumulated DATA+BIND offsets).
 	e := newTxnTestEngine(nil)
 
 	// Setup: write initial value (non-tx)
@@ -2055,7 +2068,8 @@ func TestFlushTx_ConsumesTips_LinearChain(t *testing.T) {
 			t.Fatalf("iteration %d: Flush failed: %v", i, err)
 		}
 
-		// After each transaction, the index should have exactly 1 tip (the BIND)
+		// After each transaction, the verdict snapshot consumes the bind,
+		// leaving exactly one tip rather than accumulating transaction history.
 		postTips := e.index.Contains("k")
 		if postTips == nil {
 			t.Fatalf("iteration %d: expected tips after flush, got nil", i)
@@ -2066,16 +2080,16 @@ func TestFlushTx_ConsumesTips_LinearChain(t *testing.T) {
 				i, len(postTips.Tips()), postTips.Tips())
 		}
 
-		// Verify the tip is a BIND effect via effectCache
-		bindOffset := postTips.Tips()[0]
+		// Verify the tip is a verdict snapshot with evidence for the bind.
+		snapshotOffset := postTips.Tips()[0]
 
-		cached, ok := e.effectCache.Get(bindOffset)
+		cached, ok := e.effectCache.Get(snapshotOffset)
 		if !ok {
-			t.Fatalf("iteration %d: could not find BIND at offset %d in effectCache", i, bindOffset)
+			t.Fatalf("iteration %d: could not find snapshot at offset %v in effectCache", i, snapshotOffset)
 		}
 
-		if cached.GetTxnBind() == nil {
-			t.Fatalf("iteration %d: tip at offset %d is not a BIND", i, bindOffset)
+		if len(cached.GetSnapshot().GetEvidence().GetBinds()) != 1 {
+			t.Fatalf("iteration %d: tip at offset %v lacks bind evidence", i, snapshotOffset)
 		}
 	}
 }
@@ -2129,7 +2143,7 @@ func TestSpokenBinds_PreflightAbortsOnHit(t *testing.T) {
 	e := NewTestEngine()
 	defer func() { _ = e.Close() }()
 
-	if err := e.ensureSubscribed("k"); err != nil {
+	if err := e.ensureSubscribed(logicalAddress("k")); err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
 
@@ -2182,7 +2196,7 @@ func TestSpokenBinds_PreflightAllowsOnMiss(t *testing.T) {
 	e := NewTestEngine()
 	defer func() { _ = e.Close() }()
 
-	if err := e.ensureSubscribed("k"); err != nil {
+	if err := e.ensureSubscribed(logicalAddress("k")); err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
 

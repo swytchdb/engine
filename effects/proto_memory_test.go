@@ -188,7 +188,7 @@ func TestMemoryConcurrentDuplicatePut(t *testing.T) {
 	}
 
 	wg.Wait()
-	p.decrefChainNode("key", Tip{1, 1})
+	p.decrefChainNode(logicalAddress("key"), Tip{1, 1})
 	p.drainReclaim()
 
 	if p.Bytes() != baseline {

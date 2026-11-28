@@ -1,0 +1,4 @@
+type TreeMeta {
+    isLeaf: bool
+    values: map<string, string>
+}

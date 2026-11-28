@@ -78,7 +78,7 @@ func TestBindConsumedTipsSubstitutesForeignInflightTip(t *testing.T) {
 	// mid-flush that would perturb the tip set).
 	subState := &subscriptionState{ready: make(chan struct{})}
 	close(subState.ready)
-	e.subscriptions.Store(key, subState)
+	e.subscriptions.Store(logicalAddress(key), subState)
 
 	// Step 2: committed base on the key — a plain, non-tx data effect in
 	// both index and effectCache. This is what a correct ConsumedTips/deps
@@ -163,15 +163,14 @@ func TestBindConsumedTipsSubstitutesForeignInflightTip(t *testing.T) {
 		t.Fatalf("local txn did not commit: %v", err)
 	}
 
-	// Step 5: locate the emitted bind. After commit it is the index tip on
-	// the key whose effect carries a TxnBind.
+	// Step 5: locate the emitted bind through the verdict snapshot.
 	bind := findBindOnKey(t, e, key)
 
 	// Inspect its ConsumedTips for the key.
 	var consumed []Tip
 
 	for _, kb := range bind.GetKeys() {
-		if string(kb.GetKey()) == key {
+		if string(kb.GetKey()) == logicalAddress(key) {
 			consumed = fromPbRefs(kb.GetConsumedTips())
 
 			break
@@ -199,8 +198,7 @@ func TestBindConsumedTipsSubstitutesForeignInflightTip(t *testing.T) {
 	}
 }
 
-// findBindOnKey returns the TransactionalBindEffect that is a live index
-// tip on key, failing the test if none is present.
+// findBindOnKey returns the bind at a live tip or in its verdict evidence.
 func findBindOnKey(t *testing.T, e *Engine, key string) *pb.TransactionalBindEffect {
 	t.Helper()
 
@@ -210,10 +208,7 @@ func findBindOnKey(t *testing.T, e *Engine, key string) *pb.TransactionalBindEff
 	}
 
 	for _, off := range tips.Tips() {
-		eff, ok := e.effectCache.Get(off)
-		if !ok {
-			continue
-		}
+		eff := bindAtTip(t, e, off)
 
 		if bind := eff.GetTxnBind(); bind != nil {
 			return bind

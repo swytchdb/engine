@@ -30,7 +30,7 @@ func (r *EngineLogReader) ReadAncestry(key string, root effects.Tip, send func(*
 
 	count, bytes := 0, 0
 
-	r.effectCache.VisitAncestry(key, root, func(tip effects.Tip, eff *pb.Effect, isRoot bool) bool {
+	r.effectCache.VisitAncestryInternal(key, root, func(tip effects.Tip, eff *pb.Effect, isRoot bool) bool {
 		resp := &pb.AncestryResponse{Ref: &pb.EffectRef{NodeId: tip[0], Offset: tip[1]}, IsRoot: isRoot}
 		if eff != nil {
 			resp.EffectData, sendErr = MarshalEffectWire(eff, r.effectCache)
@@ -73,8 +73,8 @@ func handleAncestryStream(stream *quic.Stream, reader LogReader) {
 	}
 
 	var err error
-	if source, ok := reader.(ancestryReader); ok && req.GetRoot() != nil && req.GetKey() != "" {
-		err = source.ReadAncestry(req.GetKey(), effects.Tip{req.GetRoot().GetNodeId(), req.GetRoot().GetOffset()},
+	if source, ok := reader.(ancestryReader); ok && req.GetRoot() != nil && len(req.GetKey()) != 0 {
+		err = source.ReadAncestry(string(req.GetKey()), effects.Tip{req.GetRoot().GetNodeId(), req.GetRoot().GetOffset()},
 			func(resp *pb.AncestryResponse) error {
 				if err := stream.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
 					return err
@@ -124,7 +124,7 @@ func ancestryOverConn(ctx context.Context, conn *quic.Conn, key string, root eff
 		return err
 	}
 
-	if err := writeMessage(stream, &pb.AncestryRequest{Key: key, Root: &pb.EffectRef{NodeId: root[0], Offset: root[1]}}); err != nil {
+	if err := writeMessage(stream, &pb.AncestryRequest{Key: []byte(key), Root: &pb.EffectRef{NodeId: root[0], Offset: root[1]}}); err != nil {
 		return err
 	}
 

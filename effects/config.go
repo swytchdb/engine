@@ -44,6 +44,10 @@ type KeyRangeRule struct {
 
 // EngineConfig holds configuration for creating an Engine.
 type EngineConfig struct {
+	// BuildVersion identifies the application in standalone mode. Empty means
+	// unknown and retains compatibility evidence. Clustered engines use their
+	// broadcaster's MinimumVersion, including its local node.
+	BuildVersion string
 	// DataDir enables a local mirror of resident effects. Empty keeps memory-only behavior.
 	DataDir       string
 	NodeID        pb.NodeID

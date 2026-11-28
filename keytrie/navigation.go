@@ -27,20 +27,24 @@ import (
 	"strings"
 )
 
-func (c *Critbit[T]) FirstWithPrefix(prefix string, claim bool) (string, bool, ReleaseClaimFunc) {
-	return c.seekPrefix(prefix, "", false, 0, claim)
+// FirstWithPrefixInternal returns the smallest raw key starting with prefix.
+func (c *Critbit[T]) FirstWithPrefixInternal(prefix string, claim bool) (string, bool, ReleaseClaimFunc) {
+	return c.seekPrefix(prefix, "", false, 0, claim, false)
 }
 
-func (c *Critbit[T]) LastWithPrefix(prefix string, claim bool) (string, bool, ReleaseClaimFunc) {
-	return c.seekPrefix(prefix, "", false, 1, claim)
+// LastWithPrefixInternal returns the largest raw key starting with prefix.
+func (c *Critbit[T]) LastWithPrefixInternal(prefix string, claim bool) (string, bool, ReleaseClaimFunc) {
+	return c.seekPrefix(prefix, "", false, 1, claim, false)
 }
 
-func (c *Critbit[T]) NextWithPrefix(prefix, after string, claim bool) (string, bool, ReleaseClaimFunc) {
-	return c.seekPrefix(prefix, after, strings.HasPrefix(after, prefix), 0, claim)
+// NextWithPrefixInternal returns the next raw key after after starting with prefix.
+func (c *Critbit[T]) NextWithPrefixInternal(prefix, after string, claim bool) (string, bool, ReleaseClaimFunc) {
+	return c.seekPrefix(prefix, after, strings.HasPrefix(after, prefix), 0, claim, false)
 }
 
-func (c *Critbit[T]) PrevWithPrefix(prefix, before string, claim bool) (string, bool, ReleaseClaimFunc) {
-	return c.seekPrefix(prefix, before, strings.HasPrefix(before, prefix), 1, claim)
+// PrevWithPrefixInternal returns the previous raw key before before starting with prefix.
+func (c *Critbit[T]) PrevWithPrefixInternal(prefix, before string, claim bool) (string, bool, ReleaseClaimFunc) {
+	return c.seekPrefix(prefix, before, strings.HasPrefix(before, prefix), 1, claim, false)
 }
 
 // extremeLeaf finds the first live leaf in direction order: 0 is ascending,
@@ -68,7 +72,7 @@ func (c *Critbit[T]) extremeLeaf(node *critNode[T], prefix string, direction int
 // seekPrefix shares the lock and traversal for all four ordered lookups.
 // A missing boundary is located at its hypothetical insertion point; following
 // only its search path can skip neighbours when it differs at an earlier bit.
-func (c *Critbit[T]) seekPrefix(prefix, boundary string, bounded bool, direction int, claim bool) (string, bool, ReleaseClaimFunc) {
+func (c *Critbit[T]) seekPrefix(prefix, boundary string, bounded bool, direction int, claim bool, logical bool) (string, bool, ReleaseClaimFunc) {
 	c.reapMu.RLock()
 	defer c.reapMu.RUnlock()
 
@@ -128,9 +132,14 @@ func (c *Critbit[T]) seekPrefix(prefix, boundary string, bounded bool, direction
 		return "", false, nil
 	}
 
-	if claim {
-		return leaf.key, true, noop
+	key := leaf.key
+	if logical {
+		key = c.logicalLeafKey(leaf)
 	}
 
-	return leaf.key, true, nil
+	if claim {
+		return key, true, noop
+	}
+
+	return key, true, nil
 }

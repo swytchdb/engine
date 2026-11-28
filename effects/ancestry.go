@@ -17,11 +17,17 @@ type AncestryFetcher interface {
 	FetchAncestry(key string, root Tip, peers []pb.NodeID, have func(Tip) bool, receive func(Tip, []byte, bool) error) error
 }
 
-// VisitAncestry visits resident dependencies, including missing boundaries.
+// VisitAncestry visits resident dependencies for a logical key, including
+// missing boundaries.
 // The consumer bounds the transfer by returning false. It never fetches, adds
 // reverse links, publishes a frontier, or interprets snapshot state. Root
 // markers travel with the records; they do not hide resident ancestry.
 func (p *VertexPool) VisitAncestry(key string, root Tip, visit func(Tip, *pb.Effect, bool) bool) {
+	p.VisitAncestryInternal(logicalAddress(key), root, visit)
+}
+
+// VisitAncestryInternal visits resident dependencies for a complete trie address.
+func (p *VertexPool) VisitAncestryInternal(key string, root Tip, visit func(Tip, *pb.Effect, bool) bool) {
 	seen := make(map[Tip]struct{})
 
 	stack := []Tip{root}
@@ -67,7 +73,7 @@ func (e *Engine) ancestryPeers(key string, root Tip) []pb.NodeID {
 
 	var subscribers []pb.NodeID
 
-	if leaf := e.index.LoadData(key); leaf != nil {
+	if leaf := e.index.LoadDataInternal(key); leaf != nil {
 		leaf.subMu.Lock()
 		subscribers = slices.Clone(leaf.subscribers)
 		leaf.subMu.Unlock()
@@ -94,11 +100,17 @@ func (e *Engine) ancestryPeers(key string, root Tip) []pb.NodeID {
 
 		i, found := e.peerFilterIndex(peer)
 
-		return found && e.peerKeyFilters[i].hasBulk && !e.peerKeyFilters[i].maybeContains(key)
+		return found && e.peerKeyFilters[i].hasBulk && !e.peerKeyFilters[i].maybeContains(wireKey(key))
 	})
 
 	e.keyFilterMu.RUnlock()
 	rand.Shuffle(len(peers), func(i, j int) { peers[i], peers[j] = peers[j], peers[i] })
+	// A subscriber may hold no history yet. Keep the advertised effect origin
+	// in the bounded candidate set instead of randomly excluding its source.
+	if i := slices.Index(peers, pb.NodeID(root[0])); i >= 0 {
+		peers[0], peers[i] = peers[i], peers[0]
+	}
+
 	peers = peers[:min(2, len(peers))]
 
 	return peers

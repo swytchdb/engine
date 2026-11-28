@@ -24,6 +24,7 @@
 package effects
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -31,6 +32,7 @@ import (
 	"strconv"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
+	"github.com/swytchdb/engine/keytrie"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 )
@@ -113,7 +115,7 @@ func (e *Engine) unresolvedConflictTip(key string, bind Tip, tips []Tip, reaches
 	// A dependency on any associated key resolves this envelope, including
 	// when another key still indexes its old WON snapshot.
 	for _, kb := range eff.GetTxnBind().GetKeys() {
-		heads = append(heads, e.conflictHeads(string(kb.GetKey()), e.index.Contains(string(kb.GetKey())).Tips())...)
+		heads = append(heads, e.conflictHeads(string(kb.GetKey()), e.index.ContainsInternal(string(kb.GetKey())).Tips())...)
 	}
 
 	for _, head := range heads {
@@ -192,7 +194,7 @@ func (e *Engine) emitConflict(key string, a, b Tip, checks map[string]conflictDo
 
 		txn := conflictTransaction{Version: 1, TxID: envelopes[i].GetTxnId(), Bind: conflictReference(bind), MapKeyEncoding: "hex"}
 		for _, kb := range envelopes[i].GetTxnBind().GetKeys() {
-			state := conflictKey{Key: kb.GetKey()}
+			state := conflictKey{Key: bytes.Clone(keytrie.WireKeyBytes(kb.GetKey()))}
 			for _, tip := range fromPbRefs(kb.GetConsumedTips()) {
 				state.ConsumedTips = append(state.ConsumedTips, conflictReference(tip))
 			}
@@ -236,11 +238,12 @@ func (e *Engine) emitConflict(key string, a, b Tip, checks map[string]conflictDo
 
 	for _, envelope := range envelopes {
 		for _, kb := range envelope.GetTxnBind().GetKeys() {
-			if err := e.appendConflictValue(ctx, conflictIndexPrefix+string(kb.GetKey()), []byte(envelope.GetTxnId())); err != nil {
+			key := string(kb.GetKey())
+			if err := e.appendConflictValueInternal(ctx, conflictIndexAddress(key), []byte(envelope.GetTxnId())); err != nil {
 				return err
 			}
 
-			keys[string(kb.GetKey())] = struct{}{}
+			keys[key] = struct{}{}
 		}
 	}
 
@@ -249,7 +252,7 @@ func (e *Engine) emitConflict(key string, a, b Tip, checks map[string]conflictDo
 	}
 
 	for key := range keys {
-		if err := e.appendConflictValue(ctx, conflictDirectory, []byte(key)); err != nil {
+		if err := e.appendConflictValue(ctx, conflictDirectory, []byte(wireKey(key))); err != nil {
 			return err
 		}
 	}
@@ -272,15 +275,31 @@ func emitConflictDocument(ctx *Context, key string, value []byte) error {
 	})
 }
 
+// conflictIndexAddress constructs a derived address at the conflict-report API
+// boundary. Existing logical report names remain unchanged; internal indexes
+// occupy their own trie namespace even if an application key has identical bytes.
+func conflictIndexAddress(address string) string {
+	logical := keytrie.WireKey(address)
+	if len(logical) != len(address) {
+		return logicalAddress(conflictIndexPrefix + logical)
+	}
+
+	return keytrie.InternalKey(conflictDirectory, address)
+}
+
 func (e *Engine) appendConflictValue(ctx *Context, key string, value []byte) error {
-	if err := ctx.Emit(&pb.Effect{Key: []byte(key), Kind: &pb.Effect_Meta{Meta: &pb.MetaEffect{TypeTag: pb.ValueType_TYPE_LIST}}}); err != nil {
+	return e.appendConflictValueInternal(ctx, logicalAddress(key), value)
+}
+
+func (e *Engine) appendConflictValueInternal(ctx *Context, key string, value []byte) error {
+	if err := ctx.Emit(&pb.Effect{Key: []byte(wireKey(key)), IKey: []byte(key), Kind: &pb.Effect_Meta{Meta: &pb.MetaEffect{TypeTag: pb.ValueType_TYPE_LIST}}}); err != nil {
 		return err
 	}
 
 	id := e.nextOffset()
 
 	return ctx.Emit(&pb.Effect{
-		Key: []byte(key), Kind: &pb.Effect_Data{Data: &pb.DataEffect{
+		Key: []byte(wireKey(key)), IKey: []byte(key), Kind: &pb.Effect_Data{Data: &pb.DataEffect{
 			Op: pb.EffectOp_INSERT_OP, Merge: pb.MergeRule_LAST_WRITE_WINS, Collection: pb.CollectionKind_ORDERED,
 			Placement: pb.Placement_PLACE_TAIL, Id: []byte(fmt.Sprintf("%d:%d", id[0], id[1])), Value: &pb.DataEffect_Raw{Raw: value},
 		}},

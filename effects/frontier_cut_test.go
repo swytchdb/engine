@@ -48,38 +48,38 @@ func requireCutTips(t *testing.T, got, want []Tip) {
 }
 
 func TestFrontierCutDominanceStillResolvesBoundary(t *testing.T) {
-	e := newSnapshotEngine(nil)
-	defer func() { _ = e.Close() }()
-
 	old, middle, newest, gone := Tip{7, 1}, Tip{8, 1}, Tip{9, 1}, Tip{6, 1}
-	putCutEffects(t, e, map[Tip]*pb.Effect{
-		old: cutEffect(old, gone), middle: cutEffect(middle, old), newest: cutEffect(newest, middle),
-	})
 
 	transport := errors.New("peer unavailable")
 	for _, failure := range []error{ErrEffectNotFound, ErrCDNBlobMissing, transport} {
-		loads := 0
-		e.broadcaster = &cutBroadcaster{load: func(tip Tip) ([]byte, error) {
-			loads++
-
-			if tip != gone {
-				t.Fatalf("unexpected boundary %v", tip)
-			}
-
-			return nil, failure
-		}}
-
 		for _, tips := range [][]Tip{{old, newest, middle}, {newest, middle, old}} {
-			got, complete, err := e.closeIngestedFrontier("k", tips, make(map[Tip]error))
+			e := newSnapshotEngine(nil)
+			putCutEffects(t, e, map[Tip]*pb.Effect{
+				old: cutEffect(old, gone), middle: cutEffect(middle, old), newest: cutEffect(newest, middle),
+			})
+
+			loads := 0
+			e.broadcaster = &cutBroadcaster{load: func(tip Tip) ([]byte, error) {
+				loads++
+
+				if tip != gone {
+					t.Fatalf("unexpected boundary %v", tip)
+				}
+
+				return nil, failure
+			}}
+			got, complete, err := e.closeIngestedFrontier(logicalAddress("k"), tips, make(map[Tip]error))
+			_ = e.Close()
+
 			requireCutTips(t, got, []Tip{newest})
 
 			if complete != (failure != transport) || errors.Is(err, transport) != (failure == transport) {
 				t.Fatalf("boundary %v: complete=%t error=%v", failure, complete, err)
 			}
-		}
 
-		if loads != 2 {
-			t.Fatalf("boundary %v fetched %d times, want once per closure", failure, loads)
+			if loads != 1 {
+				t.Fatalf("new history boundary %v fetched %d times", failure, loads)
+			}
 		}
 	}
 }
@@ -133,7 +133,7 @@ func TestFrontierCutSingleTipLoadsRequiredHistory(t *testing.T) {
 				return nil, ErrEffectNotFound
 			}}
 
-			state, _, err := e.reconstruct("k", []Tip{{7, 3}}, "", false)
+			state, _, err := e.reconstruct(logicalAddress("k"), []Tip{{7, 3}}, "", false)
 			if err != nil || state.GetScalar().GetIntVal() != 3 {
 				t.Fatalf("reconstruction: state=%v error=%v", state, err)
 			}
@@ -160,7 +160,7 @@ func TestFrontierCutDiscoversUnrelatedRemoteHistories(t *testing.T) {
 		return wireEffect(cutEffect(tip, Tip{tip[0], tip[1] - 1})), nil
 	}}
 
-	got, complete, err := e.closeIngestedFrontier("k", []Tip{b, a}, make(map[Tip]error))
+	got, complete, err := e.closeIngestedFrontier(logicalAddress("k"), []Tip{b, a}, make(map[Tip]error))
 	requireCutTips(t, got, []Tip{a, b})
 
 	if !complete || err != nil {
@@ -188,14 +188,14 @@ func TestFrontierCutResidentPhasePrecedesRemoteLoads(t *testing.T) {
 	e.broadcaster = &cutBroadcaster{load: func(Tip) ([]byte, error) {
 		for dep, parent := range map[Tip]Tip{x: a, y: b} {
 			v := e.effectCache.getVertex(dep)
-			if got, ok := v.firstParent("k"); !ok || got != parent {
+			if got, ok := v.firstParent(logicalAddress("k")); !ok || got != parent {
 				t.Fatalf("remote load began before resident edge %v -> %v was visited", parent, dep)
 			}
 		}
 
 		return nil, ErrEffectNotFound
 	}}
-	e.installIngestedTips("k", a, b)
+	e.installIngestedTips(logicalAddress("k"), a, b)
 	requireFrontier(t, e, a, b)
 }
 
@@ -210,7 +210,7 @@ func TestFrontierCutDownwardEncounterDiscoversEstablishedCut(t *testing.T) {
 	})
 	// Reverse links arise by establishing this region, not by fabricating
 	// arbitrary upward edges in the fixture.
-	e.installIngestedTips("k", established, separate)
+	e.installIngestedTips(logicalAddress("k"), established, separate)
 	requireFrontier(t, e, established, separate)
 
 	incoming, gap := Tip{8, 2}, Tip{8, 1}
@@ -229,7 +229,7 @@ func TestFrontierCutDownwardEncounterDiscoversEstablishedCut(t *testing.T) {
 
 	// Reconcile the supplied unknown region. Reaching X downward discovers
 	// the previously established tip through its resident reverse chain.
-	got, complete, err := e.closeIngestedFrontier("k", []Tip{incoming, separate}, make(map[Tip]error))
+	got, complete, err := e.closeIngestedFrontier(logicalAddress("k"), []Tip{incoming, separate}, make(map[Tip]error))
 	requireCutTips(t, got, []Tip{incoming, established, separate})
 
 	if !complete || err != nil || loads != 1 {
@@ -246,9 +246,9 @@ func TestFrontierCutReclaimedParentIsAnEstablishedJoin(t *testing.T) {
 		x: cutEffect(x), middle: cutEffect(middle, x), old: cutEffect(old, middle),
 		separate: cutEffect(separate),
 	})
-	e.installIngestedTips("k", old, separate)
+	e.installIngestedTips(logicalAddress("k"), old, separate)
 	putCutEffects(t, e, map[Tip]*pb.Effect{current: cutEffect(current, old)})
-	e.installIngestedTips("k", current)
+	e.installIngestedTips(logicalAddress("k"), current)
 	requireFrontier(t, e, current, separate)
 
 	// Retire payloads from the established region while X survives. Its
@@ -269,7 +269,7 @@ func TestFrontierCutReclaimedParentIsAnEstablishedJoin(t *testing.T) {
 		return nil, ErrEffectNotFound
 	}}
 
-	got, complete, err := e.closeIngestedFrontier("k", []Tip{incoming, current, separate}, make(map[Tip]error))
+	got, complete, err := e.closeIngestedFrontier(logicalAddress("k"), []Tip{incoming, current, separate}, make(map[Tip]error))
 	requireCutTips(t, got, []Tip{incoming, current, separate})
 
 	if !complete || err != nil {
@@ -278,42 +278,48 @@ func TestFrontierCutReclaimedParentIsAnEstablishedJoin(t *testing.T) {
 }
 
 func TestFrontierCutSharedBindNavigationStaysOnItsKey(t *testing.T) {
-	e := newSnapshotEngine(nil)
-	defer func() { _ = e.Close() }()
+	for _, reclaim := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reclaimed=%t", reclaim), func(t *testing.T) {
+			e := newSnapshotEngine(nil)
+			defer func() { _ = e.Close() }()
 
-	kRoot, otherRoot, bind := Tip{7, 1}, Tip{8, 1}, Tip{9, 1}
-	kTip, otherTip, separate := Tip{7, 2}, Tip{8, 2}, Tip{10, 1}
-	shared := cutEffect(bind)
-	shared.Kind = &pb.Effect_TxnBind{TxnBind: &pb.TransactionalBindEffect{
-		Keys: []*pb.TransactionalBindEffect_KeyBind{
-			{Key: []byte("k"), NewTip: toPbRef(kRoot)},
-			{Key: []byte("other"), NewTip: toPbRef(otherRoot)},
-		},
-	}}
-	otherBase, otherParent := cutEffect(otherRoot), cutEffect(otherTip, bind)
-	otherBase.Key, otherParent.Key = []byte("other"), []byte("other")
-	putCutEffects(t, e, map[Tip]*pb.Effect{
-		kRoot: cutEffect(kRoot), otherRoot: otherBase, bind: shared,
-		kTip: cutEffect(kTip, bind), otherTip: otherParent, separate: cutEffect(separate),
-	})
-	// Establish the other key first, so its reverse link is stored first.
-	e.installIngestedTips("other", otherTip, otherRoot)
-	e.installIngestedTips("k", kTip, separate)
-	e.effectCache.decref(otherTip)
-	e.effectCache.drainReclaim()
+			kRoot, otherRoot, bind := Tip{7, 1}, Tip{8, 1}, Tip{9, 1}
+			kTip, otherTip, separate := Tip{7, 2}, Tip{8, 2}, Tip{10, 1}
+			shared := cutEffect(bind)
+			shared.Kind = &pb.Effect_TxnBind{TxnBind: &pb.TransactionalBindEffect{
+				Keys: []*pb.TransactionalBindEffect_KeyBind{
+					{Key: []byte("k"), NewTip: toPbRef(kRoot)},
+					{Key: []byte("other"), NewTip: toPbRef(otherRoot)},
+				},
+			}}
+			otherBase, otherParent := cutEffect(otherRoot), cutEffect(otherTip, bind)
+			otherBase.Key, otherParent.Key = []byte("other"), []byte("other")
+			putCutEffects(t, e, map[Tip]*pb.Effect{
+				kRoot: cutEffect(kRoot), otherRoot: otherBase, bind: shared,
+				kTip: cutEffect(kTip, bind), otherTip: otherParent, separate: cutEffect(separate),
+			})
+			// Establish the other key first, so its reverse link is stored first.
+			e.installIngestedTips(logicalAddress("other"), otherTip, otherRoot)
+			e.installIngestedTips(logicalAddress("k"), kTip, separate)
 
-	incoming := Tip{11, 1}
-	putCutEffects(t, e, map[Tip]*pb.Effect{incoming: cutEffect(incoming, bind)})
-	e.broadcaster = &cutBroadcaster{load: func(tip Tip) ([]byte, error) {
-		t.Fatalf("key-scoped resident closure unexpectedly fetched %v", tip)
+			if reclaim {
+				e.effectCache.decref(otherTip)
+				e.effectCache.drainReclaim()
+			}
 
-		return nil, ErrEffectNotFound
-	}}
-	got, complete, err := e.closeIngestedFrontier("k", []Tip{incoming, separate}, make(map[Tip]error))
-	requireCutTips(t, got, []Tip{incoming, kTip, separate})
+			incoming := Tip{11, 1}
+			putCutEffects(t, e, map[Tip]*pb.Effect{incoming: cutEffect(incoming, bind)})
+			e.broadcaster = &cutBroadcaster{load: func(tip Tip) ([]byte, error) {
+				t.Fatalf("key-scoped resident closure unexpectedly fetched %v", tip)
 
-	if !complete || err != nil {
-		t.Fatalf("shared-bind closure: complete=%t error=%v", complete, err)
+				return nil, ErrEffectNotFound
+			}}
+			// Publication must retain the existing frontier on k even when the
+			// shared bind's sole reverse hint belongs to the other key. Production
+			// supplies current tips; it does not recover them through reverse hints.
+			e.installIngestedTips(logicalAddress("k"), incoming)
+			requireFrontier(t, e, incoming, kTip, separate)
+		})
 	}
 }
 
@@ -342,7 +348,7 @@ func TestFrontierCutSnapshotLabelsPreserveDirectedClosure(t *testing.T) {
 					slices.Reverse(tips)
 				}
 
-				e.installIngestedTips("k", tips...)
+				e.installIngestedTips(logicalAddress("k"), tips...)
 				// B consumes middle. Meeting at X does not consume A or B.
 				requireFrontier(t, e, a, b)
 			})
@@ -371,7 +377,7 @@ func TestFrontierCutAbsenceClosesBoundaryButTransportDoesNot(t *testing.T) {
 
 				return nil, failure
 			}}
-			got, complete, err := e.closeIngestedFrontier("k", []Tip{a, b}, make(map[Tip]error))
+			got, complete, err := e.closeIngestedFrontier(logicalAddress("k"), []Tip{a, b}, make(map[Tip]error))
 			requireCutTips(t, got, []Tip{a, b})
 
 			if complete != (failure != transport) || errors.Is(err, transport) != (failure == transport) {
@@ -406,12 +412,12 @@ func TestFrontierCutRetryResolvesUnavailableConnection(t *testing.T) {
 
 		return wireEffect(cutEffect(gap, a)), nil
 	}}
-	e.installIngestedTips("k", a, b)
+	e.installIngestedTips(logicalAddress("k"), a, b)
 	requireFrontier(t, e, a, b)
 
 	available = true
 
-	e.installIngestedTips("k", b)
+	e.installIngestedTips(logicalAddress("k"), b)
 	requireFrontier(t, e, b)
 
 	if calls != 2 {
@@ -427,7 +433,7 @@ func TestFrontierCutPublicationRetryIncludesConcurrentTip(t *testing.T) {
 	putCutEffects(t, e, map[Tip]*pb.Effect{
 		old: cutEffect(old), incoming: cutEffect(incoming, gap), concurrent: cutEffect(concurrent),
 	})
-	e.installIngestedTips("k", old)
+	e.installIngestedTips(logicalAddress("k"), old)
 
 	loads := 0
 	e.broadcaster = &cutBroadcaster{load: func(tip Tip) ([]byte, error) {
@@ -444,7 +450,7 @@ func TestFrontierCutPublicationRetryIncludesConcurrentTip(t *testing.T) {
 
 		return wireEffect(cutEffect(gap, old)), nil
 	}}
-	e.installIngestedTips("k", incoming)
+	e.installIngestedTips(logicalAddress("k"), incoming)
 	requireFrontier(t, e, incoming, concurrent)
 
 	if loads != 1 {
@@ -452,7 +458,7 @@ func TestFrontierCutPublicationRetryIncludesConcurrentTip(t *testing.T) {
 	}
 
 	before := e.index.Contains("k")
-	e.installIngestedTips("k", incoming)
+	e.installIngestedTips(logicalAddress("k"), incoming)
 
 	if e.index.Contains("k") != before {
 		t.Fatal("unchanged frontier publication invalidated its identity")
@@ -487,12 +493,17 @@ func TestFrontierCutSharedHistoryWorkRemainsLinear(t *testing.T) {
 	}}
 	for attempt := range 3 {
 		before, _, _ := e.effectCache.Stats()
-		e.installIngestedTips("k", a, b)
+		e.installIngestedTips(logicalAddress("k"), a, b)
 		requireFrontier(t, e, a, b)
 		after, _, _ := e.effectCache.Stats()
 		// A repeated closure sees established reverse links throughout the
 		// chain. Following each one to the tip would make work quadratic.
-		if after-before > 30*length || loads != attempt+1 {
+		limit := uint64(30 * length)
+		if attempt > 0 {
+			limit = 32
+		}
+
+		if after-before > limit || loads != 1 {
 			t.Fatalf("attempt=%d lookups=%d loads=%d", attempt, after-before, loads)
 		}
 	}
@@ -549,11 +560,11 @@ func TestFrontierCutIngestionMatchesReachability(t *testing.T) {
 				putCutEffects(t, e, map[Tip]*pb.Effect{tip: eff})
 			}
 
-			e.installIngestedTips("k", tips[0], tips[2])
+			e.installIngestedTips(logicalAddress("k"), tips[0], tips[2])
 
 			for phase, candidates := range [][]int{{0, 2}, {0, 2, 4}} {
 				if phase == 1 {
-					e.installIngestedTips("k", tips[4])
+					e.installIngestedTips(logicalAddress("k"), tips[4])
 				}
 
 				var want []Tip

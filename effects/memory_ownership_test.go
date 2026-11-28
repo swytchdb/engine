@@ -27,7 +27,6 @@ import (
 	"fmt"
 	"strings"
 	"testing"
-	"unsafe"
 
 	pb "github.com/swytchdb/engine/cluster/proto"
 	"github.com/swytchdb/engine/keytrie"
@@ -43,24 +42,26 @@ func TestMemorySharedPrimaryKeyOwners(t *testing.T) {
 	})
 
 	key := strings.Repeat("shared", 100)
-	owned := e.retainKey(key)
+	owned := e.retainKey(logicalAddress(key))
 	e.subscriptions.Store(owned, &subscriptionState{ownedKey: true})
 	e.index.Insert(key, nil, keytrie.NewTipSet(Tip{1, 1}))
 	e.index.Range(func(indexKey string) bool {
-		if unsafe.StringData(indexKey) != unsafe.StringData(owned) {
-			t.Fatal("subscription and index did not share key allocation")
+		if indexKey != key {
+			t.Fatal("logical iteration changed key")
 		}
 
 		return true
 	})
 	before := e.keyBytes
-	e.dropSubscription(key)
+	e.dropSubscription(logicalAddress(key))
 
-	if e.keyBytes != before {
-		t.Fatal("subscription release credited the trie's key")
+	if e.keyBytes >= before {
+		t.Fatal("subscription allocation was not released")
 	}
 
-	e.index.SetEvictHooks(func(string) bool { return true }, nil, nil)
+	before = e.keyBytes
+
+	e.index.SetEvictHooksInternal(func(string) bool { return true }, nil, nil)
 
 	if e.index.EvictBatch(1) != 1 {
 		t.Fatal("no eviction")
@@ -92,8 +93,8 @@ func TestMemoryClusterFiltersHaveIndependentBudget(t *testing.T) {
 
 	for i := range 5000 {
 		key := fmt.Sprintf("filter-only:%d", i)
-		e.ownFilterAdd(key)
-		e.peerFilterAdd(pb.NodeID(123), key)
+		e.ownFilterAdd(logicalAddress(key))
+		e.peerFilterAdd(pb.NodeID(123), logicalAddress(key))
 	}
 
 	e.OwnKeyFilterSnapshot()

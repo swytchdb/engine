@@ -25,6 +25,7 @@ package effects
 
 import (
 	"bytes"
+	"encoding/binary"
 	"maps"
 	"slices"
 
@@ -314,6 +315,11 @@ func reduceFirst(e *pb.Effect, d *pb.DataEffect) *pb.ReducedEffect {
 		Commutative:    isCommutative(d.GetMerge()),
 		ForkChoiceHash: e.GetForkChoiceHash(),
 	}
+	// An element removal is a collection delta, not a whole-key tombstone.
+	// Retain it across seeded folds without hiding later inserts in this batch.
+	if d.GetOp() == pb.EffectOp_REMOVE_OP && d.GetCollection() != pb.CollectionKind_SCALAR {
+		r.Op = pb.EffectOp_UNKNOWN_OP
+	}
 
 	switch d.GetCollection() {
 	case pb.CollectionKind_SCALAR:
@@ -334,6 +340,8 @@ func reduceFirst(e *pb.Effect, d *pb.DataEffect) *pb.ReducedEffect {
 		r.NetRemoves = make(map[string]bool)
 		if d.GetOp() == pb.EffectOp_INSERT_OP {
 			r.OrderedElements = []*pb.ReducedElement{elementFromData(e, d)}
+		} else {
+			r.NetRemoves[string(d.GetId())] = true
 		}
 	}
 
@@ -403,7 +411,40 @@ func reduceScalar(r *pb.ReducedEffect, _ *pb.Effect, d *pb.DataEffect) {
 		}
 
 	case pb.MergeRule_LAST_WRITE_WINS:
-		r.Scalar = cloneData(d)
+		switch d.GetPlacement() {
+		case pb.Placement_PLACE_AFTER, pb.Placement_PLACE_BEFORE, pb.Placement_PLACE_HEAD, pb.Placement_PLACE_TAIL:
+			v := d.Decompress()
+			scalar := r.GetScalar().Decompress()
+
+			idx := 0
+			if d.Reference != nil {
+				idx = int(binary.BigEndian.Uint64(d.GetReference()))
+			}
+
+			switch d.GetPlacement() {
+			case pb.Placement_PLACE_TAIL:
+				idx = len(scalar)
+			case pb.Placement_PLACE_HEAD:
+				idx = 0
+			case pb.Placement_PLACE_AFTER:
+				idx++
+			case pb.Placement_PLACE_BEFORE:
+				// The reference already identifies the insertion offset.
+			case pb.Placement_PLACE_NONE, pb.Placement_PLACE_SELF:
+				// Replacement placements are handled by the outer switch.
+			}
+
+			next := make([]byte, len(scalar)+len(v))
+
+			copy(next[:idx], scalar[:idx])
+			copy(next[idx:], v)
+			copy(next[idx+len(v):], scalar[idx:])
+
+			r.Scalar.Value = &pb.DataEffect_Raw{Raw: next}
+		case pb.Placement_PLACE_NONE, pb.Placement_PLACE_SELF:
+			r.Scalar = cloneData(d)
+		}
+
 		r.Merge = pb.MergeRule_LAST_WRITE_WINS
 		r.Commutative = false
 		// A LWW write replaces the entire value — clear any inherited TTL.
@@ -469,47 +510,34 @@ func reduceKeyed(r *pb.ReducedEffect, e *pb.Effect, d *pb.DataEffect) {
 		return
 	}
 
-	// Accumulate into existing element — always create a new element to
-	// avoid mutating shared pointers (e.g. snapshot state in the effect cache).
-	switch d.GetMerge() {
-	case pb.MergeRule_ADDITIVE_INT:
-		base := scalarIntBase(existing.GetData())
-		newElem := &pb.ReducedElement{
-			Data:      cloneData(existing.GetData()),
-			Hlc:       existing.GetHlc(),
-			NodeId:    existing.GetNodeId(),
-			ExpiresAt: existing.GetExpiresAt(),
-		}
-		newElem.Data.Value = &pb.DataEffect_IntVal{IntVal: base + d.GetIntVal()}
-		r.NetAdds[key] = newElem
-	case pb.MergeRule_ADDITIVE_FLOAT:
-		base := scalarFloatBase(existing.GetData())
-		newElem := &pb.ReducedElement{
-			Data:      cloneData(existing.GetData()),
-			Hlc:       existing.GetHlc(),
-			NodeId:    existing.GetNodeId(),
-			ExpiresAt: existing.GetExpiresAt(),
-		}
-		newElem.Data.Value = &pb.DataEffect_FloatVal{FloatVal: base + d.GetFloatVal()}
-		r.NetAdds[key] = newElem
-	case pb.MergeRule_MAX_INT:
-		if d.GetIntVal() > existing.GetData().GetIntVal() {
-			newElem := &pb.ReducedElement{
-				Data:      cloneData(existing.GetData()),
-				Hlc:       existing.GetHlc(),
-				NodeId:    existing.GetNodeId(),
-				ExpiresAt: existing.GetExpiresAt(),
-			}
-			newElem.Data.Value = &pb.DataEffect_IntVal{IntVal: d.GetIntVal()}
-			r.NetAdds[key] = newElem
-		}
-	case pb.MergeRule_LAST_WRITE_WINS, pb.MergeRule_FIRST_WRITE_WINS, pb.MergeRule_MAX_BYTES:
-		// Preserve replacement semantics for non-accumulating keyed rules.
-		r.NetAdds[key] = elementFromData(e, d)
-	default:
-		// Unknown rules retain the existing replacement fallback.
-		r.NetAdds[key] = elementFromData(e, d)
+	r.NetAdds[key] = reduceElement(existing, e, d)
+}
+
+// reduceElement applies scalar value semantics without changing collection
+// membership or ordering. Snapshot elements and effect payloads are shared, so
+// reduceScalar must receive a private DataEffect before it accumulates a value.
+func reduceElement(existing *pb.ReducedElement, e *pb.Effect, d *pb.DataEffect) *pb.ReducedElement {
+	value := &pb.ReducedEffect{
+		Scalar:    cloneData(existing.GetData()),
+		Merge:     existing.GetData().GetMerge(),
+		ExpiresAt: existing.GetExpiresAt(),
 	}
+	reduceScalar(value, e, d)
+
+	result := &pb.ReducedElement{
+		Data:           value.GetScalar(),
+		Hlc:            existing.GetHlc(),
+		NodeId:         existing.GetNodeId(),
+		ForkChoiceHash: existing.GetForkChoiceHash(),
+		ExpiresAt:      value.GetExpiresAt(),
+	}
+	if d.GetMerge() == pb.MergeRule_LAST_WRITE_WINS {
+		result.Hlc = e.GetHlc()
+		result.NodeId = e.GetNodeId()
+		result.ForkChoiceHash = e.GetForkChoiceHash()
+	}
+
+	return result
 }
 
 // --- Ordered reduction ---
@@ -564,7 +592,7 @@ func reduceOrdered(r *pb.ReducedEffect, e *pb.Effect, d *pb.DataEffect) {
 		// Update existing element in place (LSET)
 		idx := findOrderedByID(r.GetOrderedElements(), d.GetId())
 		if idx >= 0 {
-			r.OrderedElements[idx] = elem
+			r.OrderedElements[idx] = reduceElement(r.GetOrderedElements()[idx], e, d)
 		}
 	}
 }

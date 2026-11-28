@@ -52,11 +52,6 @@ import (
 // post-resolution state.
 var errHorizonRetryNeeded = errors.New("reconstruct: horizon ancestor resolved, retry")
 
-const compactionInterval = 5 * time.Second
-
-// Elapsed time is used only to pace local maintenance, never to order effects.
-var compactionEpoch = time.Now()
-
 // leafState is the per-key payload attached to each critbit leaf (the trie's
 // T). It carries the cached subdag for the key so reads reuse the prepared
 // structure instead of rebuilding it. It is created once per key and mutated
@@ -64,9 +59,6 @@ var compactionEpoch = time.Now()
 // the subdag, which is why this is a struct rather than a bare subdag pointer.
 type leafState struct {
 	subdag atomic.Pointer[cachedDag]
-	// Monotonic nanoseconds since compactionEpoch (+1 reserves zero for an
-	// unused leaf). Claiming before emission also paces aborted attempts.
-	lastCompaction atomic.Int64
 	// cloudConsulted marks that the Cloud read-miss backstop has received one
 	// complete answer for this key during this leaf's residency. It turns a
 	// nil reduction from "not known — ask Cloud" into "authoritatively
@@ -93,15 +85,6 @@ type leafState struct {
 	subMu           sync.Mutex
 	subscribers     []pb.NodeID
 	subscriberBytes int64
-}
-
-func (ls *leafState) claimCompaction(now int64) bool {
-	previous := ls.lastCompaction.Load()
-	if previous != 0 && now-previous < int64(compactionInterval) {
-		return false
-	}
-
-	return ls.lastCompaction.CompareAndSwap(previous, now)
 }
 
 // cachedDag is the reusable output of dag.prepare for a specific tip set: the
@@ -165,7 +148,7 @@ func (e *Engine) prepareDag(d *dag, key string, tips []Tip) error {
 		return d.prepare(tips)
 	}
 
-	ls, _ := e.index.LoadOrStoreData(key, &leafState{})
+	ls, _ := e.index.LoadOrStoreDataInternal(key, &leafState{})
 	if ls == nil {
 		return d.prepare(tips)
 	}
@@ -185,7 +168,7 @@ func (e *Engine) prepareDag(d *dag, key string, tips []Tip) error {
 		}
 	}
 
-	d.compact = d.activeTxnID == ""
+	d.compact = true
 	if err := d.prepare(tips); err != nil {
 		if !errors.Is(err, errEffectNotResident) {
 			return err
@@ -268,13 +251,26 @@ func (e *Engine) installBoundSubdags(root *dag) {
 	}
 
 	queue := []*dag{root}
+	verdicts := make(verdictMap)
+
 	for len(queue) > 0 {
 		d := queue[len(queue)-1]
 		queue = queue[:len(queue)-1]
 
+		// A completed competition already supplies the cross-key outcome.
+		// Collect its certificates before considering any bind in this DAG;
+		// nodes is a map, so iteration order must not decide whether we expand.
+		for tip, eff := range d.nodes {
+			if snap := eff.GetSnapshot(); snap != nil {
+				for txn, entry := range settledSnapshotVerdicts(tip, snap) {
+					verdicts.retain(txn, entry)
+				}
+			}
+		}
+
 		for offset, eff := range d.nodes {
 			bind := eff.GetTxnBind()
-			if bind == nil {
+			if bind == nil || verdicts[eff.GetTxnId()].settled {
 				continue
 			}
 
@@ -289,16 +285,16 @@ func (e *Engine) installBoundSubdags(root *dag) {
 
 				seen[b] = true
 
-				if _, subscribed := e.subscriptions.Load(key); !subscribed {
+				if _, subscribed := e.subscription(key); !subscribed {
 					continue
 				}
 
-				tips := e.index.Contains(key)
+				tips := e.index.ContainsInternal(key)
 				if tips != nil && tips.Contains(offset) {
 					continue
 				}
 
-				if ls := e.index.LoadData(key); ls != nil && tips != nil {
+				if ls := e.index.LoadDataInternal(key); ls != nil && tips != nil {
 					if cs := ls.subdag.Load(); cs != nil && cs != evictedSubdag &&
 						tipsEqual(cs.tips, tips.Tips()) && slices.Contains(cs.topoOrder, offset) {
 						continue
@@ -311,7 +307,7 @@ func (e *Engine) installBoundSubdags(root *dag) {
 				// Do not add a redundant ancestor to a live frontier: a
 				// transaction can capture it before the next read prunes it,
 				// then mistake that pruning for a concurrent write at Flush.
-				candidates, _, err := NormalizeCloudTipCandidates(key, []Tip{offset}, tips.Tips(), func(t Tip) (*pb.Effect, error) {
+				candidates, _, err := normalizeCloudTipCandidates(key, []Tip{offset}, tips.Tips(), func(t Tip) (*pb.Effect, error) {
 					return e.getEffect(key, t)
 				})
 				if err != nil || len(candidates) == 0 {
@@ -425,11 +421,12 @@ func (e *Engine) publishSubdag(ls *leafState, d *dag, tips []Tip) {
 type verdictEntry struct {
 	verdict     pb.Verdict
 	snapshotTip Tip
-	proven      bool // derived from retained proof, not merely a cached label
+	proven      bool // established by retained proof or completed subscriber responses
+	settled     bool // explicitly no outstanding subscribers; no further competition
 }
 
 // verdictMap accumulates snapshot-supplied verdicts during a walk. Recorded
-// losses suppress binds; recorded wins still need checks against concurrent binds.
+// losses suppress binds; wins with outstanding/unknown subscribers still compete.
 type verdictMap map[string]verdictEntry
 
 // harvest folds a snapshot's TxnVerdicts into the map. First-seen wins;
@@ -453,6 +450,16 @@ func (v verdictMap) retain(txnID string, entry verdictEntry) {
 	}
 
 	existing, ok := v[txnID]
+	if entry.settled && !existing.settled {
+		v[txnID] = entry
+
+		return
+	}
+
+	if existing.settled && !entry.settled {
+		return
+	}
+
 	if entry.proven && !existing.proven {
 		v[txnID] = entry
 
@@ -481,11 +488,12 @@ func (v verdictMap) retain(txnID string, entry verdictEntry) {
 		"new_snapshot", entry.snapshotTip)
 }
 
-// isJSONType reports whether the type tag marks a RedisJSON node (key root or a
-// nested object/array). JSON nodes are exempt from Redis empty-collection
-// auto-delete — an empty {} or [] is a real value.
-func isJSONType(t pb.ValueType) bool {
-	return t == pb.ValueType_TYPE_JSON || t == pb.ValueType_TYPE_JSON_OBJECT || t == pb.ValueType_TYPE_JSON_ARRAY
+// preservesEmptyValue reports whether the type represents a value even when
+// empty or metadata-only. JSON containers and graph descriptors are exempt
+// from Redis empty-collection auto-delete.
+func preservesEmptyValue(t pb.ValueType) bool {
+	return t == pb.ValueType_TYPE_JSON || t == pb.ValueType_TYPE_JSON_OBJECT ||
+		t == pb.ValueType_TYPE_JSON_ARRAY || t == pb.ValueType_TYPE_GRAPH
 }
 
 // filterSnapshot applies post-reconstruction filtering: key-level expiry,
@@ -505,10 +513,10 @@ func filterSnapshotAt(result *pb.ReducedEffect, now time.Time) *pb.ReducedEffect
 	if result.GetExpiresAt() != nil && now.After(result.GetExpiresAt().AsTime()) {
 		return nil
 	}
-	// JSON nodes manage their own emptiness: an empty object/array (or a
+	// Nested values manage their own emptiness: an empty object/array/graph (or a
 	// meta-only root) is a real value, not a Redis empty-collection auto-delete.
 	// (Cf. the TYPE_STREAM exception for empty streams below.)
-	if isJSONType(result.GetTypeTag()) {
+	if preservesEmptyValue(result.GetTypeTag()) {
 		return result
 	}
 	// Filter expired elements from KEYED collections
@@ -528,6 +536,11 @@ func filterSnapshotAt(result *pb.ReducedEffect, now time.Time) *pb.ReducedEffect
 				delete(result.GetNetAdds(), k)
 			}
 		}
+	}
+	// Partitions are data even when the root has no scalar or collection
+	// elements. Apply root expiry above, but do not auto-delete their parent.
+	if len(result.GetPartitions()) > 0 {
+		return result
 	}
 	// Empty keyed collection = non-existent (Redis auto-delete)
 	if result.GetCollection() == pb.CollectionKind_KEYED &&
@@ -566,6 +579,11 @@ func filterSnapshotAt(result *pb.ReducedEffect, now time.Time) *pb.ReducedEffect
 // the index tip set and reconstructs via ReduceBranch + canonical merge.
 // Unavailable ancestry returns an error, never a successful missing value.
 func (e *Engine) GetSnapshot(key string) (*pb.ReducedEffect, []Tip, int, error) {
+	return e.GetSnapshotInternal(logicalAddress(key))
+}
+
+// GetSnapshotInternal uses a complete trie address.
+func (e *Engine) GetSnapshotInternal(key string) (*pb.ReducedEffect, []Tip, int, error) {
 	// Free miss: nothing local (no tips, no subscription record) and no peer
 	// filter admits the key — there is no state to bootstrap and no writer to
 	// hear from, so announcing a subscription would be pure DAG noise (on
@@ -593,7 +611,7 @@ func (e *Engine) GetSnapshot(key string) (*pb.ReducedEffect, []Tip, int, error) 
 	// for this leaf's residency; subscriptions reconcile subsequent changes.
 	if result == nil && e.cloudReader != nil && e.subscriptionOnlyTips(tips) &&
 		(e.inMajorityPartition() || e.modeForKey(key) == UnsafeMode) {
-		ls, _ := e.index.LoadOrStoreData(key, &leafState{})
+		ls, _ := e.index.LoadOrStoreDataInternal(key, &leafState{})
 		if ls == nil || !ls.cloudConsulted.Load() {
 			if ls != nil {
 				ls.cloudMu.Lock()
@@ -626,7 +644,7 @@ func (e *Engine) GetSnapshot(key string) (*pb.ReducedEffect, []Tip, int, error) 
 
 				if ls == nil {
 					// The hydrate may have just created the leaf.
-					ls, _ = e.index.LoadOrStoreData(key, &leafState{})
+					ls, _ = e.index.LoadOrStoreDataInternal(key, &leafState{})
 				}
 
 				if ls != nil {
@@ -654,7 +672,7 @@ func (e *Engine) GetSnapshot(key string) (*pb.ReducedEffect, []Tip, int, error) 
 // by a failure path (markFailed) rather than a successful bootstrap — the
 // closeOnce + Store-before-close in markFailed ensures the re-load sees the
 // up-to-date value.
-func (e *Engine) awaitSubscription(existing *subscriptionState, unsafe, allowAsync bool) error {
+func (e *Engine) awaitSubscription(key string, existing *subscriptionState, unsafe, allowAsync bool) error {
 	if existing.incomplete.Load() {
 		if unsafe {
 			return nil
@@ -679,7 +697,7 @@ func (e *Engine) awaitSubscription(existing *subscriptionState, unsafe, allowAsy
 			existing.announcement = nil
 			existing.bootstrapMu.Unlock()
 			// Retry work may outlive this caller's borrowed key buffer.
-			return e.bootstrapSubscription(string(notify.GetKey()), existing, notify, unsafe)
+			return e.bootstrapSubscription(strings.Clone(key), existing, notify, unsafe)
 		}
 		existing.bootstrapMu.Unlock()
 		<-existing.ready
@@ -706,11 +724,11 @@ func (e *Engine) awaitSubscription(existing *subscriptionState, unsafe, allowAsy
 // claim on it means there is nothing to announce — a later write (or a peer's
 // claim) puts it on the subscribe path like any other key.
 func (e *Engine) freeMissEligible(key string) bool {
-	if _, ok := e.subscriptions.Load(key); ok {
+	if _, ok := e.subscription(key); ok {
 		return false // already subscribed; ensureSubscribed is a cheap no-op
 	}
 
-	if e.index.Contains(key) != nil {
+	if e.index.ContainsInternal(key) != nil {
 		return false // we hold state (peer arrivals, backfill): formalize authority
 	}
 
@@ -718,7 +736,7 @@ func (e *Engine) freeMissEligible(key string) bool {
 		return false // a peer may hold it: bootstrap required
 	}
 
-	if e.cloudReader != nil && e.cloudReader.MayHold(key) {
+	if e.cloudReader != nil && e.cloudReader.MayHold(wireKey(key)) {
 		// Cloud may hold it: the consult path below needs the subscription's
 		// leaf to anchor the cloudConsulted marker that caps WAN round-trips.
 		return false
@@ -752,7 +770,7 @@ func (e *Engine) subscriptionOnlyTips(tips []Tip) bool {
 func (e *Engine) reconstructLocal(key string) (*pb.ReducedEffect, []Tip, int, error) {
 	// Read index tips once — these are the tips the returned snapshot
 	// corresponds to.
-	indexTips := e.index.Contains(key)
+	indexTips := e.index.ContainsInternal(key)
 
 	var snapshotTips []Tip
 	if indexTips != nil {
@@ -795,14 +813,15 @@ func (e *Engine) reconstructLocal(key string) (*pb.ReducedEffect, []Tip, int, er
 	// Targeted filter: surface a metadata-only ReducedEffect as nil so
 	// callers don't see a "key exists" signal driven by the originator's
 	// own SubscriptionEffect (installed by ensureSubscribed during this
-	// call) or by a REMOVE_OP tombstone. Expiry, element-level expiry,
+	// call) or by a REMOVE_OP tombstone. A root with partitions is data.
+	// Expiry, element-level expiry,
 	// and empty-collection auto-delete are presentation concerns and stay
 	// in filterSnapshot for the Context layer — engine.GetSnapshot must
 	// return raw causal state for those cases per the test
 	// TestGetSnapshot_ExpiredReconstructedStillReturnsState. When we
 	// surface nil here, also zero chainLen so the caller's compaction
 	// path doesn't dereference a nil result.
-	if result != nil && !isJSONType(result.GetTypeTag()) &&
+	if result != nil && !preservesEmptyValue(result.GetTypeTag()) && len(result.GetPartitions()) == 0 &&
 		result.GetScalar() == nil && len(result.GetNetAdds()) == 0 && len(result.GetOrderedElements()) == 0 &&
 		(result.GetOp() == pb.EffectOp_UNKNOWN_OP || result.GetOp() == pb.EffectOp_REMOVE_OP) {
 		return nil, snapshotTips, 0, nil
@@ -833,7 +852,7 @@ func (e *Engine) reconstructLocal(key string) (*pb.ReducedEffect, []Tip, int, er
 // Unreachable peers are skipped without retry, the bootstrap proceeds with
 // whatever peers respond, and the branches merge later via anti-entropy.
 func (e *Engine) ensureSubscribed(key string) error {
-	return e.ensureSubscribedMode(key, true)
+	return e.ensureSubscribedMode(key, subscriptionOrdinary)
 }
 
 // ensureSubscribedBlocking forces the synchronous bootstrap even when no peer
@@ -841,16 +860,23 @@ func (e *Engine) ensureSubscribed(key string) error {
 // fork-choice base-sharing depends on the round-2 tip collection completing
 // before the bind is emitted, so it must never take the async-announce path.
 func (e *Engine) ensureSubscribedBlocking(key string) error {
-	return e.ensureSubscribedMode(key, false)
+	return e.ensureSubscribedMode(key, subscriptionBlocking)
 }
 
-func (e *Engine) ensureSubscribedMode(key string, allowAsync bool) error {
+type subscriptionMode uint8
+
+const (
+	subscriptionOrdinary subscriptionMode = iota
+	subscriptionBlocking
+)
+
+func (e *Engine) ensureSubscribedMode(key string, mode subscriptionMode) error {
 	isUnsafe := e.modeForKey(key) == UnsafeMode
 	// Allocation-free fast path: Emit calls this on every effect, so the
 	// already-subscribed case must not pay the state+channel allocation the
 	// LoadOrStore below needs.
-	if existing, ok := e.subscriptions.Load(key); ok {
-		return e.awaitSubscription(existing, isUnsafe, allowAsync)
+	if existing, ok := e.subscription(key); ok {
+		return e.awaitSubscription(key, existing, isUnsafe, mode == subscriptionOrdinary)
 	}
 	// Callers on the Redis hot path may borrow key from a pooled command
 	// buffer. A new subscription outlives that command, so own the map/trie key
@@ -864,7 +890,7 @@ func (e *Engine) ensureSubscribedMode(key string, allowAsync bool) error {
 		state.bootstrapMu.Unlock()
 		e.releaseKey(ownedKey)
 
-		return e.awaitSubscription(existing, isUnsafe, allowAsync)
+		return e.awaitSubscription(key, existing, isUnsafe, mode == subscriptionOrdinary)
 	}
 
 	if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
@@ -873,7 +899,7 @@ func (e *Engine) ensureSubscribedMode(key string, allowAsync bool) error {
 
 	hlc := timestamppb.New(e.clock.Now())
 	eff := &pb.Effect{
-		Key:            []byte(ownedKey),
+		Key: []byte(wireKey(ownedKey)), IKey: []byte(ownedKey),
 		Hlc:            hlc,
 		NodeId:         uint64(e.nodeID),
 		ForkChoiceHash: ComputeForkChoiceHash(e.nodeID, hlc),
@@ -917,16 +943,14 @@ func (e *Engine) ensureSubscribedMode(key string, allowAsync bool) error {
 
 	notify := BuildOffsetNotify(e.nodeID, offset, eff, data, nil)
 
-	// Ordinary accesses can announce asynchronously when peer filters report
-	// no holder. Concurrent peers may still subscribe: the announcement is
-	// not completed discovery, and a later transaction must run the blocking
-	// rounds. Local installation stays synchronous so Emit can depend on our
-	// SubscriptionEffect. Missing peer filters force the blocking path below.
-	if allowAsync &&
+	// Ordinary accesses can announce asynchronously when no peer holds the
+	// key. This announcement does not claim discovery is complete.
+	if mode == subscriptionOrdinary &&
 		(e.inMajorityPartition() || isUnsafe) && !e.clusterMaybeHasKey(ownedKey) {
 		// Keep ready open: a later blocking caller must perform discovery,
 		// even if this announcement has already been delivered.
 		state.announcement = notify
+
 		go e.broadcaster.BroadcastWithData(notify, notify.GetEffectData())
 		state.bootstrapMu.Unlock()
 
@@ -951,11 +975,12 @@ func (e *Engine) bootstrapSubscription(ownedKey string, state *subscriptionState
 
 	// Register bootstrap collector before broadcasting so NACKs aren't missed
 	collector := &bootstrapCollector{
+		key:   ownedKey,
 		nacks: make(chan *pb.NackNotify, 64),
 	}
 
-	e.pendingBootstraps.Store(ownedKey, collector)
-	defer e.pendingBootstraps.Delete(ownedKey)
+	e.pendingBootstraps.Store(r(notify.GetOrigin()), collector)
+	defer e.pendingBootstraps.Delete(r(notify.GetOrigin()))
 
 	// Send to each peer individually and wait for ACKs. Retry if no peers
 	// responded (e.g. noise sessions not yet established after restart).
@@ -1086,7 +1111,7 @@ done:
 // unsubscribed peer would re-establish it as a holder and defeat eviction.
 // Verdict snapshots (State == nil) carry no subscribers and are skipped.
 func (e *Engine) seedSubscribersFromDag(key string) {
-	cs := e.index.Contains(key)
+	cs := e.index.ContainsInternal(key)
 	if cs == nil {
 		return
 	}
@@ -1270,7 +1295,13 @@ func (e *Engine) reconstructWithView(key string, tips []Tip, txID string, waitFo
 
 		if view != nil {
 			bindsByKey, snapshotVerdicts = view.anchors, view.verdicts
-			atomicallyLost, crossKeyWalked = view.lost, view.walked
+
+			atomicallyLost = view.lost
+			for k, walked := range view.walked {
+				if k != key {
+					crossKeyWalked += walked
+				}
+			}
 		} else {
 			bindsByKey, snapshotVerdicts, err = e.bindKeyClosure(key)
 			if err != nil {
@@ -1285,7 +1316,7 @@ func (e *Engine) reconstructWithView(key string, tips []Tip, txID string, waitFo
 			var walkedByKey map[string]int
 
 			atomicallyLost, walkedByKey = e.losersOnKeysAt(bindsByKey, func(k string) []Tip {
-				return e.index.Contains(k).Tips()
+				return e.index.ContainsInternal(k).Tips()
 			}, snapshotVerdicts, invisible, true)
 			for k, walked := range walkedByKey {
 				if k != key {
@@ -1321,6 +1352,7 @@ func (e *Engine) reconstructWithView(key string, tips []Tip, txID string, waitFo
 
 		d = newDag(e, key, txID)
 		if view != nil && view.historical {
+			d.compact = txID != "" && e.index != nil
 			err = d.prepare(tips)
 		} else {
 			err = e.prepareDag(d, key, tips)
@@ -1509,7 +1541,7 @@ func (e *Engine) reconstructWithView(key string, tips []Tip, txID string, waitFo
 			}
 		}
 
-		currentIndex := e.index.Contains(key)
+		currentIndex := e.index.ContainsInternal(key)
 		hasCommitted := false
 
 		var stale []Tip
@@ -1528,7 +1560,7 @@ func (e *Engine) reconstructWithView(key string, tips []Tip, txID string, waitFo
 
 		if hasCommitted && len(stale) > 0 {
 			slog.Debug("reconstruct: pruning stale tips", "key", key, "stale", stale)
-			e.index.RemoveTips(key, stale)
+			e.index.RemoveTipsInternal(key, stale)
 		}
 	}
 
@@ -1555,6 +1587,9 @@ func (e *Engine) reconstructWithView(key string, tips []Tip, txID string, waitFo
 func (e *Engine) walkBindEvidence(key string, tips []Tip, visit func(Tip, *pb.Effect)) error {
 	d := newDag(e, key, "")
 	failed := make(map[Tip]error)
+
+	var selected []Tip
+
 	load := func(t Tip) *pb.Effect {
 		if eff := d.nodes[t]; eff != nil {
 			return eff
@@ -1579,9 +1614,13 @@ func (e *Engine) walkBindEvidence(key string, tips []Tip, visit func(Tip, *pb.Ef
 
 		paths, err := d.topoCollect(tips, true)
 		if err != nil {
-			// Tolerant callers historically inspect cyclic evidence. Without
-			// a proven common snapshot, no snapshot can stop the walk.
-			d.lcaTip = Tip{}
+			// Tolerant callers still inspect cyclic evidence. Use the collected
+			// key records without claiming a common snapshot or walking again.
+			for tip, eff := range d.nodes {
+				if eff == nil || effectHasAddress(eff, key) {
+					selected = append(selected, tip)
+				}
+			}
 
 			break
 		}
@@ -1602,23 +1641,19 @@ func (e *Engine) walkBindEvidence(key string, tips []Tip, visit func(Tip, *pb.Ef
 		}
 
 		if !loaded {
+			selected = d.topoOrder[start:]
+
 			break
 		}
 	}
 
 	seen := make(map[Tip]bool)
-	stack := slices.Clone(tips)
 
 	var snapshots []Tip
 
-	for len(stack) > 0 {
-		t := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-
-		if seen[t] {
-			continue
-		}
-
+	// Interpret reconstruction's selected graph. Following dependency edges
+	// again would reopen excluded cross-key observations and folded history.
+	for _, t := range selected {
 		seen[t] = true
 
 		eff := load(t)
@@ -1630,12 +1665,6 @@ func (e *Engine) walkBindEvidence(key string, tips []Tip, visit func(Tip, *pb.Ef
 
 		if prev := eff.GetSnapshot().GetPrevSnapshot(); prev != nil {
 			snapshots = append(snapshots, r(prev))
-		}
-
-		if t != d.lcaTip {
-			for dep := range keyDeps(key, eff) {
-				stack = append(stack, r(dep))
-			}
 		}
 	}
 
@@ -1698,7 +1727,7 @@ func (e *Engine) bindKeyClosure(startKey string) (map[string][]Tip, verdictMap, 
 			return nil, err
 		}
 
-		return e.index.Contains(key).Tips(), nil
+		return e.index.ContainsInternal(key).Tips(), nil
 	}, false)
 }
 
@@ -1803,7 +1832,7 @@ func (e *Engine) losersOnKey(key string, extraTips []Tip, snapshotVerdicts verdi
 		isInvisible = e.horizon.IsInvisible
 	}
 
-	return e.losersOnKeyAt(key, e.index.Contains(key).Tips(), extraTips, snapshotVerdicts, isInvisible, true)
+	return e.losersOnKeyAt(key, e.index.ContainsInternal(key).Tips(), extraTips, snapshotVerdicts, isInvisible, true)
 }
 
 func (e *Engine) losersOnKeyAt(key string, tips, extraTips []Tip, snapshotVerdicts verdictMap, isInvisible func(string) bool, reportConflicts bool) (map[string]struct{}, int) {
@@ -1978,7 +2007,7 @@ func (e *Engine) forkChoicesOnKeyAt(key string, tips, extraTips []Tip, snapshotV
 			}
 
 			verdictAdjudicated[b.txnID] = bindWithSource{seenBind: b, verdictSrc: entry.snapshotTip}
-			if entry.verdict == pb.Verdict_WON {
+			if entry.verdict == pb.Verdict_WON && !entry.settled {
 				candidates = append(candidates, b)
 			}
 
@@ -2208,7 +2237,7 @@ func (e *Engine) collectBindEffects(bindEff *pb.Effect, key string) ([]*pb.Effec
 			return nil, err
 		}
 
-		if eff.GetTxnId() != txnID {
+		if eff.GetTxnId() != txnID || !effectHasAddress(eff, key) {
 			continue
 		}
 

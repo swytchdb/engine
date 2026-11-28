@@ -55,7 +55,7 @@ func TestAncestryConcurrentRootsJoinActiveDownload(t *testing.T) {
 
 		fetch := func(tip Tip) {
 			wg.Go(func() {
-				if _, err := e.fetchFrontierAncestry("k", tip); err != nil {
+				if _, err := e.fetchFrontierAncestry(logicalAddress("k"), tip); err != nil {
 					t.Error(err)
 				}
 			})
@@ -104,11 +104,11 @@ func TestAncestryFailedDownloadCanRetry(t *testing.T) {
 
 		return receive(root, wireEffect(cutEffect(root)), false)
 	}}
-	if _, err := e.fetchFrontierAncestry("k", root); !errors.Is(err, failure) {
+	if _, err := e.fetchFrontierAncestry(logicalAddress("k"), root); !errors.Is(err, failure) {
 		t.Fatal(err)
 	}
 
-	if _, err := e.fetchFrontierAncestry("k", root); err != nil {
+	if _, err := e.fetchFrontierAncestry(logicalAddress("k"), root); err != nil {
 		t.Fatal(err)
 	}
 
@@ -129,11 +129,11 @@ func TestAncestryPeersUseKeyEvidenceAndMembership(t *testing.T) {
 		e.getOrCreatePeerFilter(peer).hasBulk = true
 	}
 
-	e.peerFilterAdd(13, "k")
-	e.addPeerSubscriber("k", 11)
-	e.addPeerSubscriber("k", 14) // removed member, stale leaf subscriber
+	e.peerFilterAdd(13, logicalAddress("k"))
+	e.addPeerSubscriber(logicalAddress("k"), 11)
+	e.addPeerSubscriber(logicalAddress("k"), 14) // removed member, stale leaf subscriber
 
-	got := e.ancestryPeers("k", Tip{15, 1})
+	got := e.ancestryPeers(logicalAddress("k"), Tip{15, 1})
 	if len(got) != 2 || got[0] == got[1] || !slices.Contains([]pb.NodeID{15, 11, 12, 13}, got[0]) || !slices.Contains([]pb.NodeID{15, 11, 12, 13}, got[1]) {
 		t.Fatalf("holders = %v", got)
 	}
@@ -168,7 +168,7 @@ func TestAncestryStreamFeedsExistingCutDiscoveryAndBoundaries(t *testing.T) {
 
 		return receive(Tip{9, 1}, nil, false)
 	}}
-	got, complete, err := e.closeIngestedFrontier("k", []Tip{a, b}, make(map[Tip]error))
+	got, complete, err := e.closeIngestedFrontier(logicalAddress("k"), []Tip{a, b}, make(map[Tip]error))
 	requireCutTips(t, got, []Tip{a, b})
 
 	if err != nil || !complete {
@@ -213,7 +213,7 @@ func TestAncestryRootEvidenceSuppressesSubsequentFetches(t *testing.T) {
 
 				var err error
 
-				source.VisitAncestry(key, root, func(id Tip, eff *pb.Effect, isRoot bool) bool {
+				source.VisitAncestryInternal(key, root, func(id Tip, eff *pb.Effect, isRoot bool) bool {
 					records++
 
 					var data []byte
@@ -229,7 +229,7 @@ func TestAncestryRootEvidenceSuppressesSubsequentFetches(t *testing.T) {
 				return err
 			}}
 			for range 2 {
-				got, complete, err := e.closeIngestedFrontier("k", []Tip{tip}, make(map[Tip]error))
+				got, complete, err := e.closeIngestedFrontier(logicalAddress("k"), []Tip{tip}, make(map[Tip]error))
 				requireCutTips(t, got, []Tip{tip})
 
 				if err != nil || !complete {
@@ -278,7 +278,7 @@ func TestAncestryRootStillProcessesResidentHistory(t *testing.T) {
 				return nil, ErrEffectNotFound
 			}}
 			for range 2 {
-				got, complete, err := e.closeIngestedFrontier("k", []Tip{cut, old}, make(map[Tip]error))
+				got, complete, err := e.closeIngestedFrontier(logicalAddress("k"), []Tip{cut, old}, make(map[Tip]error))
 				requireCutTips(t, got, []Tip{cut})
 
 				if err != nil || !complete {
@@ -288,7 +288,7 @@ func TestAncestryRootStillProcessesResidentHistory(t *testing.T) {
 
 			seen := make(map[Tip]bool)
 
-			e.effectCache.VisitAncestry("k", cut, func(tip Tip, eff *pb.Effect, _ bool) bool {
+			e.effectCache.VisitAncestryInternal(logicalAddress("k"), cut, func(tip Tip, eff *pb.Effect, _ bool) bool {
 				if eff != nil {
 					seen[tip] = true
 				}

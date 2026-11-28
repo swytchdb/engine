@@ -35,6 +35,7 @@ import (
 	pb "github.com/swytchdb/engine/cluster/proto"
 	dp "github.com/swytchdb/engine/cluster/proto/dataplane"
 	"github.com/swytchdb/engine/effects"
+	"github.com/swytchdb/engine/keytrie"
 	gproto "google.golang.org/protobuf/proto"
 )
 
@@ -70,7 +71,13 @@ func (cs *CloudSync) MayHold(key string) bool {
 // Sidecars supply cloud effect bytes inline; outbox bytes are already local.
 // Missing refs identify known cloud holes and avoid redundant CDN fetches.
 func (cs *CloudSync) CloudTips(ctx context.Context, key string) ([]effects.Tip, []effects.CloudEffect, []effects.Tip, error) {
-	name := CloudKeyName(cs.keyNameKey, []byte(key))
+	return cs.CloudTipsInternal(ctx, keytrie.LogicalAddress(key))
+}
+
+// CloudTipsInternal retains a complete trie address for background reconciliation.
+// The outbox uses the canonical address. Cloud naming remains a transport boundary.
+func (cs *CloudSync) CloudTipsInternal(ctx context.Context, key string) ([]effects.Tip, []effects.CloudEffect, []effects.Tip, error) {
+	name := CloudKeyName(cs.keyNameKey, []byte(keytrie.WireKey(key)))
 	if !cs.cloudMayHold(name) {
 		return nil, nil, nil, nil
 	}
@@ -93,7 +100,7 @@ func (cs *CloudSync) CloudTips(ctx context.Context, key string) ([]effects.Tip, 
 			// re-consults until the cloud answers and merges the missed
 			// frontier into the DAG.
 			slog.Warn("cloud sync: get tips failed, serving outbox frontier", "key", key, "error", err)
-			cs.MarkPending(key)
+			cs.markPendingInternal(key)
 
 			return tips, nil, nil, nil
 		}
@@ -132,6 +139,10 @@ func (cs *CloudSync) CloudTips(ctx context.Context, key string) ([]effects.Tip, 
 // MarkPending schedules a re-consult when the outbox was served without a
 // complete GetTips response. It does not classify the graph's reconstructability.
 func (cs *CloudSync) MarkPending(key string) {
+	cs.markPendingInternal(keytrie.LogicalAddress(key))
+}
+
+func (cs *CloudSync) markPendingInternal(key string) {
 	cs.mu.Lock()
 	if cs.reconcile == nil {
 		cs.reconcile = make(map[string]struct{})
@@ -208,7 +219,7 @@ func (cs *CloudSync) reconcileBatch(keys []string) {
 
 	byName := make(map[string]string, len(keys))
 	for i, key := range keys {
-		name := CloudKeyName(cs.keyNameKey, []byte(key))
+		name := CloudKeyName(cs.keyNameKey, []byte(keytrie.WireKey(key)))
 		names[i] = name
 		byName[string(name)] = key
 	}
@@ -235,7 +246,7 @@ func (cs *CloudSync) reconcileBatch(keys []string) {
 			continue
 		}
 
-		if err := cs.engine.InstallCloudTips(key, tips, cs.appendSidecar(nil, kt)); err != nil {
+		if err := cs.engine.InstallCloudTipsInternal(key, tips, cs.appendSidecar(nil, kt)); err != nil {
 			slog.Warn("cloud reconcile: install failed; will retry", "key", key, "error", err)
 
 			continue

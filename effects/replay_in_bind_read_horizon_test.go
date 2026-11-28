@@ -321,7 +321,7 @@ func TestReplayRun26373595271InBindReadDiverges(t *testing.T) {
 	// --- Step 6: do a fresh reconstruct from the SAME logical tip set
 	// preTxTips (the index state BEFORE T's emits). With R promoted, this
 	// is the read every other client / process would do post-promotion.
-	postReduced, _, err := e.reconstruct("el-0", preTxTips, "", false)
+	postReduced, _, err := e.reconstruct(logicalAddress("el-0"), preTxTips, "", false)
 	if err != nil {
 		t.Fatalf("post-promotion reconstruct: %v", err)
 	}
@@ -374,7 +374,7 @@ func newInBindReadReplayEngine(t *testing.T) *Engine {
 		pendingTxns:       xsync.NewMap[Tip, *pendingTxn](),
 		pendingTxTips:     xsync.NewMap[Tip, []Tip](),
 		txAbortCounts:     xsync.NewMap[string, *atomic.Int32](),
-		pendingBootstraps: xsync.NewMap[string, *bootstrapCollector](),
+		pendingBootstraps: xsync.NewMap[Tip, *bootstrapCollector](),
 		spokenBinds:       clox.NewCloxCache[Tip, *spokenBindHistory](clox.ConfigFromCapacity(256)),
 	}
 	e.safety.Store(&safetyMap{defaultMode: UnsafeMode})
@@ -389,7 +389,7 @@ func newInBindReadReplayEngine(t *testing.T) *Engine {
 func markInBindReadSubscribed(e *Engine, key string) {
 	st := &subscriptionState{ready: make(chan struct{})}
 	close(st.ready)
-	e.subscriptions.Store(key, st)
+	e.subscriptions.Store(logicalAddress(key), st)
 }
 
 // pushInBindEffect routes a synthetic remote effect through HandleRemote

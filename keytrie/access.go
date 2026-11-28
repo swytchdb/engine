@@ -28,11 +28,11 @@ import (
 	"unsafe"
 )
 
-// Pin adds a dynamic do-not-evict hold on key's live leaf, reporting whether
+// PinInternal adds a dynamic do-not-evict hold on key's live leaf, reporting whether
 // one was taken (false: no live leaf — nothing to protect). Taken under the
 // reap read lock, writer discipline: chunk compaction copies leaf fields under
 // the write lock, so a hold can never land on a husk the copy already left.
-func (c *Critbit[T]) Pin(key string) bool {
+func (c *Critbit[T]) PinInternal(key string) bool {
 	c.reapMu.RLock()
 	defer c.reapMu.RUnlock()
 
@@ -55,12 +55,12 @@ func (c *Critbit[T]) Pin(key string) bool {
 	return true
 }
 
-// Unpin releases one dynamic hold on key's live leaf. A missing or deleted
+// UnpinInternal releases one dynamic hold on key's live leaf. A missing or deleted
 // leaf is a no-op (the key was explicitly deleted or the index flushed while
 // held — the hold died with the leaf). A negative count on a live leaf is an
 // unpin without a matching pin: a protocol bug that would let the sweep evict
 // a key another holder still protects, so it panics like a refcount underflow.
-func (c *Critbit[T]) Unpin(key string) bool {
+func (c *Critbit[T]) UnpinInternal(key string) bool {
 	c.reapMu.RLock()
 	defer c.reapMu.RUnlock()
 
@@ -76,9 +76,9 @@ func (c *Critbit[T]) Unpin(key string) bool {
 	return true
 }
 
-// Contains checks if a key exists and returns its TipSet.
+// ContainsInternal checks if a raw trie key exists and returns its TipSet.
 // Returns nil if the key doesn't exist or is deleted.
-func (c *Critbit[T]) Contains(key string) *TipSet {
+func (c *Critbit[T]) ContainsInternal(key string) *TipSet {
 	c.reapMu.RLock()
 	defer c.reapMu.RUnlock()
 
@@ -90,11 +90,11 @@ func (c *Critbit[T]) Contains(key string) *TipSet {
 	return leaf.tips.Load()
 }
 
-// LoadData returns the existing leaf payload without installing one. Like
-// Contains, it holds the structural read lock until it has copied the payload
+// LoadDataInternal returns the existing leaf payload without installing one. Like
+// ContainsInternal, it holds the structural read lock until it has copied the payload
 // pointer. The returned payload remains valid after the leaf is retired.
 // A successful lookup records the access for eviction policy.
-func (c *Critbit[T]) LoadData(key string) *T {
+func (c *Critbit[T]) LoadDataInternal(key string) *T {
 	c.reapMu.RLock()
 	defer c.reapMu.RUnlock()
 
@@ -159,7 +159,7 @@ func (c *Critbit[T]) bumpAccess(leaf *critNode[T]) {
 	c.windowOps.add(p, 1)
 }
 
-// LoadOrStoreData returns the leaf payload for key, installing def if none is
+// LoadOrStoreDataInternal returns the leaf payload for key, installing def if none is
 // present yet (CAS, so concurrent callers agree on a single payload). Returns
 // (nil, false) if the key is missing/deleted. The bool reports whether an
 // existing payload was loaded (true) rather than def being stored (false).
@@ -171,7 +171,7 @@ func (c *Critbit[T]) bumpAccess(leaf *critNode[T]) {
 // The install CAS runs under the reap read-lock like every other leaf-field
 // mutation: compaction (write lock) relocates leaves, and a CAS landing on a
 // relocated husk would be silently lost.
-func (c *Critbit[T]) LoadOrStoreData(key string, def *T) (*T, bool) {
+func (c *Critbit[T]) LoadOrStoreDataInternal(key string, def *T) (*T, bool) {
 	c.reapMu.RLock()
 	defer c.reapMu.RUnlock()
 

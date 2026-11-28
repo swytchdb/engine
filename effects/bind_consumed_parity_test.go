@@ -75,7 +75,7 @@ func TestBindConsumedTipsMatchEmittedDeps(t *testing.T) {
 	// and doesn't block waiting on the ready channel.
 	subState := &subscriptionState{ready: make(chan struct{})}
 	subState.markReady()
-	e.subscriptions.Store(key, subState)
+	e.subscriptions.Store(logicalAddress(key), subState)
 
 	base := Tip{7, 100}    // committed base on el-1 (plays B:522)
 	foreign := Tip{8, 200} // foreign in-flight tx tip on el-1 (plays A:491 / 31947)
@@ -175,16 +175,13 @@ func TestBindConsumedTipsMatchEmittedDeps(t *testing.T) {
 	)
 
 	for _, off := range committedTips.Tips() {
-		eff, ok := e.effectCache.Get(off)
-		if !ok {
-			continue
-		}
+		eff := bindAtTip(t, e, off)
 
 		if b := eff.GetTxnBind(); b != nil && eff.GetTxnId() == txnID {
 			bindEff = eff
 			// The bind's NewTip on el-1 points to our committed data effect.
 			for _, kb := range b.GetKeys() {
-				if string(kb.GetKey()) != key {
+				if string(kb.GetKey()) != logicalAddress(key) {
 					continue
 				}
 
@@ -210,7 +207,7 @@ func TestBindConsumedTipsMatchEmittedDeps(t *testing.T) {
 	var consumed []Tip
 
 	for _, kb := range bindEff.GetTxnBind().GetKeys() {
-		if string(kb.GetKey()) == key {
+		if string(kb.GetKey()) == logicalAddress(key) {
 			consumed = fromPbRefs(kb.GetConsumedTips())
 		}
 	}

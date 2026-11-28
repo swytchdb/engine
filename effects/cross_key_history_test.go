@@ -62,8 +62,8 @@ func newCrossKeyHistory(t *testing.T, gap bool) crossKeyHistory {
 
 	f.previous = state(parent)
 	f.latest = state(f.previous)
-	e.installIngestedTips("el-0", f.shared, f.competitor)
-	e.installIngestedTips("el-4", f.latest)
+	e.installIngestedTips(logicalAddress("el-0"), f.shared, f.competitor)
+	e.installIngestedTips(logicalAddress("el-4"), f.latest)
 
 	return f
 }
@@ -71,7 +71,7 @@ func newCrossKeyHistory(t *testing.T, gap bool) crossKeyHistory {
 func (f crossKeyHistory) compact(t *testing.T) {
 	t.Helper()
 
-	d := newDag(f.engine, "el-4", "")
+	d := newDag(f.engine, logicalAddress("el-4"), "")
 
 	d.compact = true
 	if err := d.prepare([]Tip{f.latest}); err != nil {
@@ -104,7 +104,7 @@ func TestCompactionPreservesOtherKeyBindOwnership(t *testing.T) {
 	owners := slices.Clone(shared.creationKeys)
 	shared.creationMu.Unlock()
 
-	if !slices.Equal(owners, []string{"el-0"}) {
+	if !slices.Equal(owners, []string{logicalAddress("el-0")}) {
 		t.Fatalf("bind owners = %v, want only el-0", owners)
 	}
 
@@ -118,7 +118,7 @@ func TestCompactionPreservesOtherKeyBindOwnership(t *testing.T) {
 		}
 	}
 	// el-0's own DAG remains complete after the other key's compaction.
-	d := newDag(f.engine, "el-0", "")
+	d := newDag(f.engine, logicalAddress("el-0"), "")
 	if err := d.prepare(f.engine.index.Contains("el-0").Tips()); err != nil {
 		t.Fatal(err)
 	}
@@ -127,12 +127,12 @@ func TestCompactionPreservesOtherKeyBindOwnership(t *testing.T) {
 		t.Fatal("el-0 no longer reaches its bind and data")
 	}
 
-	losers, _ := f.engine.losersOnKey("el-0", nil, nil)
+	losers, _ := f.engine.losersOnKey(logicalAddress("el-0"), nil, nil)
 	if _, lost := losers["competitor"]; !lost || len(losers) != 1 {
 		t.Fatalf("retained el-0 evidence gives losers %v, want only competitor", losers)
 	}
 	// Releasing the final key must release the shared envelope too.
-	f.engine.releaseChainRefs("el-0", f.engine.index.Contains("el-0").Tips(), nil)
+	f.engine.releaseChainRefs(logicalAddress("el-0"), f.engine.index.Contains("el-0").Tips(), nil)
 	f.engine.reclaimUnreferenced()
 
 	if _, ok := p.Get(f.shared); ok {
@@ -154,7 +154,7 @@ func TestBindReconstructionAfterOtherKeyCompaction(t *testing.T) {
 					t.Fatal(err)
 				}
 
-				if err := f.engine.emitSnapshot("el-0", nil, proof); err != nil {
+				if err := f.engine.emitSnapshot(logicalAddress("el-0"), nil, proof); err != nil {
 					t.Fatal(err)
 				}
 
@@ -250,7 +250,7 @@ func TestCrossKeyClosureEquivalentDiscovery(t *testing.T) {
 						e.broadcaster = &ancestryBroadcaster{load: func(key string, root Tip, _ []pb.NodeID, have func(Tip) bool, receive func(Tip, []byte, bool) error) error {
 							var err error
 
-							pool.VisitAncestry(key, root, func(tip Tip, _ *pb.Effect, isRoot bool) bool {
+							pool.VisitAncestry(logicalAddress(key), root, func(tip Tip, _ *pb.Effect, isRoot bool) bool {
 								if have(tip) {
 									return true
 								}
@@ -281,7 +281,7 @@ func TestCrossKeyClosureEquivalentDiscovery(t *testing.T) {
 						t.Fatal(err)
 					}
 
-					_, complete, err := e.closeIngestedFrontier("el-0", []Tip{incoming}, make(map[Tip]error))
+					_, complete, err := e.closeIngestedFrontier(logicalAddress("el-0"), []Tip{incoming}, make(map[Tip]error))
 
 					wantFailure := tc.subscribed && tc.failure == transport
 					if complete == wantFailure || errors.Is(err, transport) != wantFailure || (!wantFailure && err != nil) {
@@ -332,7 +332,7 @@ func TestHistoricalBindRetainsOtherKeyLoss(t *testing.T) {
 		snapshot: {Key: []byte("el-4"), Deps: toPbRefs([]Tip{f.latest, bind}), Kind: &pb.Effect_Snapshot{Snapshot: &pb.SnapshotEffect{State: state}}},
 		latest:   {Key: []byte("el-4"), Deps: toPbRefs([]Tip{snapshot}), Kind: &pb.Effect_Snapshot{Snapshot: &pb.SnapshotEffect{State: state}}},
 	})
-	f.engine.installIngestedTips("el-4", latest)
+	f.engine.installIngestedTips(logicalAddress("el-4"), latest)
 
 	got, err := f.engine.GetSnapshots(context.Background(), []string{"el-0", "el-4"})
 	if err != nil {
@@ -404,7 +404,7 @@ func TestBindIngestionClosesAllSubscribedKeys(t *testing.T) {
 						b = &ancestryBroadcaster{load: func(key string, root Tip, _ []pb.NodeID, have func(Tip) bool, receive func(Tip, []byte, bool) error) error {
 							var err error
 
-							log.effectCache.VisitAncestry(key, root, func(tip Tip, eff *pb.Effect, isRoot bool) bool {
+							log.effectCache.VisitAncestry(logicalAddress(key), root, func(tip Tip, eff *pb.Effect, isRoot bool) bool {
 								if have(tip) {
 									return true
 								}
@@ -451,7 +451,7 @@ func TestBindIngestionClosesAllSubscribedKeys(t *testing.T) {
 							}
 						}
 
-						d := newDag(e, key, "")
+						d := newDag(e, logicalAddress(key), "")
 						if err := d.prepare([]Tip{bindTip}); err != nil {
 							t.Fatal(err)
 						}

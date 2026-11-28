@@ -1,0 +1,9 @@
+// The public Node wraps this value with a graph address and observed tips.
+type NodeFields<T> {
+    value: T
+    regions: map<string, string>
+    up: list<string>
+    down: list<string>
+    left: list<string>
+    right: list<string>
+}

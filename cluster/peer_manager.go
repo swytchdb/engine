@@ -72,14 +72,16 @@ type PeerManager struct {
 	// swaps pm.config under pm.mu; callers that only need THIS node's ID
 	// (which never changes for a given PeerManager) read selfID instead
 	// to avoid the lock.
-	selfID    NodeId
-	peers     map[NodeId]*PeerConn
-	listener  *quic.Listener
-	handler   EffectHandler
-	logReader LogReader
-	lisAddr   net.Addr // actual listening address after binding
-	serverTLS *tls.Config
-	clientTLS *tls.Config
+	selfID       NodeId
+	localVersion string            // immutable after construction, including topology updates
+	versions     map[NodeId]string // announced versions, protected by mu
+	peers        map[NodeId]*PeerConn
+	listener     *quic.Listener
+	handler      EffectHandler
+	logReader    LogReader
+	lisAddr      net.Addr // actual listening address after binding
+	serverTLS    *tls.Config
+	clientTLS    *tls.Config
 
 	// Own the QUIC transport and its socket so Stop can release the port
 	// synchronously; closing a ListenAddr listener alone does not wait for it.
@@ -126,6 +128,11 @@ type PeerManager struct {
 
 // NewPeerManager creates a new PeerManager from the cluster configuration.
 func NewPeerManager(config *ClusterConfig, handler EffectHandler, logReader LogReader) (*PeerManager, error) {
+	localVersion := config.Version
+	if localVersion == "" {
+		localVersion = Version
+	}
+
 	serverTLS, err := config.BuildTLSConfig()
 	if err != nil {
 		return nil, err
@@ -139,6 +146,8 @@ func NewPeerManager(config *ClusterConfig, handler EffectHandler, logReader LogR
 	return &PeerManager{
 		config:       config,
 		selfID:       config.NodeID,
+		localVersion: localVersion,
+		versions:     make(map[NodeId]string),
 		peers:        make(map[NodeId]*PeerConn),
 		handler:      handler,
 		logReader:    logReader,
@@ -247,6 +256,7 @@ func (pm *PeerManager) Start(ctx context.Context) error {
 				}
 
 				pm.sendKeyFilterTo(peerID)
+				pm.sendVersionTo(peerID)
 			},
 		)
 
@@ -807,6 +817,8 @@ func (pm *PeerManager) UpdateTopology(newCfg *ClusterConfig) {
 	stops := make([]*PeerConn, 0, len(diff.Removed)+len(diff.Changed))
 
 	for _, removed := range diff.Removed {
+		delete(pm.versions, removed.ID)
+
 		if pc, ok := pm.peers[removed.ID]; ok {
 			slog.Info("disconnecting removed peer", "peer", removed.ID, "address", removed.Address)
 
@@ -824,6 +836,8 @@ func (pm *PeerManager) UpdateTopology(newCfg *ClusterConfig) {
 	}
 
 	for _, changed := range diff.Changed {
+		delete(pm.versions, changed.ID)
+
 		if pc, ok := pm.peers[changed.ID]; ok {
 			slog.Info("reconnecting peer with new config", "peer", changed.ID, "old_address", pc.addr, "new_address", changed.Address)
 			stops = append(stops, pc)
@@ -1090,5 +1104,6 @@ func (pm *PeerManager) newPeerConnection(peer NodeConfig, selfRegion string) *Pe
 		}
 
 		pm.sendKeyFilterTo(peer.ID)
+		pm.sendVersionTo(peer.ID)
 	})
 }
